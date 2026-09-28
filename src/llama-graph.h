@@ -340,15 +340,22 @@ public:
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    // the rotation matrices of layer il, stored in the KV cache buffers
+    // note: assumes rot^2 == I
+    ggml_tensor * get_k_rot(int32_t il) const;
+    ggml_tensor * get_v_rot(int32_t il) const;
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+                                              // or I32 [2, n_batch/n_stream, 1, n_stream] range mask
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
-    // note: assumes v_rot^2 == I
-    ggml_tensor * self_k_rot = nullptr;
-    ggml_tensor * self_v_rot = nullptr;
+    // whether the graph was built with a range mask allowed, and the n_kv it was built with
+    // note: the range mask shape does not carry n_kv, so it has to be compared separately on reuse
+    bool     allow_range = false;
+    uint32_t n_kv_graph  = 0;
 
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
@@ -420,6 +427,9 @@ public:
     ggml_tensor * get_kq_mask_mla() const { return self_kq_mask_mla_cnv; }
     ggml_tensor * get_kq_mask_lid() const { return self_kq_mask_lid; }
 
+    // the rotation matrix of the indexer cache for layer il
+    ggml_tensor * get_k_rot_lid(int32_t il) const;
+
     ggml_tensor * self_k_idxs_mla = nullptr; // I64 [n_batch]
     ggml_tensor * self_k_idxs_lid = nullptr; // I64 [n_batch]
 
@@ -427,8 +437,6 @@ public:
     ggml_tensor * self_kq_mask_mla_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_lid     = nullptr; // F32     [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_lid_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
-
-    ggml_tensor * self_k_rot_lid = nullptr;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -506,6 +514,11 @@ public:
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
 
+    // the rotation matrices of the base or SWA cache that layer il belongs to
+    // note: assumes rot^2 == I
+    ggml_tensor * get_k_rot(int32_t il) const;
+    ggml_tensor * get_v_rot(int32_t il) const;
+
     ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs     = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
@@ -515,12 +528,6 @@ public:
     ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
-
-    ggml_tensor * self_k_rot = nullptr;
-    ggml_tensor * self_v_rot = nullptr;
-
-    ggml_tensor * self_k_rot_swa = nullptr;
-    ggml_tensor * self_v_rot_swa = nullptr;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -550,6 +557,10 @@ public:
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
 
+    // the rotation matrices of the base or SWA cache that layer il belongs to
+    // note: assumes rot^2 == I
+    ggml_tensor * get_k_rot(int32_t il) const;
+
     ggml_tensor * self_k_idxs     = nullptr; // I64 [n_batch]
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
 
@@ -557,9 +568,6 @@ public:
     ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
-
-    ggml_tensor * self_k_rot = nullptr;
-    ggml_tensor * self_k_rot_swa = nullptr;
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -583,12 +591,13 @@ public:
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    // the rotation matrix of the raw cache for layer il
+    ggml_tensor * get_k_rot(int32_t il) const;
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
-
-    ggml_tensor * self_k_rot = nullptr;
 
     const llama_cparams cparams;
 
@@ -610,8 +619,6 @@ public:
         ggml_tensor * state_write_pos  = nullptr; // I32 [n_state_write]
 
         ggml_tensor * kq_mask    = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
-
-        ggml_tensor * k_rot      = nullptr;
     };
 
     llm_graph_input_dsv4(
@@ -632,6 +639,11 @@ public:
     const comp_input & get_csa() const { return inp_csa; }
     const comp_input & get_hca() const { return inp_hca; }
     const comp_input & get_lid() const { return inp_lid; }
+
+    // rotation matrices of the compressed K caches for layer il
+    ggml_tensor * get_csa_k_rot(int32_t il) const;
+    ggml_tensor * get_hca_k_rot(int32_t il) const;
+    ggml_tensor * get_lid_k_rot(int32_t il) const;
 
     std::unique_ptr<llm_graph_input_dsv4_raw> inp_raw;
 
@@ -813,6 +825,12 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // DFlash2 device feature sink, see llama_enable_layer_inp_sink
+    ggml_tensor * t_layer_inp_sink = nullptr;    // target: sink written by this graph
+    ggml_tensor * t_embd_src       = nullptr;    // draft: staging sink read by the injection graph
+    std::vector<uint32_t> layer_inp_sink_layers; // target: row order within the sink
+    size_t token_offset = 0;                     // target: first sink column written by this ubatch
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -883,7 +901,11 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            t_layer_inp_sink      == other.t_layer_inp_sink      &&
+            t_embd_src            == other.t_embd_src            &&
+            token_offset          == other.token_offset          &&
+            layer_inp_sink_layers == other.layer_inp_sink_layers;
     }
 };
 
@@ -939,6 +961,11 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+
+    // top-k logits output (llama_set_logits_topk): [1, k, n_shards, n_outputs] logits and
+    // [k, n_shards, n_outputs] ids local to their vocab shard
+    ggml_tensor * t_logits_topk     = nullptr;
+    ggml_tensor * t_logits_topk_ids = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1037,6 +1064,12 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    // DFlash2 device feature sink, copied from the graph parameters
+    ggml_tensor * const t_layer_inp_sink;    // target: sink written by this graph
+    ggml_tensor * const t_embd_src;          // draft: staging sink read by the injection graph
+    const std::vector<uint32_t> layer_inp_sink_layers;
+    const size_t token_offset;               // target: first sink column written by this ubatch
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
@@ -1210,7 +1243,8 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    llm_graph_input_attn_kv * build_attn_inp_kv() const;
+    // range_mask: see build_inp_mem_hybrid
+    llm_graph_input_attn_kv * build_attn_inp_kv(bool range_mask = false) const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_kv * inp,
@@ -1359,7 +1393,9 @@ struct llm_graph_context {
     // hybrid
     //
 
-    llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
+    // range_mask: the model feeds the attention mask to ggml_flash_attn_ext only (build_attn), so a
+    // single-sequence causal ubatch may use an I32 [lo, hi) range mask instead of the dense mask
+    llm_graph_input_mem_hybrid * build_inp_mem_hybrid(bool range_mask = false) const;
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
@@ -1381,6 +1417,8 @@ struct llm_graph_context {
 
     void build_sampling() const;
 
+    void build_logits_topk() const;
+
     //
     // dense (out)
     //
@@ -1389,6 +1427,13 @@ struct llm_graph_context {
             ggml_tensor * dense_2,
             ggml_tensor * dense_2_b,
             ggml_tensor * dense_3) const;
+
+    //
+    // DFlash2 device feature sink
+    //
+
+    // append copies of the extracted layer inputs into the device sink (target side, no-op when not enabled)
+    void build_layer_inp_sink() const;
 };
 
 // TODO: better name

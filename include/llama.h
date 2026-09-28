@@ -1138,6 +1138,22 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // Top-k logits output. With k > 0 the k largest logits of every output row are copied back with
+    // their token ids, and a batch with several outputs (e.g. a speculative verification) no longer
+    // copies its full logits: only llama_get_logits_topk_ith is valid for its rows. A batch with a
+    // single output still gets its full logits. When the vocab is split over several devices (tensor
+    // parallelism) every shard selects its own k candidates, so a row holds k * n_shards candidates in
+    // no particular order, a superset of its top k. 0 disables it.
+    LLAMA_API void llama_set_logits_topk(struct llama_context * ctx, int32_t k);
+
+    // Candidates of the output for the ith token (indexed like llama_get_logits_ith): returns their
+    // number and sets `ids` and `logits` to them, or returns 0 if the top-k output is not enabled.
+    LLAMA_API int32_t llama_get_logits_topk_ith(
+            struct llama_context * ctx,
+                         int32_t   i,
+               const llama_token ** ids,
+                     const float ** logits);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
@@ -1466,6 +1482,10 @@ extern "C" {
 
     /// seed == LLAMA_DEFAULT_SEED to use a random seed.
     LLAMA_API struct llama_sampler * llama_sampler_init_dist(uint32_t seed);
+
+    /// @details Draw a uniform random number in [0, 1) from the dist sampler's RNG.
+    /// Aborts if the sampler is not a dist sampler.
+    LLAMA_API float llama_sampler_dist_draw_u(struct llama_sampler * smpl);
 
     /// @details Top-K sampling described in academic paper "The Curious Case of Neural Text Degeneration" https://arxiv.org/abs/1904.09751
     /// Setting k <= 0 makes this a noop

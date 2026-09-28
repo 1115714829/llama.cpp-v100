@@ -387,6 +387,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qkv_bias        ("blk\\.\\d*\\.attn_qkv.bias");
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
+    static const std::regex pattern_kv_rot          ("cache_(k|v)_rot");
+    static const std::regex pattern_layer_inp_sink  ("embd_(layer_inp|src)_sink");
     static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
     static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
@@ -513,6 +515,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // the PLE table is model-level and its conv is mirrored, so every device runs the whole conv and needs the whole history
         if (std::regex_match(tensor_name, pattern_ple_r_cache)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+
+        // the attention rotation matrices are used in full by every device, they are not tied to a layer
+        if (std::regex_match(tensor_name, pattern_kv_rot)) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
+        }
+
+        // the DFlash2 feature sinks are written and read by every device in full
+        if (std::regex_match(tensor_name, pattern_layer_inp_sink)) {
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
         }
 
         // standard attention
@@ -2338,6 +2350,11 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+bool llama_model::kq_range_mask_supported() const {
+    // these architectures feed the attention mask to ggml_flash_attn_ext only
+    return arch == LLM_ARCH_QWEN35;
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
@@ -2835,11 +2852,17 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // add backend sampling layers (if any)
     llm->build_sampling();
 
+    // add the top-k logits output (if enabled)
+    llm->build_logits_topk();
+
     // if the gguf model was converted with --sentence-transformers-dense-modules
     // there will be two additional dense projection layers
     // dense linear projections are applied after pooling
     // TODO: move reranking logic here and generalize
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
+
+    // DFlash2: copy the extracted layer inputs into the device sink (if enabled)
+    llm->build_layer_inp_sink();
 
     llm->res->set_outputs(params);
 

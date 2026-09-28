@@ -114,7 +114,7 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer*ggml_tensor_overhead() + 2u*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -161,6 +161,9 @@ llama_kv_cache::llama_kv_cache(
     }
 
     const bool is_mla = hparams.is_mla();
+
+    // the buffer type of every layer that owns K/V tensors, used to place the rotation matrices
+    std::vector<ggml_backend_buffer_type_t> layer_buft(n_layer, nullptr);
 
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
@@ -222,6 +225,8 @@ llama_kv_cache::llama_kv_cache(
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
 
+        layer_buft[il] = buft;
+
         ggml_context * ctx = ctx_for_buft(buft);
         if (!ctx) {
             throw std::runtime_error("failed to create ggml context for kv cache");
@@ -246,7 +251,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, nullptr, nullptr, k_stream, v_stream, });
     }
 
     if (reuse) {
@@ -271,37 +276,6 @@ llama_kv_cache::llama_kv_cache(
 
             LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
         }
-    }
-
-    // allocate tensors and initialize the buffers to avoid NaNs in the padding
-    for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf;
-        if (hparams.no_alloc) {
-            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
-            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
-                t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
-            }
-        } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
-        }
-        if (!buf) {
-            throw std::runtime_error("failed to allocate buffer for kv cache");
-        }
-
-        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
-
-        ggml_backend_buffer_clear(buf, 0);
-        ctxs_bufs.emplace_back(std::move(ctx), buf);
-    }
-
-    {
-        const size_t memory_size_k = size_k_bytes();
-        const size_t memory_size_v = size_v_bytes();
-
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
-                ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
-                ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
     }
 
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
@@ -341,8 +315,7 @@ llama_kv_cache::llama_kv_cache(
     LLAMA_LOG_INFO("%s: attn_rot_k = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_k, n_embd_head_k_all);
     LLAMA_LOG_INFO("%s: attn_rot_v = %d, n_embd_head_k_all = %d\n", __func__, attn_rot_v, n_embd_head_v_all);
 
-    // pre-compute the haramard matrices and keep them in host memory
-    // TODO: in the future, we can make copies in the backend buffers to avoid host -> device transfers
+    // pre-compute the Hadamard matrices, they are kept in host memory for the upload into the K/V buffers
     if (attn_rot_k || attn_rot_v) {
         for (int64_t n = 64; n <= std::max(n_embd_head_k_all, n_embd_head_v_all); n *= 2) {
             attn_rot_hadamard[n] = std::vector<float>(n*n);
@@ -362,6 +335,94 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // place the rotation matrices in the K/V buffers, so that they are not copied to the devices on every graph
+    if (attn_rot_k || attn_rot_v) {
+        int64_t n_rot_k = 0;
+
+        // using smaller rotation matrices for V seems beneficial
+        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
+        const int64_t n_rot_v = 64;
+
+        std::map<ggml_backend_buffer_type_t, ggml_tensor *, ggml_backend_buft_comparator> k_rot_map;
+        std::map<ggml_backend_buffer_type_t, ggml_tensor *, ggml_backend_buft_comparator> v_rot_map;
+
+        for (auto & layer : layers) {
+            const ggml_backend_buffer_type_t buft = layer_buft[layer.il];
+            if (buft == nullptr) {
+                continue; // K/V of this layer are shared with the other cache
+            }
+
+            if (attn_rot_k) {
+                auto it = k_rot_map.find(buft);
+                if (it == k_rot_map.end()) {
+                    if (n_rot_k == 0) {
+                        n_rot_k = 64;
+
+                        // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
+                        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
+                        do {
+                            n_rot_k *= 2;
+                        } while (n_embd_head_k_all % n_rot_k == 0);
+                        n_rot_k /= 2;
+                    }
+
+                    ggml_tensor * k_rot = ggml_new_tensor_2d(ctx_map.at(buft).get(), GGML_TYPE_F32, n_rot_k, n_rot_k);
+                    ggml_set_name(k_rot, "cache_k_rot");
+
+                    it = k_rot_map.emplace(buft, k_rot).first;
+                    attn_rot_tensors.push_back(k_rot);
+                }
+                layer.k_rot = it->second;
+            }
+
+            if (attn_rot_v) {
+                auto it = v_rot_map.find(buft);
+                if (it == v_rot_map.end()) {
+                    ggml_tensor * v_rot = ggml_new_tensor_2d(ctx_map.at(buft).get(), GGML_TYPE_F32, n_rot_v, n_rot_v);
+                    ggml_set_name(v_rot, "cache_v_rot");
+
+                    it = v_rot_map.emplace(buft, v_rot).first;
+                    attn_rot_tensors.push_back(v_rot);
+                }
+                layer.v_rot = it->second;
+            }
+        }
+    }
+
+    // allocate tensors and initialize the buffers to avoid NaNs in the padding
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf;
+        if (hparams.no_alloc) {
+            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
+            }
+        } else {
+            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+        }
+        if (!buf) {
+            throw std::runtime_error("failed to allocate buffer for kv cache");
+        }
+
+        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+
+        ggml_backend_buffer_clear(buf, 0);
+        ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    // the buffers above were zeroed, so the rotation matrices have to be written now
+    upload_rot_tensors();
+
+    {
+        const size_t memory_size_k = size_k_bytes();
+        const size_t memory_size_v = size_v_bytes();
+
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
+                (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
+                ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
+                ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+    }
+
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
 }
@@ -376,6 +437,9 @@ void llama_kv_cache::clear(bool data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
+
+        // the rotation matrices are stored in the same buffers
+        upload_rot_tensors();
     }
 }
 
@@ -402,15 +466,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
-
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
+        // collect first, as seq_rm() updates seq_pos and would invalidate the iteration
+        for (const uint32_t i : cells.seq_pos_range(seq_id, p0, p1)) {
+            if (cells.seq_rm(i, seq_id)) {
+                new_head = std::min(new_head, i);
             }
         }
 
@@ -863,6 +922,10 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
         // apply K-shift if needed
         if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
+            // inputs are copied to the backends asynchronously, so wait for any in-flight copies
+            // before overwriting the k_shift input
+            llama_synchronize(lctx);
+
             ggml_backend_sched_reset(sched);
 
             auto * res = lctx->get_gf_res_reserve();
@@ -1247,20 +1310,39 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     return v_cells[seq_to_stream[seq_id]];
 }
 
-uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, bool full) const {
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
     // note: this also helps some backends with performance (f.ex https://github.com/ggml-org/llama.cpp/pull/16812#issuecomment-3455112220)
-    const uint32_t n_pad_cur = std::max(n_pad, 256u);
-
+    // a new n_kv rebuilds the graph and, with tensor parallelism, re-records its CUDA graphs (about 0.1 s), so the grain
+    // is large: 2048 cells, doubling with the used context beyond 64K so that the boundaries stay rare in long generations
+    // note: the extra cells are empty and masked, but FA still reads them - the waste is below the grain (1/32 of the used length at 128K)
+    // full: range-mask prompt ubatches always view the whole cache so that they share one n_kv and one graph
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))), result);
+        if (full) {
+            result = std::max(cells.size(), result);
+
+            continue;
+        }
+
+        const uint32_t n_used = cells.used_max_p1();
+
+        uint32_t grain = std::max(n_pad, 2048u);
+        while (grain * 32 < n_used) {
+            grain *= 2;
+        }
+
+        result = std::max(std::min(cells.size(), std::max(grain, GGML_PAD(n_used, grain))), result);
     }
 
     return result;
+}
+
+void llama_kv_cache::set_kq_range_allowed(bool allowed) {
+    kq_range_enabled = allowed;
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
@@ -1434,45 +1516,24 @@ ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama
     return v_idxs;
 }
 
-ggml_tensor * llama_kv_cache::build_input_k_rot(ggml_context * ctx) const {
-    ggml_tensor * res = nullptr;
+ggml_tensor * llama_kv_cache::build_input_k_rot(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
 
-    if (attn_rot_k) {
-        int nrot = 64;
-
-        // TODO: investigate if using the smallest rotation matrix is beneficial also for K (similar as for V)
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4141323088
-        do {
-            nrot *= 2;
-        } while (n_embd_head_k_all % nrot == 0);
-        nrot /= 2;
-
-        res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
-        ggml_set_input(res);
-        ggml_set_name(res, "attn_inp_k_rot");
+    if (it == map_layer_ids.end()) {
+        return nullptr;
     }
 
-    return res;
+    return layers[it->second].k_rot;
 }
 
-ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
-    ggml_tensor * res = nullptr;
+ggml_tensor * llama_kv_cache::build_input_v_rot(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
 
-    if (attn_rot_v) {
-        int nrot = 64;
-        // using smaller rotation matrices for V seems beneficial
-        // ref: https://github.com/ggml-org/llama.cpp/pull/21038#issuecomment-4146397570
-        //do {
-        //    nrot *= 2;
-        //} while (hparams.n_embd_head_v() % nrot == 0);
-        //nrot /= 2;
-
-        res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, nrot, nrot);
-        ggml_set_input(res);
-        ggml_set_name(res, "attn_inp_v_rot");
+    if (it == map_layer_ids.end()) {
+        return nullptr;
     }
 
-    return res;
+    return layers[it->second].v_rot;
 }
 
 void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
@@ -1593,7 +1654,6 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
             const auto & cells = v_cells.at(seq_to_stream[seq_id]);
 
-                  llama_pos p0 = -1;
             const llama_pos p1 = ubatch->pos[i];
 
             // for M-RoPE
@@ -1602,16 +1662,14 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
             const uint64_t idst = n_kv*i;
 
+            auto & idxs = seq_idxs[seq_id];
+
             // for tokens of the same sequence, the mask is mostly the same, so we can reuse it
             // the only cells that could change are the ones that are with similar positions as the
             //   ones in the batch (i.e. due to causal masking, SWA, etc.)
             // keep track of those cells and shortcut the loop to save time
             // note: this optimization is not compatible with Alibi position encoding
             // ref:  https://github.com/ggml-org/llama.cpp/pull/18842
-            bool prev = false;
-
-            auto & idxs = seq_idxs[seq_id];
-
             if (!alibi) {
                 if (seq_srct.find(seq_id) != seq_srct.end()) {
                     const uint32_t srct = seq_srct[seq_id];
@@ -1619,64 +1677,108 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     const uint64_t idst_prev = n_kv*srct;
 
                     std::copy(data + idst_prev, data + idst_prev + n_kv, data + idst);
-
-                    prev = true;
                 } else {
                     idxs.clear();
                     idxs.reserve(ubatch->n_tokens + n_swa + 32);
 
                     seq_srct[seq_id] = i;
+
+                    // first mask for this sequence: compute it from scratch
+                    // read the cell arrays directly to keep this loop compact
+                    const llama_pos * cell_pos = cells.pos_data();
+                    const auto      * cell_seq = cells.seq_data();
+
+                    const llama_pos pos_min = seq_pos_min[seq_id];
+
+                    // every used cell carries this sequence (e.g. a single sequence): a non-empty cell is enough
+                    const bool all_seq = cells.seq_n_cells(seq_id) == cells.get_used();
+
+                    for (uint32_t j = 0; j < n_kv; ++j) {
+                        const llama_pos p0 = cell_pos[j];
+
+                        // mask the token if the cell is empty or not from the same sequence
+                        if (p0 < 0 || (!all_seq && !cell_seq[j].test(seq_id))) {
+                            data[idst + j] = mask_drop;
+                            continue;
+                        }
+
+                        // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
+                        if (p0 + (int32_t) (n_swa + 32) >= pos_min) {
+                            idxs.push_back(j);
+                        }
+
+                        // mask future tokens
+                        if (causal && p0 > p1) {
+                            data[idst + j] = mask_drop;
+                            continue;
+                        }
+
+                        // M-RoPE causal mask
+                        if (causal && is_2d && p0 == p1) {
+                            const auto & p0_ext = cells.ext_get(j);
+
+                            if (p0_ext.is_2d_gt(p1_x, p1_y)) {
+                                data[idst + j] = mask_drop;
+                                continue;
+                            }
+                        }
+
+                        // apply SWA if any
+                        if (swa) {
+                            // see llama_non_causal_type
+                            const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= pos_min;
+                            if (!in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
+                                data[idst + j] = mask_drop;
+                                continue;
+                            }
+                        }
+
+                        data[idst + j] = mask_keep;
+                    }
+
+                    continue;
                 }
             }
 
+            // for Alibi, or for the other tokens of the same sequence: update the cells of interest
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
                 uint32_t j = jj;
 
-                // we have an exiting mask for this sequence -> update just seq_idxs
                 if (!alibi) {
-                    if (prev) {
-                        if (jj >= idxs.size()) {
-                            break;
-                        }
-
-                        j = idxs[jj];
+                    if (jj >= idxs.size()) {
+                        break;
                     }
+
+                    j = idxs[jj];
                 }
 
                 if (cells.is_empty(j)) {
-                    goto skip;
+                    data[idst + j] = mask_drop;
+                    continue;
                 }
 
                 // mask the token if not the same sequence
                 if (!cells.seq_has(j, seq_id)) {
-                    goto skip;
+                    data[idst + j] = mask_drop;
+                    continue;
                 }
 
-                p0 = cells.pos_get(j);
-
-                if (!alibi) {
-                    if (!prev) {
-                        // record all cells for which: p0 >= seq_pos_min[seq_id] - n_swa - 32
-                        if (p0 + (int32_t) (n_swa + 32) >= seq_pos_min[seq_id]) {
-                            idxs.push_back(j);
-                        }
-                    }
-                }
+                const llama_pos p0 = cells.pos_get(j);
 
                 if (causal) {
                     // mask future tokens
                     if (p0 > p1) {
-                        goto skip;
+                        data[idst + j] = mask_drop;
+                        continue;
                     }
 
                     // M-RoPE causal mask
-                    if (is_2d) {
-                        if (p0 == p1) {
-                            const auto & p0_ext = cells.ext_get(j);
+                    if (is_2d && p0 == p1) {
+                        const auto & p0_ext = cells.ext_get(j);
 
-                            if (p0_ext.is_2d_gt(p1_x, p1_y)) {
-                                goto skip;
-                            }
+                        if (p0_ext.is_2d_gt(p1_x, p1_y)) {
+                            data[idst + j] = mask_drop;
+                            continue;
                         }
                     }
                 }
@@ -1686,7 +1788,8 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                     // see llama_non_causal_type
                     const bool in_span = !causal && args.hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_FULL && p0 >= seq_pos_min[seq_id];
                     if (!in_span && llama_hparams::is_masked_swa(n_swa, swa_type, p0, p1)) {
-                        goto skip;
+                        data[idst + j] = mask_drop;
+                        continue;
                     }
                 }
 
@@ -1695,10 +1798,6 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 } else {
                     data[idst + j] = mask_keep;
                 }
-
-                continue;
-skip:
-                data[idst + j] = mask_drop;
             }
         }
     }
@@ -1787,6 +1886,72 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch & ubatch) const {
+    if (!kq_range_enabled) {
+        return false;
+    }
+
+    if (swa_type != LLAMA_SWA_TYPE_NONE) {
+        return false;
+    }
+
+    if (sinfo.n_stream() != 1) {
+        return false;
+    }
+
+    if (ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (ubatch.n_seq_id[i] != 1) {
+            return false;
+        }
+    }
+
+    const llama_seq_id s = ubatch.seq_id_unq[0];
+
+    const auto & cells = v_cells[sinfo.strm[0]];
+
+    const uint32_t n_used = cells.get_used();
+
+    if (n_used == 0 || n_used != cells.used_max_p1()) {
+        return false;
+    }
+
+    if (cells.seq_n_cells(s) != n_used) {
+        return false;
+    }
+
+    const llama_pos pos0 = cells.pos_get(0);
+
+    for (uint32_t j = 1; j < n_used; ++j) {
+        if (cells.pos_get(j) != pos0 + (llama_pos) j) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+void llama_kv_cache::set_input_kq_range(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->ne[0] == 2);
+    GGML_ASSERT(dst->ne[1] == ubatch->n_tokens);
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    const auto & cells = v_cells[seq_to_stream[ubatch->seq_id[0][0]]];
+
+    const llama_pos pos0 = cells.pos_get(0);
+
+    int32_t * data = (int32_t *) dst->data;
+
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        data[2*i + 0] = 0;
+        data[2*i + 1] = ubatch->pos[i] - pos0 + 1;
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -1812,22 +1977,17 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
     }
 }
 
-void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+void llama_kv_cache::upload_rot_tensors() const {
+    if (hparams.no_alloc) {
+        return;
+    }
 
-    const auto n_rot = dst->ne[0];
-    GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
+    for (ggml_tensor * t : attn_rot_tensors) {
+        const auto it = attn_rot_hadamard.find(t->ne[0]);
+        GGML_ASSERT(it != attn_rot_hadamard.end());
 
-    memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
-}
-
-void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-
-    const auto n_rot = dst->ne[0];
-    GGML_ASSERT(attn_rot_hadamard.count(dst->ne[0]));
-
-    memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
+        ggml_backend_tensor_set(t, it->second.data(), 0, ggml_nbytes(t));
+    }
 }
 
 bool llama_kv_cache::has_cell_ext() const {
@@ -1982,9 +2142,6 @@ public:
 
     ggml_tensor * k_shift; // I32 [kv_size*n_stream]
 
-    // note: assumes k_rot^2 == I
-    ggml_tensor * k_rot = nullptr;
-
     const llama_kv_cache * kv_self;
 };
 
@@ -1993,10 +2150,6 @@ void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
 
     if (k_shift) {
         kv_self->set_input_k_shift(k_shift);
-    }
-
-    if (k_rot && k_rot->buffer) {
-        kv_self->set_input_k_rot(k_rot);
     }
 }
 
@@ -2011,8 +2164,6 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
 
     inp->k_shift = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t) get_size()*n_stream);
     ggml_set_input(inp->k_shift);
-
-    inp->k_rot = build_input_k_rot(ctx);
 
     const auto & cparams = lctx->get_cparams();
 
@@ -2042,7 +2193,7 @@ ggml_cgraph * llama_kv_cache::build_graph_shift(llm_graph_result * res, llama_co
                 ggml_row_size(layer.k->type, n_embd_k_gqa),
                 ggml_row_size(layer.k->type, n_embd_nope));
 
-        ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, inp->k_rot, rope_factors, freq_base_l, freq_scale_l, il);
+        ggml_tensor * cur = build_rope_shift(cparams, ctx, k, inp->k_shift, layer.k_rot, rope_factors, freq_base_l, freq_scale_l, il);
 
         ggml_build_forward_expand(gf, cur);
     }
@@ -2832,7 +2983,15 @@ bool llama_kv_cache_context::apply() {
     }
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
-    n_kv = kv->get_n_kv(sinfos[i_cur]);
+    kq_range = kv->get_kq_range_ok(sinfos[i_cur], ubatches[i_cur]);
+    // with a range mask an ubatch of 2+ tokens attends the whole cache: the range bounds the work (the
+    // sm70 prompt and verify kernels split by it), and the graph no longer depends on the context length,
+    // so prompt ubatches and verify batches are each built once (single-token ubatches keep the grain).
+    // bounded caches that view the whole cache saturate, but their n_kv still changes with the used-cell
+    // grain: 2+ token ubatches on them also view the whole cache so that the block graph is built once
+    // (dense mask, the extra cells are masked)
+    const bool full = sinfos[i_cur].size() >= 2 && (kq_range || kv->get_view_full());
+    n_kv = kv->get_n_kv(sinfos[i_cur], full);
 
     return true;
 }
@@ -2883,12 +3042,12 @@ ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, con
     return kv->build_input_v_idxs(ctx, ubatch);
 }
 
-ggml_tensor * llama_kv_cache_context::build_input_k_rot(ggml_context * ctx) const {
-    return kv->build_input_k_rot(ctx);
+ggml_tensor * llama_kv_cache_context::build_input_k_rot(int32_t il) const {
+    return kv->build_input_k_rot(il);
 }
 
-ggml_tensor * llama_kv_cache_context::build_input_v_rot(ggml_context * ctx) const {
-    return kv->build_input_v_rot(ctx);
+ggml_tensor * llama_kv_cache_context::build_input_v_rot(int32_t il) const {
+    return kv->build_input_v_rot(il);
 }
 
 void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
@@ -2904,19 +3063,17 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 }
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    if (dst->type == GGML_TYPE_I32) {
+        kv->set_input_kq_range(dst, ubatch);
+
+        return;
+    }
+
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_pos_bucket(dst, ubatch);
-}
-
-void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
-    kv->set_input_k_rot(dst);
-}
-
-void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
-    kv->set_input_v_rot(dst);
 }
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {

@@ -40,6 +40,21 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
+// DFlash2: device-side link between a target context (writes the layer-input sink) and a draft
+// context (copies from it). The same object is held by both contexts.
+struct llama_embd_link {
+    ggml_backend_event_t ev_tgt_done  = nullptr; // target finished writing the sink
+    ggml_backend_event_t ev_copy_done = nullptr; // draft finished copying from the sink
+
+    ggml_tensor * t_layer_inp_sink = nullptr;    // target sink, [n_embd * n_layers, n_batch]
+    ggml_tensor * t_embd_src_sink  = nullptr;    // draft staging sink, [n_embd_inp, n_ubatch]
+
+    ~llama_embd_link() {
+        ggml_backend_event_free(ev_tgt_done);
+        ggml_backend_event_free(ev_copy_done);
+    }
+};
+
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
     llama_context(
@@ -82,6 +97,9 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    void    set_logits_topk(int32_t k);
+    int32_t get_logits_topk_ith(int32_t i, const llama_token ** ids, const float ** logits);
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -120,6 +138,15 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    // DFlash2: keep the target layer inputs in a device sink instead of host buffers
+    bool enable_layer_inp_sink(const std::vector<uint32_t> & lids);
+    // DFlash2: link a draft context to this target context (allocates the draft staging sink)
+    bool link_embd(llama_context * ctx_dft);
+    // DFlash2: switch the next embd batch of a linked draft between the device sink and the host input
+    void set_embd_source(bool enable, int32_t token_offset);
+    // DFlash2: read back [token_offset, token_offset + n_tokens) rows of the sink into dst
+    bool layer_inp_sink_get(size_t token_offset, size_t n_tokens, float * dst);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -139,7 +166,8 @@ struct llama_context {
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
-                       ggml_status & ret);
+                       ggml_status & ret,
+                         size_t     token_offset = 0);
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
@@ -237,7 +265,7 @@ private:
 
     // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
     // from backend into host-side embd_layer_inp buffers
-    void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
+    void extract_layer_inputs(ggml_backend_sched_t sched, const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
     //
     // graph
@@ -253,21 +281,33 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
     // reserve a graph with a dummy ubatch of the specified size
+    // n_embd > 0 reserves the graph of an embd ubatch with that row width (e.g. DFlash feature injection)
     ggml_cgraph * graph_reserve(
-        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
+        uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr, uint32_t n_embd = 0,
+        ggml_backend_sched_t sched_override = nullptr);
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
-    llm_graph_result * get_gf_res_prev();
+    llm_graph_result * get_gf_res_prev(int slot);
+
+    // slot of the previous-graph cache for this ubatch
+    int gf_res_slot(const llama_ubatch & ubatch) const;
+
+    // scheduler that holds the graph state of the given slot
+    ggml_backend_sched_t sched_for_slot(int slot) const;
 
     llm_graph_params graph_params(
-                        llm_graph_result * res,
+                     ggml_backend_sched_t sched,
+                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const;
+                          llm_graph_type   gtype,
+                             size_t        token_offset = 0) const;
 
-    llm_graph_cb graph_get_cb() const;
+    llm_graph_cb graph_get_cb(ggml_backend_sched_t sched) const;
+
+    ggml_status graph_compute_impl(ggml_backend_sched_t sched, ggml_cgraph * gf, bool batched);
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -311,6 +351,31 @@ private:
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
 
+    // DFlash2: device-side sink for the target layer inputs, [n_embd * n_layers, n_batch]
+    ggml_context_ptr        ctx_sink; // declared before buf_sink so that the buffer is freed first
+    ggml_backend_buffer_ptr buf_sink;
+    ggml_tensor *           t_layer_inp_sink = nullptr;
+    std::vector<uint32_t>   layer_inp_sink_layers;
+
+    // DFlash2: draft-side staging sink for the injected features, [n_embd_inp, n_ubatch]
+    ggml_context_ptr        ctx_embd_src;
+    ggml_backend_buffer_ptr buf_embd_src;
+    ggml_tensor *           t_embd_src_sink = nullptr;
+
+    // producer/consumer link, shared with the linked context
+    std::shared_ptr<llama_embd_link> embd_link;
+    bool    embd_src_enable = false; // draft: the next embd batch reads the staging sink
+    int32_t embd_src_offset = 0;     // draft: first target-sink column to copy
+
+    // top-k logits output (3-dimensional arrays: [n_outputs][n_shards][k]), see llama_set_logits_topk;
+    // the ids are local to their vocab shard, topk_ids_row holds the global ids of the last row read
+    buffer_view<float>       topk_logits = {nullptr, 0};
+    buffer_view<int32_t>     topk_ids    = {nullptr, 0};
+    std::vector<llama_token> topk_ids_row;
+
+    // false when the last batch only copied its top-k logits
+    bool logits_full = true;
+
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
         std::map<llama_seq_id, llama_sampler *> samplers;
@@ -351,6 +416,14 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // DFlash drafts keep the embd injection graph on a separate scheduler so that
+    // the alternating inject/block passes do not invalidate each other's graph state
+    ggml_backend_sched_ptr sched_slot0;
+
+    // decode graphs (verification/single-token batches) get their own scheduler so that
+    // prefill allocations do not invalidate them across requests, see gf_res_slot
+    ggml_backend_sched_ptr sched_dec;
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
@@ -372,11 +445,13 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
-    // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // Separate arenas give batches with different graph layouts distinct CUDA graph cache keys:
+    // by outputs for regular contexts, by input kind (embd/token) for DFlash drafts,
+    // slot 2 for decode batches when sched_dec is enabled
+    std::array<llm_graph_result_ptr, 3> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
-    llm_graph_result * gf_res_prev_active = nullptr;
+    std::array<llm_graph_result *, 3> gf_res_prev_active = { nullptr, nullptr, nullptr };
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <random>
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -927,6 +928,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     bool    is_mrope       = false;
     int32_t selector_top_k = 0;
 
+    // rejection sampling proposal RNG, one per seq, re-seeded when the request seed changes
+    std::vector<std::mt19937> walk_rngs;
+    std::vector<uint32_t>     walk_rng_seeds;
+    std::vector<bool>         walk_rng_init;
+
     // draft-dspark: the draft carries a Markov head and uses an anchor-first block layout
     const bool is_dspark;
 
@@ -938,6 +944,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
+
+    // DFlash2 device path: target device sink + cross-context link
+    bool sink_ready = false;
+    bool link_ready = false;
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1024,6 +1034,10 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             s.reset(common_sampler_init(model_dft, sparams));
         }
 
+        walk_rngs.resize(n_seq);
+        walk_rng_seeds.assign(n_seq, 0);
+        walk_rng_init.assign(n_seq, false);
+
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
         if (this->params.backend_sampling && !is_dflash2) {
@@ -1043,6 +1057,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         // turn on extraction of the target layers' input embeddings
         for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
+        }
+
+        // DFlash2: keep the target layer inputs on the device and copy them to the draft directly.
+        // If enable fails the regular host extraction stays; without a link the features are read
+        // back from the sink per chunk instead.
+        {
+            std::vector<uint32_t> lids(target_layer_ids, target_layer_ids + target_layer_ids_n);
+            sink_ready = llama_enable_layer_inp_sink(ctx_tgt, lids.data(), (uint32_t) lids.size());
+        }
+        if (sink_ready) {
+            link_ready = llama_context_link_embd(ctx_tgt, ctx_dft);
+            if (!link_ready) {
+                LOG_WRN("%s: device feature link unavailable, using the host fallback\n", __func__);
+            }
         }
 
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
@@ -1071,6 +1099,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
+
+        // a new request re-seeds the proposal RNG on its first walk
+        walk_rng_init[seq_id] = false;
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1122,6 +1153,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // the device path needs the target sink, a token batch and a single active sequence: the
+        // staging copy always fills column 0 and the injection graph reads a fixed view there
+        int32_t n_active = 0;
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            n_active += (i_batch_beg[s] >= 0);
+        }
+        const bool dev_batch = sink_ready && link_ready && has_tokens && !has_embeddings && n_active == 1;
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
@@ -1137,19 +1176,38 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+                const int32_t col_beg = i_batch_beg[seq_id] + offset;
 
-                // gather target features per extract layer; the fused decode encodes and
-                // injects them into the K/V cache at the target positions
+                // only a chunk starting at column 0 can use the device path; the fused decode
+                // encodes the features and injects them into the K/V cache at the target positions
+                const bool use_dev = dev_batch && col_beg == 0;
+
                 batch_inject.n_tokens = n_chunk;
-                for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                    if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
-                    }
-                    for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
-                        std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+
+                if (use_dev) {
+                    // batch_inject.embd stays as a placeholder; process_ubatch copies the sink
+                    llama_set_embd_source(ctx_dft, true, col_beg);
+                } else {
+                    llama_set_embd_source(ctx_dft, false, 0);
+
+                    if (sink_ready) {
+                        // the features are on the target device: read back the columns of this chunk
+                        if (!llama_layer_inp_sink_get(ctx_tgt, (size_t) col_beg, (size_t) n_chunk, batch_inject.embd)) {
+                            LOG_ERR("%s: failed to read the target feature sink\n", __func__);
+                            return false;
+                        }
+                    } else {
+                        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                            const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                            if (!layer) {
+                                GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                            }
+                            for (int32_t i = 0; i < n_chunk; ++i) {
+                                float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                                const float * src = layer + (size_t) (col_beg + i) * n_embd_tgt;
+                                std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                            }
+                        }
                     }
                 }
 
@@ -1234,6 +1292,77 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             if (is_dflash2) {
                 const float * lattice = llama_get_embeddings_nextn(ctx_dft);
                 GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
+
+                if (dp.use_rejection) {
+                    GGML_ASSERT(dp.result_q);
+                    GGML_ASSERT(dp.temp > 0.0f);
+
+                    auto & result_q = *dp.result_q;
+
+                    // lazily seed the proposal RNG; the same request keeps drawing from it across rounds
+                    if (!walk_rng_init[seq_id] || walk_rng_seeds[seq_id] != dp.seed) {
+                        walk_rngs[seq_id].seed(dp.seed ^ 0x9E3779B9);
+                        walk_rng_seeds[seq_id] = dp.seed;
+                        walk_rng_init[seq_id]  = true;
+                    }
+                    auto & rng = walk_rngs[seq_id];
+
+                    int32_t predecessor = 0;
+                    for (int32_t i = 1; i < n_block_tokens; ++i) {
+                        const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
+                        const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
+
+                        // q = softmax(scores / temp) over the selector candidates
+                        float max_score = -INFINITY;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            max_score = std::max(max_score, scores[k]);
+                        }
+
+                        common_sampler_draft_q cand;
+                        cand.ids.resize(selector_top_k);
+                        cand.q.resize(selector_top_k);
+
+                        float sum = 0.0f;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            cand.q[k] = std::exp((scores[k] - max_score) / dp.temp);
+                            sum += cand.q[k];
+                        }
+
+                        float q_max = 0.0f;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            cand.q[k] /= sum;
+                            cand.ids[k] = (llama_token) row[k];
+                            q_max = std::max(q_max, cand.q[k]);
+                        }
+
+                        if (params.p_min > 0.0f && q_max < params.p_min) {
+                            break;
+                        }
+
+                        // categorical sample from q, 24-bit uniform in [0, 1)
+                        const float r = (float) (rng() >> 8) * (1.0f / 16777216.0f);
+
+                        float acc = 0.0f;
+                        int32_t index = selector_top_k - 1;
+                        for (int32_t k = 0; k < selector_top_k; ++k) {
+                            acc += cand.q[k];
+                            if (r < acc) {
+                                index = k;
+                                break;
+                            }
+                        }
+
+                        predecessor = index;
+                        result.push_back(cand.ids[index]);
+                        result_q.push_back(std::move(cand));
+                    }
+
+                    if (result.size() < (size_t) params.n_min) {
+                        result.clear();
+                        result_q.clear();
+                    }
+                    continue;
+                }
 
                 int32_t predecessor = 0;
                 for (int32_t i = 1; i < n_block_tokens; ++i) {
@@ -2850,7 +2979,11 @@ void common_speculative_draft(common_speculative * spec) {
                 if (dp.n_max > 0) {
                     if (!result.empty() && (int) result.size() > dp.n_max) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
+                        const bool q_matches = dp.result_q && dp.result_q->size() == result.size();
                         result.resize(dp.n_max);
+                        if (q_matches) {
+                            dp.result_q->resize(dp.n_max);
+                        }
                     }
                 }
 

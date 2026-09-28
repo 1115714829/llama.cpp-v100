@@ -252,10 +252,12 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+    std::vector<common_sampler_draft_q> spec_draft_q;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+    bool spec_use_rejection = false;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -370,6 +372,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
+        spec_use_rejection = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -381,6 +384,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_q.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -490,11 +494,10 @@ struct server_slot {
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
+        // note: the remaining budget is not used to limit the draft on purpose - drafting the full
+        //       length keeps the verification batch shape stable near the end of the request, which
+        //       avoids graph rebuilds; accepted tokens that exceed the budget are dropped on output (as in vLLM)
         int n_draft_max = n_ctx - prompt.n_tokens() - 2;
-
-        if (n_remaining() > 0) {
-            n_draft_max = std::min(n_draft_max, n_remaining() - 1);
-        }
 
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
@@ -1810,6 +1813,20 @@ private:
                     : task.params.sampling.seed;
                 slot.spec_synth_rng.seed(seed);
             }
+
+            // the rejection mode is fixed for the whole request
+            const bool spec_dflash2 = std::find(
+                    params_base.speculative.types.begin(),
+                    params_base.speculative.types.end(),
+                    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
+            slot.spec_use_rejection = spec && spec_dflash2 && common_sampler_can_sparse_reject(slot.smpl.get());
+
+            // the rejection reads only the top-k logits of the verified rows, so they do not have to leave
+            // the device; the context setting is shared by the slots, hence a single slot only
+            if (params_base.n_parallel == 1) {
+                llama_set_logits_topk(ctx_tgt, slot.spec_use_rejection && !use_backend_sampling && !need_pre_sample_logits
+                        ? common_sampler_sparse_k(slot.smpl.get()) : 0);
+            }
         } else {
             slot.smpl.reset();
         }
@@ -3023,15 +3040,23 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        const llama_tokens * prompt_text = slot.prompt.tokens.text_tokens_or_null();
+                        if (prompt_text == nullptr) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                            prompt_text = &slot.spec_prompt;
+                        }
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .pos0     = */ slot.prompt.tokens.pos_next(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
+                            /* .drafting      = */ true,
+                            /* .n_max         = */ n_draft_max,
+                            /* .pos0          = */ slot.prompt.tokens.pos_next(),
+                            /* .id_last       = */ slot.sampled,
+                            /* .prompt        = */ prompt_text,
+                            /* .result        = */ &slot.spec_draft,
+                            /* .use_rejection = */ slot.spec_use_rejection,
+                            /* .temp          = */ slot.task->params.sampling.temp,
+                            /* .seed          = */ common_sampler_get_seed(slot.smpl.get()),
+                            /* .result_q      = */ &slot.spec_draft_q,
                         };
 
                         drafting.push_back(&slot);
@@ -3677,10 +3702,12 @@ private:
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
+        // with speculative decoding the target is synchronized after the draft injection below,
+        // so that the injection is enqueued behind the target on the device instead of after it on the host
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
-            if (ret == 0 && has_output) {
+            if (ret == 0 && has_output && !spec) {
                 llama_synchronize(ctx_tgt);
             }
         });
@@ -3745,6 +3772,9 @@ private:
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
+                if (ok && has_output) {
+                    llama_synchronize(ctx_tgt);
+                }
             });
 
             if (!ok) {
@@ -3912,8 +3942,15 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
+                // the draft cached q for every token only when it used the rejection walk
+                const bool use_rejection =
+                    slot.spec_use_rejection && slot.spec_draft_q.size() == slot.spec_draft.size();
                 auto accepted = synth_probs.empty()
-                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
+                    ? (use_rejection
+                            ? common_sampler_reject_and_accept_n(
+                                    slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q)
+                            : common_sampler_sample_and_accept_n(
+                                    slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft))
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
@@ -3937,6 +3974,9 @@ private:
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
+                        if (use_rejection) {
+                            slot.spec_draft_q.resize(slot.spec_draft.size());
+                        }
 
                         const auto & ckpt = slot.spec_ckpt;
 
@@ -3967,6 +4007,7 @@ private:
             }
 
             const auto ids = std::move(slot.spec_draft);
+            slot.spec_draft_q.clear();
 
             size_t n_accepted = ids.size() - 1;
             if (slot.spec_is_replay && n_accepted > 0) {

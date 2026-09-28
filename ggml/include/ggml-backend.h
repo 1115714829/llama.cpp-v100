@@ -209,6 +209,25 @@ extern "C" {
     typedef void   (*ggml_backend_comm_free_t)(void * comm_ctx);
     typedef bool   (*ggml_backend_comm_allreduce_tensor_t)(void * comm_ctx, struct ggml_tensor ** tensors);
 
+    // Per-rank all-reduce, for callers that drive every rank from its own thread: enqueue rank's
+    // part of the reduction of `tensor` on that rank's backend. Every rank must call it for the
+    // same sequence of collectives. `can` gets the tensors of all ranks and reports (without
+    // enqueueing anything) whether the per-rank calls handle this collective, all ranks taking
+    // the same route.
+    typedef bool   (*ggml_backend_comm_allreduce_rank_can_t)(void * comm_ctx, struct ggml_tensor ** tensors, bool exact);
+    typedef bool   (*ggml_backend_comm_allreduce_rank_t)    (void * comm_ctx, size_t rank, struct ggml_tensor * tensor, bool exact);
+
+    // Whole-graph capture of everything a backend enqueues between begin and end, e.g. all subgraphs and
+    // per-rank all-reduces of one rank of the meta backend, so that they can be replayed with a single
+    // launch. `end` returns an opaque executable, NULL if the capture failed, in which case nothing of the
+    // captured work was executed. `allreduce_rank_capturable` reports whether the per-rank calls of this
+    // collective can be recorded into such a capture (same arguments as `can`).
+    typedef bool   (*ggml_backend_capture_begin_t) (ggml_backend_t backend);
+    typedef void * (*ggml_backend_capture_end_t)   (ggml_backend_t backend);
+    typedef bool   (*ggml_backend_capture_launch_t)(ggml_backend_t backend, void * exec);
+    typedef void   (*ggml_backend_capture_free_t)  (void * exec);
+    typedef bool   (*ggml_backend_comm_allreduce_rank_capturable_t)(void * comm_ctx, struct ggml_tensor ** tensors, bool exact);
+
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
     // Set the number of threads for the backend
@@ -345,6 +364,11 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
+    // copy user input tensors to the split backends asynchronously (default: false)
+    // the caller synchronizes the scheduler before it writes the input tensors again, so user inputs
+    // can be copied asynchronously (see ggml_backend_sched_compute_splits)
+    GGML_API void                 ggml_backend_sched_set_async_inputs(ggml_backend_sched_t sched, bool async_inputs);
+
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
@@ -403,6 +427,15 @@ extern "C" {
     //       express this as a backend registry functionality instead
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
+
+    // returns true if the buffer belongs to a meta backend
+    GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
+
+    // Copies nbytes from src (at byte offset src_offs) to dst (at dst_offs) asynchronously on every
+    // device of the meta backend. src and dst are static (non-view) meta tensors that are MIRRORED,
+    // so every device holds a full copy of each; the copy is device local.
+    GGML_API void ggml_backend_meta_copy_mirrored_async(ggml_backend_t backend,
+            const struct ggml_tensor * src, size_t src_offs, struct ggml_tensor * dst, size_t dst_offs, size_t nbytes);
 
     //
     // Utils

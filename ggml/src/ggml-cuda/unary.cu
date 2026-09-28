@@ -702,6 +702,134 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
+/* fused cont + unary + mul with a strided input view */
+
+// like unary_gated_op_kernel, but g is an F32 view with its own strides and the layout of dst
+template <float (*op)(float)>
+static __global__ void unary_gated_view_kernel(
+        const float * x, const float * g, float * dst,
+        const int64_t k, const int64_t nc, const int64_t ne0, const int64_t ne2,
+        const int64_t nb1, const int64_t nb2, const int64_t nb3) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t col = i % nc;
+    const int64_t row = i / nc;
+
+    const int64_t g0 = col % ne0;
+    const int64_t g1 = col / ne0;
+    const int64_t g2 = row % ne2;
+
+    const int64_t j = g0 + g1*nb1 + g2*nb2 + (row / ne2)*nb3;
+
+    ggml_cuda_pdl_sync();
+    dst[i] = op(g[j]) * x[i];
+}
+
+static void unary_gated_view_cuda(
+        const float * x, const float * g, float * dst,
+        const int64_t k, const int64_t nc, const int64_t ne0, const int64_t ne2,
+        const int64_t nb1, const int64_t nb2, const int64_t nb3, cudaStream_t stream) {
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(unary_gated_view_kernel<op_sigmoid>, launch_params, x, g, dst, k, nc, ne0, ne2, nb1, nb2, nb3);
+}
+
+// CONT -> UNARY(SIGMOID) -> MUL: the attention gate is a strided view whose CONT is elided
+void ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * sigmoid, ggml_tensor * mul) {
+    const ggml_tensor * gate = cont->src[0];
+    const ggml_tensor * attn = mul->src[0] == sigmoid ? mul->src[1] : mul->src[0];
+
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(gate->type == GGML_TYPE_F32 && gate->nb[0] == sizeof(float));
+    GGML_ASSERT(attn->type == GGML_TYPE_F32 && ggml_is_contiguous(attn));
+    GGML_ASSERT(mul->type  == GGML_TYPE_F32 && ggml_is_contiguous(mul));
+
+    const int64_t k  = ggml_nelements(mul);
+    const int64_t nc = cont->ne[0];
+
+    unary_gated_view_cuda((const float *) attn->data, (const float *) gate->data, (float *) mul->data,
+        k, nc, gate->ne[0], gate->ne[2],
+        gate->nb[1] / sizeof(float), gate->nb[2] / sizeof(float), gate->nb[3] / sizeof(float), stream);
+}
+
+/* fused gated delta net gating */
+
+// beta_out = sigmoid(beta) and gate = softplus(alpha + dt) * a, the gating of the GDN layers.
+// The two chains are independent. When their sizes match, thread i handles element i of both
+// chains and reads all inputs before writing, so either output may alias either input. Otherwise
+// the chains take two halves of the launch and an output may only alias its own input.
+static __global__ void gdn_gating_kernel(
+        const float * beta, float * beta_out, const int64_t n_beta,
+        const float * alpha, float * gate, const int64_t n_alpha,
+        const float * dt, const float * a, const int64_t n_heads) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (n_beta == n_alpha) {
+        if (i >= n_beta) {
+            return;
+        }
+
+        ggml_cuda_pdl_sync();
+        const float b = beta[i];
+        const float x = alpha[i];
+        const int64_t h = i % n_heads;
+        const float d = dt[h];
+        const float w = a[h];
+        beta_out[i] = op_sigmoid(b);
+        gate[i]     = op_softplus(x + d) * w;
+        return;
+    }
+
+    if (i >= n_beta + n_alpha) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    if (i < n_beta) {
+        beta_out[i] = op_sigmoid(beta[i]);
+        return;
+    }
+
+    const int64_t j = i - n_beta;
+    const int64_t h = j % n_heads;
+    gate[j] = op_softplus(alpha[j] + dt[h]) * a[h];
+}
+
+static void gdn_gating_cuda(
+        const float * beta, float * beta_out, const int64_t n_beta,
+        const float * alpha, float * gate, const int64_t n_alpha,
+        const float * dt, const float * a, const int64_t n_heads, cudaStream_t stream) {
+    // paired chains share one thread per element, see gdn_gating_kernel
+    const int64_t n = n_beta == n_alpha ? n_beta : n_beta + n_alpha;
+    const int64_t num_blocks = (n + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(gdn_gating_kernel, launch_params, beta, beta_out, n_beta, alpha, gate, n_alpha, dt, a, n_heads);
+}
+
+void ggml_cuda_op_gdn_gating(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * beta_in, ggml_tensor * beta_out,
+        const ggml_tensor * alpha_in, const ggml_tensor * dt, const ggml_tensor * a,
+        ggml_tensor * gate_out) {
+    GGML_ASSERT(beta_in->type  == GGML_TYPE_F32 && beta_out->type  == GGML_TYPE_F32);
+    GGML_ASSERT(alpha_in->type == GGML_TYPE_F32 && gate_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(dt->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(beta_in) && ggml_is_contiguous(alpha_in));
+
+    cudaStream_t stream = ctx.stream();
+
+    gdn_gating_cuda((const float *) beta_in->data,  (float *) beta_out->data,  ggml_nelements(beta_out),
+                    (const float *) alpha_in->data, (float *) gate_out->data, ggml_nelements(gate_out),
+                    (const float *) dt->data, (const float *) a->data, alpha_in->ne[0], stream);
+}
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {

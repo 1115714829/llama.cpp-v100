@@ -607,15 +607,28 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
 
     // KV cache injection
     if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+        ggml_tensor * inp_target = nullptr;
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
+        if (t_embd_src != nullptr) {
+            // DFlash2 device path: read the target features from the staging sink
+            GGML_ASSERT(t_embd_src->type == GGML_TYPE_F32);
+            GGML_ASSERT(t_embd_src->ne[0] == n_embd_inp);
+            GGML_ASSERT((int64_t) n_tokens <= t_embd_src->ne[1]);
 
-        ggml_tensor * inp_target = inp->embd;
-        cb(inp_target, "inp_target_features", -1);
+            // the copy always fills the staging sink from column 0
+            inp_target = ggml_view_2d(ctx0, t_embd_src, n_embd_inp, n_tokens, t_embd_src->nb[1], 0);
+            cb(inp_target, "inp_target_features", -1);
+        } else {
+            auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-        res->add_input(std::move(inp));
+            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
+            ggml_set_input(inp->embd);
+
+            inp_target = inp->embd;
+            cb(inp_target, "inp_target_features", -1);
+
+            res->add_input(std::move(inp));
+        }
 
         // fuse the target features through the encoder
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
@@ -647,8 +660,8 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 ggml_tensor * k_idxs = is_swa ? inp_attn_iswa->get_k_idxs_swa() : inp_attn_iswa->get_k_idxs();
                 ggml_tensor * v_idxs = is_swa ? inp_attn_iswa->get_v_idxs_swa() : inp_attn_iswa->get_v_idxs();
                 // rotate K/V into the cache's rotated space
-                ggml_tensor * k_rot  = is_swa ? inp_attn_iswa->self_k_rot_swa : inp_attn_iswa->self_k_rot;
-                ggml_tensor * v_rot  = is_swa ? inp_attn_iswa->self_v_rot_swa : inp_attn_iswa->self_v_rot;
+                ggml_tensor * k_rot  = kv->build_input_k_rot(il);
+                ggml_tensor * v_rot  = kv->build_input_v_rot(il);
                 if (k_rot) {
                     Kcur = llama_mul_mat_hadamard(ctx0, Kcur, k_rot);
                 }
@@ -659,11 +672,13 @@ llama_model_dflash::graph<false>::graph(const llama_model & model, const llm_gra
                 ggml_build_forward_expand(gf, kv->cpy_v(ctx0, Vcur, v_idxs, il));
             } else {
                 // rotate K/V into the cache's rotated space
-                if (inp_attn->self_k_rot) {
-                    Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot);
+                ggml_tensor * k_rot = inp_attn->get_k_rot(il);
+                ggml_tensor * v_rot = inp_attn->get_v_rot(il);
+                if (k_rot) {
+                    Kcur = llama_mul_mat_hadamard(ctx0, Kcur, k_rot);
                 }
-                if (inp_attn->self_v_rot) {
-                    Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot);
+                if (v_rot) {
+                    Vcur = llama_mul_mat_hadamard(ctx0, Vcur, v_rot);
                 }
                 ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
                 ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
@@ -868,15 +883,28 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 
     // KV cache injection: fused target features from the encoder
     if (ubatch.embd) {
-        auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
+        ggml_tensor * inp_target = nullptr;
 
-        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
-        ggml_set_input(inp->embd);
+        if (t_embd_src != nullptr) {
+            // DFlash2 device path: read the target features from the staging sink
+            GGML_ASSERT(t_embd_src->type == GGML_TYPE_F32);
+            GGML_ASSERT(t_embd_src->ne[0] == n_embd_inp);
+            GGML_ASSERT((int64_t) n_tokens <= t_embd_src->ne[1]);
 
-        ggml_tensor * inp_target = inp->embd;
-        cb(inp_target, "inp_target_features", -1);
+            // the copy always fills the staging sink from column 0
+            inp_target = ggml_view_2d(ctx0, t_embd_src, n_embd_inp, n_tokens, t_embd_src->nb[1], 0);
+            cb(inp_target, "inp_target_features", -1);
+        } else {
+            auto inp = std::make_unique<llm_graph_input_embd>(n_embd_inp);
 
-        res->add_input(std::move(inp));
+            inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, n_tokens);
+            ggml_set_input(inp->embd);
+
+            inp_target = inp->embd;
+            cb(inp_target, "inp_target_features", -1);
+
+            res->add_input(std::move(inp));
+        }
 
         // fuse the target features through the encoder
         ggml_tensor * inp_g = build_lora_mm(model.fc, inp_target, model.fc_s);
@@ -897,8 +925,9 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
             kv = ggml_rope_set_offset(kv, n_embd_head_nope);
             cb(kv, "kv_injected", il);
 
-            if (inp_attn->self_k_rot_swa) {
-                kv = llama_mul_mat_hadamard(ctx0, kv, inp_attn->self_k_rot_swa);
+            ggml_tensor * k_rot = inp_attn->mctx->get_swa()->build_input_k_rot(il);
+            if (k_rot) {
+                kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
             }
             ggml_build_forward_expand(gf, inp_attn->mctx->get_swa()->cpy_k(ctx0, kv, inp_attn->get_k_idxs_swa(), il));
         }
