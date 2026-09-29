@@ -915,6 +915,11 @@ private:
 
     int n_empty_consecutive = 0;
 
+    // prefill pacing (see params_base.prefill_pace): timing of the last update_slots() step that
+    // contained prompt tokens, used to decide when the next prompt chunk may be processed
+    int64_t t_prompt_step_end_us = 0; // when that step ended
+    int64_t t_prompt_step_dur_us = 0; // how long that step took
+
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
     server_metrics metrics;
@@ -2856,6 +2861,9 @@ private:
             }
         }
 
+        // prefill pacing: start of this update_slots() step, used to measure its duration
+        const int64_t t_update_start = ggml_time_us();
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
@@ -2927,6 +2935,24 @@ private:
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
                 break; // stop any further processing
+            }
+        }
+
+        // prefill pacing: if this step processed prompt tokens, remember when it ended and how
+        // long it took; the next prompt chunk must wait proportionally to prefill_pace
+        if (params_base.prefill_pace > 0 && batch.size() > 0) {
+            bool has_prompt = false;
+
+            for (const auto & t : batch.tokens) {
+                if (t.is_prompt) {
+                    has_prompt = true;
+                    break;
+                }
+            }
+
+            if (has_prompt) {
+                t_prompt_step_end_us = ggml_time_us();
+                t_prompt_step_dur_us = t_prompt_step_end_us - t_update_start;
             }
         }
     }
@@ -3133,6 +3159,12 @@ private:
             slot.handle_last_sampled_token(batch);
         });
 
+        // prefill pacing: if a generating slot already added tokens to the batch, a slot that is
+        // still processing its prompt may add tokens only while prompt processing has used less
+        // than prefill_pace percent of the wall clock
+        const bool pace_active = params_base.prefill_pace > 0 && params_base.prefill_pace < 100 && batch.size() > 0;
+        const int64_t t_now = ggml_time_us();
+
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
@@ -3166,6 +3198,13 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    // paced: not enough time has passed since the last prompt step, skip this slot
+                    // note: SLOT_STATE_STARTED is never paced, the first chunk is always processed
+                    if (pace_active && slot.state == SLOT_STATE_PROCESSING_PROMPT &&
+                            t_now - t_prompt_step_end_us < t_prompt_step_dur_us * (100 - params_base.prefill_pace) / params_base.prefill_pace) {
+                        return;
+                    }
+
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot

@@ -1153,13 +1153,257 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
-        // the device path needs the target sink, a token batch and a single active sequence: the
-        // staging copy always fills column 0 and the injection graph reads a fixed view there
+        // single active sequence: the sink column of every token is its batch column, so keep the
+        // original 1.0.3 path and skip the per-token sink column mapping below
         int32_t n_active = 0;
         for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
             n_active += (i_batch_beg[s] >= 0);
         }
-        const bool dev_batch = sink_ready && link_ready && has_tokens && !has_embeddings && n_active == 1;
+
+        if (n_active == 1) {
+            // the device path needs the target sink, a token batch and a single active sequence: the
+            // staging copy always fills column 0 and the injection graph reads a fixed view there
+            const bool dev_batch = sink_ready && link_ready && has_tokens && !has_embeddings && n_active == 1;
+
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_batch_beg[seq_id] < 0) {
+                    continue;
+                }
+                const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+
+                // an M-RoPE image pins all its rows to one position, so a windowed draft
+                // cache cannot free cells for it - skip it, the draft can jump over the gap
+                const bool pos_pinned = batch_in.pos[i_batch_beg[seq_id]] == batch_in.pos[i_batch_end[seq_id]];
+                if (has_embeddings && n_rows > 1 && pos_pinned) {
+                    continue;
+                }
+
+                for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
+                    const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
+                    const int32_t col_beg = i_batch_beg[seq_id] + offset;
+
+                    // only a chunk starting at column 0 can use the device path; the fused decode
+                    // encodes the features and injects them into the K/V cache at the target positions
+                    const bool use_dev = dev_batch && col_beg == 0;
+
+                    batch_inject.n_tokens = n_chunk;
+
+                    if (use_dev) {
+                        // batch_inject.embd stays as a placeholder; process_ubatch copies the sink
+                        llama_set_embd_source(ctx_dft, true, col_beg);
+                    } else {
+                        llama_set_embd_source(ctx_dft, false, 0);
+
+                        if (sink_ready) {
+                            // the features are on the target device: read back the columns of this chunk
+                            if (!llama_layer_inp_sink_get(ctx_tgt, (size_t) col_beg, (size_t) n_chunk, batch_inject.embd)) {
+                                LOG_ERR("%s: failed to read the target feature sink\n", __func__);
+                                return false;
+                            }
+                        } else {
+                            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                                const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                                if (!layer) {
+                                    GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                                }
+                                for (int32_t i = 0; i < n_chunk; ++i) {
+                                    float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                                    const float * src = layer + (size_t) (col_beg + i) * n_embd_tgt;
+                                    std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                                }
+                            }
+                        }
+                    }
+
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+                        batch_inject.pos[i] = p;
+                        if (is_mrope) {
+                            batch_inject.pos[1 * n_chunk + i] = p;
+                            batch_inject.pos[2 * n_chunk + i] = p;
+                            batch_inject.pos[3 * n_chunk + i] = 0;
+                        }
+                        batch_inject.n_seq_id[i]  = 1;
+                        batch_inject.seq_id[i][0] = seq_id;
+                        batch_inject.logits[i]    = false;
+                    }
+                    const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_chunk, (int) offset);
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        // the target sink orders its columns by target ubatch, which differs from the batch order
+        // when several sequences are split, so map each token to its sink column
+        const bool map_sink_col = sink_ready && has_tokens && !has_embeddings;
+
+        bool warned_sink_col = false;
+
+        // DFlash2 cross-sequence merge: group all mapped tokens of the batch by sink column, so
+        // tokens of concurrent sequences that form a contiguous sink range are injected with one
+        // draft decode instead of one decode per sequence
+        struct inject_tok {
+            llama_seq_id seq_id;
+            llama_pos    pos;
+            int32_t      sink_col;
+        };
+
+        std::vector<inject_tok> toks;
+        toks.reserve(n_tokens);
+        if (map_sink_col) {
+            int32_t n_seq_inj = 0;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                n_seq_inj += i_batch_beg[seq_id] >= 0;
+            }
+
+            if (n_seq_inj > 1) {
+                bool all_mapped = true;
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq && all_mapped; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
+                    }
+                    for (int32_t k = i_batch_beg[seq_id]; k <= i_batch_end[seq_id]; ++k) {
+                        const int32_t col = llama_layer_inp_sink_col(ctx_tgt, seq_id, batch_in.pos[k]);
+                        if (col < 0) {
+                            all_mapped = false;
+                            break;
+                        }
+                        toks.push_back({ seq_id, batch_in.pos[k], col });
+                    }
+                }
+                if (!all_mapped) {
+                    toks.clear();
+                }
+            }
+        }
+
+        if (!toks.empty()) {
+            // sink column order is the target decode order; it also keeps the tokens of each
+            // sequence in position order
+            std::sort(toks.begin(), toks.end(), [](const inject_tok & a, const inject_tok & b) {
+                return a.sink_col < b.sink_col;
+            });
+
+            const char * fname = __func__;
+
+            auto inject = [&](const inject_tok * t, int32_t n_run, int32_t col_run) -> bool {
+                batch_inject.n_tokens = n_run;
+
+                if (link_ready) {
+                    // batch_inject.embd stays as a placeholder; process_ubatch copies the sink
+                    llama_set_embd_source(ctx_dft, true, col_run);
+                } else {
+                    llama_set_embd_source(ctx_dft, false, 0);
+
+                    // the features are on the target device: read back the columns of this run
+                    if (!llama_layer_inp_sink_get(ctx_tgt, (size_t) col_run, (size_t) n_run, batch_inject.embd)) {
+                        LOG_ERR("%s: failed to read the target feature sink\n", fname);
+                        return false;
+                    }
+                }
+
+                for (int32_t i = 0; i < n_run; ++i) {
+                    const llama_pos p = t[i].pos;
+                    batch_inject.pos[i] = p;
+                    if (is_mrope) {
+                        batch_inject.pos[1 * n_run + i] = p;
+                        batch_inject.pos[2 * n_run + i] = p;
+                        batch_inject.pos[3 * n_run + i] = 0;
+                    }
+                    batch_inject.n_seq_id[i]  = 1;
+                    batch_inject.seq_id[i][0] = t[i].seq_id;
+                    batch_inject.logits[i]    = false;
+                }
+
+                const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                if (rc != 0) {
+                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, col=%d)\n",
+                            fname, rc, n_run, col_run);
+                    return false;
+                }
+
+                return true;
+            };
+
+            // cut the column order into runs of consecutive columns, then into ubatch-sized pieces
+            for (int32_t run_beg = 0; run_beg < (int32_t) toks.size(); ) {
+                int32_t run_end = run_beg + 1;
+                while (run_end < (int32_t) toks.size() && toks[run_end].sink_col == toks[run_end - 1].sink_col + 1) {
+                    ++run_end;
+                }
+
+                for (int32_t i_run = run_beg; i_run < run_end; i_run += n_ubatch) {
+                    const int32_t n_piece = std::min(n_ubatch, run_end - i_run);
+                    const inject_tok * piece = toks.data() + i_run;
+
+                    // the device path maps draft batch row i to sink column col_run + i, so the
+                    // draft batch must stay in sink order. split_equal() groups a multi-sequence
+                    // batch by sequence, which keeps that order only if each sequence appears as
+                    // one block, the sequence ids grow consecutively and all blocks but the last
+                    // have the same size. otherwise, decode the piece per sequence
+                    bool one_ubatch = true;
+                    {
+                        llama_seq_id prev_seq = -1;
+                        int32_t n_first = 0;
+                        int32_t n_cur   = 0;
+                        for (int32_t i = 0; i < n_piece; ++i) {
+                            const auto & t = piece[i];
+                            if (t.seq_id != prev_seq) {
+                                if (n_cur > 0) {
+                                    if (n_first == 0) {
+                                        n_first = n_cur;
+                                    } else if (n_cur != n_first) {
+                                        one_ubatch = false;
+                                    }
+                                }
+                                if (prev_seq >= 0 && t.seq_id != prev_seq + 1) {
+                                    one_ubatch = false;
+                                }
+                                prev_seq = t.seq_id;
+                                n_cur    = 1;
+                            } else {
+                                ++n_cur;
+                                if (t.pos <= piece[i - 1].pos) {
+                                    one_ubatch = false;
+                                }
+                            }
+                        }
+                        if (n_first > 0 && n_cur < n_first) {
+                            one_ubatch = false;
+                        }
+                    }
+
+                    if (one_ubatch) {
+                        if (!inject(piece, n_piece, piece[0].sink_col)) {
+                            return false;
+                        }
+                    } else {
+                        for (int32_t i = 0; i < n_piece; ) {
+                            const llama_seq_id seq_cur = piece[i].seq_id;
+                            int32_t j = i + 1;
+                            while (j < n_piece && piece[j].seq_id == seq_cur &&
+                                   piece[j].sink_col == piece[j - 1].sink_col + 1) {
+                                ++j;
+                            }
+                            if (!inject(piece + i, j - i, piece[i].sink_col)) {
+                                return false;
+                            }
+                            i = j;
+                        }
+                    }
+                }
+
+                run_beg = run_end;
+            }
+
+            return true;
+        }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
@@ -1178,56 +1422,91 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 const int32_t n_chunk = std::min(n_ubatch, n_rows - offset);
                 const int32_t col_beg = i_batch_beg[seq_id] + offset;
 
-                // only a chunk starting at column 0 can use the device path; the fused decode
-                // encodes the features and injects them into the K/V cache at the target positions
-                const bool use_dev = dev_batch && col_beg == 0;
+                std::vector<int32_t> col_sink(n_chunk, -1);
+                if (map_sink_col) {
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        col_sink[i] = llama_layer_inp_sink_col(ctx_tgt, seq_id, batch_in.pos[col_beg + i]);
+                    }
+                }
 
-                batch_inject.n_tokens = n_chunk;
-
-                if (use_dev) {
-                    // batch_inject.embd stays as a placeholder; process_ubatch copies the sink
-                    llama_set_embd_source(ctx_dft, true, col_beg);
-                } else {
-                    llama_set_embd_source(ctx_dft, false, 0);
-
-                    if (sink_ready) {
-                        // the features are on the target device: read back the columns of this chunk
-                        if (!llama_layer_inp_sink_get(ctx_tgt, (size_t) col_beg, (size_t) n_chunk, batch_inject.embd)) {
-                            LOG_ERR("%s: failed to read the target feature sink\n", __func__);
-                            return false;
+                // the fused device decode copies one contiguous extent of the sink, so split the
+                // chunk into runs of consecutive sink columns; tokens missing from the sink share
+                // one run and fall back to the batch order
+                for (int32_t run_beg = 0; run_beg < n_chunk; ) {
+                    int32_t run_end = run_beg + 1;
+                    if (!map_sink_col) {
+                        run_end = n_chunk;
+                    } else if (col_sink[run_beg] < 0) {
+                        while (run_end < n_chunk && col_sink[run_end] < 0) {
+                            ++run_end;
                         }
                     } else {
-                        for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                            const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                            if (!layer) {
-                                GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                        while (run_end < n_chunk && col_sink[run_end] == col_sink[run_end - 1] + 1) {
+                            ++run_end;
+                        }
+                    }
+
+                    const int32_t n_run   = run_end - run_beg;
+                    const int32_t i_run   = col_beg + run_beg;
+                    const int32_t col_run = col_sink[run_beg] >= 0 ? col_sink[run_beg] : i_run;
+
+                    if (map_sink_col && col_sink[run_beg] < 0 && !warned_sink_col) {
+                        LOG_WRN("%s: token not found in the target feature sink, falling back to the batch order\n", __func__);
+                        warned_sink_col = true;
+                    }
+
+                    const bool use_dev = link_ready && col_sink[run_beg] >= 0;
+
+                    batch_inject.n_tokens = n_run;
+
+                    if (use_dev) {
+                        // batch_inject.embd stays as a placeholder; process_ubatch copies the sink
+                        llama_set_embd_source(ctx_dft, true, col_run);
+                    } else {
+                        llama_set_embd_source(ctx_dft, false, 0);
+
+                        if (sink_ready) {
+                            // the features are on the target device: read back the columns of this run
+                            if (!llama_layer_inp_sink_get(ctx_tgt, (size_t) col_run, (size_t) n_run, batch_inject.embd)) {
+                                LOG_ERR("%s: failed to read the target feature sink\n", __func__);
+                                return false;
                             }
-                            for (int32_t i = 0; i < n_chunk; ++i) {
-                                float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                                const float * src = layer + (size_t) (col_beg + i) * n_embd_tgt;
-                                std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                        } else {
+                            // no sink: the layer inputs stay on the host in the batch order
+                            for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
+                                const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
+                                if (!layer) {
+                                    GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
+                                }
+                                for (int32_t i = 0; i < n_run; ++i) {
+                                    float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                                    const float * src = layer + (size_t) (i_run + i) * n_embd_tgt;
+                                    std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
+                                }
                             }
                         }
                     }
-                }
 
-                for (int32_t i = 0; i < n_chunk; ++i) {
-                    const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
-                    batch_inject.pos[i] = p;
-                    if (is_mrope) {
-                        batch_inject.pos[1 * n_chunk + i] = p;
-                        batch_inject.pos[2 * n_chunk + i] = p;
-                        batch_inject.pos[3 * n_chunk + i] = 0;
+                    for (int32_t i = 0; i < n_run; ++i) {
+                        const llama_pos p = batch_in.pos[i_run + i];
+                        batch_inject.pos[i] = p;
+                        if (is_mrope) {
+                            batch_inject.pos[1 * n_run + i] = p;
+                            batch_inject.pos[2 * n_run + i] = p;
+                            batch_inject.pos[3 * n_run + i] = 0;
+                        }
+                        batch_inject.n_seq_id[i]  = 1;
+                        batch_inject.seq_id[i][0] = seq_id;
+                        batch_inject.logits[i]    = false;
                     }
-                    batch_inject.n_seq_id[i]  = 1;
-                    batch_inject.seq_id[i][0] = seq_id;
-                    batch_inject.logits[i]    = false;
-                }
-                const int32_t rc = llama_decode(ctx_dft, batch_inject);
-                if (rc != 0) {
-                    LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                            __func__, rc, (int) n_chunk, (int) offset);
-                    return false;
+                    const int32_t rc = llama_decode(ctx_dft, batch_inject);
+                    if (rc != 0) {
+                        LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
+                                __func__, rc, (int) n_run, (int) offset);
+                        return false;
+                    }
+
+                    run_beg = run_end;
                 }
             }
         }

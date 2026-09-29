@@ -13,6 +13,7 @@
 
 #include <array>
 #include <map>
+#include <unordered_map>
 #include <vector>
 
 struct llama_model;
@@ -147,6 +148,9 @@ struct llama_context {
     void set_embd_source(bool enable, int32_t token_offset);
     // DFlash2: read back [token_offset, token_offset + n_tokens) rows of the sink into dst
     bool layer_inp_sink_get(size_t token_offset, size_t n_tokens, float * dst);
+    // DFlash2: the sink column that holds the features of token (seq_id, pos) of the last decoded
+    // batch, or -1 if the token is not in the sink
+    int32_t layer_inp_sink_col(llama_seq_id seq_id, llama_pos pos) const;
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -358,6 +362,11 @@ private:
     ggml_tensor *           t_layer_inp_sink = nullptr;
     std::vector<uint32_t>   layer_inp_sink_layers;
 
+    // DFlash2: the (seq_id, pos) of each sink column written by the last batch, in column order
+    std::vector<std::pair<llama_seq_id, llama_pos>> sink_cols;
+    // DFlash2: per-sequence (pos, column) index into sink_cols; positions grow within a batch
+    std::unordered_map<llama_seq_id, std::vector<std::pair<llama_pos, int32_t>>> sink_cols_by_seq;
+
     // DFlash2: draft-side staging sink for the injected features, [n_embd_inp, n_ubatch]
     ggml_context_ptr        ctx_embd_src;
     ggml_backend_buffer_ptr buf_embd_src;
@@ -424,6 +433,9 @@ private:
     // decode graphs (verification/single-token batches) get their own scheduler so that
     // prefill allocations do not invalidate them across requests, see gf_res_slot
     ggml_backend_sched_ptr sched_dec;
+
+    // max tokens of a batch that sched_dec accepts and is reserved for, set once in the constructor
+    uint32_t n_dec_max = 0;
 
     bool sched_need_reserve = true;
 

@@ -10830,25 +10830,27 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
     // Q8_0 skinny GEMM (repacked QPN8 layout, sm_70) on the DFlash2 verify shapes. M <= 16 uses
-    // the new kernel, M = 17/32 the dequant fallback; N = 256 is too small and stays on the old path.
+    // the single-stage kernel, M = 17..32 the two-phase M=32 kernel, M = 33..64 two M=32 calls;
+    // N = 256 is too small and stays on the old path.
     const std::vector<std::pair<int64_t, int64_t>> q8_0_skinny_shapes = {
         { 4352, 5120}, { 5120, 4352}, { 2560, 5120}, { 1536, 5120}, { 5120, 1536}, { 3072, 5120}, {62080, 5120},
     };
     for (const auto & [n_out, k_red] : q8_0_skinny_shapes) {
-        for (int64_t n_tokens : {1, 2, 4, 7, 8, 9, 16, 17, 32}) {
+        for (int64_t n_tokens : {1, 2, 4, 7, 8, 9, 16, 17, 24, 32, 40, 48, 64}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, n_out, n_tokens, k_red, {1, 1}, {1, 1}));
         }
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, 5120, {1, 1}, {1, 1}));
 
-    // Q8_0 skinny gated pair: both matmuls and the SWIGLU in one kernel on sm_70
-    for (int64_t n_tokens : {1, 8, 16}) {
+    // Q8_0 skinny gated pair: both matmuls and the SWIGLU in one kernel on sm_70, M > 16 as two
+    // M=32 kernels plus the elementwise SWIGLU
+    for (int64_t n_tokens : {1, 8, 16, 24, 32, 48, 64}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n_tokens, 4352, 5120,
             false, 1, 1, false, false, true, false, {1, 1}));
     }
 
     // multiple Q8_0 matmuls sharing one input: one input conversion and one multi-weight kernel
-    for (int64_t n_tokens : {1, 8, 16}) {
+    for (int64_t n_tokens : {1, 8, 16, 32}) {
         test_cases.emplace_back(new test_mul_mat_multi({2560, 1536, 12, 12}, n_tokens, 5120));
         test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, n_tokens, 5120));
     }
@@ -11814,6 +11816,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int kv : { 1025, 4096 }) {
             for (int nb : { 2, 8, 16 }) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, false, 3));
+            }
+        }
+    }
+
+    // multi-stream (non-unified KV) range masks: one sequence per stream, so the mask row of a
+    // token is indexed by (stream, token) like the dense mask. Split-D prefill and grouped verify
+    // must read each stream's own range.
+    for (int n_stream : { 2, 3 }) {
+        for (int kv : { 1024, 4096 }) {
+            for (int nb : { 64, 256 }) {
+                for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                    for (int range : { 1, 2 }) {
+                        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, n_stream}, kv, nb, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 0, false, range));
+                    }
+                }
+            }
+        }
+        // verify: q = 8 per stream reaches the grouped sm_70 kernel
+        for (int kv : { 1024, 4096 }) {
+            for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+                for (int range : { 1, 2 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, n_stream}, kv, 8, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 0, false, range));
+                }
             }
         }
     }
