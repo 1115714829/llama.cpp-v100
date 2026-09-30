@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT
 //
 // SM70 (Volta) D256 Split-D prefill attention, host side: dispatch predicate,
-// scratch layout, K/V dequant, Q staging, mask pre-scan, kernel launch and O
-// scatter. Device kernel provenance: fattn-sm70-d256-kernel.cuh.
+// scratch layout, K/V dequant (F16 read in place, Q8_0 or Q4_0 mirrored to f16),
+// Q staging, mask pre-scan, kernel launch and O scatter. Device kernel
+// provenance: fattn-sm70-d256-kernel.cuh.
 
 // The HIP and MUSA backends glob ../ggml-cuda/*.cu into their own libraries and
 // cannot compile CuTe/CUTLASS. This file is only used by the CUDA backend.
@@ -312,38 +313,72 @@ static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst) {
 // output index ((i3*ne2 + i2)*ne1 + i1)*ne0 + i0. The linear to_fp16() variant
 // is deliberately not used: it preserves the source memory order, which for a
 // packed permuted view is not the canonical one.
-static void sm70_d256_dequant_kv(
-        const ggml_tensor * K, const ggml_tensor * V,
-        const sm70_d256_scratch & s, cudaStream_t stream) {
-    if (s.need_f16_k) {
-        GGML_ASSERT(s.f16_extra.K != 0);
-        const size_t ts = ggml_type_size(K->type);
-        const to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(K->type);
-        to_fp16(K->data, (half *) s.f16_extra.K, K->ne[0], K->ne[1], K->ne[2], K->ne[3],
-                K->nb[1] / ts, K->nb[2] / ts, K->nb[3] / ts, stream);
-    }
-    // A view of a quantized K shares the K mirror; only a separate tensor is
-    // converted here.
-    if (!s.need_f16_v || s.v_is_k_view) {
-        return;
-    }
-    GGML_ASSERT(s.f16_extra.V != 0);
-    const size_t ts = ggml_type_size(V->type);
-    const to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(V->type);
-    to_fp16(V->data, (half *) s.f16_extra.V, V->ne[0], V->ne[1], V->ne[2], V->ne[3],
-            V->nb[1] / ts, V->nb[2] / ts, V->nb[3] / ts, stream);
+static void sm70_d256_dequant_kv_tensor(
+        const ggml_tensor * t, half * dst, cudaStream_t stream) {
+    const size_t ts = ggml_type_size(t->type);
+    const to_fp16_nc_cuda_t to_fp16 = ggml_get_to_fp16_nc_cuda(t->type);
+    to_fp16(t->data, dst, t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+            t->nb[1] / ts, t->nb[2] / ts, t->nb[3] / ts, stream);
 }
 
-// q8_0 -> f16 mirror of the rows [0, *kv_limit) only. With a range mask the dense kernel never reads
+// Block layout of the quantized K/V types the partial mirror supports. QK8_0 == QK4_0 == 32
+// values per block, so one lane of the row kernel decodes 8 values from one block.
+template <ggml_type type>
+struct sm70_d256_dequant_block;
+
+template <>
+struct sm70_d256_dequant_block<GGML_TYPE_Q8_0> {
+    static constexpr int kBlockBytes = sizeof(block_q8_0);
+
+    // iq is the lane's 8-value group inside the block, d its scale.
+    static __device__ __forceinline__ void decode(const char * block, const int iq, const float d, half2 * h) {
+        const int8_t * qs = reinterpret_cast<const int8_t *>(block) + sizeof(__half);
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            h[i] = __floats2half2_rn(d * qs[iq + 2*i], d * qs[iq + 2*i + 1]);
+        }
+    }
+};
+
+template <>
+struct sm70_d256_dequant_block<GGML_TYPE_Q4_0> {
+    static constexpr int kBlockBytes = sizeof(block_q4_0);
+
+    static __device__ __forceinline__ __half2 pair(const uint32_t packed, const int shift, const float d) {
+        return __floats2half2_rn(d * ((int) ((packed >> shift) & 0xf) - 8),
+                                 d * ((int) ((packed >> (8 + shift)) & 0xf) - 8));
+    }
+
+    // q4_0 packs values 0..15 into the low nibbles of qs[0..15] and 16..31 into the high nibbles.
+    static __device__ __forceinline__ void decode(const char * block, const int iq, const float d, half2 * h) {
+        // The 18 B block makes qs only 2 B aligned, so assemble each u32 code word from two
+        // u16 loads and shift the nibbles out.
+        const char * codes = block + sizeof(__half) + (iq & 15);
+        const uint32_t w0 = (uint32_t) *reinterpret_cast<const uint16_t *>(codes)
+                          | (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 2) << 16;
+        const uint32_t w1 = (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 4)
+                          | (uint32_t) *reinterpret_cast<const uint16_t *>(codes + 6) << 16;
+        const int shift = iq >= 16 ? 4 : 0;
+        h[0] = pair(w0,      shift, d);
+        h[1] = pair(w0 >> 16, shift, d);
+        h[2] = pair(w1,      shift, d);
+        h[3] = pair(w1 >> 16, shift, d);
+    }
+};
+
+// q8_0/q4_0 -> f16 mirror of the rows [0, *kv_limit) only. With a range mask the dense kernel never reads
 // a KV row at or past kv_limit, so a K/V view much wider than the attended range (a prompt ubatch that
 // attends the whole cache) costs no conversion. Output layout as sm70_d256_dequant_kv:
 // [ne3][ne2][ne1][ne0] contiguous, i.e. ((i3*ne2 + i2)*ne1 + i1)*ne0 + i0.
 // One warp per row, grid.y = ne2, grid.z = ne3, rows i1 >= *kv_limit are skipped.
-static __global__ void sm70_d256_dequant_q8_0_rows(
+template <ggml_type type>
+static __global__ void sm70_d256_dequant_rows(
         const char * __restrict__ src, half * __restrict__ dst,
         const int ne0, const int ne1, const int ne2,
         const int64_t nb1, const int64_t nb2, const int64_t nb3,
         const int * __restrict__ kv_limit) {
+    static_assert(type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q4_0, "unsupported KV type");
+
     const int i1 = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
     if (i1 >= *kv_limit) {
         return;
@@ -353,19 +388,17 @@ static __global__ void sm70_d256_dequant_q8_0_rows(
     const int i2 = blockIdx.y;
     const int i3 = blockIdx.z;
 
-    // lane's q8_0 block of the row and its 8-value group inside the block
+    // lane's block of the row and its 8-value group inside the block
     const int ib = lane / 4;
     const int iq = (lane % 4) * 8;
 
-    const block_q8_0 * src_row = (const block_q8_0 *) (src + (int64_t) i3*nb3 + (int64_t) i2*nb2 + (int64_t) i1*nb1);
+    const char * src_row = src + (int64_t) i3*nb3 + (int64_t) i2*nb2 + (int64_t) i1*nb1;
     half * dst_row = dst + (((int64_t) i3*ne2 + i2)*ne1 + i1)*ne0;
 
-    const float d = __half2float(src_row[ib].d);
+    const char * src_block = src_row + ib * sm70_d256_dequant_block<type>::kBlockBytes;
+    const float d = __half2float(*reinterpret_cast<const __half *>(src_block));
     half2 h[4];
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-        h[i] = __floats2half2_rn(d * src_row[ib].qs[iq + 2*i], d * src_row[ib].qs[iq + 2*i + 1]);
-    }
+    sm70_d256_dequant_block<type>::decode(src_block, iq, d, h);
     uint4 out;
     memcpy(&out.x, &h[0], sizeof(uint32_t));
     memcpy(&out.y, &h[1], sizeof(uint32_t));
@@ -374,15 +407,34 @@ static __global__ void sm70_d256_dequant_q8_0_rows(
     *reinterpret_cast<uint4 *>(dst_row + ib*32 + iq) = out;
 }
 
+// Partial mirror of one q8_0/q4_0 K/V tensor: rows [0, *kv_limit) only, bounds known host side.
+static void sm70_d256_dequant_kv_partial(
+        const ggml_tensor * t, half * dst, const int * kv_limit, cudaStream_t stream) {
+    GGML_ASSERT(t->ne[0] == SM70_D256_D);
+    const dim3 grid((unsigned) ((t->ne[1] + 7) / 8), (unsigned) t->ne[2], (unsigned) t->ne[3]);
+    if (t->type == GGML_TYPE_Q8_0) {
+        sm70_d256_dequant_rows<GGML_TYPE_Q8_0><<<grid, 256, 0, stream>>>(
+            (const char *) t->data, dst,
+            (int) t->ne[0], (int) t->ne[1], (int) t->ne[2],
+            t->nb[1], t->nb[2], t->nb[3], kv_limit);
+    } else {
+        sm70_d256_dequant_rows<GGML_TYPE_Q4_0><<<grid, 256, 0, stream>>>(
+            (const char *) t->data, dst,
+            (int) t->ne[0], (int) t->ne[1], (int) t->ne[2],
+            t->nb[1], t->nb[2], t->nb[3], kv_limit);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 // F16 is read in place: contiguous rows plus 16 B aligned strides for the
-// 128-bit global loads. The q8_0 mirror needs block-aligned source strides.
+// 128-bit global loads. The q8_0/q4_0 mirrors need block-aligned source strides.
 static bool sm70_d256_kv_type_ok(const ggml_tensor * t) {
     if (t->type == GGML_TYPE_F16) {
         return t->nb[0] == sizeof(half) && t->nb[1] % 16 == 0 &&
                t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
     }
-    if (t->type == GGML_TYPE_Q8_0) {
-        const size_t ts = ggml_type_size(GGML_TYPE_Q8_0);
+    if (t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q4_0) {
+        const size_t ts = ggml_type_size(t->type);
         return t->nb[0] == ts && t->nb[1] % ts == 0 &&
                t->nb[2] % ts == 0 && t->nb[3] % ts == 0;
     }
@@ -542,18 +594,28 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
 
     cudaStream_t stream = ctx.stream();
 
-    // A range mask bounds the rows the dense kernel reads, so a q8_0 K/V mirror only needs
-    // [0, *kv_limit) rows. Everything else keeps the full mirror.
-    const bool range_q8 = mask_range && K->type == GGML_TYPE_Q8_0;
+    // A range mask bounds the rows the dense kernel reads, so a quantized K/V mirror
+    // only needs [0, *kv_limit) rows. Everything else keeps the full mirror.
+    const bool k_partial = mask_range && (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0);
+    const bool v_partial = mask_range && !scratch.v_is_k_view &&
+                           (V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0);
 
     // Zero the Q pad rows; their outputs are dropped by the scatter.
     CUDA_CHECK(cudaMemsetAsync(Qs, 0, scratch.n_q * sizeof(half), stream));
 
-    if (range_q8) {
+    if (k_partial || v_partial) {
         // the bounds kernel raises it to the rows its bounds allow
         CUDA_CHECK(cudaMemsetAsync(kv_limit, 0, sizeof(int), stream));
-    } else {
-        sm70_d256_dequant_kv(K, V, scratch, stream);
+    }
+    if (scratch.need_f16_k && !k_partial) {
+        GGML_ASSERT(scratch.f16_extra.K != 0);
+        sm70_d256_dequant_kv_tensor(K, (half *) scratch.f16_extra.K, stream);
+    }
+    // A view of a quantized K shares the K mirror; only a separate tensor is
+    // converted here.
+    if (scratch.need_f16_v && !scratch.v_is_k_view && !v_partial) {
+        GGML_ASSERT(scratch.f16_extra.V != 0);
+        sm70_d256_dequant_kv_tensor(V, (half *) scratch.f16_extra.V, stream);
     }
 
     // K/V are read either in place (f16, strides from the tensor) or from the
@@ -609,24 +671,12 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             mask->ne[3] == 1 ? 0 : (int64_t) mask->nb[3] / sizeof(int2));
         CUDA_CHECK(cudaGetLastError());
 
-        if (range_q8) {
+        if (k_partial) {
             // the bounds are known now: mirror only the rows they allow
-            GGML_ASSERT(K->ne[0] == SM70_D256_D);
-            const dim3 grid_k((unsigned) ((K->ne[1] + 7) / 8), (unsigned) K->ne[2], (unsigned) K->ne[3]);
-            sm70_d256_dequant_q8_0_rows<<<grid_k, 256, 0, stream>>>(
-                (const char *) K->data, (half *) scratch.f16_extra.K,
-                (int) K->ne[0], (int) K->ne[1], (int) K->ne[2],
-                K->nb[1], K->nb[2], K->nb[3], kv_limit);
-            CUDA_CHECK(cudaGetLastError());
-            if (!scratch.v_is_k_view && V->type != GGML_TYPE_F16) {
-                GGML_ASSERT(V->ne[0] == SM70_D256_D);
-                const dim3 grid_v((unsigned) ((V->ne[1] + 7) / 8), (unsigned) V->ne[2], (unsigned) V->ne[3]);
-                sm70_d256_dequant_q8_0_rows<<<grid_v, 256, 0, stream>>>(
-                    (const char *) V->data, (half *) scratch.f16_extra.V,
-                    (int) V->ne[0], (int) V->ne[1], (int) V->ne[2],
-                    V->nb[1], V->nb[2], V->nb[3], kv_limit);
-                CUDA_CHECK(cudaGetLastError());
-            }
+            sm70_d256_dequant_kv_partial(K, (half *) scratch.f16_extra.K, kv_limit, stream);
+        }
+        if (v_partial) {
+            sm70_d256_dequant_kv_partial(V, (half *) scratch.f16_extra.V, kv_limit, stream);
         }
     } else {
         const int n_splits = (kv_len + SM70_D256_MASK_SPLIT - 1) / SM70_D256_MASK_SPLIT;

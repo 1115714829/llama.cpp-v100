@@ -1,3 +1,10 @@
+// SPDX-FileCopyrightText: Copyright 2026 the llama.cpp authors
+// SPDX-License-Identifier: MIT
+//
+// SM70 (Volta) grouped verify attention, host side: dispatch predicate, K/V
+// type combination selection and kernel launch. K/V cache types: F16, Q8_0 or
+// Q4_0. Device kernel: fattn-sm70-grouped.cuh.
+
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-sm70-grouped.cuh"
@@ -16,7 +23,7 @@ bool ggml_cuda_flash_attn_ext_sm70_grouped_supported(const ggml_tensor * dst, in
         return false;
     }
     for (const ggml_tensor * t : {K, V}) {
-        if ((t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_Q8_0) || t->ne[0] != 256) {
+        if ((t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_Q8_0 && t->type != GGML_TYPE_Q4_0) || t->ne[0] != 256) {
             return false;
         }
         if (reinterpret_cast<uintptr_t>(t->data) % 16 != 0) {
@@ -138,8 +145,18 @@ void ggml_cuda_flash_attn_ext_sm70_grouped(ggml_backend_cuda_context & ctx, ggml
             ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_F16,  GGML_TYPE_F16 >(ctx, dst);
         } else if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q8_0) {
             ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_F16,  GGML_TYPE_Q8_0>(ctx, dst);
+        } else if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q4_0) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_F16,  GGML_TYPE_Q4_0>(ctx, dst);
         } else if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_F16) {
             ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q8_0, GGML_TYPE_F16 >(ctx, dst);
+        } else if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0>(ctx, dst);
+        } else if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_F16) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q4_0, GGML_TYPE_F16 >(ctx, dst);
+        } else if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q8_0) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0>(ctx, dst);
+        } else if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
         } else {
             ggml_cuda_flash_attn_ext_sm70_grouped_launch<8, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
         }
@@ -148,8 +165,18 @@ void ggml_cuda_flash_attn_ext_sm70_grouped(ggml_backend_cuda_context & ctx, ggml
             ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_F16,  GGML_TYPE_F16 >(ctx, dst);
         } else if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q8_0) {
             ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_F16,  GGML_TYPE_Q8_0>(ctx, dst);
+        } else if (K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_Q4_0) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_F16,  GGML_TYPE_Q4_0>(ctx, dst);
         } else if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_F16) {
             ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q8_0, GGML_TYPE_F16 >(ctx, dst);
+        } else if (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0>(ctx, dst);
+        } else if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_F16) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q4_0, GGML_TYPE_F16 >(ctx, dst);
+        } else if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q8_0) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0>(ctx, dst);
+        } else if (K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0) {
+            ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0>(ctx, dst);
         } else {
             ggml_cuda_flash_attn_ext_sm70_grouped_launch<16, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
         }
