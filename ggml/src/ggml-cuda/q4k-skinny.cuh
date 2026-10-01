@@ -26,9 +26,10 @@ bool ggml_cuda_q4k_skinny_is_repacked(const ggml_tensor * t);
 void ggml_cuda_q4k_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph);
 void ggml_cuda_q4k_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_tensor * t);
 
-// Returns true if the small-M kernel handled the multiplication. If it returns false the
-// caller must expand the repacked weights to dense F16 and use the regular path.
+// Returns true if the small-M kernel handled the multiplication (M up to 64; M = 17..64 runs
+// the two-phase M=32 kernel on split-16 shapes). If it returns false the caller must expand
+// the repacked weights to dense F16 and use the regular path.
 bool ggml_cuda_q4k_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
-// Expands repacked weights to dense F16 [N][K], for M > 16.
+// Expands repacked weights to dense F16 [N][K], for M > 64.
 void ggml_cuda_q4k_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream);
