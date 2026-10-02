@@ -1055,6 +1055,7 @@ private:
 
         std::string & mmproj_path = params_base.mmproj.path;
         mtmd_context_params mparams = mtmd_context_params_default();
+        std::vector<ggml_backend_dev_t> mmproj_devices; // devices to split the mmproj model across
         if (has_mmproj) {
             mparams.use_gpu          = params_base.mmproj_use_gpu;
             mparams.device           = params_base.mmproj_device;
@@ -1069,6 +1070,30 @@ private:
             // progress callback
             mparams.progress_callback           = load_progress_callback;
             mparams.progress_callback_user_data = &load_progress_mmproj;
+            // split the mmproj model across the devices used by the main model;
+            // an explicit -mmdev keeps the projector on that one device
+            if (params_base.mmproj_use_gpu && !params_base.mmproj_device_explicit) {
+                if (!params_base.devices.empty()) {
+                    // the --device list ends with a nullptr terminator
+                    for (ggml_backend_dev_t dev : params_base.devices) {
+                        if (dev != nullptr && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            mmproj_devices.push_back(dev);
+                        }
+                    }
+                } else {
+                    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                            mmproj_devices.push_back(dev);
+                        }
+                    }
+                }
+                if (mmproj_devices.size() > 1) {
+                    SRV_INF("splitting mmproj across %zu devices\n", mmproj_devices.size());
+                    mparams.devices   = mmproj_devices.data();
+                    mparams.n_devices = (int32_t) mmproj_devices.size();
+                }
+            }
         }
 
         // optionally get the memory usage of mmproj

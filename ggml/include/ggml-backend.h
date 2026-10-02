@@ -446,6 +446,109 @@ extern "C" {
     GGML_API void ggml_backend_meta_copy_mirrored_async(ggml_backend_t backend,
             const struct ggml_tensor * src, size_t src_offs, struct ggml_tensor * dst, size_t dst_offs, size_t nbytes);
 
+    // Assist enable thresholds: below these shapes the cross-device KV transfer costs more than
+    // the attention work it saves. Compile-time only, there is no runtime override.
+    #define GGML_BACKEND_META_ASSIST_MIN_Q  256
+    #define GGML_BACKEND_META_ASSIST_MIN_KV 32768
+
+    // K/V window the owner and its idle device partition the K/V view with; must match the CUDA
+    // backend's SM70_D256_KV_WINDOW.
+    #define GGML_BACKEND_META_ASSIST_KV_WINDOW 131072
+
+    // Split point of an assist owner, computed on the owner device from the mask bounds and
+    // read by the idle device: kv_end is the last KV row the batch uses, s the row where the
+    // idle device takes over. The owner computes [0, s), the idle [s, kv_end); rows past
+    // kv_end are masked out. s == kv_end means this batch is not split.
+    struct ggml_backend_meta_assist_split {
+        int32_t kv_end;
+        int32_t s;
+    };
+
+    // Description of one rank of an assist collective: an idle device (role 1) computes the
+    // attention partials of the KV tail of one or two owner devices (role 0). The idle device
+    // pulls the owner K/V rows into a local staging buffer (a device-side row range [s, kv_end)
+    // narrows each window), dequantizes them into a local f16 window mirror, runs the Split-D
+    // partial kernel and merges the window partials into the owner's partial slots. The owner
+    // computes [0, s) with its existing windowed path, merges the idle partial and scatters the
+    // normalized output. Epoch slots order the cross-device accesses; every slot belongs to the
+    // device that waits on it (epoch on the owner, last on the idle/owner that spins). All
+    // pointers are valid for the lifetime of the plan.
+    struct ggml_backend_meta_assist_rank {
+        int32_t role;            // 0 = owner, 1 = assist
+        int32_t n_owners;        // role 1: owners served (1 or 2); role 0: 1
+        int32_t owners[2];       // role 1: owner ranks; role 0: unused
+        int32_t assist_rank;     // role 0: rank of its assist; role 1: unused
+        int32_t owner_dev[2];    // role 1: owner CUDA device ordinals for the peer copies
+
+        // KV window partition in rows: both ranks walk the whole K/V view [0, kv_view) in
+        // kv_window-row windows; the device-side split [s, kv_end) narrows the work inside each
+        // window. The split point itself lives in the owner's split slot.
+        int32_t kv_view;         // global K/V view rows (the cache width)
+        int32_t kv_window;       // window size the two ranks partition the view with
+
+        int32_t q_pad;           // padded q rows per batch (multiple of the 64-row q block)
+        int32_t q_len;           // real q rows per batch
+        int32_t heads_q;         // query heads computed by an owner
+        int32_t heads_kv;        // KV heads of the owner (the first version requires 1)
+        int32_t batch;           // FA batch (the first version requires 1)
+        int32_t kv_type;         // ggml_type of the owner K/V cache (Q8_0 or Q4_0)
+        float   scale;           // FA softmax scale, natural log domain
+
+        // Mask: the same mirrored copy exists on every device, the descriptor holds this device's.
+        const void * mask;
+        int64_t mask_row_stride;   // range mask: int2 units, f16 mask: halfs
+        int64_t mask_batch_stride; // same units, 0 when the mask has a single batch
+        bool    mask_is_range;
+
+        // role 1: owner buffers (VA on the owner device, peer accessible)
+        const void * k_src[2];   // owner cache_k base
+        const void * v_src[2];   // owner cache_v base
+        const void * qs_src[2];  // owner staged f16 Q, [batch][heads_q][q_pad][D]
+        float * p_out_dst[2];    // owner raw partial slots
+        float * p_max_dst[2];
+        float * p_sum_dst[2];
+        uint32_t * epoch_kv[2];      // wait: owner signals after its Q staging and split point
+        uint32_t * epoch_partial[2]; // signal: owner waits before merging
+        uint32_t * epoch_free[2];    // wait: owner signals after its merge/scatter
+        uint32_t * last_kv[2];       // idle local
+        uint32_t * last_free[2];     // idle local
+        const struct ggml_backend_meta_assist_split * split_src[2]; // owner split point, peer VA
+        struct ggml_backend_meta_assist_split * split_local;        // role 0: own slot; role 1: local copy
+
+        // role 0: owner slots, on the owner device
+        float * p_out_local;
+        float * p_max_local;
+        float * p_sum_local;
+        uint32_t * epoch_kv_local;      // signal after stage_q and the split point
+        uint32_t * epoch_partial_local; // wait before the merge
+        uint32_t * last_partial_local;  // owner local
+        uint32_t * epoch_free_local;    // signal after the scatter
+
+        // role 1: idle workspace, ggml_backend_cuda_assist_workspace_size bytes
+        void * work;
+        size_t work_bytes;
+    };
+
+    typedef bool   (*ggml_backend_set_assist_t)(ggml_backend_t backend, const struct ggml_backend_meta_assist_rank * desc);
+    typedef bool   (*ggml_backend_assist_run_t)(ggml_backend_t backend, const struct ggml_backend_meta_assist_rank * desc);
+    typedef size_t (*ggml_backend_assist_workspace_size_t)(int q_pad, int heads_q);
+
+    // Offsets of the FA scratch buffers of the owner node, relative to dst->data + ggml_nbytes(dst).
+    // The values come from the same layout the launch uses, so the meta backend does not have to
+    // replicate it. Returns false when the node does not use the windowed partial path.
+    struct ggml_backend_meta_assist_scratch {
+        size_t  qs_offset;      // staged f16 Q, [batch][heads_q][q_pad][D]
+        size_t  p_out_offset;
+        size_t  p_max_offset;
+        size_t  p_sum_offset;
+        int32_t q_pad;
+    };
+
+    typedef bool (*ggml_backend_assist_scratch_layout_t)(const struct ggml_tensor * dst, struct ggml_backend_meta_assist_scratch * layout);
+
+    // CUDA device ordinal of a backend, for the peer copies of an assist collective.
+    typedef int (*ggml_backend_device_ordinal_t)(ggml_backend_t backend);
+
     //
     // Utils
     //

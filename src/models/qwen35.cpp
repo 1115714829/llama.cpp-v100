@@ -447,9 +447,22 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     if (attn_kv_overlap_3card(hparams, model, il)) {
         cur = build_attn_3card(inp, Qcur, Kcur, Vcur, kq_scale, il);
     } else {
+        const size_t n_fused = res->get_fused_nodes().size();
         cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+
+        // 6-card attention load balancing: allow the meta backend to hand the KV tail of this
+        // layer to the idle devices; the host-side gate in graph_params keeps the plain node
+        // until the batch really spans the assist threshold
+        if (fa_assist) {
+            const auto & fused = res->get_fused_nodes();
+            for (size_t i = n_fused; i < fused.size(); i++) {
+                if (fused[i].op == LLM_FUSED_OP_FLASH_ATTN) {
+                    ggml_flash_attn_ext_set_assist_capable(fused[i].tensor, true);
+                }
+            }
+        }
     }
     cb(cur, "attn_pregate", il);
 
