@@ -1956,8 +1956,8 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
-    // a repacked Q4_K weight has no gated kernel in this version; keep it on the single
-    // MUL_MAT path so the regular nodes compute it
+    // the mul_mat_vec fusions cannot read a repacked Q4_K weight; a plain pair is fused by
+    // the skinny gated kernel instead (see ggml_cuda_can_fuse and ggml_cuda_try_fuse)
     if (ggml_cuda_q4k_skinny_is_repacked(ffn_up->src[0]) || ggml_cuda_q4k_skinny_is_repacked(ffn_gate->src[0])) {
         return false;
     }
@@ -4164,6 +4164,15 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             int out_nodes[] = { node_idx + 2 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }
+
+        // a repacked Q4_K SwiGLU pair is fused by the skinny gated kernel in the caller
+        if (ops.begin()[0] == GGML_OP_MUL_MAT &&
+                ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && !ggml_get_op_params_i32(glu, 1) &&
+                ggml_cuda_q4k_skinny_is_repacked(ffn_gate->src[0]) &&
+                ggml_cuda_q4k_skinny_is_repacked(ffn_up->src[0])) {
+            int out_nodes[] = { node_idx + 2 };
+            return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
+        }
     }
 
     std::initializer_list<enum ggml_op> rms_norm_mul_rope_ops          = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE };
@@ -4661,12 +4670,14 @@ static int ggml_cuda_try_ssm_conv_rollback_fusion(ggml_backend_cuda_context * cu
 }
 
 // Collects up to four MUL_MAT nodes starting at node_idx that share one src1 and read only
-// weights the q8 skinny multi-weight kernel can handle: repacked weights, or narrow row-major
-// Q8_0 weights (N is not a multiple of 32) that the kernel dot path reads directly. Above
-// M = 16 the M=32 kernel replaces the multi-weight kernel, so every weight must be repacked;
-// groups with a narrow weight fall through to the large-M fusion below.
+// weights one multi-weight kernel can handle. With q4k, every weight must be a repacked
+// Q4_K tensor. Otherwise: repacked Q8_0 weights, or narrow row-major Q8_0 weights (N is not
+// a multiple of 32) that the kernel dot path reads directly. Above M = 16 the M=32 kernel
+// replaces the multi-weight kernel, so every weight must be repacked; groups with a narrow
+// weight fall through to the large-M fusion below.
 static int ggml_cuda_match_mul_mat_multi(const ggml_cgraph * cgraph, int node_idx,
-                                         const ggml_tensor * src0s[4], ggml_tensor * dsts[4]) {
+                                         const ggml_tensor * src0s[4], ggml_tensor * dsts[4],
+                                         bool q4k) {
     const ggml_tensor * first = cgraph->nodes[node_idx];
     if (first->op != GGML_OP_MUL_MAT) {
         return 0;
@@ -4688,15 +4699,25 @@ static int ggml_cuda_match_mul_mat_multi(const ggml_cgraph * cgraph, int node_id
             break;
         }
         const ggml_tensor * w = node->src[0];
-        // a repacked Q4_K weight has no multi-weight kernel, do not fuse its group
-        if (ggml_cuda_q4k_skinny_is_repacked(w)) {
+        if (w->ne[0] != k) {
             break;
         }
-        const bool repacked = ggml_cuda_q8_skinny_is_repacked(w);
-        const bool narrow = w->type == GGML_TYPE_Q8_0 && w->view_src == nullptr && w->op == GGML_OP_NONE &&
-                            w->ne[1] % 32 != 0;
-        if (w->ne[0] != k || (!repacked && (!narrow || src1->ne[1] > 16))) {
-            break;
+        if (q4k) {
+            // the skinny multi kernel reads repacked segments only, one codec type per launch
+            if (!ggml_cuda_q4k_skinny_is_repacked(w) || w->type != first->src[0]->type) {
+                break;
+            }
+        } else {
+            // a repacked skinny weight is not readable by the q8 multi kernel
+            if (ggml_cuda_q4k_skinny_is_repacked(w)) {
+                break;
+            }
+            const bool repacked = ggml_cuda_q8_skinny_is_repacked(w);
+            const bool narrow = w->type == GGML_TYPE_Q8_0 && w->view_src == nullptr && w->op == GGML_OP_NONE &&
+                                w->ne[1] % 32 != 0;
+            if (!repacked && (!narrow || src1->ne[1] > 16)) {
+                break;
+            }
         }
         if (node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node)) {
             break;
@@ -4730,15 +4751,12 @@ static int ggml_cuda_match_mul_mat_multi_large(const ggml_cgraph * cgraph, int n
             break;
         }
         const ggml_tensor * w = node->src[0];
-        // a repacked Q4_K weight is expanded per node instead, do not fuse it
-        if (ggml_cuda_q4k_skinny_is_repacked(w)) {
-            break;
-        }
+        const bool repacked_q4k = ggml_cuda_q4k_skinny_is_repacked(w);
         const bool repacked = ggml_cuda_q8_skinny_is_repacked(w);
         const bool q8_0 = w->type == GGML_TYPE_Q8_0 && w->view_src == nullptr && w->op == GGML_OP_NONE &&
                           ggml_is_contiguous(w);
         const bool f16 = w->type == GGML_TYPE_F16 && ggml_is_contiguous(w);
-        if (w->ne[0] != k || (!repacked && !q8_0 && !f16)) {
+        if (w->ne[0] != k || (!repacked && !repacked_q4k && !q8_0 && !f16)) {
             break;
         }
         if (node->type != GGML_TYPE_F32 || !ggml_is_contiguous(node) || node->op_params[0] == GGML_PREC_F32) {
@@ -4788,6 +4806,8 @@ static bool ggml_cuda_mul_mat_multi_shared_src1(ggml_backend_cuda_context & ctx,
         ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(), ggml_nelements(w));
         if (ggml_cuda_q8_skinny_is_repacked(w)) {
             ggml_cuda_q8_skinny_to_f16(w, src0_f16.get(), ctx.stream());
+        } else if (ggml_cuda_q4k_skinny_is_repacked(w)) {
+            ggml_cuda_q4k_skinny_to_f16(w, src0_f16.get(), ctx.stream());
         } else {
             const to_fp16_cuda_t to_fp16_w = ggml_get_to_fp16_cuda(w->type);
             GGML_ASSERT(to_fp16_w != nullptr);
@@ -5369,12 +5389,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
 
-            // a repacked Q4_K weight has no gated kernel in this version; leave the pair to the
-            // single MUL_MAT path and the regular GLU node
-            if (ggml_cuda_q4k_skinny_is_repacked(gate->src[0]) || ggml_cuda_q4k_skinny_is_repacked(up->src[0])) {
-                continue;
-            }
-
             // q8 skinny gated pair: gate and up in one kernel, GLU written directly
             if (op == GGML_OP_MUL_MAT && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
                     gate->src[1] == up->src[1] &&
@@ -5384,8 +5398,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
+            // q4k skinny gated pair: gate and up in one kernel, GLU written directly
+            if (op == GGML_OP_MUL_MAT && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                    gate->src[1] == up->src[1] &&
+                    ggml_cuda_q4k_skinny_mul_mat_gated(*cuda_ctx, gate->src[0], up->src[0], src1, glu)) {
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
             // the mul_mat_vec fusion kernels cannot read a repacked weight
-            if (ggml_cuda_q8_skinny_is_repacked(gate->src[0]) || ggml_cuda_q8_skinny_is_repacked(up->src[0])) {
+            if (ggml_cuda_q8_skinny_is_repacked(gate->src[0]) || ggml_cuda_q8_skinny_is_repacked(up->src[0]) ||
+                    ggml_cuda_q4k_skinny_is_repacked(gate->src[0]) || ggml_cuda_q4k_skinny_is_repacked(up->src[0])) {
                 continue;
             }
 
@@ -5425,7 +5449,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_MUL_MAT) {
         const ggml_tensor * multi_src0[4];
         ggml_tensor * multi_dst[4];
-        const int n_multi = ggml_cuda_match_mul_mat_multi(cgraph, i, multi_src0, multi_dst);
+        const bool q4k = ggml_cuda_q4k_skinny_is_repacked(node->src[0]);
+        const int n_multi = ggml_cuda_match_mul_mat_multi(cgraph, i, multi_src0, multi_dst, q4k);
         if (n_multi > 0) {
             // every node of the group is a formal output and is only read after the group, so
             // the fusion memory ranges cover all of them
@@ -5433,7 +5458,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             int out_nodes[4] = { i, i + 1, i + 2, i + 3 };
             if (ggml_can_fuse_subgraph(cgraph, i, n_multi, ops, out_nodes, n_multi) &&
                     ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_multi, out_nodes, n_multi) &&
-                    ggml_cuda_q8_skinny_mul_mat_multi(*cuda_ctx, multi_src0, multi_dst, n_multi, node->src[1])) {
+                    (q4k ? ggml_cuda_q4k_skinny_mul_mat_multi(*cuda_ctx, multi_src0, multi_dst, n_multi, node->src[1])
+                         : ggml_cuda_q8_skinny_mul_mat_multi(*cuda_ctx, multi_src0, multi_dst, n_multi, node->src[1]))) {
                 return n_multi - 1;
             }
         }
