@@ -1,11 +1,10 @@
-# V100 (sm_70) image of llama.cpp-v100, following the structure of .devops/cuda.Dockerfile.
+# V100 (sm_70) image of llama.cpp-v100.
 #
 # One Dockerfile for both platforms, built per platform and combined into one multi-arch tag:
 #   linux/amd64    any x86_64 host with V100 GPUs
 #   linux/ppc64le  IBM Power AC922 only (POWER9 + V100-SXM2 + NVLink); other ppc64le hosts are not supported
 #
-# The base is the CUDA 12.4 UBI8 image because it is the CUDA image published for both amd64 and
-# ppc64le; NCCL (required for multi-GPU tensor split) comes with it. Only sm_70 SASS is built.
+# Base: CUDA 12.4 UBI8 image (amd64 and ppc64le), which includes NCCL. Only sm_70 SASS is built.
 #
 #   docker build -f .devops/v100-cuda.Dockerfile -t llama.cpp-v100:server .
 #
@@ -52,8 +51,8 @@ RUN mkdir -p /app/licenses && \
     cp licenses/* ggml/src/ggml-cuda/LICENSE.v100-skinny ggml/src/ggml-cuda/gdn-chunk-sm70/LICENSE-tilelang \
        ggml/src/ggml-cuda/sm70-vendor/LICENSE-* /app/licenses/
 
-# ---------- ffmpeg (video input), from conda-forge: available for both linux-64 and linux-ppc64le ----------
-FROM ${BASE_CUDA_DEV_CONTAINER} AS ffmpeg
+# ---------- ffmpeg (video input) and numactl, from conda-forge ----------
+FROM ${BASE_CUDA_DEV_CONTAINER} AS tools
 
 RUN dnf install -y bzip2 && dnf clean all && \
     case "$(uname -m)" in \
@@ -62,7 +61,7 @@ RUN dnf install -y bzip2 && dnf clean all && \
         *) echo "unsupported architecture $(uname -m)"; exit 1 ;; \
     esac && \
     curl -fsSL "https://micro.mamba.pm/api/micromamba/linux-${arch}/latest" | tar -xj -C /usr/local bin/micromamba && \
-    micromamba create -y -p /opt/ffmpeg -c conda-forge ffmpeg && \
+    micromamba create -y -p /opt/tools -c conda-forge ffmpeg numactl && \
     micromamba clean -a -y
 
 # ---------- server (default) ----------
@@ -71,13 +70,14 @@ FROM ${BASE_CUDA_RUN_CONTAINER} AS server
 RUN dnf install -y libgomp && dnf clean all
 
 COPY --from=build /app /app
-COPY --from=ffmpeg /opt/ffmpeg /opt/ffmpeg
+COPY --from=tools /opt/tools /opt/tools
+COPY .devops/v100-entrypoint.sh /app/entrypoint.sh
 
-ENV PATH=/opt/ffmpeg/bin:/app:${PATH} \
+ENV PATH=/opt/tools/bin:/app:${PATH} \
     LLAMA_ARG_HOST=0.0.0.0
 
 WORKDIR /app
 
 HEALTHCHECK CMD [ "curl", "-f", "http://localhost:8080/health" ]
 
-ENTRYPOINT [ "/app/llama-server" ]
+ENTRYPOINT [ "/app/entrypoint.sh" ]

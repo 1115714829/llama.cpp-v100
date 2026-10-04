@@ -1,8 +1,6 @@
-# Docker image of this project (V100 / sm_70), built from .devops/v100-cuda.Dockerfile.
-# Runs only when started by hand (Actions -> V100 docker -> Run workflow); nothing is scheduled and
-# nothing is pushed to a registry. The x86_64 (linux/amd64) image is saved with `docker save` and
-# uploaded as a workflow artifact. The linux/ppc64le image (IBM Power AC922 only) is built on an
-# AC922 host with the same Dockerfile; GitHub has no ppc64le machine for it.
+# Builds the linux/amd64 image from .devops/v100-cuda.Dockerfile and uploads it (docker save) as a
+# workflow artifact. Manual trigger only; no schedule, no registry push.
+# The linux/ppc64le image (IBM Power AC922 only) is built on an AC922 host from the same Dockerfile.
 name: V100 docker
 
 on:
@@ -45,6 +43,7 @@ jobs:
           missing=$(docker run --rm --entrypoint bash "$img" -c 'ldd /app/llama-server /app/libggml-cuda.so | grep "not found" | grep -v "libcuda.so.1" || true')
           [ -z "$missing" ] || { echo "missing libraries: $missing"; exit 1; }
           docker run --rm --entrypoint ffmpeg "$img" -version | head -1
+          docker run --rm --entrypoint numactl "$img" --show | head -1
 
       - name: Save
         run: |
