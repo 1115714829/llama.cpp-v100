@@ -13,6 +13,7 @@
 - **6 卡多路长上下文崩溃**：两路（或更多路）同时处理长提示词、且各自的上下文都超过 32768 时（例如带大图片的 Agent 会话），服务可能报 `illegal memory access` 或段错误退出。原因是空闲 GPU 分担注意力时使用的工作缓冲在多路之间切换时会重建，而 CUDA Graph 缓存仍重放旧的捕获、写入已释放的显存。现在 CUDA Graph 缓存把分担用的缓冲一并纳入是否重新捕获的判断。修复后，两路分担带来的长上下文预填充提速保持不变。
 - 回归测试：6 卡 `-c 524288 -np 2`，两路同时各约 4 万 token 文字 + 6 张大图：1.0.9 两次都在约 23 s 时崩溃；1.1.0 两次两路都完成（各约 7.2 万 token）。
 - 4/6 卡 T=0 输出与 1.0.9 逐字相同。与 1.0.9 交替测量，速度与显存持平：6 卡 200K 合成预填充 2085.5 / 2082.0 tok/s、吐字 300.2 / 300.3 tok/s；6 卡 419430 合成 1469.1 / 1467.0 tok/s、238.6 / 238.4 tok/s；4 卡真实 16K 预填充 2554.5 / 2561.0 tok/s；4 卡 200K 合成（5 轮交替平均）预填充 1754.0 / 1752.2 tok/s、吐字 281.3 / 281.3 tok/s；3 卡、2 卡、多路并发与多模态各项持平，各卡显存峰值相同。
+- **Docker 镜像**（1.1.0 修订，版本号不变）：`ghcr.io/1115714829/llama.cpp-v100:1.1.0`，同一标签含 x86_64 与 IBM Power AC922（ppc64le），见“Docker”一节。
 
 ---
 
@@ -304,6 +305,69 @@ scripts/v100-get-models.sh -s hf      # 改用 Hugging Face
 
 ---
 
+## Docker
+
+镜像只包含 sm_70（V100）代码，基于 CUDA 12.4.1，内含 NCCL、ffmpeg（视频输入）、numactl 和 `llama-quantize`。宿主机需要 NVIDIA 驱动 550 或更新。镜像发布在 GitHub Container Registry，同一个标签同时包含 linux/amd64 与 linux/ppc64le，`docker pull` 时按宿主机架构自动选择。
+
+| 平台 | 支持范围 | 容器内使用 GPU |
+|---|---|---|
+| linux/amd64 | x86_64 + V100 | NVIDIA Container Toolkit，`--gpus all` |
+| linux/ppc64le | 仅 IBM Power AC922（POWER9 + V100-SXM2） | CDI 描述（`.devops/v100-ac922-cdi.sh` 生成），`--device nvidia.com/gpu=all` |
+
+镜像的入口是 `llama-server`，`docker run` 镜像名之后的参数直接传给它（参数见“启动参数”一节，路径改成容器内的 `/models/...`）。
+
+x86_64，4 卡、上下文 262144（模型放在 `/path/to/models`，见“模型下载”）：
+
+```bash
+docker run -d --name llama-v100 --gpus all --ipc=host --ulimit memlock=-1 \
+  -p 8080:8080 -v /path/to/models:/models \
+  ghcr.io/1115714829/llama.cpp-v100:1.1.0 \
+  -m /models/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
+  --split-mode tensor --tensor-split 1,1,1,1 \
+  -c 262144 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
+  --model-draft /models/Qwen3.8-27B-DFlash2-F16.gguf \
+  --spec-type draft-dflash --spec-draft-n-max 7 \
+  --port 8080
+```
+
+AC922（podman，`podman-docker` 提供同名的 `docker` 命令）：
+
+```bash
+sudo dnf install -y podman podman-docker
+sudo bash .devops/v100-ac922-cdi.sh        # 生成 /etc/cdi/nvidia.yaml；驱动升级后重新执行
+docker run -d --name llama-v100 --device nvidia.com/gpu=all --ipc=host --ulimit memlock=-1 \
+  -e LLAMA_NUMA_MEMBIND=0,8 \
+  -p 8080:8080 -v /path/to/models:/models \
+  ghcr.io/1115714829/llama.cpp-v100:1.1.0 \
+  ...（同上，按卡数改 --tensor-split）
+```
+
+草稿模型转 F16 也可以用镜像里的 `llama-quantize`：
+
+```bash
+docker run --rm --entrypoint /app/llama-quantize -v /path/to/models:/models \
+  ghcr.io/1115714829/llama.cpp-v100:1.1.0 \
+  /models/Qwen3.8-27B-DFlash2-BF16.gguf /models/Qwen3.8-27B-DFlash2-F16.gguf F16
+```
+
+参数说明：
+
+| 参数 | 作用 |
+|---|---|
+| `--gpus all` / `--device nvidia.com/gpu=all` | 把宿主机全部 GPU 交给容器；只用部分 GPU 时 x86 写 `--gpus '"device=0,1"'`，AC922 写 `--device nvidia.com/gpu=0` 等 |
+| `--ipc=host`、`--ulimit memlock=-1` | 多卡通信需要的共享内存与锁页内存 |
+| `-v /path/to/models:/models` | 挂载模型目录 |
+| `-e LLAMA_NUMA_MEMBIND=<节点>` | 用 `numactl --membind=<节点>` 启动，把主机内存限定在指定 NUMA 节点。只用于把 GPU 显存上线为 NUMA 节点的机器（如 AC922，填有 CPU 的节点 `0,8`），防止主机内存与页缓存占用显存。普通 x86 服务器不要设置；节点号必须是 `numactl --hardware` 中存在的节点，否则容器启动即退出 |
+| `--video-ffmpeg-dir /opt/tools/bin` | 视频输入使用镜像内的 ffmpeg |
+| `--api-key-file /run/llama.apikey` | 配合 `-v <密钥文件>:/run/llama.apikey:ro` 启用 API 密钥 |
+
+- 镜像默认设置环境变量 `LLAMA_ARG_HOST=0.0.0.0`，在容器内监听所有地址；对外是否可访问由 `-p` 或 `--network host` 决定。
+- 不要用 `--cpuset-mems` 限定内存节点：GPU 显存作为 NUMA 节点上线时，这会使容器内 CUDA 初始化失败；请用 `LLAMA_NUMA_MEMBIND`。
+- 2 卡请用 Q4 配置（见“卡数与量化适配”）。
+- 不能访问 ghcr.io 时，可从 Releases 页面下载镜像文件（`llama.cpp-v100-server-<版本>-<架构>.tar.gz`），`docker load -i <文件>` 导入；也可以在源码目录自行构建：`docker build -f .devops/v100-cuda.Dockerfile -t llama.cpp-v100:server .`。
+
+---
+
 ## 启动参数
 
 以下是测试数据对应的启动命令。`numactl --membind=0,8` 把主机内存限定在本机的两个 CPU 节点（AC922 把 GPU 显存上线成 NUMA 节点，不限定时页缓存可能占用显存），其他机器用 `numactl -H` 查看节点编号。
@@ -438,6 +502,7 @@ CUDA_VISIBLE_DEVICES=0,1 numactl --membind=0,8 ./build/bin/llama-server \
 
 | 参数 | 说明 |
 |---|---|
+| `numactl --membind=<节点>` | 把主机内存限定在指定的 NUMA 节点（写在 `llama-server` 前面）。用于把 GPU 显存上线为 NUMA 节点的机器（如 AC922，填有 CPU 的节点 `0,8`），防止主机内存与页缓存占用显存；普通 x86 服务器不需要。节点号用 `numactl --hardware` 查看，必须是存在的节点，否则无法启动。Docker 中用环境变量 `LLAMA_NUMA_MEMBIND` |
 | `-ngl 999` | 所有层放 GPU |
 | `--split-mode tensor --tensor-split 1,…,1` | 张量并行，各卡均分 |
 | `-c` | 上下文长度 |

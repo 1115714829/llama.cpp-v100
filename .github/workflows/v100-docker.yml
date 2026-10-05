@@ -1,6 +1,11 @@
-# Builds the linux/amd64 image from .devops/v100-cuda.Dockerfile and uploads it (docker save) as a
-# workflow artifact. Manual trigger only; no schedule, no registry push.
-# The linux/ppc64le image (IBM Power AC922 only) is built on an AC922 host from the same Dockerfile.
+# Publishes the multi-architecture image ghcr.io/<owner>/llama.cpp-v100:<version> (and :latest).
+# Manual trigger only; no schedule.
+# - linux/amd64: built here from .devops/v100-cuda.Dockerfile, checked, pushed, and its docker save
+#   file attached to the v100-<version> release.
+# - linux/ppc64le (IBM Power AC922 only): built on an AC922 host from the same Dockerfile; its docker
+#   save file llama.cpp-v100-server-<version>-ppc64le.tar.gz (with .sha256) must already be attached
+#   to the v100-<version> release. It is loaded, checked and pushed here.
+# - The two are combined into one tag; `docker pull` selects the host architecture.
 name: V100 docker
 
 on:
@@ -11,11 +16,16 @@ on:
         required: true
 
 permissions:
-  contents: read
+  contents: write
+  packages: write
 
 defaults:
   run:
     shell: bash
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/llama.cpp-v100
+  VERSION: ${{ inputs.version }}
 
 jobs:
   amd64:
@@ -33,29 +43,63 @@ jobs:
 
       - name: Build
         run: |
-          docker build -f .devops/v100-cuda.Dockerfile --target server \
-            -t "llama.cpp-v100:server-${{ inputs.version }}-amd64" .
+          docker build -f .devops/v100-cuda.Dockerfile --target server -t "$IMAGE:$VERSION-amd64" .
 
-      - name: Smoke test (no GPU on the runner)
+      - name: Check (no GPU on the runner)
         run: |
-          img="llama.cpp-v100:server-${{ inputs.version }}-amd64"
           # libcuda.so.1 comes from the host driver at run time; every other library must resolve in the image
-          missing=$(docker run --rm --entrypoint bash "$img" -c 'ldd /app/llama-server /app/libggml-cuda.so | grep "not found" | grep -v "libcuda.so.1" || true')
+          missing=$(docker run --rm --entrypoint bash "$IMAGE:$VERSION-amd64" -c 'ldd /app/llama-server /app/libggml-cuda.so | grep "not found" | grep -v "libcuda.so.1" || true')
           [ -z "$missing" ] || { echo "missing libraries: $missing"; exit 1; }
-          docker run --rm --entrypoint ffmpeg "$img" -version | head -1
-          docker run --rm --entrypoint numactl "$img" --show | head -1
+          docker run --rm --entrypoint ffmpeg "$IMAGE:$VERSION-amd64" -version | head -1
+          docker run --rm --entrypoint numactl "$IMAGE:$VERSION-amd64" --show | head -1
 
-      - name: Save
+      - name: Push
         run: |
-          name="llama.cpp-v100-server-${{ inputs.version }}-amd64"
-          docker save "llama.cpp-v100:server-${{ inputs.version }}-amd64" | gzip -1 > "$name.tar.gz"
-          ls -l "$name.tar.gz"
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE:$VERSION-amd64"
 
-      - name: Upload
-        uses: actions/upload-artifact@v6
-        with:
-          name: llama.cpp-v100-server-${{ inputs.version }}-amd64
-          path: llama.cpp-v100-server-*-amd64.tar.gz
-          compression-level: 0
-          retention-days: 14
-          if-no-files-found: error
+      - name: Attach to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          name="llama.cpp-v100-server-$VERSION-amd64.tar.gz"
+          docker tag "$IMAGE:$VERSION-amd64" "llama.cpp-v100:server-$VERSION-amd64"
+          docker save "llama.cpp-v100:server-$VERSION-amd64" | gzip -1 > "$name"
+          sha256sum "$name" > "$name.sha256"
+          ls -l "$name"
+          gh release upload "v100-$VERSION" "$name" "$name.sha256" --clobber --repo "${{ github.repository }}"
+
+  ppc64le:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          name="llama.cpp-v100-server-$VERSION-ppc64le.tar.gz"
+          gh release download "v100-$VERSION" -p "$name" -p "$name.sha256" --repo "${{ github.repository }}"
+          sha256sum -c "$name.sha256"
+
+      - name: Load and check
+        run: |
+          loaded=$(docker load -i "llama.cpp-v100-server-$VERSION-ppc64le.tar.gz" | sed -n 's/^Loaded image: //p' | tail -1)
+          [ -n "$loaded" ] || { echo "no image loaded"; exit 1; }
+          arch=$(docker image inspect -f '{{.Architecture}}' "$loaded")
+          [ "$arch" = "ppc64le" ] || { echo "unexpected architecture: $arch"; exit 1; }
+          docker tag "$loaded" "$IMAGE:$VERSION-ppc64le"
+
+      - name: Push
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker push "$IMAGE:$VERSION-ppc64le"
+
+  manifest:
+    needs: [amd64, ppc64le]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Combine
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker buildx imagetools create -t "$IMAGE:$VERSION" -t "$IMAGE:latest" \
+            "$IMAGE:$VERSION-amd64" "$IMAGE:$VERSION-ppc64le"
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
