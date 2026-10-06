@@ -11698,10 +11698,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Unsloth Qwen3.8-Flash-Next UD-Q4_K_XL expert projections: 512 experts, top-10,
     // gate/up (m = 640, k = 2560) and fused gate/up (m = 1280, k = 2560) with the K-quant types,
     // down (m = 2560, k = 640) with the types the model actually uses there (K = 640 is not a
-    // multiple of QK_K, so Q4_K/Q5_K cannot be used for down).
-    // n = 9 is the MMVQ to grouped-kernel boundary, 17/65 sit just past the J = 16/64 tile edges.
-    for (int n : {1, 8, 9, 16, 17, 32, 48, 64, 65, 128}) {
-        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+    // multiple of QK_K, so Q4_K/Q5_K/Q6_K cannot be used for down).
+    // n = 8/16 are the MMVQ mmid limits, 17/65 sit just past the J = 16/64 grouped tile edges.
+    for (int n : {1, 8, 9, 12, 16, 17, 24, 32, 48, 64, 65, 128}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // gate/up
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560)); // fused gate/up
         }

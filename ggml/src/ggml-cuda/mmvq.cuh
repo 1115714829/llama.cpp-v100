@@ -2,6 +2,15 @@
 
 #define MMVQ_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVQ kernels.
 
+// MUL_MAT_ID uses a separate kernel (mul_mat_vec_q_moe) that gives one warp per token, so its
+// block is ncols_dst warps wide. Volta allows 1024 threads per block, so the cheap types can go
+// past MMVQ_MAX_BATCH_SIZE. 16 keeps the block at 512 threads and lets n = 9..16 use the mmid
+// path instead of the padded MMQ tile. Types with a heavier vec_dot stay at MMVQ_MAX_BATCH_SIZE.
+#define MMVQ_MMID_MAX_BATCH_VOLTA 16
+
+// Upper bound of get_mmvq_mmid_max_batch() over all architectures, used for asserts.
+#define MMVQ_MMID_MAX_BATCH_SIZE 16
+
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,

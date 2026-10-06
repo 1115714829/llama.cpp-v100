@@ -31,6 +31,7 @@ struct moe_grouped_traits;
 
 MOE_GROUPED_TRAITS(GGML_TYPE_Q4_K, QK_K,  QI4_K, VDR_Q4_K_Q8_1_MMVQ, block_q4_K, vec_dot_q4_K_q8_1)
 MOE_GROUPED_TRAITS(GGML_TYPE_Q5_K, QK_K,  QI5_K, VDR_Q5_K_Q8_1_MMVQ, block_q5_K, vec_dot_q5_K_q8_1)
+MOE_GROUPED_TRAITS(GGML_TYPE_Q6_K, QK_K,  QI6_K, VDR_Q6_K_Q8_1_MMVQ, block_q6_K, vec_dot_q6_K_q8_1)
 MOE_GROUPED_TRAITS(GGML_TYPE_Q5_1, QK5_1, QI5_1, VDR_Q5_1_Q8_1_MMVQ, block_q5_1, vec_dot_q5_1_q8_1)
 MOE_GROUPED_TRAITS(GGML_TYPE_Q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ, block_q8_0, vec_dot_q8_0_q8_1)
 
@@ -132,6 +133,7 @@ bool ggml_cuda_moe_grouped_mul_mat_id_supported(const ggml_tensor * dst, const i
     switch (src0->type) {
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
             break;
@@ -260,6 +262,10 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
             break;
         case GGML_TYPE_Q5_K:
             moe_grouped_launch<GGML_TYPE_Q5_K>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
+                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream);
+            break;
+        case GGML_TYPE_Q6_K:
+            moe_grouped_launch<GGML_TYPE_Q6_K>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
                 xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream);
             break;
         case GGML_TYPE_Q5_1:
