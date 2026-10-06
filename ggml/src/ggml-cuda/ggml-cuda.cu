@@ -6713,6 +6713,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // SCALE -> UNARY(SILU): the hyper-connection mixer activation, silu(x*s), as built by
+    // qwen4exp. The scale is folded into the silu kernel, which is what the Strata fused_gr.cu
+    // down projection does in its epilogue (refs/strata/src/kernels/cuda/fused_gr.cu:102-103).
+    if (node->op == GGML_OP_SCALE &&
+            ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU }) &&
+            ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU &&
+            cgraph->nodes[i + 1]->src[0] == node &&
+            ggml_is_contiguous(node->src[0]) &&
+            node->src[0]->type == GGML_TYPE_F32 &&
+            node->type == GGML_TYPE_F32) {
+        ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        return 1;
+    }
+
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
@@ -6728,6 +6742,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
+    }
+
+    // SCALE -> UNARY(SIGMOID) -> SCALE -> DSV4_HC_POST: the hyper-connection combine gate,
+    // post = 2*sigmoid(inject/hc), folded into the post kernel. qwen4exp builds the chain in
+    // build_hc_combine. Strata folds the same gate into its up projection epilogue:
+    // rv = fmaf(bo, 2*sigmoid(inj/HC), rv) (refs/strata/src/kernels/cuda/fused_gr.cu:124).
+    if (node->op == GGML_OP_SCALE &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST }, { i + 3 }) &&
+            ggml_check_edges(cgraph, i, {{1, 0, 0}, {2, 0, 1}, {3, 2, 2}}) &&
+            ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SIGMOID &&
+            cgraph->nodes[i + 3]->src[3] == nullptr &&
+            node->src[0]->type == GGML_TYPE_F32 &&
+            node->type == GGML_TYPE_F32 &&
+            cgraph->nodes[i + 3]->src[0]->type == GGML_TYPE_F32 &&
+            cgraph->nodes[i + 3]->src[1]->type == GGML_TYPE_F32) {
+        ggml_cuda_op_dsv4_hc_post_gated(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2]);
+        return 3;
     }
 
     return 0;

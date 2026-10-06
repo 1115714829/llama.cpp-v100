@@ -4726,6 +4726,44 @@ struct test_unary_mul : public test_case {
     }
 };
 
+// GGML_OP_SCALE + GGML_OP_UNARY(SILU): silu(x*s), the hyper-connection mixer activation
+// (qwen4exp builds silu(scale(lo, 1/hc))). The backend may fold the scale of the first
+// node into the silu kernel; both nodes must then match the unfused chain.
+struct test_scale_silu : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SCALE_SILU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne, scale);
+    }
+
+    test_scale_silu(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = { 320, 1, 1, 1 },
+            float scale = 0.25f)
+        : type(type), ne(ne), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * scaled = ggml_scale(ctx, a, scale);
+        ggml_set_name(scaled, "scaled");
+
+        ggml_tensor * out = ggml_silu(ctx, scaled);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -10709,6 +10747,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    // production width: decode (n_tokens=1) and prefill (2048), the DSV4_HC_POST gate fused
+    // into the post kernel; identity comb, as qwen4exp builds the hyper-connection combine
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 2048, true, true));
+
+    // scale + unary(silu): decode and prefill shapes of the hyper-connection mixer activation
+    test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 320, 1, 1, 1 }));
+    test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 320, 2048, 1, 1 }));
+    test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 128, 2, 2, 2 }, -1.5f));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
