@@ -11687,6 +11687,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 1024, 10, false, 128, n, 512));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,   GGML_TYPE_F32, 1024, 10, false, 256, n, 128));
     }
+
+    // Qwen3.8-Flash-Next expert projections: Q2_0 weights, 512 experts, top-10,
+    // gate/up (m = 640, k = 2560) and down (m = 2560, k = 640)
+    for (int n : {1, 8, 64}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
     // multiple blocks per row: exercises the block-stride loop and the
@@ -13477,6 +13484,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+    // Qwen3.8-Flash-Next expert projections: 512 experts, top-10, Q2_0/Q8_0 weights.
+    // gate/up: m = 640, k = 2560; down: m = 2560, k = 640.
+    for (ggml_type type_a : {GGML_TYPE_Q2_0, GGML_TYPE_Q8_0}) {
+        for (int64_t n : {1, 2, 4, 8, 16, 64, 512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // Qwen3.8-Flash-Next
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640)); // Qwen3.8-Flash-Next
+        }
+    }
 
     return test_cases;
 }
