@@ -923,6 +923,32 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(
     return cur;
 }
 
+// BF16 weights are stored as F16 on devices without native BF16 support: the conversion is
+// exact for values in the F16 range, finite values beyond it are clamped to +-65504, and the
+// weights then use the F16 tensor cores for prefill and the F16 kernels for decode.
+bool llama_model_loader::bf16_weights_as_f16(const buft_list_t * buft_list) {
+    if (buft_list == nullptr) {
+        return false;
+    }
+
+    for (const auto & entry : *buft_list) {
+        if (!ggml_backend_dev_supports_bf16(entry.first)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool llama_model_loader::is_bf16_as_f16(const struct ggml_tensor * tensor) const {
+    if (tensor->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    const auto * weight = get_weight(ggml_get_name(tensor));
+    return weight != nullptr && weight->tensor->type == GGML_TYPE_BF16;
+}
+
 // checks if the weight tensor can be used with the specified buffer type and device
 static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
     GGML_ASSERT(w != nullptr);
@@ -1118,6 +1144,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
+    bool bf16_as_f16 = false;
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         const ctx_key key { buft, is_lazy };
@@ -1195,6 +1222,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             op = GGML_OP_MUL_MAT_ID;
         } else {
             op = info.op;
+        }
+
+        // only weights of matmuls take the F16 copy: they are the ones the F16 tensor cores and
+        // GEMV kernels are for, and the CUDA binary ops do not accept an F32 src0 with an F16 src1.
+        // the type change must happen before the buffer type is selected: the F16 copy of a weight
+        // is supported by a different set of devices and ops than the BF16 one
+        if (bf16_as_f16 && (op == GGML_OP_MUL_MAT || op == GGML_OP_MUL_MAT_ID)) {
+            t_meta->type = GGML_TYPE_F16;
         }
 
         // sanity checks
@@ -1339,9 +1374,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
+    // the matmul weights of this tensor are loaded as F16 when any target device lacks native
+    // BF16 support; buft_for_tensor() switches the type once it knows the op
+    bf16_as_f16 = cur->type == GGML_TYPE_BF16 &&
+        (bf16_weights_as_f16(buft_list_input) || bf16_weights_as_f16(buft_list_output) || bf16_weights_as_f16(buft_list_layer));
+
     if (flags & TENSOR_READ_LAZY) {
+        // a converted tensor is rewritten while loading, so it cannot stay in the mapping
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+        is_lazy = !bf16_as_f16 && lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
     }
 
     ggml_tensor t_meta = *cur;
@@ -1654,6 +1695,30 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
+        // BF16 weights loaded as F16 are converted here: the file holds BF16 but the tensor that
+        // was created is F16 and the model expects F16 from this point on
+        if (weight->tensor->type == GGML_TYPE_BF16 && cur->type == GGML_TYPE_F16) {
+            std::vector<no_init<uint8_t>> read_buf(n_size);
+
+            const void * data = load_data_range(*weight, 0, n_size, read_buf.data());
+            if (data != read_buf.data()) {
+                memcpy(read_buf.data(), data, n_size);
+            }
+
+            const int64_t n = n_size / sizeof(ggml_bf16_t);
+            n_bf16_clamped += ggml_bf16_to_fp16_row((const ggml_bf16_t *) read_buf.data(), (ggml_fp16_t *) read_buf.data(), n);
+            n_bf16_converted += n;
+
+            if (check_tensors && !ggml_validate_row_data(GGML_TYPE_F16, read_buf.data(), n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+
+            ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+
+            size_done += n_size;
+            continue;
+        }
+
         const bool from_mapping = use_mmap || lazy.has(cur);
 
         if (from_mapping) {
@@ -1797,6 +1862,11 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
+        if (n_bf16_converted > 0) {
+            LLAMA_LOG_INFO("%s: converted %zu BF16 weight values to F16 (%zu clamped to +-65504)\n",
+                    __func__, n_bf16_converted, n_bf16_clamped);
+        }
+
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {

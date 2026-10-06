@@ -486,6 +486,25 @@ void ggml_bf16_to_fp32_row(const ggml_bf16_t * x, float * y, int64_t n) {
     }
 }
 
+int64_t ggml_bf16_to_fp16_row(const ggml_bf16_t * x, ggml_fp16_t * y, int64_t n) {
+    int64_t n_clamped = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        float f = GGML_BF16_TO_FP32(x[i]);
+        // the 7-bit mantissa of a BF16 fits in the 10 bits of an F16, so the conversion is exact
+        // for every value in the F16 range; finite values beyond it are clamped instead of
+        // rounding to Inf (same rule as Strata's bf16_to_f16_kernel)
+        if (f > 65504.0f && !isinf(f)) {
+            f = 65504.0f;
+            n_clamped++;
+        } else if (f < -65504.0f && !isinf(f)) {
+            f = -65504.0f;
+            n_clamped++;
+        }
+        y[i] = GGML_FP32_TO_FP16(f);
+    }
+    return n_clamped;
+}
+
 void ggml_fp32_to_bf16_row_ref(const float * x, ggml_bf16_t * y, int64_t n) {
     for (int i = 0; i < n; i++) {
         y[i] = ggml_compute_fp32_to_bf16(x[i]);

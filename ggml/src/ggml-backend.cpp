@@ -795,6 +795,37 @@ bool ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_te
     return false;
 }
 
+bool ggml_backend_dev_supports_bf16(ggml_backend_dev_t device) {
+    GGML_ASSERT(device);
+
+    if (ggml_backend_dev_is_meta(device)) {
+        // a meta device supports BF16 only if all of its devices do
+        const size_t n_devs = ggml_backend_meta_dev_n_devs(device);
+        for (size_t i = 0; i < n_devs; i++) {
+            if (!ggml_backend_dev_supports_bf16(ggml_backend_meta_dev_simple_dev(device, i))) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    ggml_backend_reg_t reg = device->reg;
+    if (reg == NULL || reg->iface.get_proc_address == NULL) {
+        return true;
+    }
+
+    typedef bool (*ggml_backend_dev_supports_bf16_t)(ggml_backend_dev_t);
+    ggml_backend_dev_supports_bf16_t supports_bf16 =
+        (ggml_backend_dev_supports_bf16_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_supports_bf16");
+    if (supports_bf16 == NULL) {
+        // devices that do not report the capability are assumed to support BF16
+        return true;
+    }
+
+    return supports_bf16(device);
+}
+
 // Backend (reg)
 
 const char * ggml_backend_reg_name(ggml_backend_reg_t reg) {
