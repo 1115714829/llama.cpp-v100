@@ -1608,6 +1608,24 @@ bool llama_model_loader::load_all_data(
         tensors.push_back(cur);
     }
 
+    // a device-readable host buffer (e.g. the CUDA mapped host buffer) is copied into, so the page
+    // cache of the source file range can be dropped right after each tensor to avoid keeping a
+    // second copy of the weights in host memory
+    auto is_device_readable_buft = [](ggml_backend_buffer_type_t buft) -> bool {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (dev == nullptr) {
+            return false;
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            return false;
+        }
+        typedef bool (*ggml_backend_buft_is_mapped_t)(ggml_backend_buffer_type_t);
+        auto is_mapped = (ggml_backend_buft_is_mapped_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_mapped");
+        return is_mapped != nullptr && is_mapped(buft);
+    };
+
     // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
     // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
     if (!use_mmap) {
@@ -1667,6 +1685,11 @@ bool llama_model_loader::load_all_data(
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+
+                // the weights are now in a buffer the device reads directly, drop the page cache
+                if (cur->buffer != nullptr && is_device_readable_buft(ggml_backend_buffer_get_type(cur->buffer))) {
+                    mapping->drop_page_cache(weight->offs, weight->offs + n_size);
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
