@@ -11694,6 +11694,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
     }
+
+    // Unsloth Qwen3.8-Flash-Next UD-Q4_K_XL expert projections: 512 experts, top-10,
+    // gate/up (m = 640, k = 2560) and fused gate/up (m = 1280, k = 2560) with the K-quant types,
+    // down (m = 2560, k = 640) with the types the model actually uses there (K = 640 is not a
+    // multiple of QK_K, so Q4_K/Q5_K cannot be used for down).
+    // n = 9 is the MMVQ to grouped-kernel boundary, 17/65 sit just past the J = 16/64 tile edges.
+    for (int n : {1, 8, 9, 16, 17, 32, 48, 64, 65, 128}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // gate/up
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560)); // fused gate/up
+        }
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640)); // down
+        }
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
     // multiple blocks per row: exercises the block-stride loop and the
@@ -13490,6 +13505,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t n : {1, 2, 4, 8, 16, 64, 512, 2048}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // Qwen3.8-Flash-Next
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640)); // Qwen3.8-Flash-Next
+        }
+    }
+
+    // Unsloth Qwen3.8-Flash-Next UD-Q4_K_XL expert projections: 512 experts, top-10,
+    // Q4_K/Q5_K gate/up and Q5_1/Q8_0 down (K = 640 is not a multiple of QK_K, so the K-quant
+    // types cannot be used for down). n covers the MMVQ -> grouped-kernel boundary
+    // (8/16/32/64) and the prefill path (128/512/2048).
+    for (int64_t n : {1, 8, 16, 32, 64, 128, 512, 2048}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // gate/up
+        }
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // gate/up
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640)); // down
         }
     }
 

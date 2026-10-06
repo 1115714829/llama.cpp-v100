@@ -35,6 +35,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/moe-grouped.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -2275,11 +2276,23 @@ static void ggml_cuda_mul_mat_q4k_skinny(ggml_backend_cuda_context & ctx, const 
     ggml_cuda_mul_mat(ctx, &src0_tmp, src1, dst);
 }
 
+// Column count to judge MMQ tiles against on Volta. Volta runs MMQ with dp4a and has no int8
+// tensor cores, so a tile padded to J columns is real compute time. Judge by the average number
+// of columns per expert instead of the total token count, so prefill (n >= 64) stays on the
+// batched MMQ path instead of the per-expert fallback that needs stream synchronization.
+static int64_t ggml_cuda_mul_mat_id_ncols_typ(const ggml_tensor * src0, const ggml_tensor * src1, const int64_t n_expert_used, const int cc) {
+    if (cc != GGML_CUDA_CC_VOLTA || src0->ne[2] == 0) {
+        return src1->ne[2];
+    }
+    return (src1->ne[2]*n_expert_used + src0->ne[2] - 1) / src0->ne[2];
+}
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         return true;
@@ -2295,7 +2308,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         }
     }
 
-    if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2])) {
+    if (ggml_cuda_moe_grouped_mul_mat_id_supported(dst, cc)) {
+        return false;
+    }
+
+    if (ggml_cuda_should_use_mmq(src0->type, cc, ggml_cuda_mul_mat_id_ncols_typ(src0, src1, ids->ne[0], cc), /*n_experts=*/src0->ne[2])) {
         return false;
     }
 
@@ -2336,7 +2353,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
 
-        if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+        if (ggml_cuda_moe_grouped_mul_mat_id(ctx, dst)) {
+            return;
+        }
+
+        if (ggml_cuda_should_use_mmq(src0->type, cc, ggml_cuda_mul_mat_id_ncols_typ(src0, src1, ids->ne[0], cc), /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }

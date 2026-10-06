@@ -297,9 +297,10 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-    // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+    // On RDNA3, RDNA4 and Volta it is faster to pick the tile size against this value instead of ne12:
+    // Volta has no int8 tensor cores, so padding a tile to J columns costs real dp4a time.
     int64_t ncols_opt = ne12;
-    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || cc == GGML_CUDA_CC_VOLTA) {
         ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
     }
 
