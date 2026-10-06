@@ -6060,9 +6060,259 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
     }
 };
 
-// GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
-struct test_mul_mat_id_fusion : public test_case {
+// expert parallelism: the same weights are split along the expert dim and each part is
+// computed with its own expert_offset. The per-shard outputs cover disjoint slots (the other
+// devices' slots are zero) and their sum must equal the full computation.
+struct test_mul_mat_id_ep : public test_case {
     const ggml_type type_a;
+    const ggml_type type_b;
+    const int n_mats;
+    const int n_used;
+    const int n_shards;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool broadcast_b; // gate/up activations are broadcast across the experts
+    const bool check_full;  // output the difference against the full mul_mat_id
+    ggml_tensor * out_diff = nullptr; // the SUB node of the shard sum and the full result
+
+    std::string vars() override {
+        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, n_shards, m, n, k, broadcast_b, check_full);
+    }
+
+    // the full comparison is an absolute check: both sides are zero when correct
+    double err(const float * a, const float * b, size_t n) override {
+        if (!check_full) {
+            return test_case::err(a, b, n);
+        }
+        double result = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            result = std::max(result, (double) fabsf(a[i] - b[i]));
+        }
+        return result;
+    }
+
+    // With check_full only the SUB node is compared: it must be exactly zero on every backend,
+    // which is what "the shards sum to the full result" means. Comparing every intermediate node
+    // with the absolute tolerance of err() would instead flag the normal difference between the
+    // CPU Q8_K and the CUDA Q8_1 activation quantization, which reaches a few 0.1 at K = 2560.
+    bool run_whole_graph() override { return check_full; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return check_full ? std::vector<ggml_tensor *>{ out_diff } : std::vector<ggml_tensor *>{};
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        if (!check_full) {
+            return test_case::max_err(backend);
+        }
+        GGML_UNUSED(backend);
+        return 1e-2;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * n_used;
+    }
+
+    // the output node is the SUB of the shard sum and the full result, filter with -o MUL_MAT_ID_EP
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EP";
+    }
+
+    test_mul_mat_id_ep(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 512, int n_used = 10, int n_shards = 6,
+            int64_t m = 640, int64_t n = 1, int64_t k = 2560, bool broadcast_b = true, bool check_full = true)
+        : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), n_shards(n_shards),
+            m(m), n(n), k(k), broadcast_b(broadcast_b), check_full(check_full) {
+            GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(n_shards > 0 && n_shards <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // C^T = A * B^T: (k, m) * (k, n) => (m, n)
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+
+        // gate/up broadcasts one activation row per token, down has one row per (token, slot)
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, broadcast_b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+
+        // uneven contiguous slices along the expert dim, as the real per-device split gives
+        ggml_tensor * out = nullptr;
+        for (int s = 0; s < n_shards; ++s) {
+            const int64_t start = (int64_t) n_mats * s / n_shards;
+            const int64_t end   = (int64_t) n_mats * (s + 1) / n_shards;
+            if (end == start) {
+                continue;
+            }
+            ggml_tensor * as_s = ggml_view_3d(ctx, as, k, m, end - start, as->nb[1], as->nb[2], start*as->nb[2]);
+            ggml_tensor * out_s = ggml_mul_mat_id(ctx, as_s, b, ids);
+            ggml_mul_mat_id_set_expert_parallel(out_s, true);
+            ggml_mul_mat_id_set_expert_offset(out_s, (int32_t) start);
+            ggml_set_name(out_s, "out_s");
+            out = out == nullptr ? out_s : ggml_add(ctx, out, out_s);
+        }
+        ggml_set_name(out, "out");
+
+        if (check_full) {
+            // the full computation in the same graph; the difference must be zero on both backends
+            ggml_tensor * full = ggml_mul_mat_id(ctx, as, b, ids);
+            ggml_set_name(full, "full");
+            out = ggml_sub(ctx, out, full);
+            ggml_set_name(out, "out_diff");
+            out_diff = out;
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // weights and activations uniformly, then ids spread over the whole expert range so
+        // that every shard (offset > 0 as well) actually gets matches. The n_used experts of
+        // a token are drawn without replacement, as in the top-k routing that MUL_MAT_ID models.
+        init_mul_mat_id_tensors(ctx, n_mats, 1.0f);
+
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            std::vector<int32_t> data(n_mats);
+            for (int i = 0; i < n_mats; i++) {
+                data[i] = i;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// expert parallelism with the gate/up GLU fusion: gate and up are each split along the expert
+// dim, fused with swiglu per shard, and the shard results sum to the full fused result.
+struct test_mul_mat_id_ep_fusion : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int n_shards;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, n_mats, n_used, n_shards, m, n, k);
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double result = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            result = std::max(result, (double) fabsf(a[i] - b[i]));
+        }
+        return result;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return 1e-2;
+    }
+
+    // filter with -o MUL_MAT_ID_EP_FUSION
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EP_FUSION";
+    }
+
+    test_mul_mat_id_ep_fusion(ggml_type type_a = GGML_TYPE_Q4_K,
+            int n_mats = 512, int n_used = 10, int n_shards = 6,
+            int64_t m = 640, int64_t n = 1, int64_t k = 2560)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), n_shards(n_shards), m(m), n(n), k(k) {
+            GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(n_shards > 0 && n_shards <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * up = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(up, "up");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+
+        // gate/up broadcast one activation row per token
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = nullptr;
+        for (int s = 0; s < n_shards; ++s) {
+            const int64_t start = (int64_t) n_mats * s / n_shards;
+            const int64_t end   = (int64_t) n_mats * (s + 1) / n_shards;
+            if (end == start) {
+                continue;
+            }
+            ggml_tensor * gate_s = ggml_view_3d(ctx, gate, k, m, end - start, gate->nb[1], gate->nb[2], start*gate->nb[2]);
+            ggml_tensor * up_s   = ggml_view_3d(ctx, up,   k, m, end - start, up->nb[1],   up->nb[2],   start*up->nb[2]);
+            ggml_tensor * gate_mm = ggml_mul_mat_id(ctx, gate_s, b, ids);
+            ggml_mul_mat_id_set_expert_parallel(gate_mm, true);
+            ggml_mul_mat_id_set_expert_offset(gate_mm, (int32_t) start);
+            ggml_tensor * up_mm = ggml_mul_mat_id(ctx, up_s, b, ids);
+            ggml_mul_mat_id_set_expert_parallel(up_mm, true);
+            ggml_mul_mat_id_set_expert_offset(up_mm, (int32_t) start);
+            ggml_tensor * glu_s = ggml_swiglu_split(ctx, gate_mm, up_mm);
+            out = out == nullptr ? glu_s : ggml_add(ctx, out, glu_s);
+        }
+        ggml_set_name(out, "out_ep");
+
+        // full fused reference in the same graph
+        ggml_tensor * gate_full = ggml_mul_mat_id(ctx, gate, b, ids);
+        ggml_tensor * up_full   = ggml_mul_mat_id(ctx, up,   b, ids);
+        ggml_tensor * glu_full  = ggml_swiglu_split(ctx, gate_full, up_full);
+        ggml_set_name(glu_full, "glu_full");
+
+        ggml_tensor * diff = ggml_sub(ctx, out, glu_full);
+        ggml_set_name(diff, "out_diff");
+        out_diff = diff;
+        return diff;
+    }
+
+    // the fusion only triggers when the whole graph is computed, and only the difference is checked
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out_diff }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats, 1.0f);
+
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        std::uniform_int_distribution<int32_t> dist(0, n_mats - 1);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = dist(rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+
+    ggml_tensor * out_diff = nullptr;
+};
+
+// GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
+struct test_mul_mat_id_fusion : public test_case {    const ggml_type type_a;
     const ggml_type type_b;
     const int n_mats;
     const int n_used;
@@ -11693,6 +11943,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : {1, 8, 64}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
+    }
+
+    // expert parallelism: split the experts along the expert dim and compare the sum of the
+    // per-shard results against the full computation. n covers the MMVQ single-token path,
+    // the MMVQ mmid path (n = 9..16), the grouped kernel (n = 9..64) and the MMQ path.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_Q2_0}) {
+        for (int n : {1, 8, 12, 16, 24, 64, 128, 512}) {
+            // gate/up shape, broadcast activation (this is what the model graph uses)
+            test_cases.emplace_back(new test_mul_mat_id_ep(type_a, GGML_TYPE_F32, 512, 10, 6,  640, n, 2560, true));
+            if (640 % ggml_blck_size(type_a) == 0) {
+                // down shape, one activation row per (token, slot)
+                test_cases.emplace_back(new test_mul_mat_id_ep(type_a, GGML_TYPE_F32, 512, 10, 6, 2560, n,  640, false));
+            }
+        }
+    }
+
+    // expert parallelism with the gate/up GLU fusion: the shards must sum to the full fused result.
+    // The MMVQ fusion only handles up to 16 tokens per block on Volta.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 8, 12, 16}) {
+            test_cases.emplace_back(new test_mul_mat_id_ep_fusion(type_a, 512, 10, 6, 640, n, 2560));
+        }
     }
 
     // Unsloth Qwen3.8-Flash-Next UD-Q4_K_XL expert projections: 512 experts, top-10,

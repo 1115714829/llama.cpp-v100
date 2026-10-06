@@ -2412,6 +2412,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         moe_out = ggml_cont(ctx0, moe_out);
     }
 
+    if (llm_arch_uses_expert_parallel(arch)) {
+        // expert parallelism: each device holds a partial sum of the MoE output, the meta backend
+        // turns this marker into the single all-reduce of the layer (no tensor names involved)
+        moe_out->flags |= GGML_TENSOR_FLAG_EXPERT_PARALLEL_PARTIAL;
+    }
+
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;

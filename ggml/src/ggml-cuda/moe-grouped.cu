@@ -228,13 +228,23 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
+    const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
+
+    if (ggml_mul_mat_id_is_expert_parallel(dst)) {
+        // the grouped kernel only writes the local entries, zero the others
+        ggml_cuda_mmid_zero_nonlocal((float *) dst->data, (const int32_t *) ids->data, expert_offset, (int) ne02,
+            ne12, (int) n_expert_used, dst->ne[0], ids->nb[1] / (int64_t) sizeof(int32_t),
+            dst->nb[1] / sizeof(float), dst->nb[2] / sizeof(float), stream);
+    }
+
     {
         GGML_ASSERT(ids->nb[0] == ggml_type_size(ids->type));
         const int si1  = ids->nb[1] / ggml_type_size(ids->type);
         const int sis1 = nb12 / nb11;
 
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/false, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/false,
+            expert_offset, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 

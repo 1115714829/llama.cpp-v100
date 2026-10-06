@@ -3424,6 +3424,32 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+void ggml_mul_mat_id_set_expert_parallel(struct ggml_tensor * a, bool enabled) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(a, 5, enabled ? 1 : 0);
+}
+
+bool ggml_mul_mat_id_is_expert_parallel(const struct ggml_tensor * a) {
+    // the fused kernels read the state from a downstream node, which has no expert parallel state
+    if (a->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    return ggml_get_op_params_i32(a, 5) != 0;
+}
+
+void ggml_mul_mat_id_set_expert_offset(struct ggml_tensor * a, int32_t expert_offset) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(a, 4, expert_offset);
+}
+
+int32_t ggml_mul_mat_id_get_expert_offset(const struct ggml_tensor * a) {
+    // the fused kernels read the offset from a downstream node, which has no expert offset
+    if (a->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+    return ggml_get_op_params_i32(a, 4);
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {

@@ -407,6 +407,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const std::string tensor_name = tensor->name;
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
+    // expert parallelism: split the routed experts along the expert dim instead of the intermediate dim
+    const bool is_ep = llm_arch_uses_expert_parallel(ud->model->arch) &&
+        ud->model->split_mode() == LLAMA_SPLIT_MODE_TENSOR;
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -607,6 +610,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
+        if (is_ep && tensor_name.find("_exps") != std::string::npos &&
+                (std::regex_match(tensor_name, pattern_ffn_up_weight) ||
+                 std::regex_match(tensor_name, pattern_ffn_gate_weight) ||
+                 std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+                 std::regex_match(tensor_name, pattern_ffn_down_weight))) {
+            // expert parallelism: each device holds a contiguous slice of the routed experts.
+            // Keep the device order unrotated so the slices line up with the source order and
+            // the per-device expert offset is the plain prefix sum of the slice lengths.
+            tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            tc.rotation = 0;
+            return tc;
+        }
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
@@ -702,7 +717,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
 
             // the FFN is the same for Qwen 3 Next and Qwen 3.5:
-            if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
+            if (axis != GGML_BACKEND_SPLIT_AXIS_2 && std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
                 const int64_t n_ff_exp = hparams.n_ff_exp(il);
                 GGML_ASSERT(tensor->ne[axis] == 2*n_ff_exp);
                 return {{n_ff_exp, 2}};
@@ -878,6 +893,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+            if (is_ep && tensor_name.find("_exps") != std::string::npos) {
+                // expert parallelism splits along the expert dim, so the granularity is one whole expert
+                return std::vector<int64_t>(segments.size(), 1);
+            }
             const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
             return {blck_size_perf};

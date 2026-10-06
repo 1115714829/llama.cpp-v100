@@ -47,6 +47,8 @@ const char * ggml_backend_meta_split_axis_name(enum ggml_backend_meta_split_axis
             return "MIRRORED";
         case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
             return "PARTIAL";
+        case GGML_BACKEND_SPLIT_AXIS_LOCAL_PARTIAL:
+            return "LOCAL_PARTIAL";
         case GGML_BACKEND_SPLIT_AXIS_NONE:
             return "NONE";
         case GGML_BACKEND_SPLIT_AXIS_UNKNOWN:
@@ -856,6 +858,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 tensor->src[1]->ne[src_ss[0].axis] == 1 && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
             return src_ss[0];
         }
+        // expert parallel: a device-private value combined element-wise with a replicated operand stays device-private
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_LOCAL_PARTIAL && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return src_ss[0];
+        }
+        if (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_LOCAL_PARTIAL && src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            return src_ss[1];
+        }
         if (src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[0].axis == src_ss[1].axis ||
            (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL)))) {
             return src_ss[0]; // GGML_OP_ADD_ID
@@ -942,6 +951,19 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         //return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1, {0}, false};
     };
 
+    // MUL_MAT_ID with the expert weights split along the expert dim (expert parallelism):
+    // each device computes the full gate/up/down of its own experts, so the results are
+    // device-private complete values (not partial sums) and are not summed. The weights are
+    // only split along axis 2 when expert parallelism is on, so the axis alone identifies it.
+    auto handle_mul_mat_id = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_2 &&
+                (src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED ||
+                 src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_LOCAL_PARTIAL)) {
+            return {GGML_BACKEND_SPLIT_AXIS_LOCAL_PARTIAL, {0}, {1}, 1, {0}, false};
+        }
+        return handle_mul_mat(src_ss);
+    };
+
     auto handle_reshape = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         switch (src_ss[0].axis) {
             case GGML_BACKEND_SPLIT_AXIS_0:
@@ -986,7 +1008,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 GGML_ABORT("shape mismatch for %s", ggml_op_name(tensor->op));
             }
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
-            case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
+            case GGML_BACKEND_SPLIT_AXIS_LOCAL_PARTIAL: {
                 return src_ss[0];
             }
             default: {
@@ -1031,7 +1054,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             GGML_ABORT("fatal error");
         }
-        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL) {
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED || src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_PARTIAL ||
+                src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_LOCAL_PARTIAL) {
             return src_ss[0];
         }
         GGML_ABORT("view of permuted tensor not implemented");
@@ -1048,7 +1072,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 return {ggml_backend_meta_split_axis(tensor->op_params[src_ss[0].axis]), {0}, {src_ss[0].nr[0]}, 1, {0}, false};
             }
             case GGML_BACKEND_SPLIT_AXIS_MIRRORED:
-            case GGML_BACKEND_SPLIT_AXIS_PARTIAL: {
+            case GGML_BACKEND_SPLIT_AXIS_PARTIAL:
+            case GGML_BACKEND_SPLIT_AXIS_LOCAL_PARTIAL: {
                 return src_ss[0];
             }
             default: {
@@ -1321,8 +1346,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_per_row(src_ss);
             } break;
             case GGML_OP_MUL_MAT:
-            case GGML_OP_MUL_MAT_ID: {
                 split_state = handle_mul_mat(src_ss);
+                break;
+            case GGML_OP_MUL_MAT_ID: {
+                split_state = handle_mul_mat_id(src_ss);
             } break;
             case GGML_OP_OUT_PROD: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
@@ -1528,6 +1555,15 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             }
             GGML_ASSERT(!first_src_split_by_axis);
         }
+        // Expert parallel: the MoE output is the weighted sum over the expert slots of a
+        // device-private value. The per-device contributions are disjoint, so the sum is a
+        // partial sum of the full output and needs one all-reduce. The graph marks this node
+        // (no tensor names involved), and only a LOCAL_PARTIAL chain may become PARTIAL.
+        if ((tensor->flags & GGML_TENSOR_FLAG_EXPERT_PARALLEL_PARTIAL) != 0 &&
+                split_state.axis == GGML_BACKEND_SPLIT_AXIS_LOCAL_PARTIAL) {
+            split_state = {assume_sync ? GGML_BACKEND_SPLIT_AXIS_MIRRORED : GGML_BACKEND_SPLIT_AXIS_PARTIAL,
+                {0}, {1}, 1, {0}, false};
+        }
         return split_state;
     };
 
@@ -1732,6 +1768,24 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
         }
         t_ij->flags = tensor->flags;
         memcpy(t_ij->op_params, tensor->op_params, sizeof(tensor->op_params));
+        if (tensor->op == GGML_OP_MUL_MAT_ID && tensor->src[0] != nullptr) {
+            // expert parallelism: record the global index of this device's first expert so the
+            // kernels can skip the ids that belong to other devices
+            const ggml_backend_meta_split_state weight_ss =
+                ggml_backend_meta_get_split_state(stc, tensor->src[0], /*assume_sync =*/ true);
+            if (weight_ss.axis == GGML_BACKEND_SPLIT_AXIS_2) {
+                // the expert slices are contiguous and the device order is unrotated, so the
+                // offset is the sum of the slice lengths of all preceding devices
+                int64_t expert_offset = 0;
+                for (size_t jj = 0; jj < j; jj++) {
+                    for (size_t s = 0; s < weight_ss.n_segments; s++) {
+                        expert_offset += weight_ss.ne[s*n_simple_bufs + jj] * weight_ss.nr[s];
+                    }
+                }
+                ggml_mul_mat_id_set_expert_parallel(t_ij, true);
+                ggml_mul_mat_id_set_expert_offset(t_ij, (int32_t) expert_offset);
+            }
+        }
         if (tensor->op == GGML_OP_FLASH_ATTN_EXT && ggml_get_op_params_i32(tensor, 5) < 0) {
             // 3-card attention split: derive the per-device Q head boundary from the Q/K head windows
             const ggml_tensor * q_src = tensor->src[0];

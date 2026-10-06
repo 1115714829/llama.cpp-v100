@@ -1592,6 +1592,11 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    // expert parallelism: the fused output node (GLU or ADD) has no expert state of its own,
+    // so it is copied from the MUL_MAT_ID node that carries it
+    bool expert_parallel = false;
+    int  expert_offset = 0;
+    int  n_experts = 0;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;

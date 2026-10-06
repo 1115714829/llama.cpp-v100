@@ -665,6 +665,8 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
+        // ...is the MoE output of expert parallelism: each backend holds a partial sum of it
+        GGML_TENSOR_FLAG_EXPERT_PARALLEL_PARTIAL = 32,
     };
 
     enum ggml_tri_type {
@@ -1502,6 +1504,15 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // expert parallelism: global index of the first expert held by this device.
+    // MUL_MAT_ID entries whose id lies outside [expert_offset, expert_offset + as->ne[2]) are skipped
+    // (the output for them is zero), so the per-device weight slices need no renumbering of the ids.
+    // The enabled flag is needed in addition to the offset because the first device has offset 0.
+    GGML_API void    ggml_mul_mat_id_set_expert_parallel(struct ggml_tensor * a, bool enabled);
+    GGML_API bool    ggml_mul_mat_id_is_expert_parallel(const struct ggml_tensor * a);
+    GGML_API void    ggml_mul_mat_id_set_expert_offset(struct ggml_tensor * a, int32_t expert_offset);
+    GGML_API int32_t ggml_mul_mat_id_get_expert_offset(const struct ggml_tensor * a);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

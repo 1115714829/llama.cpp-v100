@@ -2387,18 +2387,29 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     std::vector<int32_t> tokens_per_expert(ne02);
 
     ggml_cuda_pool_alloc<char> src1_sorted(ctx.pool(), ne12*n_expert_used*ne10*ts_src1_sorted);
-    ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
+    // expert parallelism appends one zero row that the skipped slots gather
+    ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), (ne2*n_expert_used + 1)* ne0*ts_dst_sorted);
 
     std::vector<char> ids_host(ggml_nbytes(ids));
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
+    // expert parallelism: ids outside the local expert range belong to other devices; they are
+    // not scheduled on this device and their output slots are overwritten with the zero row
+    const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
+
+    // non-local slots gather a dedicated zero row appended after the compact rows. The row is
+    // also the target of the assert below when the compact rows end at ne_get_rows exactly.
+    const int32_t zero_row = (int32_t) ne_get_rows;
+    std::fill(ids_from_sorted_host.begin(), ids_from_sorted_host.end(), zero_row);
+
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
-                assert(expert_to_use >= 0 && expert_to_use < ne02);
-                if (expert_to_use == i02) {
+                assert(expert_to_use >= 0);
+                assert(ggml_mul_mat_id_is_expert_parallel(dst) || expert_to_use < ne02);
+                if (expert_to_use == i02 + expert_offset) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
@@ -2407,21 +2418,33 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             }
         }
     }
-    GGML_ASSERT(ids_to_sorted_host.size() == size_t(ne_get_rows));
 
+    const int64_t n_matched = (int64_t) ids_to_sorted_host.size();
+    GGML_ASSERT(n_matched <= ne_get_rows);
+    if (!ggml_mul_mat_id_is_expert_parallel(dst)) {
+        GGML_ASSERT(n_matched == ne_get_rows);
+    }
+
+    // expert parallelism leaves the maps of the other devices empty, so the compact entries come
+    // first and the full from-map for every (token, slot) starts right after them
     ids_to_sorted_host.insert(ids_to_sorted_host.end(), ids_from_sorted_host.begin(), ids_from_sorted_host.end());
 
-    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), 2*ne_get_rows*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ids_buf_dev.ptr, ids_to_sorted_host.data(), ids_to_sorted_host.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    const int32_t * ids_to_sorted   = ids_buf_dev.ptr + 0*ne_get_rows;
-    const int32_t * ids_from_sorted = ids_buf_dev.ptr + 1*ne_get_rows;
+    const int32_t * ids_to_sorted   = ids_buf_dev.ptr;
+    const int32_t * ids_from_sorted = ids_buf_dev.ptr + n_matched;
 
     get_rows_cuda(src1->data, src1->type, ids_to_sorted, src1_sorted.ptr, type_src1_sorted,
         ne10, nb11, nb12, nb13,
-        ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
-        ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, ne_get_rows*ne10*ts_src1_sorted, stream);
+        n_matched, 1, 1, sizeof(int32_t), n_matched*sizeof(int32_t), n_matched*sizeof(int32_t),
+        ne10*ts_src1_sorted, n_matched*ne10*ts_src1_sorted, n_matched*ne10*ts_src1_sorted, stream);
     CUDA_CHECK(cudaGetLastError());
+
+    // zero the row that the skipped slots gather
+    if (n_matched < ne_get_rows) {
+        CUDA_CHECK(cudaMemsetAsync((char *) dst_sorted.ptr + zero_row*ne0*ts_dst_sorted, 0, ne0*ts_dst_sorted, stream));
+    }
 
     char * src1_data_cur = (char *) src1_sorted.ptr;
     char *  dst_data_cur = (char *)  dst_sorted.ptr;
@@ -2473,8 +2496,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst_data_cur  +=  dst_slice.nb[2];
     }
 
+    // scatter every dst entry: the matched ones read their compact row, the entries of the other
+    // devices (expert parallelism) read the zero row
     get_rows_cuda(dst_sorted.ptr, type_dst_sorted, ids_from_sorted, dst->data, dst->type,
-        ne0, ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted, ne_get_rows*ne0*ts_dst_sorted,
+        ne0, ne0*ts_dst_sorted, n_matched*ne0*ts_dst_sorted, n_matched*ne0*ts_dst_sorted,
         ne_get_rows, 1, 1, sizeof(int32_t), ne_get_rows*sizeof(int32_t), ne_get_rows*sizeof(int32_t),
         nb1, nb2, nb3, stream);
 }
@@ -4937,6 +4962,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // Expert parallelism: the fused kernels write the GLU or ADD node, which does not carry the
+    // expert state of the MUL_MAT_ID nodes, so it is copied into the fusion arguments here.
+    auto fusion_args_ep = [](const ggml_tensor * mm_id) {
+        ggml_cuda_mm_fusion_args_host fusion{};
+        if (mm_id->op == GGML_OP_MUL_MAT_ID) {
+            fusion.expert_parallel = ggml_mul_mat_id_is_expert_parallel(mm_id);
+            fusion.expert_offset   = ggml_mul_mat_id_get_expert_offset(mm_id);
+            fusion.n_experts       = (int) mm_id->src[0]->ne[2];
+        }
+        return fusion;
+    };
+
     // gated_delta_net prologue: fold the q/k l2 normalization into the gdn kernel. Tried before
     // the other rms_norm fusions, which would otherwise eat the first rms_norm of the pattern.
     if (node->op == GGML_OP_RMS_NORM) {
@@ -4960,7 +4997,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             ggml_tensor * routed = cgraph->nodes[i + 2];
             ggml_tensor * shared = cgraph->nodes[i + 5];
             const ggml_tensor * up = routed->src[1];
-            ggml_cuda_mm_fusion_args_host fusion{};
+            ggml_cuda_mm_fusion_args_host fusion = fusion_args_ep(up);
             fusion.gate = routed->src[0]->src[0];
             fusion.glu_op = ggml_get_glu_op(routed);
             fusion.glu_limit = ggml_get_op_params_f32(routed, 3);
@@ -5302,7 +5339,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const ggml_tensor * src1 = up_n->src[1];
                 const ggml_tensor * ids  = up_n->src[2];
 
-                ggml_cuda_mm_fusion_args_host fusion_data{};
+                ggml_cuda_mm_fusion_args_host fusion_data = fusion_args_ep(up_n);
                 fusion_data.gate       = gate_n->src[0];
                 fusion_data.x_bias     = up_bias;
                 fusion_data.gate_bias  = gate_bias;
@@ -5396,7 +5433,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const ggml_tensor * src1 = up_n->src[1];
                 const ggml_tensor * ids  = up_n->src[2];
 
-                ggml_cuda_mm_fusion_args_host fusion_data{};
+                ggml_cuda_mm_fusion_args_host fusion_data = fusion_args_ep(up_n);
                 fusion_data.gate       = gate_n->src[0];
                 fusion_data.x_bias     = up_bias;
                 fusion_data.gate_bias  = gate_bias;
@@ -5455,7 +5492,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * ids  = up_n->src[2];
 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up_n)) {
-                ggml_cuda_mm_fusion_args_host fusion_data{};
+                ggml_cuda_mm_fusion_args_host fusion_data = fusion_args_ep(up_n);
                 fusion_data.gate      = gate_n->src[0];
                 fusion_data.x_bias    = up_bias_tensor;
                 fusion_data.gate_bias = gate_bias_tensor;
@@ -5469,7 +5506,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(up_n)) {
-                ggml_cuda_mm_fusion_args_host fusion_data{};
+                ggml_cuda_mm_fusion_args_host fusion_data = fusion_args_ep(up_n);
                 fusion_data.gate      = gate_n->src[0];
                 fusion_data.x_bias    = up_bias_tensor;
                 fusion_data.gate_bias = gate_bias_tensor;
@@ -5522,7 +5559,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
 
             if (ggml_cuda_should_fuse_mul_mat_vec_f(up)) {
-                ggml_cuda_mm_fusion_args_host fusion_data{};
+                ggml_cuda_mm_fusion_args_host fusion_data = fusion_args_ep(up);
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
@@ -5534,7 +5571,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
-                ggml_cuda_mm_fusion_args_host fusion_data{};
+                ggml_cuda_mm_fusion_args_host fusion_data = fusion_args_ep(up);
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
                 fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
@@ -5661,7 +5698,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = mm_node->src[1];
             const ggml_tensor * ids  = mm_node->src[2];
 
-            ggml_cuda_mm_fusion_args_host fusion_data{};
+            ggml_cuda_mm_fusion_args_host fusion_data = fusion_args_ep(mm_node);
             fusion_data.x_bias  = bias;
             fusion_data.x_scale = scale;
 
@@ -5720,7 +5757,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             continue;
         }
 
-        ggml_cuda_mm_fusion_args_host fusion_data{};
+        ggml_cuda_mm_fusion_args_host fusion_data = fusion_args_ep(mm_node);
         fusion_data.x_bias = bias_tensor;
 
         if (ggml_cuda_should_fuse_mul_mat_vec_f(mm_node)) {

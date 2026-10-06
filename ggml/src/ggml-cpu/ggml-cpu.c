@@ -1585,6 +1585,10 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 
+    // expert parallelism: the local weights only cover the experts [expert_offset, expert_offset + n_as),
+    // the other ids are not computed and their output slots stay zero
+    const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
+
     void * wdata_cur = params->wdata;
 
     if (src1->type != vec_dot_type) {
@@ -1652,10 +1656,21 @@ static void ggml_compute_forward_mul_mat_id(
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                assert(i02 >= 0);
+                // expert parallelism: the local weights only cover [expert_offset, expert_offset + n_as),
+                // ids of the other devices are valid and their output slots are zeroed below
+                assert(ggml_mul_mat_id_is_expert_parallel(dst) || i02 < n_as);
+                if (i02 < expert_offset || i02 >= expert_offset + n_as) {
+                    // this id belongs to another device, zero its output slot
+                    float * dst_slot = (float *) ((char *) dst->data + iid1*nb2 + id*nb1);
+                    for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                        dst_slot[i0] = 0.0f;
+                    }
+                    continue;
+                }
 
-                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
-                matrix_row_counts[i02] += 1;
+                MMID_MATRIX_ROW(i02 - expert_offset, matrix_row_counts[i02 - expert_offset]) = (struct mmid_row_mapping) {id, iid1};
+                matrix_row_counts[i02 - expert_offset] += 1;
             }
         }
     }

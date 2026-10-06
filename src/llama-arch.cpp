@@ -1193,6 +1193,16 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
     }
 }
 
+bool llm_arch_uses_expert_parallel(const llm_arch & arch) {
+    // Qwen3.8-Flash-Next splits its routed experts along the expert dim instead of the intermediate dim
+    switch (arch) {
+        case LLM_ARCH_QWEN4EXP:
+            return true;
+        default:
+            return false;
+    }
+}
+
 bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
     switch (arch) {
         case LLM_ARCH_GROK:
