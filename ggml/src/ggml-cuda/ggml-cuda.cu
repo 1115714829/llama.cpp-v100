@@ -3411,8 +3411,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src0_slice.nb[3]    = src0_slice.nb[2];
         src0_slice.op       = GGML_OP_VIEW;
         src0_slice.view_src = dst->src[0]; // non-const pointer to src0
-        // expert store: the per-expert base comes from the device pointer table
-        src0_slice.data     = is_expert_store ? (char *) ex_table.main[i02] : (char *) src0->data + i02*nb02;
+        // expert store: the per-expert base comes from the host shadow of the pointer table,
+        // the device table cannot be dereferenced on the host
+        GGML_ASSERT(!is_expert_store || ex_table.main_host != nullptr);
+        src0_slice.data     = is_expert_store ? (char *) ex_table.main_host[i02] : (char *) src0->data + i02*nb02;
 
         ggml_tensor src1_slice;
         memset(&src1_slice, 0, sizeof(src1_slice));
@@ -8556,7 +8558,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_expert_get_allocation;
     }
     if (strcmp(name, "ggml_backend_cuda_expert_get_host_peak") == 0) {
-        return (void *)ggml_backend_cuda_expert_get_host_peak;
+        return (void *)ggml_cuda_expert_get_host_peak;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_reset_allocation") == 0) {
+        return (void *)ggml_cuda_expert_reset_allocation;
     }
     if (strcmp(name, "ggml_backend_cuda_expert_plan") == 0) {
         return (void *)ggml_cuda_expert_plan;

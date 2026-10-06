@@ -6168,16 +6168,25 @@ static void check_expert_tiers(ggml_backend_reg_t reg, ggml_backend_buffer_type_
 
 // expert store: the experts of one tensor are split between VRAM slots and the
 // device-readable host arena, and the kernels read them through a device pointer table.
-// n covers every dispatch path: MMVQ (1, 8), the grouped kernel (9..64), MMQ prefill
-// (65+, where the host experts are staged into VRAM first) and large batches (512).
-// The weight tensor is marked explicitly, its name does not match the llama pattern.
+// On Volta n covers every dispatch path: MMVQ mmid (1..16), the grouped kernel (17..64),
+// MMQ prefill (65..504, where the host experts are staged into VRAM first) and the large
+// batches (512) that take the expert-wise fallback. The weight tensor is marked explicitly,
+// its name does not match the llama pattern. stage_full gives the staging area enough
+// room for the whole host complement of a prefill batch; the default keeps it
+// deliberately small so most routed host experts overflow to a direct host read.
 struct test_mul_mat_id_expert : public test_mul_mat_id {
     test_mul_mat_id_expert(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
-            int n_mats = 32, int n_used = 4, int64_t m = 640, int64_t n = 8, int64_t k = 2560)
-        : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k) {}
+            int n_mats = 32, int n_used = 4, int64_t m = 640, int64_t n = 8, int64_t k = 2560, bool full_stage = false)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k), stage_full(full_stage) {}
+
+    const bool stage_full; // staging area: whole complement (true) or deliberately small (false)
 
     ggml_tensor * expert_weight = nullptr; // the weight tensor, marked in weight_buffer_type()
     ggml_backend_buffer_type_t expert_buft = nullptr;
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + (stage_full ? " stage_full" : " stage_small");
+    }
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -6201,12 +6210,14 @@ struct test_mul_mat_id_expert : public test_mul_mat_id {
         for (ggml_backend_buffer_type_t * extra = get_extra(dev); extra && *extra; ++extra) {
             const std::string name = ggml_backend_buft_name(*extra);
             if (name.size() >= 8 && name.compare(name.size() - 8, 8, "_Experts") == 0) {
-                // keep only a few experts in the VRAM slots so both tiers are exercised, and
-                // give the staging area room for the routed host experts of the prefill batches
+                // keep only a few experts in the VRAM slots so both tiers are exercised. The
+                // staging area either fits the whole host complement or stays deliberately
+                // small, so the prefill of both budgets must give the same result.
+                const size_t stage_rows = stage_full ? (size_t) n_mats : 4;
                 auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
                 if (set_budget != nullptr) {
-                    set_budget(*extra, 2*ggml_row_size(type_a, k) * (size_t) m, 4*ggml_row_size(type_a, k) * (size_t) m);
+                    set_budget(*extra, 2*ggml_row_size(type_a, k) * (size_t) m, stage_rows*ggml_row_size(type_a, k) * (size_t) m);
                 }
                 // explicit mark; the name of the tensor does not match the llama pattern
                 mark_expert_tensor(reg, *extra, expert_weight);
@@ -6290,6 +6301,13 @@ struct test_mul_mat_id_ep : public test_case {
         }
         GGML_UNUSED(backend);
         return 1e-2;
+    }
+
+    double max_nmse_err() override {
+        // the per-node comparison of the shard outputs against the CPU reference needs the
+        // same tolerance as the plain MUL_MAT_ID cases: Q4_K/Q8_0 weights against the CPU
+        // reference reach a few 1e-5 nMSE with the Q8_1 activation quantization
+        return 5e-4;
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
@@ -12256,8 +12274,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // (64 and up) stage the host experts into VRAM before the MMQ kernel runs.
     // The Q4_K/Q8_0 types cover the expert types of the target model.
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
-        for (int n : {1, 8, 16, 64, 512}) {
+        for (int n : {1, 8, 16, 64, 128, 512}) {
             test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 32, 4, 640, n, 2560));
+            if (n == 128) {
+                // MMQ prefill with staging: the default above has a deliberately small
+                // staging area (most routed host experts overflow to a direct host read),
+                // this one fits the whole host complement of the batch into the staging area
+                test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 32, 4, 640, n, 2560, /*full_stage=*/true));
+            }
         }
         // expert parallelism: each shard is a separate expert tensor with its own offset
         for (int n : {1, 8, 64, 512}) {

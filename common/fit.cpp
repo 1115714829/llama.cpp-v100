@@ -84,6 +84,25 @@ static bool common_buft_is_device_expert(ggml_backend_buffer_type_t buft) {
     return is_expert != nullptr && is_expert(buft);
 }
 
+// drop the recorded expert allocation of the backend (a model loaded earlier in this process
+// would otherwise leak its slot/host bytes into the no-alloc trials of this fit)
+static void common_expert_reset_allocation(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return;
+    }
+    typedef void (*ggml_backend_expert_reset_allocation_t)(ggml_backend_buffer_type_t);
+    auto reset = (ggml_backend_expert_reset_allocation_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_reset_allocation");
+    if (reset != nullptr) {
+        reset(buft);
+    }
+}
+
 // set the expert VRAM budget (slots + staging) of one buffer type before the model loads
 static void common_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t stage_bytes) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
@@ -772,6 +791,29 @@ static void common_params_fit_impl(
         moe_bufts.push_back(mapped != nullptr ? mapped : ggml_backend_cpu_buffer_type());
     }
 
+    // a model loaded earlier in this process recorded its expert allocation; the no-alloc
+    // trials of this fit must not count that allocation as their own
+    for (size_t id = 0; id < nd; id++) {
+        common_expert_reset_allocation(moe_bufts[id]);
+    }
+
+    // expert store (the MoE tiered cache): when every device supports it, all MoE expert
+    // tensors are routed to the expert buffer type of the device that computes the layer, not
+    // only the overflowing ones. The store then owns the whole expert set of the device and
+    // decides per expert between VRAM slots and host memory, and the fit budget is what
+    // remains after the dense weights, the KV cache and the compute buffers. Devices without
+    // the expert store keep the per-layer overflow placement of the previous rounds.
+    bool all_expert_store = hp_nex > 0;
+    for (size_t id = 0; id < nd; id++) {
+        if (!common_buft_is_device_expert(moe_bufts[id])) {
+            all_expert_store = false;
+            break;
+        }
+    }
+    if (hp_nex > 0 && !all_expert_store) {
+        LOG_WRN("%s: not every device supports the expert store, keeping the per-layer MoE overflow placement\n", __func__);
+    }
+
     // work buffers for the trial configurations: the real tensor_split and tensor_buft_overrides
     // arrays are only written once the fit succeeded, so a failed fit cannot leave a partial
     // configuration behind for the real model load
@@ -827,6 +869,36 @@ static void common_params_fit_impl(
 
         size_t itbo = 0;
         for (size_t id = 0; id < nd; id++) {
+            // expert store: the expert tensors of the full layers are placed on the expert
+            // buffer type of the computing device as well, so the store owns the whole expert
+            // set of each device (the layer-to-device mapping is the same as the overflow one)
+            if (all_expert_store) {
+                for (uint32_t il = il0; il < il0 + ngl_per_device[id].n_full(); il++) {
+                    if (itbo + 1 >= ntbo) {
+                        tbo_out[itbo].pattern = nullptr;
+                        tbo_out[itbo].buft    = nullptr;
+                        itbo++;
+                        mparams.tensor_buft_overrides = tbo_out;
+                        throw common_params_fit_exception("llama_max_tensor_buft_overrides() == "
+                            + std::to_string(ntbo) + " is insufficient for model");
+                    }
+
+                    const size_t id_dev = get_layer_dev(il);
+                    if (id_dev != id) {
+                        LOG_ERR("%s: layer %" PRIu32 " is computed on device %s, but its expert weights would be placed on device %s\n",
+                            __func__, il, ggml_backend_dev_name(devs[id]), id_dev < nd ? ggml_backend_dev_name(devs[id_dev]) : "out of range");
+                        tbo_out[itbo].pattern = nullptr;
+                        tbo_out[itbo].buft    = nullptr;
+                        itbo++;
+                        mparams.tensor_buft_overrides = tbo_out;
+                        throw common_params_fit_exception("layer-to-device mapping does not match llama_model::load_tensors, abort");
+                    }
+
+                    tbo_out[itbo].pattern = get_overflow_pattern(il, LAYER_FRACTION_MOE);
+                    tbo_out[itbo].buft    = moe_bufts[id_dev];
+                    itbo++;
+                }
+            }
             il0 += ngl_per_device[id].n_full();
             for (uint32_t il = il0; il < il0 + ngl_per_device[id].n_part; il++) {
                 if (itbo + 2 >= ntbo) {
@@ -881,6 +953,7 @@ static void common_params_fit_impl(
 
     // utility function that returns the memory use per device for given numbers of layers per device
     int64_t host_used = 0; // host memory of the last measurement, updated by get_memory_for_layers
+    dmds_t  dmds_last;     // device memory data of the last get_memory_for_layers call, for the logs
     auto get_memory_for_layers = [&](
             const char * func_name,
             const std::vector<ngl_t> & ngl_per_device,
@@ -907,6 +980,8 @@ static void common_params_fit_impl(
         for (size_t id = 0; id < nd; id++) {
             ret.push_back(dmd_nl[id].mb.total());
         }
+
+        dmds_last = std::move(dmd_nl);
         return ret;
     };
 
@@ -921,8 +996,11 @@ static void common_params_fit_impl(
         }
         bool uses_mapped = false;
         for (size_t id = 0; id < nd; id++) {
-            // the MoE tensors of every partial layer overflow to the device-readable host buffer
-            if (ngl_per_device[id].n_part > 0 && common_buft_is_device_mapped(moe_bufts[id])) {
+            // the MoE tensors of every partial layer overflow to the device-readable host buffer;
+            // with the expert store this check is skipped, its host complement is checked after
+            // the placement plan is known (apply_expert_budgets), which is the smaller number
+            if (ngl_per_device[id].n_part > 0 && common_buft_is_device_mapped(moe_bufts[id]) &&
+                    !common_buft_is_device_expert(moe_bufts[id])) {
                 uses_mapped = true;
                 break;
             }
@@ -996,24 +1074,27 @@ static void common_params_fit_impl(
 
     // expert VRAM budget (slots + staging) of the final layer split. The placement is
     // computed with the pure backend plan function, the same one that alloc_buffer_n uses,
-    // so the fit numbers match the real allocation byte for byte. Staging is sized for one
-    // prefill batch, which routes to almost every expert of a layer: the largest host
-    // complement of a single expert tensor of the device. More slots mean a smaller
-    // complement and vice versa, so the two are solved by iterating the plan function to a
-    // fixed point (a few microseconds per round). Only the partial layers of a device place
-    // their MoE weights on the expert buffer; the full layers keep them in device memory.
+    // so the fit numbers match the real allocation byte for byte. With the expert store the
+    // dense weights, the KV cache and the compute buffers are placed first and everything
+    // that remains is the expert budget; the store then decides per expert between slots
+    // and host memory. Staging is sized for one prefill batch, which routes to almost every
+    // expert of a layer: the largest host complement of a single expert tensor of the
+    // device. More slots mean a smaller complement and vice versa, so the two are solved by
+    // iterating the plan function to a fixed point (a few microseconds per round).
     auto apply_expert_budgets = [&]() {
         if (hp_nex == 0) {
             return;
         }
 
-        // layer -> device of the MoE overflow, the same mapping that set_ngl_tensor_split_tbo
+        // layer -> device of the MoE placement, the same mapping that set_ngl_tensor_split_tbo
         // wrote into the tensor buft overrides
-        std::vector<int> partial_dev((size_t) hp_ngl + 2, -1);
+        std::vector<int> layer_dev((size_t) hp_ngl + 2, -1);
+        uint32_t i_gpu_start = 0;
+        uint32_t act_gpu     = 0;
         {
-            const uint32_t n_gpu       = (uint32_t) mparams->n_gpu_layers;
-            const uint32_t i_gpu_start = hp_ngl + 1 > n_gpu ? hp_ngl + 1 - n_gpu : 0;
-            const uint32_t act_gpu     = n_gpu < hp_ngl + 1 ? n_gpu : hp_ngl + 1;
+            const uint32_t n_gpu = (uint32_t) mparams->n_gpu_layers;
+            i_gpu_start = hp_ngl + 1 > n_gpu ? hp_ngl + 1 - n_gpu : 0;
+            act_gpu     = n_gpu < hp_ngl + 1 ? n_gpu : hp_ngl + 1;
 
             std::vector<float> split_points(nd);
             float split_sum = 0.0f;
@@ -1036,12 +1117,26 @@ static void common_params_fit_impl(
                 return std::upper_bound(split_points.begin(), split_points.end(), float(il - i_gpu_start)/act_gpu) - split_points.begin();
             };
 
+            for (uint32_t il = i_gpu_start; il < i_gpu_start + act_gpu && (size_t) il < layer_dev.size(); il++) {
+                const size_t id_dev = get_layer_dev(il);
+                if (id_dev < nd) {
+                    layer_dev[il] = (int) id_dev;
+                }
+            }
+        }
+
+        // the MoE layers whose expert tensors use the expert buffer type: with the expert
+        // store all of them, otherwise only the partial layers (like the tensor buft
+        // overrides of set_ngl_tensor_split_tbo)
+        std::vector<int> tensor_dev = layer_dev;
+        if (!all_expert_store) {
+            std::fill(tensor_dev.begin(), tensor_dev.end(), -1);
             uint32_t il0 = i_gpu_start;
             for (size_t id = 0; id < nd; id++) {
                 il0 += ngl_per_device[id].n_full();
-                for (uint32_t il = il0; il < il0 + ngl_per_device[id].n_part; il++) {
-                    if (get_layer_dev(il) == id && (size_t) il < partial_dev.size()) {
-                        partial_dev[il] = (int) id;
+                for (uint32_t il = il0; il < il0 + ngl_per_device[id].n_part && (size_t) il < tensor_dev.size(); il++) {
+                    if (layer_dev[il] == (int) id) {
+                        tensor_dev[il] = (int) id;
                     }
                 }
                 il0 += ngl_per_device[id].n_part;
@@ -1050,23 +1145,47 @@ static void common_params_fit_impl(
 
         std::vector<std::vector<common_expert_tensor>> dev_tensors(nd);
         for (const common_expert_tensor & t : moe_expert_tensors) {
-            if (t.layer >= 0 && (size_t) t.layer < partial_dev.size() && partial_dev[t.layer] >= 0) {
-                dev_tensors[(size_t) partial_dev[t.layer]].push_back(t);
+            if (t.layer >= 0 && (size_t) t.layer < tensor_dev.size() && tensor_dev[t.layer] >= 0) {
+                dev_tensors[(size_t) tensor_dev[t.layer]].push_back(t);
             }
         }
 
+        // with the expert store the whole expert set of the device is in the store, so the
+        // surplus comes from a final measurement of the split: the no-alloc trial counts the
+        // experts as host memory, what remains on the device is the dense weights, the KV
+        // cache and the compute buffers, and the surplus is the expert budget
+        std::vector<int64_t> mem_final;
+        if (all_expert_store) {
+            mem_final = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
+        }
+
+        int64_t host_complement = 0;
         for (size_t id = 0; id < nd; id++) {
             if (!common_buft_is_device_expert(moe_bufts[id])) {
                 continue;
             }
-            const int64_t surplus = dmds_cpu_moe[id].free - int64_t(dmds_cpu_moe[id].mb.total()) - margins[id];
+            // the whole expert set of the device: the host complement when no slot fits
+            int64_t expert_bytes_card = 0;
+            for (const common_expert_tensor & t : dev_tensors[id]) {
+                expert_bytes_card += t.n_expert * (int64_t) t.blob_bytes;
+            }
+
+            int64_t surplus;
+            if (all_expert_store) {
+                surplus = dmds_full[id].free - mem_final[id] - margins[id];
+            } else {
+                surplus = dmds_cpu_moe[id].free - int64_t(dmds_cpu_moe[id].mb.total()) - margins[id];
+            }
             if (surplus <= 0) {
                 common_expert_set_budget(moe_bufts[id], 0, 0);
-                LOG_TRC("%s: device %zu: no expert VRAM surplus, all experts stay in host memory\n", __func__, id);
+                host_complement += expert_bytes_card; // no slot fits: the whole set stays in host
+                const llama_memory_breakdown_data & mb = all_expert_store ? dmds_last[id].mb : dmds_cpu_moe[id].mb;
+                LOG_INF("%s: device %zu: dense %.0f MiB, context %.0f MiB, compute %.0f MiB, no expert VRAM surplus: all experts stay in host memory\n",
+                    __func__, id, (double) mb.model/MiB, (double) mb.context/MiB, (double) mb.compute/MiB);
                 continue;
             }
             if (dev_tensors[id].empty()) {
-                // no partial layer is computed on this device, no tensor uses its expert store
+                // no MoE layer is computed on this device, no tensor uses its expert store
                 common_expert_set_budget(moe_bufts[id], 0, 0);
                 continue;
             }
@@ -1092,14 +1211,36 @@ static void common_params_fit_impl(
             }
             common_expert_set_budget(moe_bufts[id], slot_budget, stage_bytes);
 
-            LOG_INF("%s: device %zu: expert store: slots %.2f MiB (plan %.2f MiB), host complement %.2f MiB, staging %.2f MiB, prefill direct-read %.0f%%\n",
-                __func__, id, slot_budget/1024.0/1024.0, slot_used/1024.0/1024.0, host_bytes/1024.0/1024.0,
-                stage_bytes/1024.0/1024.0,
-                stage_peak > stage_bytes ? 100.0 * (double) (stage_peak - stage_bytes) / (double) stage_peak : 0.0);
+            // one line per device: what the dense weights, the context (KV cache) and the
+            // compute buffers take, how the surplus is split into slots and staging, and how
+            // much of the expert set stays in host memory (a uniform routing estimate)
+            const llama_memory_breakdown_data & mb = all_expert_store ? dmds_last[id].mb : dmds_cpu_moe[id].mb;
+            const double hit = slot_used + host_bytes > 0
+                ? 100.0 * (double) slot_used / (double) (slot_used + host_bytes) : 0.0;
+            LOG_INF("%s: device %zu: dense %.0f MiB, context %.0f MiB, compute %.0f MiB, expert slots %.0f MiB (planned %.0f MiB), staging %.0f MiB, host complement %.0f MiB, decode hit %.0f%% (uniform)\n",
+                __func__, id,
+                (double) mb.model/MiB, (double) mb.context/MiB, (double) mb.compute/MiB,
+                slot_budget/1024.0/1024.0, slot_used/1024.0/1024.0, stage_bytes/1024.0/1024.0,
+                host_bytes/1024.0/1024.0, hit);
             if (stage_peak > stage_bytes) {
                 LOG_WRN("%s: device %zu: one prefill batch needs %.2f MiB of staging for the host experts, only %.2f MiB fit: about %.0f%% of the routed host experts are read directly from host memory\n",
                     __func__, id, stage_peak/1024.0/1024.0, stage_bytes/1024.0/1024.0,
                     100.0 * (double) (stage_peak - stage_bytes) / (double) stage_peak);
+            }
+            host_complement += (int64_t) host_bytes;
+        }
+
+        // the host complement of the expert store lives in host memory
+        if (all_expert_store) {
+            const int64_t host_free   = dmds_full.back().free;
+            const int64_t host_margin = nd < llama_max_devices() ? (int64_t) margins_s[nd] : 0;
+            LOG_TRC("%s: expert store host complement %" PRId64 " MiB, %" PRId64 " MiB free, margin %" PRId64 " MiB\n",
+                __func__, host_complement/MiB, host_free/MiB, host_margin/MiB);
+            if (host_complement + host_margin > host_free) {
+                throw common_params_fit_exception(
+                    "the expert complement that does not fit in the device slots needs " + std::to_string((host_complement + host_margin)/MiB) +
+                    " MiB of host memory, but only " + std::to_string(host_free/MiB) +
+                    " MiB is available; reduce the context size, use more devices or a lower quantization");
             }
         }
     };

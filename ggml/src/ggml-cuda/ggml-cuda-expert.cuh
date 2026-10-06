@@ -21,6 +21,9 @@
 struct ggml_cuda_expert_table {
     const char * const * main  = nullptr;   // device table, one entry per local expert
     const char * const * stage = nullptr;   // device table through the prefill staging area
+    // host shadow of the main table: the ids of the fallback path are read on the host, which
+    // cannot dereference the device table. Same entries, same expert_start offset.
+    const char * const * main_host = nullptr;
     int64_t     n_expert   = 0;
     size_t      blob_bytes = 0;
     const char * stage_dev = nullptr;       // staging area base of the stream (shared)
@@ -108,6 +111,10 @@ void ggml_cuda_expert_plan(
 // Returns false when no expert buffer was allocated on that device yet.
 bool ggml_backend_cuda_expert_get_allocation(
         ggml_backend_buffer_type_t buft, size_t * slot_bytes, size_t * host_bytes, size_t * stage_bytes);
+
+// drop the recorded allocation of all devices; the fit code calls this before its no-alloc
+// trials so that a model loaded earlier in the process does not leak into the measurements
+void ggml_cuda_expert_reset_allocation(ggml_backend_buffer_type_t buft);
 
 // largest host complement of a single expert tensor in the most recent allocation on the
 // device of buft. Returns false when no expert buffer was allocated yet.

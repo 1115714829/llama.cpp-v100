@@ -363,6 +363,21 @@ static void ggml_cuda_expert_set_allocation(int device, size_t slot_bytes, size_
     g_expert_alloc_host_peak[device] = host_peak;
 }
 
+// drop the allocation accounting of all devices. The fit code calls this before its no-alloc
+// trials: the numbers of a model loaded earlier in the process must not leak into them.
+void ggml_cuda_expert_reset_allocation(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr || buft->context == nullptr || !ggml_cuda_expert_buft_is_expert(buft)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_expert_budget_mutex);
+    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+        g_expert_alloc_slot [i] = 0;
+        g_expert_alloc_host [i] = 0;
+        g_expert_alloc_stage[i] = 0;
+        g_expert_alloc_host_peak[i] = 0;
+    }
+}
+
 // all expert buffers of the process, for the load-finished byte check
 static std::mutex g_expert_buffers_mutex;
 static std::vector<ggml_backend_cuda_expert_buffer_context *> g_expert_buffers;
@@ -436,6 +451,7 @@ bool ggml_cuda_expert_table_get(const ggml_tensor * src0, ggml_cuda_expert_table
 
     table->main         = s.table_main_dev + expert_start;
     table->stage        = nullptr;
+    table->main_host    = st->table_host + expert_start;
     table->n_expert     = src0->ne[2];
     table->blob_bytes   = (size_t) src0->nb[2];
     table->stage_dev    = nullptr;
@@ -666,7 +682,9 @@ const char * const * ggml_cuda_expert_stage_prepare(
     const int64_t n_entries = ggml_nelements(ids);
     const int n_words = (int) ((s.n_expert + 31) / 32);
     // the block is sized for the largest host complement of one tensor: the worst tensor of
-    // the device fits completely, smaller tensors fit with room to spare
+    // the device fits completely, smaller tensors fit with room to spare. Beyond stage_cap
+    // routed host experts keep their main table entry and are read directly from host memory.
+    GGML_ASSERT(ss.hit_list != nullptr && ss.hit_cap >= (size_t) s.n_expert);
     const int stage_cap = (int) std::min<size_t>(ss.stage_bytes / s.blob_aligned, ss.hit_cap);
     char * block_dev = ss.stage_dev;
 
@@ -1322,6 +1340,10 @@ bool ggml_backend_cuda_expert_get_host_peak(ggml_backend_buffer_type_t buft, siz
     GGML_UNUSED(buft);
     GGML_UNUSED(peak_bytes);
     return false;
+}
+
+void ggml_cuda_expert_reset_allocation(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
 }
 
 #endif // !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
