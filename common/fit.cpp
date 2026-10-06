@@ -868,6 +868,10 @@ static void common_params_fit_impl(
             llama_model_params & mparams,
             float * ts_out,
             llama_model_tensor_buft_override * tbo_out) {
+        // every trial rebuilds the overrides from scratch: clear the whole array, so no
+        // pattern of an earlier trial can survive behind the terminator
+        std::fill(tbo_out, tbo_out + ntbo, llama_model_tensor_buft_override{nullptr, nullptr});
+
         mparams.n_gpu_layers = 0;
         for (size_t id = 0; id < nd; id++) {
             mparams.n_gpu_layers += ngl_per_device[id].n_layer;
@@ -896,12 +900,17 @@ static void common_params_fit_impl(
             }
         }
 
+        // a layer that no device computes: its weights are on the host and its experts stay
+        // on the CPU path. Trial splits can contain such layers (all layers on one device),
+        // they must not get an expert buft override.
+        auto is_gpu_layer = [&](uint32_t il) {
+            return act_gpu > 0 && il >= i_gpu_start && il - i_gpu_start < act_gpu;
+        };
+
         auto get_layer_dev = [&](uint32_t il) -> size_t {
-            if (nd == 1 || act_gpu == 0) {
-                return 0;
-            }
-            GGML_ASSERT(il >= i_gpu_start && il - i_gpu_start < act_gpu);
-            return std::upper_bound(split_points.begin(), split_points.end(), float(il - i_gpu_start)/act_gpu) - split_points.begin();
+            GGML_ASSERT(is_gpu_layer(il));
+            return nd == 1 ? 0 :
+                std::upper_bound(split_points.begin(), split_points.end(), float(il - i_gpu_start)/act_gpu) - split_points.begin();
         };
 
         uint32_t il0 = i_gpu_start; // start index for tensor buft overrides
@@ -915,6 +924,9 @@ static void common_params_fit_impl(
             // set of each device (the layer-to-device mapping is the same as the overflow one)
             if (all_expert_store) {
                 for (uint32_t il = il0; il < il0 + ngl_per_device[id].n_full(); il++) {
+                    if (!is_gpu_layer(il)) {
+                        continue; // CPU layer: its experts keep the CPU path
+                    }
                     if (itbo + 1 >= ntbo) {
                         tbo_out[itbo].pattern = nullptr;
                         tbo_out[itbo].buft    = nullptr;
@@ -942,6 +954,9 @@ static void common_params_fit_impl(
             }
             il0 += ngl_per_device[id].n_full();
             for (uint32_t il = il0; il < il0 + ngl_per_device[id].n_part; il++) {
+                if (!is_gpu_layer(il)) {
+                    continue; // CPU layer: its experts keep the CPU path
+                }
                 if (itbo + 2 >= ntbo) {
                     tbo_out[itbo].pattern = nullptr;
                     tbo_out[itbo].buft    = nullptr;
@@ -1093,8 +1108,8 @@ static void common_params_fit_impl(
                 __func__, -global_surplus_cpu_moe/MiB);
         }
 
-        // reset
-        tbo_work[0] = {nullptr, nullptr};
+        // reset: the trial overrides below are rebuilt from scratch
+        std::fill(tbo_work.begin(), tbo_work.end(), llama_model_tensor_buft_override{nullptr, nullptr});
     }
 
     std::vector<int64_t> targets; // maximum acceptable memory use per device
@@ -1148,22 +1163,44 @@ static void common_params_fit_impl(
                     split_points[id] /= split_sum;
                 }
             }
+            // the same mapping llama_model::load_tensors uses: i_gpu_start and act_gpu from
+            // the layer count, the device from the normalized cumulative tensor_split
             auto get_layer_dev = [&](uint32_t il) -> size_t {
-                if (nd == 1 || act_gpu == 0) {
-                    return 0;
+                if (act_gpu == 0 || il < i_gpu_start || il - i_gpu_start >= act_gpu) {
+                    return (size_t) -1; // CPU layer: not computed on any device
                 }
-                if (il < i_gpu_start || il - i_gpu_start >= act_gpu) {
-                    return (size_t) -1;
-                }
-                return std::upper_bound(split_points.begin(), split_points.end(), float(il - i_gpu_start)/act_gpu) - split_points.begin();
+                return nd == 1 ? 0 :
+                    std::upper_bound(split_points.begin(), split_points.end(), float(il - i_gpu_start)/act_gpu) - split_points.begin();
             };
 
+            std::vector<int> dev_first(nd, -1);
+            std::vector<int> dev_last(nd, -1);
             for (uint32_t il = i_gpu_start; il < i_gpu_start + act_gpu && (size_t) il < layer_dev.size(); il++) {
                 const size_t id_dev = get_layer_dev(il);
                 if (id_dev < nd) {
                     layer_dev[il] = (int) id_dev;
+                    if (dev_first[id_dev] < 0) {
+                        dev_first[id_dev] = (int) il;
+                    }
+                    dev_last[id_dev] = (int) il;
                 }
             }
+
+            // one INFO line with the resulting layer ranges: the real load reproduces this
+            // mapping from n_gpu_layers and tensor_split, check it against load_tensors
+            std::string ranges = i_gpu_start > 0 ? "CPU 0.." + std::to_string(i_gpu_start - 1) : "CPU none";
+            for (size_t id = 0; id < nd; id++) {
+                ranges += ", " + dev_names[id] + " ";
+                if (dev_first[id] < 0) {
+                    ranges += "none";
+                } else {
+                    ranges += std::to_string(dev_first[id]) + ".." + std::to_string(dev_last[id]);
+                    if (dev_last[id] == (int) hp_ngl) {
+                        ranges += " (out)";
+                    }
+                }
+            }
+            LOG_INF("%s: layer ranges: %s\n", __func__, ranges.c_str());
         }
 
         // the MoE layers whose expert tensors use the expert buffer type: with the expert
@@ -1438,7 +1475,8 @@ static void common_params_fit_impl(
         if (mem_high[id] > targets[id]) {
             assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
             uint32_t delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
-            while (delta > 1) {
+            // no partial layer left to move when the dense start passed the last device
+            while (delta > 1 && id_dense_start < nd) {
                 uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
                 step_size = std::max(step_size, uint32_t(1));
                 step_size = std::min(step_size, delta - 1);
@@ -1483,8 +1521,11 @@ static void common_params_fit_impl(
                 __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
         }
 
-        // try to fit at least part of one more layer
-        if (ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
+        // try to fit at least part of one more layer; the device must still hold partial
+        // layers, a layer of a fully placed device cannot be split (the output layer of the
+        // last device is always full)
+        if (id_dense_start < nd && ngl_per_device[id_dense_start].n_part > 0 &&
+                ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
             std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
             size_t id_dense_start_test = id_dense_start;
             ngl_per_device_test[id_dense_start_test].n_layer--;
