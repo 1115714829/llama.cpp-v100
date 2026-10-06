@@ -30,6 +30,7 @@
 #include "ggml-cuda/fattn-sm70-d256.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/ggml-cuda-expert.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -888,10 +889,7 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
 };
 
 // cuda buffer type
-struct ggml_backend_cuda_buffer_type_context {
-    int device;
-    std::string name;
-};
+// (ggml_backend_cuda_buffer_type_context is shared with the expert buffer type in common.cuh)
 
 static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_buffer_type_context * ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
@@ -2436,6 +2434,45 @@ static bool ggml_cuda_tensor_is_mapped(const ggml_tensor * t) {
     return t != nullptr && t->buffer != nullptr && ggml_backend_buft_is_cuda_mapped(t->buffer->buft);
 }
 
+// expert buffer type: the expert store buffer, exposed as an extra buffer type so the fit
+// code can place overflowing MoE weights on it. Unlike the mapped type it also owns VRAM
+// slots for the hot experts, and its kernels read the weights through a pointer table.
+static bool ggml_backend_buft_is_cuda_expert(ggml_backend_buffer_type_t buft) {
+    return ggml_cuda_expert_buft_is_expert(buft);
+}
+
+// buffer types whose weights sit in device-readable host memory (the mapped type and the
+// expert type): the fit code uses this to account for host memory and to drop page cache
+static bool ggml_backend_buft_is_cuda_mapped_or_expert(ggml_backend_buffer_type_t buft) {
+    return ggml_backend_buft_is_cuda_mapped(buft) || ggml_backend_buft_is_cuda_expert(buft);
+}
+
+// defined in ggml-cuda-expert.cu. The declaration lives here because ggml-cuda-expert.cuh
+// is included by the kernel files and must not depend on ggml-backend-impl.h (internal).
+extern const ggml_backend_buffer_type_i ggml_backend_cuda_expert_buffer_type_interface;
+
+ggml_backend_buffer_type_t ggml_backend_cuda_expert_buffer_type(int device) {
+    if (!ggml_cuda_expert_supported() || device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type ggml_backend_cuda_expert_buffer_types[GGML_CUDA_MAX_DEVICES];
+    static bool ggml_backend_cuda_expert_buffer_type_initialized = false;
+
+    if (!ggml_backend_cuda_expert_buffer_type_initialized) {
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            ggml_backend_cuda_expert_buffer_types[i] = {
+                /* .iface    = */ ggml_backend_cuda_expert_buffer_type_interface,
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i) + "_Experts"},
+            };
+        }
+        ggml_backend_cuda_expert_buffer_type_initialized = true;
+    }
+
+    return &ggml_backend_cuda_expert_buffer_types[device];
+}
+
 /// kernels
 
 typedef void (*ggml_cuda_op_mul_mat_t)(
@@ -3143,6 +3180,24 @@ static int64_t ggml_cuda_mul_mat_id_ncols_typ(const ggml_tensor * src0, const gg
     return (src1->ne[2]*n_expert_used + src0->ne[2] - 1) / src0->ne[2];
 }
 
+// Prefill batches that reach the batched MMQ path stage the routed host experts into VRAM
+// (the staging area only serves that path: the grouped kernel reads every weight once, the
+// decode paths read the host arena in place). Uses the same conditions as the dispatch so
+// that needs_sync and the dispatch never disagree.
+static bool ggml_cuda_expert_stage_used(const ggml_tensor * dst, const ggml_cuda_expert_table & ex_table, const int cc) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * ids  = dst->src[2];
+
+    if (!ex_table.has_stage || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+        return false;
+    }
+    if (ggml_cuda_moe_grouped_mul_mat_id_supported(dst, cc)) {
+        return false;
+    }
+    return ggml_cuda_should_use_mmq(src0->type, cc, ggml_cuda_mul_mat_id_ncols_typ(src0, src1, ids->ne[0], cc), src0->ne[2]);
+}
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -3151,6 +3206,14 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * ids  = dst->src[2];
 
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return true;
+    }
+
+    // expert store: the prefill staging has a host-side part (the stream state), so launches
+    // that stage cannot be recorded into a CUDA graph
+    ggml_cuda_expert_table ex_table;
+    const bool is_expert_store = ggml_cuda_expert_table_get(src0, &ex_table);
+    if (is_expert_store && ggml_cuda_expert_stage_used(dst, ex_table, cc)) {
         return true;
     }
 
@@ -3194,6 +3257,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
+    // expert store: the weights are read through a device pointer table, the per-layer
+    // placement is slot or host arena. The byte check runs when the loader finished the
+    // tensor data (see ggml_backend_cuda_expert_verify_all), not on the first dispatch.
+    ggml_cuda_expert_table ex_table;
+    const bool is_expert_store = ggml_cuda_expert_table_get(src0, &ex_table);
+    if (is_expert_store) {
+        ggml_cuda_expert_record_usage(src0, ids, ggml_mul_mat_id_get_expert_offset(dst), ctx.stream());
+        ggml_cuda_expert_stats_tick(src0, ctx.stream());
+    }
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         if (ggml_is_quantized(src0->type)) {
@@ -3208,12 +3281,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
 
-        if (ggml_cuda_moe_grouped_mul_mat_id(ctx, dst)) {
+        if (ggml_cuda_moe_grouped_mul_mat_id(ctx, dst, is_expert_store ? ex_table.main : nullptr)) {
             return;
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ggml_cuda_mul_mat_id_ncols_typ(src0, src1, ids->ne[0], cc), /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            // prefill re-reads the same expert rows for every tile: copy the routed host
+            // experts into the staging area once and read them from VRAM (Strata prefill ring)
+            const char * const * mmq_ptrs = is_expert_store ? ex_table.main : nullptr;
+            if (is_expert_store && ggml_cuda_expert_stage_used(dst, ex_table, cc)) {
+                mmq_ptrs = ggml_cuda_expert_stage_prepare(src0, ids, ggml_mul_mat_id_get_expert_offset(dst), ctx.stream());
+            }
+            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst, mmq_ptrs);
             return;
         }
 
@@ -3265,8 +3344,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
     // expert parallelism: ids outside the local expert range belong to other devices; they are
-    // not scheduled on this device and their output slots are overwritten with the zero row
-    const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
+    // not scheduled on this device and their output slots are overwritten with the zero row.
+    // An expert store view shifts the weights by its own expert start.
+    const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst) +
+        (is_expert_store ? (int32_t) ex_table.expert_start : 0);
 
     // non-local slots gather a dedicated zero row appended after the compact rows. The row is
     // also the target of the assert below when the compact rows end at ne_get_rows exactly.
@@ -3278,7 +3359,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
                 assert(expert_to_use >= 0);
-                assert(ggml_mul_mat_id_is_expert_parallel(dst) || expert_to_use < ne02);
+                // an expert store view is a sub range of the tensor; its ids start at expert_offset
+                assert(ggml_mul_mat_id_is_expert_parallel(dst) || is_expert_store ||
+                       expert_to_use < ne02);
                 if (expert_to_use == i02 + expert_offset) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
@@ -3328,7 +3411,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         src0_slice.nb[3]    = src0_slice.nb[2];
         src0_slice.op       = GGML_OP_VIEW;
         src0_slice.view_src = dst->src[0]; // non-const pointer to src0
-        src0_slice.data     = (char *) src0->data + i02*nb02;
+        // expert store: the per-expert base comes from the device pointer table
+        src0_slice.data     = is_expert_store ? (char *) ex_table.main[i02] : (char *) src0->data + i02*nb02;
 
         ggml_tensor src1_slice;
         memset(&src1_slice, 0, sizeof(src1_slice));
@@ -6894,9 +6978,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
-                        // mapped host memory is readable by the device, so it is allowed here
+                        // mapped and expert host memory is readable by the device, so it is allowed here
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
                                ggml_backend_buft_is_cuda_mapped(node->src[j]->buffer->buft) ||
+                               ggml_backend_buft_is_cuda_expert(node->src[j]->buffer->buft) ||
                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }
@@ -7787,7 +7872,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
     // check if all the sources are allocated on this device
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (op->src[i] && op->src[i]->buffer &&
-                (ggml_backend_buft_is_cuda(op->src[i]->buffer->buft) || ggml_backend_buft_is_cuda_mapped(op->src[i]->buffer->buft))) {
+                (ggml_backend_buft_is_cuda(op->src[i]->buffer->buft) || ggml_backend_buft_is_cuda_mapped(op->src[i]->buffer->buft) ||
+                 ggml_backend_buft_is_cuda_expert(op->src[i]->buffer->buft))) {
             ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)op->src[i]->buffer->buft->context;
             if (buft_ctx->device != dev_ctx->device) {
                 return false;
@@ -8268,6 +8354,7 @@ static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
     return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) ||
            (ggml_backend_buft_is_cuda_mapped(buft) && buft->device == dev) ||
+           (ggml_backend_buft_is_cuda_expert(buft) && buft->device == dev) ||
            (integrated && ggml_backend_buft_is_cuda_host(buft));
 }
 
@@ -8358,6 +8445,12 @@ static ggml_backend_buffer_type_t * ggml_backend_cuda_device_get_extra_bufts(ggm
     const int device = ctx->device;
 
     if (!initialized[device]) {
+        // the expert buffer type comes first: it is the preferred home of the MoE weights
+        // that do not fit in device memory (slots in VRAM + complement in mapped host memory)
+        ggml_backend_buffer_type_t expert_buft = ggml_backend_cuda_expert_buffer_type(device);
+        if (expert_buft != nullptr) {
+            extra_bufts[device].push_back(expert_buft);
+        }
         ggml_backend_buffer_type_t mapped_buft = ggml_backend_cuda_mapped_buffer_type(device);
         if (mapped_buft != nullptr) {
             extra_bufts[device].push_back(mapped_buft);
@@ -8448,7 +8541,28 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_device_get_extra_bufts;
     }
     if (strcmp(name, "ggml_backend_buft_is_device_mapped") == 0) {
-        return (void *)ggml_backend_buft_is_cuda_mapped;
+        return (void *)ggml_backend_buft_is_cuda_mapped_or_expert;
+    }
+    if (strcmp(name, "ggml_backend_buft_is_device_expert") == 0) {
+        return (void *)ggml_backend_buft_is_cuda_expert;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_set_slot_limit") == 0) {
+        return (void *)ggml_cuda_expert_set_slot_limit;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_set_budget") == 0) {
+        return (void *)ggml_cuda_expert_set_budget;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_get_allocation") == 0) {
+        return (void *)ggml_backend_cuda_expert_get_allocation;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_get_host_peak") == 0) {
+        return (void *)ggml_backend_cuda_expert_get_host_peak;
+    }
+    if (strcmp(name, "ggml_backend_expert_store_model_loaded") == 0) {
+        return (void *)ggml_backend_cuda_expert_verify_all;
+    }
+    if (strcmp(name, "ggml_backend_expert_store_mark_tensor") == 0) {
+        return (void *)ggml_backend_cuda_expert_mark_tensor;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

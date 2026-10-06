@@ -67,6 +67,76 @@ static ggml_backend_buffer_type_t common_dev_mapped_buft(ggml_backend_dev_t dev)
     return nullptr;
 }
 
+// an expert buffer type keeps part of the experts in VRAM slots and the complement in
+// device-readable host memory; its device share is part of the device memory accounting
+static bool common_buft_is_device_expert(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return false;
+    }
+    typedef bool (*ggml_backend_buft_is_expert_t)(ggml_backend_buffer_type_t);
+    auto is_expert = (ggml_backend_buft_is_expert_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_expert");
+    return is_expert != nullptr && is_expert(buft);
+}
+
+// set the expert VRAM budget (slots + staging) of one buffer type before the model loads
+static void common_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t stage_bytes) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return;
+    }
+    typedef void (*ggml_backend_expert_set_budget_t)(ggml_backend_buffer_type_t, size_t, size_t);
+    auto set_budget = (ggml_backend_expert_set_budget_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
+    if (set_budget != nullptr) {
+        set_budget(buft, slot_bytes, stage_bytes);
+    }
+}
+
+// the memory that the last expert buffer allocation of this device actually used:
+// slot_bytes and stage_bytes are VRAM, host_bytes is host memory
+static bool common_expert_get_allocation(ggml_backend_buffer_type_t buft, size_t * slot_bytes, size_t * host_bytes, size_t * stage_bytes) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return false;
+    }
+    typedef bool (*ggml_backend_expert_get_allocation_t)(ggml_backend_buffer_type_t, size_t *, size_t *, size_t *);
+    auto get_alloc = (ggml_backend_expert_get_allocation_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_get_allocation");
+    return get_alloc != nullptr && get_alloc(buft, slot_bytes, host_bytes, stage_bytes);
+}
+
+// the largest host complement of a single expert tensor in the last allocation of this
+// device: one prefill batch stages the host complement of one tensor, so this is the staging
+// requirement that fit has to budget
+static bool common_expert_get_host_peak(ggml_backend_buffer_type_t buft, size_t * peak_bytes) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return false;
+    }
+    typedef bool (*ggml_backend_expert_get_host_peak_t)(ggml_backend_buffer_type_t, size_t *);
+    auto get_peak = (ggml_backend_expert_get_host_peak_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_get_host_peak");
+    return get_peak != nullptr && get_peak(buft, peak_bytes);
+}
+
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
         const llama_model_params * mparams,
@@ -116,6 +186,32 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
 
     for (const auto & [buft, mb] : memory_breakdown) {
+        if (common_buft_is_device_expert(buft)) {
+            // expert store: the VRAM slots and the staging area are device memory, the
+            // complement is host memory. The split comes from the allocation that the load
+            // of the model just made, so the fit accounting sees the same numbers as the
+            // kernels will use.
+            size_t slot_bytes = 0;
+            size_t host_bytes = 0;
+            size_t stage_bytes = 0;
+            const bool allocated = common_expert_get_allocation(buft, &slot_bytes, &host_bytes, &stage_bytes);
+            if (allocated) {
+                ret.back().mb.model += host_bytes;
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                for (size_t i = 0; i < nd; i++) {
+                    if (dev == llama_model_get_device(model, i)) {
+                        ret[i].mb.model += slot_bytes + stage_bytes;
+                        break;
+                    }
+                }
+            } else {
+                // no expert buffer was allocated on this device yet: all experts are in host memory
+                ret.back().mb.model   += mb.model;
+                ret.back().mb.context += mb.context;
+                ret.back().mb.compute += mb.compute;
+            }
+            continue;
+        }
         if (ggml_backend_buft_is_host(buft) || common_buft_is_device_mapped(buft)) {
             // a device-readable host buffer is host memory, not device memory
             ret.back().mb.model   += mb.model;
@@ -563,7 +659,9 @@ static void common_params_fit_impl(
             case LAYER_FRACTION_MOE: {
                 static std::array<std::string, n_strings> patterns;
                 if (patterns[il].empty()) {
-                    patterns[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
+                    // only the expert weight tensor itself, not its per-expert scale tensors:
+                    // the expert store places whole experts and does not take the scales
+                    patterns[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate_up|gate)_(ch|)exps\\.weight";
                 }
                 return patterns[il].c_str();
             }
@@ -799,6 +897,74 @@ static void common_params_fit_impl(
         } else {
             LOG_TRC("%s: with only dense weights in device memory there is still a total deficit of %" PRId64 " MiB\n",
                 __func__, -global_surplus_cpu_moe/MiB);
+        }
+
+        // only the expert weight tensors, without the per-expert scale tensors: the expert
+        // buffer type places whole experts and rejects anything else
+        const static std::string pattern_moe_weight = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps\\.weight";
+
+        // measure the staging requirement of one device with the current expert budget: one
+        // no-alloc trial load with every MoE weight tensor forced onto this device's expert
+        // buffer, then read back the largest host complement of a single tensor. The slot
+        // quota of a tensor is a byte share of the device budget, so all tensors of the model
+        // on one device give the same single-tensor complement as the real layer split (for
+        // heterogeneous tensors this is slightly conservative because the share is smaller).
+        auto measure_host_peak = [&](size_t id) -> size_t {
+            llama_model_params mparams_copy = *mparams;
+            tbo_work[0] = {pattern_moe_weight.c_str(), moe_bufts[id]};
+            tbo_work[1] = {nullptr, nullptr};
+            mparams_copy.tensor_buft_overrides = tbo_work.data();
+            common_get_device_memory_data_impl(path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            size_t peak = 0;
+            common_expert_get_host_peak(moe_bufts[id], &peak);
+            return peak;
+        };
+
+        // expert VRAM budget: with all MoE weights in system memory, the surplus of each
+        // device is what remains for the expert slots and the staging area. The budget is
+        // handed to the expert buffer type before the model loads; every trial load then
+        // allocates it and the fit accounting includes the VRAM share (see
+        // common_get_device_memory_data_impl), so the expert placement competes with the
+        // weights, KV and compute buffers instead of guessing a share of the free memory.
+        for (size_t id = 0; id < nd; id++) {
+            if (!common_buft_is_device_expert(moe_bufts[id])) {
+                continue;
+            }
+            const int64_t surplus = dmds_cpu_moe[id].free - int64_t(dmds_cpu_moe[id].mb.total()) - margins[id];
+            if (surplus <= 0) {
+                common_expert_set_budget(moe_bufts[id], 0, 0);
+                LOG_TRC("%s: device %zu: no expert VRAM surplus, all experts stay in host memory\n", __func__, id);
+                continue;
+            }
+
+            // staging is sized for one prefill batch: a batch of a few thousand tokens routes
+            // to almost every expert of a layer, so the whole host complement of one expert
+            // tensor has to fit. More slots mean a smaller complement and vice versa, the two
+            // are interdependent: solve the fixed point by measuring (stage = 0 -> complement
+            // peak -> stage = peak, slot = surplus - stage -> measure again), at most 3
+            // rounds. The complement grows monotonically when the slot budget shrinks, so
+            // keeping the last value is the conservative choice.
+            size_t stage_bytes = 0;
+            size_t stage_peak  = 0;
+            for (int round = 0; round < 3; ++round) {
+                common_expert_set_budget(moe_bufts[id], (size_t) surplus - stage_bytes, stage_bytes);
+                stage_peak = measure_host_peak(id);
+                const size_t next = std::min(stage_peak, (size_t) surplus);
+                if (next == stage_bytes) {
+                    break;
+                }
+                stage_bytes = next;
+            }
+            common_expert_set_budget(moe_bufts[id], (size_t) surplus - stage_bytes, stage_bytes);
+
+            if (stage_peak > stage_bytes) {
+                LOG_WRN("%s: device %zu: one layer of host experts needs %" PRId64 " MiB of staging, only %" PRId64
+                    " MiB of the surplus fits there: about %.0f%% of the routed host experts will be read directly"
+                    " from host memory during prefill\n", __func__, id, (int64_t) stage_peak/MiB, (int64_t) stage_bytes/MiB,
+                    stage_peak > 0 ? 100.0 * (double) (stage_peak - stage_bytes) / (double) stage_peak : 0.0);
+            }
+            LOG_TRC("%s: device %zu: expert budget %" PRId64 " MiB slots + %" PRId64 " MiB staging (host peak %" PRId64 " MiB)\n",
+                __func__, id, (int64_t) ((size_t) surplus - stage_bytes)/MiB, (int64_t) stage_bytes/MiB, (int64_t) stage_peak/MiB);
         }
 
         // reset
@@ -1101,6 +1267,28 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
     for (const auto & buft_mb : memory_breakdown) {
         ggml_backend_buffer_type_t          buft = buft_mb.first;
         const llama_memory_breakdown_data & mb   = buft_mb.second;
+        if (common_buft_is_device_expert(buft)) {
+            // expert store: VRAM slots and staging are device memory, the complement is host
+            size_t slot_bytes = 0;
+            size_t host_bytes = 0;
+            size_t stage_bytes = 0;
+            if (common_expert_get_allocation(buft, &slot_bytes, &host_bytes, &stage_bytes)) {
+                mb_host.model += host_bytes;
+                ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+                for (size_t i = 0; i < devices.size(); i++) {
+                    if (devices[i] == dev) {
+                        mb_dev[i].model += slot_bytes + stage_bytes;
+                        break;
+                    }
+                }
+            } else {
+                mb_host.model   += mb.model;
+                mb_host.context += mb.context;
+                mb_host.compute += mb.compute;
+            }
+            seen_buffer_types.insert(buft);
+            continue;
+        }
         if (ggml_backend_buft_is_host(buft) || common_buft_is_device_mapped(buft)) {
             // a device-readable host buffer is host memory, not device memory
             mb_host.model   += mb.model;

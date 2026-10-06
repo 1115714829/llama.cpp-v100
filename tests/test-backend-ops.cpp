@@ -1428,6 +1428,10 @@ struct test_case {
     // when true, the test is skipped if weight_buffer_type() returns null for the backend
     virtual bool requires_weight_buffer_type() { return false; }
 
+    // called after the weight buffer was allocated: tests that use a special weight buffer
+    // type can inspect the resulting allocation (e.g. the tier split of the expert store)
+    virtual void check_weight_alloc(ggml_backend_t backend) { GGML_UNUSED(backend); }
+
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
 
@@ -1596,6 +1600,7 @@ struct test_case {
                 return test_status_t::FAIL;
             }
             ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            check_weight_alloc(backend1);
         }
 
         // allocate
@@ -6137,6 +6142,107 @@ struct test_mul_mat_id_mapped : public test_mul_mat_id {
     }
 };
 
+// mark a tensor as an expert weight through the backend proc address, like the llama loader
+// does: the store then does not have to rely on the tensor name to recognize it
+static void mark_expert_tensor(ggml_backend_reg_t reg, ggml_backend_buffer_type_t buft, ggml_tensor * t) {
+    auto mark = (void (*)(ggml_backend_buffer_type_t, ggml_tensor *))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_expert_store_mark_tensor");
+    if (mark != nullptr) {
+        mark(buft, t);
+    }
+}
+
+// the expert store must place part of the experts in VRAM slots and the rest in the host
+// arena, and it must have room to stage the routed host experts during prefill
+static void check_expert_tiers(ggml_backend_reg_t reg, ggml_backend_buffer_type_t buft) {
+    GGML_ASSERT(buft != nullptr);
+    auto get_alloc = (bool (*)(ggml_backend_buffer_type_t, size_t *, size_t *, size_t *))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_get_allocation");
+    size_t slot  = 0;
+    size_t host  = 0;
+    size_t stage = 0;
+    GGML_ASSERT(get_alloc != nullptr);
+    GGML_ASSERT(get_alloc(buft, &slot, &host, &stage));
+    GGML_ASSERT(slot > 0 && host > 0 && stage > 0);
+}
+
+// expert store: the experts of one tensor are split between VRAM slots and the
+// device-readable host arena, and the kernels read them through a device pointer table.
+// n covers every dispatch path: MMVQ (1, 8), the grouped kernel (9..64), MMQ prefill
+// (65+, where the host experts are staged into VRAM first) and large batches (512).
+// The weight tensor is marked explicitly, its name does not match the llama pattern.
+struct test_mul_mat_id_expert : public test_mul_mat_id {
+    test_mul_mat_id_expert(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 32, int n_used = 4, int64_t m = 640, int64_t n = 8, int64_t k = 2560)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k) {}
+
+    ggml_tensor * expert_weight = nullptr; // the weight tensor, marked in weight_buffer_type()
+    ggml_backend_buffer_type_t expert_buft = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT";
+    }
+
+    bool use_weight_context() override { return true; }
+    bool requires_weight_buffer_type() override { return true; }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            return nullptr;
+        }
+        auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra == nullptr) {
+            return nullptr;
+        }
+        for (ggml_backend_buffer_type_t * extra = get_extra(dev); extra && *extra; ++extra) {
+            const std::string name = ggml_backend_buft_name(*extra);
+            if (name.size() >= 8 && name.compare(name.size() - 8, 8, "_Experts") == 0) {
+                // keep only a few experts in the VRAM slots so both tiers are exercised, and
+                // give the staging area room for the routed host experts of the prefill batches
+                auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
+                if (set_budget != nullptr) {
+                    set_budget(*extra, 2*ggml_row_size(type_a, k) * (size_t) m, 4*ggml_row_size(type_a, k) * (size_t) m);
+                }
+                // explicit mark; the name of the tensor does not match the llama pattern
+                mark_expert_tensor(reg, *extra, expert_weight);
+                expert_buft = *extra;
+                return *extra;
+            }
+        }
+        return nullptr;
+    }
+
+    void check_weight_alloc(ggml_backend_t backend) override {
+        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(as, "blk.0.ffn_gate_expert.weight");
+        expert_weight = as;
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // expert parallelism: the same weights are split along the expert dim and each part is
 // computed with its own expert_offset. The per-shard outputs cover disjoint slots (the other
 // devices' slots are zero) and their sum must equal the full computation.
@@ -6271,6 +6377,95 @@ struct test_mul_mat_id_ep : public test_case {
 
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// expert store with expert parallelism: every shard is its own expert tensor holding a
+// contiguous expert range, dispatched with its own expert_offset. The pointer table of a
+// shard is indexed by the local expert number (id - expert_offset).
+struct test_mul_mat_id_expert_ep : public test_mul_mat_id_ep {
+    test_mul_mat_id_expert_ep(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 48, int n_used = 4, int n_shards = 3,
+            int64_t m = 640, int64_t n = 8, int64_t k = 2560, bool broadcast_b = true)
+        : test_mul_mat_id_ep(type_a, type_b, n_mats, n_used, n_shards, m, n, k, broadcast_b, /*check_full =*/ false) {}
+
+    std::vector<ggml_tensor *> expert_weights; // the shard tensors, marked in weight_buffer_type()
+    ggml_backend_buffer_type_t expert_buft = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_EP";
+    }
+
+    bool use_weight_context() override { return true; }
+    bool requires_weight_buffer_type() override { return true; }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            return nullptr;
+        }
+        auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra == nullptr) {
+            return nullptr;
+        }
+        for (ggml_backend_buffer_type_t * extra = get_extra(dev); extra && *extra; ++extra) {
+            const std::string name = ggml_backend_buft_name(*extra);
+            if (name.size() >= 8 && name.compare(name.size() - 8, 8, "_Experts") == 0) {
+                // one slot per shard tensor, the rest of each shard goes to the host arena;
+                // the staging area covers the routed host experts of a prefill batch
+                auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
+                if (set_budget != nullptr) {
+                    set_budget(*extra, n_shards*ggml_row_size(type_a, k) * (size_t) m, n_used*ggml_row_size(type_a, k) * (size_t) m);
+                }
+                // explicit mark of every shard tensor (their names already match the llama
+                // pattern, the test covers both recognition paths)
+                for (ggml_tensor * t : expert_weights) {
+                    mark_expert_tensor(reg, *extra, t);
+                }
+                expert_buft = *extra;
+                return *extra;
+            }
+        }
+        return nullptr;
+    }
+
+    void check_weight_alloc(ggml_backend_t backend) override {
+        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, broadcast_b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+
+        // uneven contiguous slices along the expert dim, one expert tensor per shard
+        ggml_tensor * out = nullptr;
+        for (int s = 0; s < n_shards; ++s) {
+            const int64_t start = (int64_t) n_mats * s / n_shards;
+            const int64_t end   = (int64_t) n_mats * (s + 1) / n_shards;
+            if (end == start) {
+                continue;
+            }
+            char name[64];
+            snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", s);
+            ggml_tensor * as_s = ggml_new_tensor_3d(ctx_weights, type_a, k, m, end - start);
+            ggml_set_name(as_s, name);
+            expert_weights.push_back(as_s);
+
+            ggml_tensor * out_s = ggml_mul_mat_id(ctx, as_s, b, ids);
+            ggml_mul_mat_id_set_expert_parallel(out_s, true);
+            ggml_mul_mat_id_set_expert_offset(out_s, (int32_t) start);
+            ggml_set_name(out_s, "out_s");
+            out = out == nullptr ? out_s : ggml_add(ctx, out, out_s);
+        }
+        ggml_set_name(out, "out");
+        return out;
     }
 };
 
@@ -12054,6 +12249,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // mapped weight must not add an expert-sized allocation.
     for (int n : {1, 8, 16, 64, 512, 2048}) {
         test_cases.emplace_back(new test_mul_mat_id_mapped(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 4, 640, n, 2560));
+    }
+
+    // expert store weights: a few experts in VRAM slots, the complement in the
+    // device-readable host arena, both read through a device pointer table. Prefill batches
+    // (64 and up) stage the host experts into VRAM before the MMQ kernel runs.
+    // The Q4_K/Q8_0 types cover the expert types of the target model.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 8, 16, 64, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 32, 4, 640, n, 2560));
+        }
+        // expert parallelism: each shard is a separate expert tensor with its own offset
+        for (int n : {1, 8, 64, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id_expert_ep(type_a, GGML_TYPE_F32, 48, 4, 3, 640, n, 2560, true));
+        }
     }
 
     // Unsloth Qwen3.8-Flash-Next UD-Q4_K_XL expert projections: 512 experts, top-10,

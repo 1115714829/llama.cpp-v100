@@ -3,6 +3,7 @@
 #include "mmid.cuh"
 #include "quantize.cuh"
 #include "vecdotq.cuh"
+#include "ggml-cuda-expert.cuh"
 
 #include <cstdint>
 
@@ -46,7 +47,8 @@ static __global__ void moe_grouped_kernel(
         const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ ids_src1,
         const block_q8_1 * __restrict__ xq, float * __restrict__ dst,
         const int nrows_x, const int nblocks_weight, const int nblocks_row_q8,
-        const int64_t nb01, const int64_t nb02, const int64_t dst_stride_col) {
+        const int64_t nb01, const int64_t nb02, const int64_t dst_stride_col,
+        const char * const * __restrict__ expert_ptrs) {
     constexpr int qk  = moe_grouped_traits<type>::qk;
     constexpr int qi  = moe_grouped_traits<type>::qi;
     constexpr int vdr = moe_grouped_traits<type>::vdr;
@@ -89,7 +91,9 @@ static __global__ void moe_grouped_kernel(
             if (r >= nrows_x) {
                 break;
             }
-            const char * wrow = vx + (size_t) expert * nb02 + (size_t) r * nb01;
+            // expert store: the expert base comes from the device pointer table, which may
+            // point at a VRAM slot or at the mapped host arena
+            const char * wrow = (expert_ptrs != nullptr ? expert_ptrs[expert] : vx + (size_t) expert * nb02) + (size_t) r * nb01;
 
             float acc[CT] = {0.0f};
             for (int kbx = kbx0; kbx < nblocks_weight; kbx += blocks_per_iter) {
@@ -178,7 +182,8 @@ template <ggml_type type>
 static void moe_grouped_launch(
         const char * vx, const int32_t * expert_bounds, const int32_t * ids_dst, const int32_t * ids_src1,
         const block_q8_1 * xq, float * dst, const int64_t nrows_x, const int64_t nblocks_weight, const int64_t nblocks_row_q8,
-        const int64_t nb01, const int64_t nb02, const int64_t dst_stride_col, const int n_experts, cudaStream_t stream) {
+        const int64_t nb01, const int64_t nb02, const int64_t dst_stride_col, const int n_experts, cudaStream_t stream,
+        const char * const * expert_ptrs) {
     constexpr int ROWS = 32;
     constexpr int CT   = 8;
 
@@ -195,10 +200,10 @@ static void moe_grouped_launch(
 
     moe_grouped_kernel<type, ROWS, CT><<<grid, block, nbytes_shared, stream>>>(
         vx, expert_bounds, ids_dst, ids_src1, xq, dst,
-        (int) nrows_x, (int) nblocks_weight, (int) nblocks_row_q8, nb01, nb02, dst_stride_col);
+        (int) nrows_x, (int) nblocks_weight, (int) nblocks_row_q8, nb01, nb02, dst_stride_col, expert_ptrs);
 }
 
-bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const char * const * expert_ptrs) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -228,7 +233,12 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
-    const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
+    // an expert store view shifts the weights (and the local expert numbers) by its start
+    int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
+    ggml_cuda_expert_table ex_table;
+    if (ggml_cuda_expert_table_get(src0, &ex_table)) {
+        expert_offset += (int32_t) ex_table.expert_start;
+    }
 
     if (ggml_mul_mat_id_is_expert_parallel(dst)) {
         // the grouped kernel only writes the local entries, zero the others
@@ -268,23 +278,23 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
     switch (src0->type) {
         case GGML_TYPE_Q4_K:
             moe_grouped_launch<GGML_TYPE_Q4_K>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
-                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream);
+                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
             break;
         case GGML_TYPE_Q5_K:
             moe_grouped_launch<GGML_TYPE_Q5_K>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
-                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream);
+                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
             break;
         case GGML_TYPE_Q6_K:
             moe_grouped_launch<GGML_TYPE_Q6_K>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
-                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream);
+                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
             break;
         case GGML_TYPE_Q5_1:
             moe_grouped_launch<GGML_TYPE_Q5_1>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
-                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream);
+                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
             break;
         case GGML_TYPE_Q8_0:
             moe_grouped_launch<GGML_TYPE_Q8_0>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
-                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream);
+                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
             break;
         default:
             GGML_ABORT("fatal error");

@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "mmf.cuh"
 #include "mmid.cuh"
+#include "ggml-cuda-expert.cuh"
 
 static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -32,6 +33,12 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
+
+    // expert store: the weights are read through the device pointer table of the tensor
+    ggml_cuda_expert_table ex_table;
+    const bool is_expert_store = ids != nullptr && ggml_cuda_expert_table_get(src0, &ex_table);
+    const int  expert_start    = is_expert_store ? (int) ex_table.expert_start : 0;
+    const char * const * expert_ptrs = is_expert_store ? ex_table.main : nullptr;
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = src1->nb[1] / ts_src1;
@@ -74,7 +81,8 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         const int64_t n_experts     = ne02;
         const int64_t n_tokens      = ne12;
         const int64_t ne_get_rows   = n_tokens * n_expert_used;
-        const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
+        // an expert store view shifts the weights by its own expert start
+        const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst) + expert_start;
 
         if (ggml_mul_mat_id_is_expert_parallel(dst)) {
             // the kernel only writes the local entries, zero the others
@@ -116,7 +124,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             mul_mat_f_switch_rows_per_block<float>(
                 rows_per_block, src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y/vals_per_T, stride_col_dst,
                 ids_s0, ids_s1, ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
-                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr);
+                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr, expert_ptrs);
         } break;
         case GGML_TYPE_F16: {
             const half2 * src0_d = (const half2 *) src0->data;
@@ -124,7 +132,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             mul_mat_f_switch_rows_per_block<half2>(
                 rows_per_block, src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y/vals_per_T, stride_col_dst,
                 ids_s0, ids_s1, ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
-                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr);
+                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr, expert_ptrs);
         } break;
         case GGML_TYPE_BF16: {
             const nv_bfloat162 * src0_d = (const nv_bfloat162 *) src0->data;
@@ -132,7 +140,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
             mul_mat_f_switch_rows_per_block<nv_bfloat162>(
                 rows_per_block, src0_d, src1_d, ids_d, dst_d, ne00/vals_per_T, ne01, ncols_dst, s01/vals_per_T, stride_col_y/vals_per_T, stride_col_dst,
                 ids_s0, ids_s1, ne02, nchannels_y, nchannels_dst, s02/vals_per_T, stride_channel_y, stride_channel_dst,
-                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr);
+                ne03, ne3, s03/vals_per_T, s13, s3, ctx.stream(), ids_info_ptr, expert_ptrs);
         } break;
         default:
             GGML_ABORT("unsupported type: %s", ggml_type_name(src0->type));

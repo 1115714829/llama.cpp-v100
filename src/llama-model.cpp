@@ -2111,6 +2111,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // The expert store buffer types need all tensor data written before they can check their
+    // byte-level placement. The check runs now, after the loader and before any graph, for
+    // every backend that provides the "model loaded" hook.
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        typedef void (*ggml_backend_expert_store_model_loaded_t)(void);
+        auto model_loaded = (ggml_backend_expert_store_model_loaded_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_expert_store_model_loaded");
+        if (model_loaded != nullptr) {
+            model_loaded();
+        }
+    }
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));

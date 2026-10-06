@@ -1195,6 +1195,15 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+// shared by the regular CUDA buffer type and the expert buffer type
+struct ggml_backend_cuda_buffer_type_context {
+    int device;
+    std::string name;
+};
+
+int ggml_backend_cuda_get_device_count();
+ggml_backend_reg_t ggml_backend_cuda_reg();
+
 struct ggml_cuda_pool {
     virtual ~ggml_cuda_pool() = default;
 
@@ -1610,6 +1619,12 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    // expert store: device pointer table of the src0 expert tensor, one entry per local
+    // expert; the kernel reads the weights through it instead of src0->data + expert*nb02.
+    // The gate table is the same lookup for the gate weight of a fused gate/up pair (the
+    // two weights are separate store tensors unless the model merges them).
+    const char * const * expert_ptrs = nullptr;
+    const char * const * expert_ptrs_gate = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {

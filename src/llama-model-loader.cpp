@@ -1119,6 +1119,22 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
+    // Mark MoE expert weights explicitly so that the expert store does not have to rely on
+    // the tensor name. The backend decides whether the tensor matches the tiered layout and
+    // ignores the call for other buffer types.
+    auto mark_expert_tensor = [](ggml_tensor * tensor, ggml_backend_buffer_type_t buft) {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            return;
+        }
+        typedef void (*mark_tensor_t)(ggml_backend_buffer_type_t, ggml_tensor *);
+        auto mark = (mark_tensor_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_expert_store_mark_tensor");
+        if (mark != nullptr) {
+            mark(buft, tensor);
+        }
+    };
+
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         const ctx_key key { buft, is_lazy };
 
@@ -1330,6 +1346,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        mark_expert_tensor(ret, buft);
         return ret;
     }
 
@@ -1379,6 +1396,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
+    mark_expert_tensor(tensor, buft);
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);

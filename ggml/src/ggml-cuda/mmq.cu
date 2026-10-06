@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "ggml-cuda-expert.cuh"
 
 #include <cstdint>
 
@@ -133,7 +134,8 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
 }
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const char * const * expert_ptrs) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -223,7 +225,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1, ne1};
+            ne1, ne1, nullptr};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
@@ -245,7 +247,12 @@ void ggml_cuda_mul_mat_q(
     // Expert parallelism skips the ids of other devices, so the compact maps are sparse: the
     // inverse map marks the entries of the other devices with -1, which the scatter quantizer
     // skips (they are not part of any expert's compact range either).
-    const int  expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
+    // an expert store view shifts the weights (and the local expert numbers) by its start
+    int expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
+    ggml_cuda_expert_table ex_table;
+    if (ggml_cuda_expert_table_get(src0, &ex_table)) {
+        expert_offset += (int) ex_table.expert_start;
+    }
     const bool is_ep         = ggml_mul_mat_id_is_expert_parallel(dst);
     const bool dedup_bcast   = ne11 == 1 && n_expert_used > 1;
 
@@ -331,7 +338,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, ncols_opt};
+        ne12, ncols_opt, expert_ptrs};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }

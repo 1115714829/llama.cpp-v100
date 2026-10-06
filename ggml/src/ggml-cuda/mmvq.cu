@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "ggml-cuda-expert.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -683,6 +684,12 @@ static __global__ void mul_mat_vec_q(
     // expert parallelism: src0 only holds the local experts, so the weight of a local expert is at (id - expert_offset)
     const uint32_t channel_x_local = shared_expert ? 0 : channel_x - (uint32_t) expert_offset;
 
+    // expert store: the weight base comes from the device pointer table, the channel stride
+    // within src0 is then not used
+    if (!shared_expert && fusion.expert_ptrs != nullptr) {
+        vx = fusion.expert_ptrs[channel_x_local];
+    }
+
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
@@ -714,6 +721,11 @@ static __global__ void mul_mat_vec_q(
             x_scale        = (const float *) fusion.x_scale;
             gate_scale     = (const float *) fusion.gate_scale;
         }
+    }
+
+    // expert store: the gate weight of a fused gate/up pair is read through its own table
+    if (!shared_expert && use_gate && fusion.expert_ptrs_gate != nullptr) {
+        vgate = fusion.expert_ptrs_gate[channel_x_local];
     }
 
 
@@ -757,7 +769,7 @@ static __global__ void mul_mat_vec_q(
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
-    const int kbx_offset = sample_x*stride_sample_x + channel_x_local*stride_channel_x + row0*stride_row_x;
+    const int kbx_offset = sample_x*stride_sample_x + (fusion.expert_ptrs != nullptr ? 0 : channel_x_local*stride_channel_x) + row0*stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -973,8 +985,19 @@ static __global__ void mul_mat_vec_q_moe(
     // expert parallelism: src0 only holds the local experts, so the weight of a local expert is at (id - expert_offset)
     const uint32_t channel_x_local = shared_expert ? 0 : channel_x - (uint32_t) expert_offset;
 
+    // expert store: the weight base comes from the device pointer table, the channel stride
+    // within src0 is then not used
+    if (!shared_expert && fusion.expert_ptrs != nullptr) {
+        vx = fusion.expert_ptrs[channel_x_local];
+    }
+
+    // expert store: the gate weight of a fused gate/up pair is read through its own table
+    if (!shared_expert && use_gate && fusion.expert_ptrs_gate != nullptr) {
+        vgate = fusion.expert_ptrs_gate[channel_x_local];
+    }
+
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
-    const int kbx_offset  = channel_x_local*stride_channel_x + row0*stride_row_x;
+    const int kbx_offset  = (fusion.expert_ptrs != nullptr ? 0 : channel_x_local*stride_channel_x) + row0*stride_row_x;
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
@@ -1569,6 +1592,26 @@ void ggml_cuda_mul_mat_vec_q(
         fusion_local.glu_limit = fusion->glu_limit;
     }
 
+    // expert store: read the weights through the device pointer table of the tensor instead
+    // of src0->data + expert*nb02. A fused gate/up pair looks up the gate weight as well
+    // (the two lanes are separate store tensors unless the model merges them).
+    ggml_cuda_expert_table ex_table;
+    bool is_expert_store = false;
+    if (ids != nullptr && ggml_cuda_expert_table_get(src0, &ex_table)) {
+        is_expert_store = true;
+        fusion_local.expert_ptrs = ex_table.main;
+    }
+    if (ids != nullptr && fusion != nullptr && fusion->gate != nullptr && ggml_cuda_expert_is_store(fusion->gate)) {
+        ggml_cuda_expert_table ex_table_gate;
+        if (!ggml_cuda_expert_table_get(fusion->gate, &ex_table_gate)) {
+            GGML_ABORT("%s: cannot look up the gate weight table\n", __func__);
+        }
+        fusion_local.expert_ptrs_gate = ex_table_gate.main;
+        if (!is_expert_store) {
+            GGML_ABORT("%s: expert store gate without expert store weights\n", __func__);
+        }
+    }
+
     // If src0 is a temporary compute buffer, clear any potential padding.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         const size_t size_data  = ggml_nbytes(src0);
@@ -1613,8 +1656,10 @@ void ggml_cuda_mul_mat_vec_q(
 
     // expert parallelism: the per-device weights only cover the local experts. The fused kernels
     // write the GLU/ADD node, which has no expert state, so it is taken from the MUL_MAT_ID node.
+    // An expert store view shifts the weights by its own expert start.
     const bool expert_parallel = ids && (fusion != nullptr ? fusion->expert_parallel : ggml_mul_mat_id_is_expert_parallel(dst));
-    const int  expert_offset   = expert_parallel ? (fusion != nullptr ? fusion->expert_offset : ggml_mul_mat_id_get_expert_offset(dst)) : 0;
+    const int  expert_offset   = (expert_parallel ? (fusion != nullptr ? fusion->expert_offset : ggml_mul_mat_id_get_expert_offset(dst)) : 0) +
+                                 (is_expert_store ? (int) ex_table.expert_start : 0);
     const int  n_experts       = (fusion != nullptr && fusion->n_experts > 0) ? fusion->n_experts : (int) ne02;
 
     mul_mat_vec_q_switch_type(

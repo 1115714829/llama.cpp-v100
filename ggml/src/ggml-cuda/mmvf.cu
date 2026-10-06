@@ -3,6 +3,7 @@
 #include "unary.cuh"
 #include "mmvf.cuh"
 #include "mmf.cuh"
+#include "ggml-cuda-expert.cuh"
 #include "convert.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
@@ -60,7 +61,13 @@ static __global__ void mul_mat_vec_f(
     // expert parallelism: src0 only holds the local experts, so the weight of a local expert is at (id - expert_offset)
     const int channel_x_local = ids ? channel_x - expert_offset : channel_x;
 
-    x   += int64_t(sample_x)  *stride_sample_x   + channel_x_local*stride_channel_x + row*stride_row;
+    // expert store: the weight base comes from the device pointer table, the channel stride
+    // within src0 is then not used
+    if (ids != nullptr && fusion.expert_ptrs != nullptr) {
+        x = (const T *) (fusion.expert_ptrs[channel_x_local]) + int64_t(sample_x) *stride_sample_x + row*stride_row;
+    } else {
+        x += int64_t(sample_x)  *stride_sample_x   + channel_x_local*stride_channel_x + row*stride_row;
+    }
     y   += int64_t(sample_y)  *stride_sample_y   + channel_y  *stride_channel_y;
     dst += int64_t(sample_dst)*stride_sample_dst + channel_dst*stride_channel_dst;
     if constexpr (is_multi_token_id) {
@@ -99,7 +106,12 @@ static __global__ void mul_mat_vec_f(
     }
 
     if (use_gate) {
-        gate_x += int64_t(sample_x)  *stride_sample_x   + channel_x_local*stride_channel_x   + row*stride_row;
+        // expert store: the gate weight of a fused gate/up pair is read through its own table
+        if (ids != nullptr && fusion.expert_ptrs_gate != nullptr) {
+            gate_x = (const T *) (fusion.expert_ptrs_gate[channel_x_local]) + int64_t(sample_x) *stride_sample_x + row*stride_row;
+        } else {
+            gate_x += int64_t(sample_x)  *stride_sample_x   + channel_x_local*stride_channel_x   + row*stride_row;
+        }
     }
 
     if constexpr (has_fusion) {
@@ -700,6 +712,25 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         fusion_local.glu_limit = fusion->glu_limit;
     }
 
+    // expert store: read the weights through the device pointer table of the tensor instead
+    // of src0->data + expert*nb02. A fused gate/up pair looks up the gate weight as well.
+    ggml_cuda_expert_table ex_table;
+    bool is_expert_store = false;
+    if (ids != nullptr && ggml_cuda_expert_table_get(src0, &ex_table)) {
+        is_expert_store = true;
+        fusion_local.expert_ptrs = ex_table.main;
+    }
+    if (ids != nullptr && fusion != nullptr && fusion->gate != nullptr && ggml_cuda_expert_is_store(fusion->gate)) {
+        ggml_cuda_expert_table ex_table_gate;
+        if (!ggml_cuda_expert_table_get(fusion->gate, &ex_table_gate)) {
+            GGML_ABORT("%s: cannot look up the gate weight table\n", __func__);
+        }
+        fusion_local.expert_ptrs_gate = ex_table_gate.main;
+        if (!is_expert_store) {
+            GGML_ABORT("%s: expert store gate without expert store weights\n", __func__);
+        }
+    }
+
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = src1->nb[1] / ts_src1;
     const int64_t s1  =  dst->nb[1] / ts_dst;
@@ -722,9 +753,11 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     // expert parallelism: the fused kernels write the GLU/ADD node, which has no expert state,
-    // so it is taken from the MUL_MAT_ID node.
+    // so it is taken from the MUL_MAT_ID node. An expert store view shifts the weights by its
+    // own expert start.
     const bool expert_parallel = ids && (fusion != nullptr ? fusion->expert_parallel : ggml_mul_mat_id_is_expert_parallel(dst));
-    const int  expert_offset   = expert_parallel ? (fusion != nullptr ? fusion->expert_offset : ggml_mul_mat_id_get_expert_offset(dst)) : 0;
+    const int  expert_offset   = (expert_parallel ? (fusion != nullptr ? fusion->expert_offset : ggml_mul_mat_id_get_expert_offset(dst)) : 0) +
+                                 (is_expert_store ? (int) ex_table.expert_start : 0);
     const int  n_experts       = (fusion != nullptr && fusion->n_experts > 0) ? fusion->n_experts : (int) ne02;
 
     switch (src0->type) {

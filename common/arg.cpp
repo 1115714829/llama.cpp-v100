@@ -2810,6 +2810,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+    add_opt(common_arg(
+        {"--expert-profile"}, "FILE",
+        "expert routing profile for tiered expert weights: lines of 'layer expert count',\n"
+        "the experts with the most hits keep a device memory slot (default: uniform placement)",
+        [](common_params & params, const std::string & value) {
+            params.expert_profile = value;
+            ggml_expert_store_set_profile(params.expert_profile.c_str());
+        }
+    ));
+    add_opt(common_arg(
+        {"--dump-expert-routing"}, "FILE",
+        "write the observed per-layer per-expert routing counts to this file when the model\n"
+        "unloads; the file has the same format as --expert-profile, so one run profiles the next",
+        [](common_params & params, const std::string & value) {
+            params.dump_expert_routing = value;
+            ggml_expert_store_set_dump_path(params.dump_expert_routing.c_str());
+        }
+    ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

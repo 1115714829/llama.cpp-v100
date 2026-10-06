@@ -667,6 +667,10 @@ extern "C" {
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
         // ...is the MoE output of expert parallelism: each backend holds a partial sum of it
         GGML_TENSOR_FLAG_EXPERT_PARALLEL_PARTIAL = 32,
+        // ...is an expert weight of a tiered expert store: the buffer type may keep it in
+        // device memory or in a device-readable host arena. Set by the caller that wants
+        // the tiered placement, so the store does not have to rely on the tensor name.
+        GGML_TENSOR_FLAG_EXPERT = 64,
     };
 
     enum ggml_tri_type {
@@ -2954,6 +2958,19 @@ extern "C" {
     // If this is not called, or NULL is supplied, everything is output on stderr.
     GGML_API void ggml_log_get(ggml_log_callback * log_callback, void ** user_data);
     GGML_API void ggml_log_set(ggml_log_callback   log_callback, void *  user_data);
+
+    //
+    // expert store (optional, implemented by backends with a tiered expert layout)
+    //
+
+    // routing profile used by stores created afterwards: a text file with lines
+    // "layer expert count"; experts with more hits are placed in device memory first.
+    // Set before the model loads. Without a profile the placement is uniform per layer.
+    GGML_API void ggml_expert_store_set_profile(const char * path);
+
+    // when set, the accumulated per-(layer, expert) routing counts are written to this path
+    // when the model is unloaded, in the same format as the profile above
+    GGML_API void ggml_expert_store_set_dump_path(const char * path);
 
     GGML_API struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor);
 
