@@ -78,7 +78,8 @@ static __global__ void moe_grouped_kernel(
             const int e = i / nblocks_row_q8;
             const int b = i - e * nblocks_row_q8;
             const int row = ids_src1[col_start + cg + e];
-            sh_q[e * nblocks_row_q8 + b] = xq[(size_t) row * nblocks_row_q8 + b];
+            // block_q8_1 holds a half2 union, so it is copied as raw bytes.
+            memcpy(sh_q + e * nblocks_row_q8 + b, xq + (size_t) row * nblocks_row_q8 + b, sizeof(block_q8_1));
         }
         __syncthreads();
 
@@ -248,8 +249,6 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
     }
 
     const int64_t nblocks_weight = ne00 / ggml_blck_size(src0->type);
-    const int64_t nb01 = src0->nb[1];
-    const int64_t nb02 = src0->nb[2];
     const int64_t dst_stride_col = dst->nb[1] / sizeof(float);
 
     const block_q8_1 * xq = (const block_q8_1 *) src1_q8_1.get();
