@@ -6389,7 +6389,8 @@ struct test_mul_mat_id_ep_fusion : public test_case {
 };
 
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
-struct test_mul_mat_id_fusion : public test_case {    const ggml_type type_a;
+struct test_mul_mat_id_fusion : public test_case {
+    const ggml_type type_a;
     const ggml_type type_b;
     const int n_mats;
     const int n_used;
