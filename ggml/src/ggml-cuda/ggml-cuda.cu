@@ -8558,11 +8558,14 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_expert_get_host_peak") == 0) {
         return (void *)ggml_backend_cuda_expert_get_host_peak;
     }
+    if (strcmp(name, "ggml_backend_cuda_expert_plan") == 0) {
+        return (void *)ggml_cuda_expert_plan;
+    }
     if (strcmp(name, "ggml_backend_expert_store_model_loaded") == 0) {
         return (void *)ggml_backend_cuda_expert_verify_all;
     }
     if (strcmp(name, "ggml_backend_expert_store_mark_tensor") == 0) {
-        return (void *)ggml_backend_cuda_expert_mark_tensor;
+        return (void *)ggml_cuda_expert_mark_tensor;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

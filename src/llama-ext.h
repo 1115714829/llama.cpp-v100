@@ -8,6 +8,9 @@
 
 #include <cstdint>
 #include <map>
+#include <string>
+#include <utility>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -87,6 +90,11 @@ LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
+
+// all tensors of the loaded model, by name; the fit code reads the expert tensor metadata
+// (name and shape) from it to plan the expert store without another trial load. Matches the
+// declaration in llama-model.h, the function itself is internal to libllama.
+const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 

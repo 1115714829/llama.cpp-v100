@@ -149,14 +149,44 @@ GGML_API void ggml_expert_store_set_dump_path(const char * path);
 // profile format. Called by the backend when the buffer is released.
 GGML_API void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_device);
 
-// register one expert tensor. slot_budget and host_budget are byte limits for the slot array
-// and the host arena slice of this tensor, host_budget < 0 means "as many experts as needed".
+// input of ggml_expert_store_plan: one expert tensor to place
+struct ggml_expert_store_plan_tensor {
+    int     layer      = -1; // profile row of the tensor
+    int64_t n_expert   = 0;
+    size_t  blob_bytes = 0;  // bytes of one expert
+};
+
+// result of ggml_expert_store_plan; sizes are bytes
+struct ggml_expert_store_placement {
+    std::vector<int64_t> n_slot;       // slots assigned to each tensor
+    std::vector<int64_t> host_used;    // host complement of each tensor
+    std::vector<std::vector<int64_t>> slot_experts; // expert of each slot, in slot order
+    int64_t slot_used  = 0; // slot array bytes across all tensors
+    int64_t host_bytes = 0; // host complement across all tensors
+    int64_t host_peak  = 0; // largest single-tensor complement: the staging of one prefill batch
+};
+
+// pure placement plan of one store allocation: given the expert tensors of one device and a
+// slot budget in bytes, compute the per-tensor slot counts, the host complements and the
+// totals. No allocation, repeatable. slot_budget < 0 gives every expert a slot. profile_path
+// is the routing profile that ranks the experts; nullptr means the process-wide profile
+// (ggml_expert_store_set_profile), which is the file that stores created afterwards use - so
+// fit and the real allocation plan with the same profile.
+GGML_API void ggml_expert_store_plan(
+        const ggml_expert_store_plan_tensor * tensors, size_t n_tensors,
+        int64_t slot_budget, const char * profile_path,
+        ggml_expert_store_placement * placement);
+
+// register one expert tensor at the placement computed by ggml_expert_store_plan:
+// slot_experts[0..n_slot) are the experts that get slots 0..n_slot-1, the others are packed
+// into the host arena. host_budget < 0 means "as many experts as needed".
 // returns the tensor index, or -1 when it does not fit at all.
 GGML_API int ggml_expert_store_add_tensor(
         ggml_expert_store * store,
         int layer, int kind,
         int64_t n_expert, size_t blob_bytes,
-        int64_t slot_budget, int64_t host_budget);
+        const int64_t * slot_experts, int64_t n_slot,
+        int64_t host_budget);
 
 // distribute one contiguous byte range of a tensor. offset/size are in tensor bytes, the
 // same convention as ggml_backend_buffer_i.set_tensor. Bytes of one expert that arrive in

@@ -184,26 +184,94 @@ void ggml_expert_store_free(ggml_expert_store * store) {
     delete store;
 }
 
+void ggml_expert_store_plan(
+        const ggml_expert_store_plan_tensor * tensors, size_t n_tensors,
+        int64_t slot_budget, const char * profile_path,
+        ggml_expert_store_placement * placement) {
+    GGML_ASSERT(placement != nullptr);
+
+    placement->n_slot.assign(n_tensors, 0);
+    placement->host_used.assign(n_tensors, 0);
+    placement->slot_experts.assign(n_tensors, {});
+    placement->slot_used  = 0;
+    placement->host_bytes = 0;
+    placement->host_peak  = 0;
+
+    size_t expert_bytes = 0;
+    for (size_t i = 0; i < n_tensors; ++i) {
+        expert_bytes += (size_t) tensors[i].n_expert * tensors[i].blob_bytes;
+    }
+    if (expert_bytes == 0) {
+        return;
+    }
+
+    // static profile (Strata A3): experts with the highest hit counts get the slots.
+    // Without a profile the first experts by index are placed, which is the uniform
+    // fallback of the task description and is logged as such.
+    const std::string path = profile_path != nullptr ? profile_path : ggml_expert_store_get_profile();
+    ggml_expert_store_profile profile;
+    const bool have_profile = !path.empty() && ggml_expert_store_read_profile(path.c_str(), profile);
+    if (!path.empty() && !have_profile) {
+        GGML_LOG_ERROR("%s: cannot read expert profile '%s', falling back to uniform placement\n",
+            __func__, path.c_str());
+    }
+
+    for (size_t i = 0; i < n_tensors; ++i) {
+        const ggml_expert_store_plan_tensor & in = tensors[i];
+        GGML_ASSERT(in.n_expert > 0 && in.blob_bytes > 0);
+
+        // per-layer quota: this tensor is one layer, so its slot budget is its byte share of
+        // the device budget; slot_budget < 0 means "all experts get a slot"
+        const size_t tensor_bytes = (size_t) in.n_expert * in.blob_bytes;
+        int64_t quota = (int64_t) tensor_bytes;
+        if (slot_budget >= 0) {
+            quota = (int64_t) ((double) slot_budget * (double) tensor_bytes / (double) expert_bytes);
+        }
+        const int64_t n_slot = std::min<int64_t>(in.n_expert, quota / (int64_t) in.blob_bytes);
+        const int64_t aligned = (int64_t) ggml_expert_store_align_up(in.blob_bytes);
+
+        std::vector<int64_t> order((size_t) in.n_expert);
+        for (int64_t e = 0; e < in.n_expert; ++e) {
+            order[(size_t) e] = e;
+        }
+        if (have_profile && in.layer >= 0 && profile.n_layer > in.layer && profile.n_expert > 0) {
+            std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+                const int64_t ca = a < profile.n_expert ? profile.at(in.layer, a) : 0;
+                const int64_t cb = b < profile.n_expert ? profile.at(in.layer, b) : 0;
+                return ca > cb;
+            });
+        }
+
+        placement->n_slot[i]    = n_slot;
+        placement->host_used[i] = (in.n_expert - n_slot) * aligned;
+        placement->slot_experts[i].assign(order.begin(), order.begin() + (size_t) n_slot);
+        placement->slot_used += n_slot * aligned;
+        placement->host_bytes += placement->host_used[i];
+        placement->host_peak = std::max(placement->host_peak, placement->host_used[i]);
+    }
+
+    GGML_LOG_DEBUG("%s: %zu tensors, slot budget %.2f MiB: slots %.2f MiB, host %.2f MiB, host peak %.2f MiB\n",
+        __func__, n_tensors, slot_budget / 1024.0 / 1024.0, placement->slot_used / 1024.0 / 1024.0,
+        placement->host_bytes / 1024.0 / 1024.0, placement->host_peak / 1024.0 / 1024.0);
+}
+
 int ggml_expert_store_add_tensor(
         ggml_expert_store * store,
         int layer, int kind,
         int64_t n_expert, size_t blob_bytes,
-        int64_t slot_budget, int64_t host_budget) {
+        const int64_t * slot_experts, int64_t n_slot,
+        int64_t host_budget) {
     GGML_ASSERT(store != nullptr);
     GGML_ASSERT(n_expert > 0);
     GGML_ASSERT(blob_bytes > 0);
+    GGML_ASSERT(n_slot >= 0 && n_slot <= n_expert);
+    GGML_ASSERT(n_slot == 0 || slot_experts != nullptr);
 
     if (store->tensors.size() >= (size_t) GGML_EXPERT_STORE_MAX_TENSORS) {
         GGML_LOG_ERROR("%s: too many expert tensors (%zu)\n", __func__, store->tensors.size());
         return -1;
     }
 
-    // per-layer quota: this tensor is one layer, so every slot belongs to this layer.
-    // slot_budget < 0 means "all experts get a slot" (fully resident tensor).
-    int64_t n_slot = n_expert;
-    if (slot_budget >= 0) {
-        n_slot = std::min<int64_t>(n_expert, slot_budget / (int64_t) blob_bytes);
-    }
     const int64_t n_host = n_expert - n_slot;
 
     // the host tier stores the complement of the slot set; it must fit into the budget,
@@ -224,55 +292,24 @@ int ggml_expert_store_add_tensor(
     t.residency.assign((size_t) n_expert, GGML_EXPERT_STORE_INVALID);
     t.host_offset.assign((size_t) n_expert, GGML_EXPERT_STORE_INVALID);
 
-    GGML_LOG_INFO("%s: layer %d kind %d: %" PRId64 " experts, %.2f MiB each, slots %" PRId64 ", host %" PRId64 "\n",
-        __func__, layer, kind, n_expert, blob_bytes / 1024.0 / 1024.0, n_slot, n_host);
-
-    // static profile (Strata A3): experts with the highest hit counts get the slots.
-    // Without a profile the first experts by index are placed, which is the uniform
-    // fallback of the task description and is logged as such.
-    ggml_expert_store_profile profile;
-    bool have_profile = false;
-    if (!store->profile_path.empty()) {
-        have_profile = ggml_expert_store_read_profile(store->profile_path.c_str(), profile);
-        if (!have_profile) {
-            GGML_LOG_ERROR("%s: cannot read expert profile '%s', falling back to uniform placement\n",
-                __func__, store->profile_path.c_str());
-        }
+    // the placement comes from ggml_expert_store_plan: slot s holds expert slot_experts[s],
+    // the rest is packed into the host arena in expert order
+    for (int64_t s = 0; s < n_slot; ++s) {
+        const int64_t e = slot_experts[s];
+        GGML_ASSERT(e >= 0 && e < n_expert);
+        t.residency[(size_t) e] = (int32_t) s;
     }
-
-    std::vector<int64_t> order((size_t) n_expert);
-    for (int64_t i = 0; i < n_expert; ++i) {
-        order[i] = i;
-    }
-
-    int64_t ranked = 0; // experts with a non-zero profile count
-    if (have_profile && profile.n_layer > layer && profile.n_expert > 0) {
-        for (int64_t e = 0; e < n_expert; ++e) {
-            if (e < profile.n_expert && profile.at(layer, e) > 0) {
-                ranked++;
-            }
-        }
-        std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
-            const int64_t ca = a < profile.n_expert ? profile.at(layer, a) : 0;
-            const int64_t cb = b < profile.n_expert ? profile.at(layer, b) : 0;
-            return ca > cb;
-        });
-    } else {
-        have_profile = false;
-    }
-
-    int64_t slot_next = 0;
     int64_t host_next = 0;
-    for (int64_t rank = 0; rank < n_expert; ++rank) {
-        const int64_t e = order[(size_t) rank];
-        if (rank < n_slot) {
-            t.residency[(size_t) e] = (int32_t) slot_next++;
-        } else {
+    for (int64_t e = 0; e < n_expert; ++e) {
+        if (t.residency[(size_t) e] < 0) {
             t.host_offset[(size_t) e] = host_next;
             host_next += (int64_t) ggml_expert_store_align_up(blob_bytes);
         }
     }
     t.host_used = host_next;
+
+    GGML_LOG_INFO("%s: layer %d kind %d: %" PRId64 " experts, %.2f MiB each, slots %" PRId64 ", host %" PRId64 "\n",
+        __func__, layer, kind, n_expert, blob_bytes / 1024.0 / 1024.0, n_slot, n_host);
 
     // allocate the slot array and the host arena slice
     if (n_slot > 0) {
@@ -323,19 +360,12 @@ int ggml_expert_store_add_tensor(
         }
     }
 
-    GGML_LOG_INFO("%s: layer %d kind %d: profile %s, slots %" PRId64 " (%.2f MiB), host %" PRId64 " (%.2f MiB)\n",
+    GGML_LOG_INFO("%s: layer %d kind %d: slots %" PRId64 " (%.2f MiB), host %" PRId64 " (%.2f MiB)\n",
         __func__, layer, kind,
-        have_profile ? "ranked" : "uniform (no profile)",
         n_slot, n_slot * (double) ggml_expert_store_align_up(blob_bytes) / 1024.0 / 1024.0,
         n_host, host_next / 1024.0 / 1024.0);
 
     store->tensors.push_back(std::move(t));
-    if (have_profile) {
-        GGML_LOG_INFO("%s: layer %d kind %d: profile covers %" PRId64 "/%" PRId64 " experts\n",
-            __func__, layer, kind, ranked, n_expert);
-    } else if (!store->profile_path.empty()) {
-        GGML_LOG_INFO("%s: layer %d kind %d: uniform placement within the layer quota\n", __func__, layer, kind);
-    }
 
     return (int) store->tensors.size() - 1;
 }

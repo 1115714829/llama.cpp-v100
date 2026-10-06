@@ -839,7 +839,14 @@ bool ggml_cuda_expert_buft_is_expert(ggml_backend_buffer_type_t buft) {
 }
 
 bool ggml_cuda_expert_is_store(const ggml_tensor * t) {
-    return t != nullptr && t->buffer != nullptr && ggml_cuda_expert_buft_is_expert(t->buffer->buft);
+    if (t == nullptr || t->buffer == nullptr || !ggml_cuda_expert_buft_is_expert(t->buffer->buft)) {
+        return false;
+    }
+    // tensor-level test: only tensors registered in the store are read through the pointer
+    // table, plain tensors of the same buffer type take the generic path. A fused gate weight
+    // therefore cannot hit the store path just because it shares the buffer type.
+    ggml_cuda_expert_table table;
+    return ggml_cuda_expert_table_get(t, &table);
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -886,6 +893,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
     size_t plain_size   = 0;
     std::vector<size_t> plain_offset((size_t) n_tensors, 0);
     std::vector<bool>   plain_alloc ((size_t) n_tensors, false);
+    std::vector<ggml_tensor *> expert_tensors;
 
     for (int i = 0; i < n_tensors; ++i) {
         ggml_tensor * t = tensors[i];
@@ -894,6 +902,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
         }
         if (ggml_cuda_expert_tensor_is_expert(t)) {
             expert_bytes += ggml_nbytes(t);
+            expert_tensors.push_back(t);
         } else {
             plain_offset[i] = plain_size;
             plain_size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), alignment);
@@ -918,6 +927,18 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
     ctx->store        = ggml_expert_store_init(&ctx->backend, device, nullptr);
     ctx->stage_budget = stage_budget;
 
+    // the placement of every expert tensor is computed by the store's pure plan function
+    // before anything is allocated: fit calls the same function through the backend proc, so
+    // the fit estimate and this allocation match byte for byte. The profile path is the one
+    // of the store, which is already the process-wide profile the CLI set.
+    std::vector<ggml_expert_store_plan_tensor> plan_in;
+    plan_in.reserve(expert_tensors.size());
+    for (const ggml_tensor * t : expert_tensors) {
+        plan_in.push_back({ ggml_cuda_expert_tensor_layer(t), t->ne[2], (size_t) t->nb[2] });
+    }
+    ggml_expert_store_placement plan;
+    ggml_expert_store_plan(plan_in.data(), plan_in.size(), (int64_t) slot_budget, ctx->store->profile_path.c_str(), &plan);
+
     CUDA_CHECK(cudaMalloc((void **) &ctx->usage_dev, 4 * sizeof(unsigned long long)));
     CUDA_CHECK(cudaMemset(ctx->usage_dev, 0, 4 * sizeof(unsigned long long)));
     CUDA_CHECK(cudaHostAlloc((void **) &ctx->usage_host, 4 * sizeof(unsigned long long), cudaHostAllocDefault));
@@ -925,28 +946,17 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
 
     ctx->tensors.reserve((size_t) n_tensors);
 
-    size_t host_peak_bytes = 0; // largest host complement of one tensor, fit sizes staging with it
-
     // expert tensors first: their data pointers must be set before any view of them attaches
-    for (int i = 0; i < n_tensors; ++i) {
-        ggml_tensor * t = tensors[i];
-        if (t->view_src != nullptr || t->data != nullptr || !ggml_cuda_expert_tensor_is_expert(t)) {
-            continue;
-        }
+    for (size_t k = 0; k < expert_tensors.size(); ++k) {
+        ggml_tensor * t = expert_tensors[k];
         const int64_t n_expert = t->ne[2];
         const size_t blob_bytes = t->nb[2];
 
-        const size_t tensor_bytes = ggml_nbytes(t);
-        // per-tensor quota (Strata A2): every tensor is one layer, so this split is the
-        // per-layer quota. slot_budget arrives as bytes, converted per tensor by share.
-        const int64_t slot_quota = expert_bytes > 0
-            ? (int64_t) ((double) slot_budget * (double) tensor_bytes / (double) expert_bytes)
-            : 0;
-        const int64_t host_quota = -1; // the complement must always fit in host memory
-
         const int tensor_id = ggml_expert_store_add_tensor(ctx->store,
             ggml_cuda_expert_tensor_layer(t), ggml_cuda_expert_tensor_kind(t),
-            n_expert, blob_bytes, slot_quota, host_quota);
+            n_expert, blob_bytes,
+            plan.slot_experts[k].data(), plan.n_slot[k],
+            -1); // the complement must always fit in host memory
         if (tensor_id < 0) {
             GGML_LOG_ERROR("%s: cannot place expert tensor %s\n", __func__, t->name);
             delete ctx;
@@ -954,8 +964,6 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
         }
 
         const ggml_expert_store_tensor * st = ggml_expert_store_tensor_at(ctx->store, tensor_id);
-
-        host_peak_bytes = std::max(host_peak_bytes, (size_t) st->host_used);
 
         // poison the freshly allocated tiers with zeros so reading an unfilled slot or host
         // entry is a deterministic error instead of stale bytes (Strata A1)
@@ -1010,7 +1018,16 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
     if (expert_bytes > 0) {
         ggml_expert_store_print_plan(ctx->store);
         ggml_cuda_expert_set_allocation(device, (size_t) ctx->store->slot_used, (size_t) ctx->store->host_used,
-            stage_budget, host_peak_bytes);
+            stage_budget, (size_t) plan.host_peak);
+
+        // the staging area is sized for the host complement of the largest tensor; the part
+        // above it is read directly from host memory during prefill
+        const double direct = plan.host_peak > 0 && plan.host_peak > (int64_t) stage_budget
+            ? 100.0 * (double) (plan.host_peak - (int64_t) stage_budget) / (double) plan.host_peak
+            : 0.0;
+        GGML_LOG_INFO("%s: device %d: expert store: slots %.2f MiB, host complement %.2f MiB, staging %.2f MiB, prefill direct-read %.0f%%\n",
+            __func__, device, plan.slot_used / 1024.0 / 1024.0, plan.host_bytes / 1024.0 / 1024.0,
+            stage_budget / 1024.0 / 1024.0, direct);
     }
 
     // plain tensors: one block of device memory, laid out like the regular CUDA buffer type
@@ -1099,6 +1116,38 @@ void ggml_backend_cuda_expert_verify_all(void) {
                     __func__, s.tensor != nullptr ? s.tensor->name : "?");
             }
         }
+    }
+}
+
+// pure placement plan for the fit code: the same store function that alloc_buffer_n uses, so
+// the fit estimate and the real allocation match byte for byte. The tensors arrive as
+// parallel arrays to keep the interface free of internal store types.
+void ggml_cuda_expert_plan(
+        ggml_backend_buffer_type_t buft,
+        const int * layer, const int64_t * n_expert, const size_t * blob_bytes, size_t n_tensors,
+        size_t slot_budget,
+        size_t * slot_bytes, size_t * host_bytes, size_t * host_peak) {
+    if (buft == nullptr || !ggml_cuda_expert_buft_is_expert(buft)) {
+        return;
+    }
+
+    std::vector<ggml_expert_store_plan_tensor> tensors;
+    tensors.reserve(n_tensors);
+    for (size_t i = 0; i < n_tensors; ++i) {
+        tensors.push_back({ layer[i], n_expert[i], blob_bytes[i] });
+    }
+
+    ggml_expert_store_placement plan;
+    ggml_expert_store_plan(tensors.data(), tensors.size(), (int64_t) slot_budget, nullptr, &plan);
+
+    if (slot_bytes != nullptr) {
+        *slot_bytes = (size_t) plan.slot_used;
+    }
+    if (host_bytes != nullptr) {
+        *host_bytes = (size_t) plan.host_bytes;
+    }
+    if (host_peak != nullptr) {
+        *host_peak = (size_t) plan.host_peak;
     }
 }
 
@@ -1231,6 +1280,22 @@ void ggml_backend_cuda_expert_verify_all(void) {
 void ggml_cuda_expert_stats_tick(const ggml_tensor * src0, cudaStream_t stream) {
     GGML_UNUSED(src0);
     GGML_UNUSED(stream);
+}
+
+void ggml_cuda_expert_plan(
+        ggml_backend_buffer_type_t buft,
+        const int * layer, const int64_t * n_expert, const size_t * blob_bytes, size_t n_tensors,
+        size_t slot_budget,
+        size_t * slot_bytes, size_t * host_bytes, size_t * host_peak) {
+    GGML_UNUSED(buft);
+    GGML_UNUSED(layer);
+    GGML_UNUSED(n_expert);
+    GGML_UNUSED(blob_bytes);
+    GGML_UNUSED(n_tensors);
+    GGML_UNUSED(slot_budget);
+    GGML_UNUSED(slot_bytes);
+    GGML_UNUSED(host_bytes);
+    GGML_UNUSED(host_peak);
 }
 
 void ggml_cuda_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t stage_bytes) {

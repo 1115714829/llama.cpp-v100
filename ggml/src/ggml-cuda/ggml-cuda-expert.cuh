@@ -43,8 +43,10 @@ bool ggml_cuda_expert_buft_is_expert(ggml_backend_buffer_type_t buft);
 // tensors that are not a 3D expert weight layout.
 void ggml_cuda_expert_mark_tensor(ggml_backend_buffer_type_t buft, ggml_tensor * t);
 
-// true when the weights of this tensor live in an expert store (routed through the pointer
-// table). Kernel files can call this without knowing the internals of ggml_backend_buffer.
+// true when this tensor is registered in an expert store: its weights are then read through
+// the device pointer table instead of t->data. Tensors of the same buffer type that are not
+// registered (test sentinels, plain weights) return false. Kernel files can call this
+// without knowing the internals of ggml_backend_buffer.
 bool ggml_cuda_expert_is_store(const ggml_tensor * t);
 
 // false on backends where the expert store is not implemented (HIP/MUSA stubs); the buffer
@@ -90,15 +92,25 @@ const char * ggml_backend_cuda_expert_buffer_type_name(ggml_backend_buffer_type_
 // (0, 0) keeps all experts in the host arena.
 void ggml_cuda_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t stage_bytes);
 
+// pure placement plan of the expert tensors of one device: the same store function that
+// alloc_buffer_n uses, so fit sizes the staging area without a trial load. The tensors arrive
+// as parallel arrays (layer, n_expert, blob_bytes). slot_budget is the VRAM budget for the
+// slots. Outputs: slot bytes, host complement bytes, and the largest single-tensor host
+// complement (the staging requirement of one prefill batch).
+void ggml_cuda_expert_plan(
+        ggml_backend_buffer_type_t buft,
+        const int * layer, const int64_t * n_expert, const size_t * blob_bytes, size_t n_tensors,
+        size_t slot_budget,
+        size_t * slot_bytes, size_t * host_bytes, size_t * host_peak);
+
 // actual allocation of the most recent expert buffer on the device of buft, for the fit
 // memory accounting: slot_bytes is real VRAM, host_bytes host memory, stage_bytes VRAM.
 // Returns false when no expert buffer was allocated on that device yet.
 bool ggml_backend_cuda_expert_get_allocation(
         ggml_backend_buffer_type_t buft, size_t * slot_bytes, size_t * host_bytes, size_t * stage_bytes);
 
-// largest host complement of a single expert tensor of the most recent allocation on the
-// device of buft: fit uses it to size the staging area (one prefill batch stages the host
-// complement of one tensor). Returns false when no expert buffer was allocated yet.
+// largest host complement of a single expert tensor in the most recent allocation on the
+// device of buft. Returns false when no expert buffer was allocated yet.
 bool ggml_backend_cuda_expert_get_host_peak(ggml_backend_buffer_type_t buft, size_t * peak_bytes);
 
 // cap the VRAM slot budget of one expert buffer type in bytes (0 = automatic). Exposed for
