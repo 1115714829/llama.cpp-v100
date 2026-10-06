@@ -1,5 +1,14 @@
 # 更新日志
 
+## 1.1.1（2026-10-06）
+
+- 合并上游 llama.cpp v0.6.0。本项目对投机解码与服务端的改动（DFlash2 设备端注入与按 (序列, 位置) 取特征列、稀疏拒绝采样与只禁 token 的 logit bias、多路注入合并、验证批形状保持、`--prefill-pace`、先建投机解码再加载视觉模块与 `-mmdev`、GDN 检查点对数间隔保留、跨 slot 复用更长前缀）移植到上游新的批处理接口（`common_batch` / `llama_process`）；DFlash2 注入批继续使用旧接口 `llama_batch` / `llama_decode`。
+- 合并过程中发现并已消除的一处额外开销（发布版本没有这项开销，性能与 1.1.0 相同）：上游 v0.6.0 对普通批也会构建混合批（嵌入 + token）的输入分支，每批多 3 个主机输入张量及其节点，4 卡张量切分下每个 2048 批预填充多约 10 ms。现在混合批分支只在批中确实混合时才构建，这项开销不再存在；上游对递归状态复制的修复（#29856）保持不变。
+- 与 1.1.0 同一时段交替测量：4/6 卡 T=0 输出逐字相同（每 token 5.66 / 5.65 ms）；4 卡真实 16K 预填充 2579.0 / 2585.4 tok/s；2 卡 Q4 262144 合成 209715 预填充 1082.6 / 1081.0 tok/s、每轮投机 43.7 / 43.7 ms；6 卡 524288 合成 419430 预填充 1505.9 / 1503.2 tok/s、吐字 239.6 / 239.4 tok/s；4 卡、6 卡两路并发首字相同；6 卡多模态图片、视频正常；各卡显存峰值相同。
+- 为 Qwen3.8-Flash-Next 做准备：随上游 v0.6.0 带入 `qwen4exp` 架构（Qwen3.8-Flash-Next，大 MoE）的加载与运行支持；尚未做 V100 专项优化，专项优化在 2.0.0 进行。
+- Docker 镜像随版本更新为 `ghcr.io/1115714829/llama.cpp-v100:1.1.1`（x86_64 与 IBM Power AC922 多架构）。
+- README 参数说明补充：`--cache-ram`、`--ctx-checkpoints` 与主机内存占用的关系，请求级思考强度 `reasoning_effort`，ppc64le 上自动设置的 `NCCL_P2P_LEVEL=SYS`。
+
 ## 1.1.0（2026-10-03）
 
 - Docker 镜像（1.1.0 修订，版本号不变）：`.devops/v100-cuda.Dockerfile` 构建 linux/amd64 与 linux/ppc64le（仅 IBM Power AC922），镜像发布为 `ghcr.io/1115714829/llama.cpp-v100:1.1.0`（多架构）；入口为 `llama-server`，设置 `LLAMA_NUMA_MEMBIND` 时以 `numactl --membind` 启动；`.devops/v100-ac922-cdi.sh` 在 AC922 上生成 CDI 描述。

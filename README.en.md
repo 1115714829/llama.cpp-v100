@@ -2,18 +2,19 @@
 
 [简体中文](README.md) | **English**
 
-A modified version of llama.cpp for the NVIDIA V100 (SM70). Current version **1.1.0**; see [CHANGELOG.md](CHANGELOG.md) for the changes in each release.
+A modified version of llama.cpp for the NVIDIA V100 (SM70). Current version **1.1.1**; see [CHANGELOG.md](CHANGELOG.md) for the changes in each release.
 
 ---
 
-## What's new in 1.1.0
+## What's new in 1.1.1
 
-1.1.0 fixes a crash of 6-GPU multi-slot servers (`-np 2` and up) at long context; everything else behaves as in 1.0.9. All numbers below were measured alternating with 1.0.9 in the same session.
+1.1.1 merges upstream llama.cpp v0.6.0; features and performance stay the same as 1.1.0. All numbers below were measured alternating with 1.1.0 in the same session.
 
-- **6-GPU multi-slot long-context crash**: when two (or more) slots process long prompts at the same time and each slot's context is above 32768 (for example agent sessions with large images), the server could exit with `illegal memory access` or a segmentation fault. The idle GPUs that help with attention use work buffers that are rebuilt when the server switches between slots, while the CUDA Graph cache kept replaying the old capture and wrote to freed memory. The CUDA Graph cache now includes the attention-assist buffers in its re-capture check. The long-context prefill speedup from the idle GPUs is kept for multiple slots.
-- Regression test: 6 GPUs, `-c 524288 -np 2`, two slots at the same time with about 40K tokens of text plus 6 large images each: 1.0.9 crashed both times at about 23 s; 1.1.0 completed both slots both times (about 72K tokens each).
-- 4/6-GPU T=0 output is identical to 1.0.9. Speed and memory match 1.0.9: 4-GPU 200K synthetic (5 alternating rounds) prefill 1754.0 / 1752.2 tok/s, decode 281.3 / 281.3 tok/s; 6-GPU 200K synthetic prefill 2085.5 / 2082.0 tok/s, decode 300.2 / 300.3 tok/s; 6-GPU 419430 synthetic 1469.1 / 1467.0 tok/s, 238.6 / 238.4 tok/s; 4-GPU real 16K prefill 2554.5 / 2561.0 tok/s; 3-GPU, 2-GPU, multi-slot and multimodal unchanged, per-GPU peak memory identical.
-- **Docker image** (1.1.0 revision, same version number): `ghcr.io/1115714829/llama.cpp-v100:1.1.0`, one tag for x86_64 and IBM Power AC922 (ppc64le); see "Docker".
+- **Upstream v0.6.0 merged**: brings in upstream's changes from this period (the new batch API, newly added models, fixes, etc.). This project's speculative decoding (DFlash2 on-device injection, sparse rejection sampling, multi-slot injection), prefill pacing, vision module on GPU and checkpoint policy were ported onto upstream's new batch API; the SM70 kernels, tensor parallelism and all-reduce are unchanged.
+- Measured alternating with 1.1.0: 4/6-GPU T=0 output identical, 5.66 / 5.65 ms per token; 4-GPU real 16K prefill 2579.0 / 2585.4 tok/s; 2-GPU Q4 262144 synthetic 209715 prefill 1082.6 / 1081.0 tok/s, 43.7 / 43.7 ms per speculative round; 6-GPU 524288 synthetic 419430 prefill 1505.9 / 1503.2 tok/s, decode 239.6 / 239.4 tok/s; multi-slot time to first token unchanged; multimodal images and video work; per-GPU peak memory identical.
+- **Groundwork for Qwen3.8-Flash-Next**: upstream v0.6.0 adds support for Qwen3.8-Flash-Next (architecture `qwen4exp`, a large MoE), so 1.1.1 can load and run it (when the model does not fit in GPU memory, upstream's `--n-cpu-moe` / `-ot` can put some experts on the CPU). This project has not yet optimized it for the V100; that work (expert matrix multiply, expert parallelism, GPU memory / host memory / disk tiers, MTP speculative decoding) is under way for 2.0.0.
+- **Docker image**: `ghcr.io/1115714829/llama.cpp-v100:1.1.1`, one tag for x86_64 and IBM Power AC922 (ppc64le); see "Docker".
+- **Parameter notes added**: how `--cache-ram` and `--ctx-checkpoints` relate to host memory, the per-request `reasoning_effort`, and `NCCL_P2P_LEVEL`, which is set automatically on ppc64le; see "Parameter description".
 
 ---
 
@@ -58,20 +59,20 @@ Test environment:
 - Launch parameters: see the corresponding configuration in the "Launch parameters" section.
 - Except for "Concurrent requests" and "Multimodal", every case is measured on a freshly started server; the cases in those two sections are measured sequentially in the same server.
 - The single-request table in "GPU counts and quantization" was measured on 1.0.6, the two-request table on 1.0.5 (2026-09-30); the other sections were measured on 1.0.4 (2026-09-29 to 30). On 4 GPUs with Q8, 1.0.5 and 1.0.6 produce word-for-word identical output to 1.0.4 with unchanged speed; on 6 GPUs prefill is faster from 1.0.6 on (see "What's new"), while decode and VRAM in the 6-GPU tables are unchanged. The 3-GPU balancing and long-context VRAM changes of 1.0.7 are in "What's new". Numbers measured on 1.0.8 are marked "1.0.8" in the tables (4- and 6-GPU 200K synthetic, 6-GPU 419430, vision-module VRAM); the rest were measured on earlier versions, and 6-GPU long-context prefill is faster from 1.0.8 on.
-- Values marked "1.1.0" were measured on version 1.1.0 (2026-10-03, alternating with 1.0.9 in the same session; all items unchanged).
+- Values marked "1.1.1" were measured on version 1.1.1 (2026-10-06, alternating with 1.1.0 in the same session; all items unchanged).
 - The decode speed for real content varies with the acceptance rate; some tables also give the time per speculative round.
 
 ### 4 GPUs, 262144 context
 
 | Input | Prefill | Decode | Time per speculative round | Peak VRAM per GPU |
 |---|---:|---:|---:|---:|
-| synthetic 209715 tokens (512 output tokens, 1.1.0) | 1752 tok/s | 281.3 tok/s | 28.4 ms | 12.9 GB |
+| synthetic 209715 tokens (512 output tokens, 1.1.1) | 1772 tok/s | 282.0 tok/s | 28.3 ms | 12.9 GB |
 | real code 209228 tokens (1024 output tokens) | 1635 tok/s | 88.0 tok/s | 28.6 ms | 13.3 GB |
 | synthetic 131072 tokens (512 output tokens) | 1976 tok/s | 306.0 tok/s | 26.1 ms | 13.3 GB |
 | real code 131184 tokens (1024 output tokens) | 1966 tok/s | 102.6 tok/s | 25.9 ms | 13.3 GB |
-| real code 16500 tokens (1024 output tokens, 1.1.0) | 2561 tok/s | 126.7 tok/s | 22.0 ms | 12.9 GB |
+| real code 16500 tokens (1024 output tokens, 1.1.1) | 2584 tok/s | 131.7 tok/s | 21.9 ms | 12.9 GB |
 
-<sub>Data source: values marked 1.1.0 were measured on version 1.1.0 (2026-10-03, alternating with 1.0.9 in the same session); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
+<sub>Data source: values marked 1.1.1 were measured on version 1.1.1 (2026-10-06; alternating with 1.1.0 in the same session, all items unchanged); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
 
 **Draft model quantization** (4 GPUs, Q8, 2 runs each):
 
@@ -108,7 +109,7 @@ From 1.0.7 on, non-thinking mode (presence penalty) no longer falls back to host
 
 | `-ub` | Input | Prefill | Decode | Time per speculative round | Peak VRAM per GPU |
 |---|---|---:|---:|---:|---:|
-| 2048 | synthetic 209715 tokens (512 output tokens, 1.1.0) | 2082 tok/s | 300.3 tok/s | 26.6 ms | 10.0 GB |
+| 2048 | synthetic 209715 tokens (512 output tokens, 1.1.1) | 2102 tok/s | 300.5 tok/s | 26.6 ms | 10.0 GB |
 | 2048 | real code 209227 tokens (1024 output tokens) | 1703 tok/s | 103.7 tok/s | 27.2 ms | 10.2 GB |
 | 2048 | real code 16494 tokens (1024 output tokens) | 2569 tok/s | 146.9 tok/s | 20.6 ms | 10.2 GB |
 | 4096 | synthetic 209715 tokens (512 output tokens) | 1897 tok/s | 292.2 tok/s | 27.3 ms | 11.4 GB |
@@ -116,16 +117,16 @@ From 1.0.7 on, non-thinking mode (presence penalty) no longer falls back to host
 | 4096 | real code 16500 tokens (1024 output tokens) | 2690 tok/s | 121.4 tok/s | 20.6 ms | 11.4 GB |
 | 8192 | synthetic 209715 tokens (512 output tokens) | 1905 tok/s | 291.4 tok/s | 27.4 ms | 13.8 GB |
 
-<sub>Data source: values marked 1.1.0 were measured on version 1.1.0 (2026-10-03, alternating with 1.0.9 in the same session); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
+<sub>Data source: values marked 1.1.1 were measured on version 1.1.1 (2026-10-06; alternating with 1.1.0 in the same session, all items unchanged); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
 
 ### 6 GPUs, 524288 context (YaRN)
 
 | `-ub` | Input | TTFT | Prefill | Decode | Peak VRAM per GPU |
 |---|---|---:|---:|---:|---:|
-| 2048 | synthetic 419430 tokens (512 output tokens, 1.1.0) | 285.9 s | 1467 tok/s | 238.4 tok/s | 11.5 GB |
+| 2048 | synthetic 419430 tokens (512 output tokens, 1.1.1) | 278.9 s | 1504 tok/s | 238.8 tok/s | 11.5 GB |
 | 4096 | synthetic 419430 tokens (512 output tokens) | 320 s | 1312 tok/s | 230.3 tok/s | 13.9 GB |
 
-<sub>Data source: values marked 1.1.0 were measured on version 1.1.0 (2026-10-03, alternating with 1.0.9 in the same session); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
+<sub>Data source: values marked 1.1.1 were measured on version 1.1.1 (2026-10-06; alternating with 1.1.0 in the same session, all items unchanged); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
 
 The `-ub 4096` row was measured on an earlier version (prefill is faster from 1.0.8 on as well). `-ub 8192` does not fit in VRAM and fails to start. Only speed and VRAM were measured; output quality above 262144 was not tested. The YaRN setting applies to all lengths.
 
@@ -140,29 +141,31 @@ Real code, thinking mode (T=0.6), 1024 output tokens per request, default `--pre
 
 | Scenario | TTFT | Decode per request | Aggregate decode | All done |
 |---|---|---:|---:|---:|
-| single request 16K (1.1.0) | 6.5 s | 123.1 tok/s | 123 tok/s | 14.8 s |
-| two concurrent requests of 16K each (1.1.0) | 8.1 s / 23.0 s | 74.5 / 94.0 tok/s | 79 tok/s | 33.9 s |
+| single request 16K (1.1.1) | 6.4 s | 120.9 tok/s | 121 tok/s | 14.9 s |
+| two concurrent requests of 16K each (1.1.1) | 8.1 s / 22.2 s | 84.1 / 103.6 tok/s | 86 tok/s | 32.0 s |
 | single request about 115K tokens | 55.8 s | 99.9 tok/s | 100 tok/s | 66.0 s |
-| two concurrent requests of about 115K tokens each (1.1.0) | 55.1 s / 119.1 s | 58.7 / 81.0 tok/s | 27 tok/s | 131.8 s |
+| two concurrent requests of about 115K tokens each (1.1.1) | 55.1 s / 118.9 s | 60.0 / 103.8 tok/s | 28 tok/s | 128.8 s |
 
-<sub>Data source: values marked 1.1.0 were measured on version 1.1.0 (2026-10-03, alternating with 1.0.9 in the same session); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
+<sub>Data source: values marked 1.1.1 were measured on version 1.1.1 (2026-10-06; alternating with 1.1.0 in the same session, all items unchanged); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
 
 **4 GPUs, `-c 262144 -np 4` (65536 per request)**, startup VRAM 14.2 GB per GPU, peak 14.3 GB:
 
 | Scenario | TTFT | Decode per request | Aggregate decode | All done |
 |---|---|---:|---:|---:|
 | single request 16K | 6.5 s | 116.0 tok/s | 116 tok/s | 15.3 s |
-| four concurrent requests of 16K each | 8.5 / 27.1 / 43.6 / 57.5 s | 64.0 / 69.9 / 81.9 / 124.4 tok/s | 72 tok/s | 65.7 s |
+| four concurrent requests of 16K each (1.1.1) | 8.2 / 23.2 / 39.0 / 52.5 s | 76.3 / 82.8 / 83.7 / 106.8 tok/s | 73 tok/s | 62.1 s |
+
+<sub>Data source: values marked 1.1.1 were measured on version 1.1.1 (2026-10-06; alternating with 1.1.0 in the same session, all items unchanged); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
 
 **6 GPUs, `-c 524288 -np 2` (YaRN, 262144 per request)**, startup VRAM 12.4-12.8 GB per GPU, peak 12.7-13.0 GB (measured on 1.0.4; from 1.0.8 about 0.3 GB more per GPU for the attention-assist workspace):
 
 | Scenario | TTFT | Decode per request | Aggregate decode | All done |
 |---|---|---:|---:|---:|
 | single request 16K | 6.4 s | 118.5 tok/s | 119 tok/s | 15.0 s |
-| two concurrent requests of 16K each (1.1.0) | 8.1 s / 20.7 s | 89.7 / 122.5 tok/s | 98 tok/s | 29.0 s |
-| two concurrent requests of about 115K tokens each (1.1.0) | 47.3 s / 103.0 s | 65.4 / 108.6 tok/s | 32 tok/s | 112.4 s |
+| two concurrent requests of 16K each (1.1.1) | 8.0 s / 20.1 s | 94.0 / 104.3 tok/s | 94 tok/s | 29.9 s |
+| two concurrent requests of about 115K tokens each (1.1.1) | 47.4 s / 101.6 s | 75.0 / 88.4 tok/s | 31 tok/s | 113.2 s |
 
-<sub>Data source: values marked 1.1.0 were measured on version 1.1.0 (2026-10-03, alternating with 1.0.9 in the same session); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
+<sub>Data source: values marked 1.1.1 were measured on version 1.1.1 (2026-10-06; alternating with 1.1.0 in the same session, all items unchanged); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
 
 The same configuration with each slot filled to close to 256K (1.0.9, vision module split across the 6 GPUs, thinking mode, 12.44-12.60 GB per GPU after start):
 
@@ -207,14 +210,14 @@ The draft model is DFlash2 F16 by default; for 2 GPUs with Q4 to run 262144, use
 | 2 | Q4 (draft F16) | 131072 | 1861 / 63.4 tok/s / 37.1 ms | 104857 / 74 s / 1419 / 184.4 tok/s | 13.7 GB |
 | 3 | Q8 | 131072 | 2470 / 90.0 tok/s / 28.2 ms | 104857 / 59 s / 1779 / 231.5 tok/s | 14.8 GB |
 | 3 | Q4 | 524288 | 2353 / 78.3 tok/s / 31.6 ms | 419430 / 530 s / 792 / 134.9 tok/s | 14.2 GB |
-| 4 | Q8 | 262144 | 2561 / 126.7 tok/s / 22.0 ms (1.1.0) | 209715 / 120 s / 1752 / 281.3 tok/s (1.1.0) | 12.9 GB (1.1.0) |
+| 4 | Q8 | 262144 | 2584 / 131.7 tok/s / 21.9 ms (1.1.1) | 209715 / 118 s / 1772 / 282.0 tok/s (1.1.1) | 12.9 GB (1.1.1) |
 | 4 | Q4 | 524288 | 2458 / 110.4 tok/s / 26.7 ms | 419430 / 379 s / 1107 / 198.5 tok/s | 11.6 GB |
 | 5 | Q8 | 524288 | 2612 / 126.1 tok/s / 22.2 ms | 419430 / 367 s / 1143 / 222.4 tok/s | 14.2 GB |
 | 5 | Q4 | 524288 | 2489 / 93.2 tok/s / 26.5 ms | 419430 / 374 s / 1122 / 198.7 tok/s | 10.3 GB |
-| 6 | Q8 | 524288 | 2774 / 114.1 tok/s / 20.5 ms | 419430 / 285.9 s / 1467 / 238.4 tok/s (1.1.0) | 12.8 GB |
+| 6 | Q8 | 524288 | 2774 / 114.1 tok/s / 20.5 ms | 419430 / 278.9 s / 1504 / 238.8 tok/s (1.1.1) | 12.8 GB |
 | 6 | Q4 | 524288 | 2599 / 110.6 tok/s / 25.5 ms | 419430 / 358 s / 1171 / 203.3 tok/s | 9.5 GB |
 
-<sub>Data source: values marked 1.1.0 were measured on version 1.1.0 (2026-10-03, alternating with 1.0.9 in the same session); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
+<sub>Data source: values marked 1.1.1 were measured on version 1.1.1 (2026-10-06; alternating with 1.1.0 in the same session, all items unchanged); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
 
 - On 2 GPUs use the Q4 configuration: the Q8_0 target model is about 29 GB and does not fit on two 16 GB GPUs.
 - 3 GPUs with Q8 cannot fit 262144 in VRAM (not even with the Q4_K_M draft); the maximum is 131072.
@@ -243,17 +246,17 @@ Decode for real content varies a lot with the acceptance rate (single measuremen
 
 | Input | Tokens | Prompt processing | Decode |
 |---|---:|---:|---:|
-| image (paper figure, 1.1.0) | 3078 | 4.8 s | 171 tok/s |
+| image (paper figure, 1.1.1) | 3078 | 4.8 s | 145 tok/s |
 | image (diagram) | 4069 | 5.7 s | 163 tok/s |
 | PDF first 6 pages (one image per page) | 3590 | 3.5 s | 190 tok/s |
-| 12-second video (slides, 1.1.0) | 23104 | 18.7 s | 148 tok/s |
+| 12-second video (slides, 1.1.1) | 23104 | 18.7 s | 173 tok/s |
 | 10-second video | 6387 | 7.3 s | 131 tok/s |
 | 200K tokens of text + 1 image | 206958 | 122.7 s | 87 tok/s |
 
-<sub>Data source: values marked 1.1.0 were measured on version 1.1.0 (2026-10-03, alternating with 1.0.9 in the same session); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
+<sub>Data source: values marked 1.1.1 were measured on version 1.1.1 (2026-10-06; alternating with 1.1.0 in the same session, all items unchanged); unmarked values are from the earlier versions noted below the table or in "Test environment".</sub>
 
-- From 1.0.8 the vision module is split across all GPUs by layer: after image and video requests the per-GPU VRAM peak on 6 GPUs is 11.6-11.8 GB (measured on 1.1.0; 1.0.7: 12.2 GB on GPU 0, 10.8-11.2 GB on the others). Unmarked rows in the table were measured on 1.0.4.
-- 4 GPUs, 262144 context, vision module on GPU: image prompt processing 4.3 s and the PDF first 6 pages 3.2 s; peak VRAM 13.5 GB on every GPU, at most 28 MiB apart (measured on 1.1.0; 1.0.7: 14.2 GB on GPU 0).
+- From 1.0.8 the vision module is split across all GPUs by layer: after image and video requests the per-GPU VRAM peak on 6 GPUs is 11.6-11.8 GB (measured on 1.1.1; 1.0.7: 12.2 GB on GPU 0, 10.8-11.2 GB on the others). Unmarked rows in the table were measured on 1.0.4.
+- 4 GPUs, 262144 context, vision module on GPU: image prompt processing 4.2 s and a 12-second video 18.5 s; peak VRAM 13.5 GB on every GPU, at most 26 MiB apart (measured on 1.1.1). PDF first 6 pages 3.2 s (measured on 1.1.0). 1.0.7: 14.2 GB on GPU 0.
 - Appending 8034 tokens to the same session after 209K tokens: TTFT 7.7 s (only the new part is processed; measured on 1.0.3).
 - With the vision module on CPU (`--no-mmproj-offload`, measured on 1.0.1): the same two images take 150 s and 232 s to first token, and a 12-second video 649 s.
 
@@ -321,7 +324,7 @@ x86_64, 4 GPUs, context 262144 (models in `/path/to/models`, see "Model download
 ```bash
 docker run -d --name llama-v100 --gpus all --ipc=host --ulimit memlock=-1 \
   -p 8080:8080 -v /path/to/models:/models \
-  ghcr.io/1115714829/llama.cpp-v100:1.1.0 \
+  ghcr.io/1115714829/llama.cpp-v100:1.1.1 \
   -m /models/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
   --split-mode tensor --tensor-split 1,1,1,1 \
   -c 262144 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
@@ -338,7 +341,7 @@ sudo bash .devops/v100-ac922-cdi.sh        # writes /etc/cdi/nvidia.yaml; run ag
 docker run -d --name llama-v100 --device nvidia.com/gpu=all --ipc=host --ulimit memlock=-1 \
   -e LLAMA_NUMA_MEMBIND=0,8 \
   -p 8080:8080 -v /path/to/models:/models \
-  ghcr.io/1115714829/llama.cpp-v100:1.1.0 \
+  ghcr.io/1115714829/llama.cpp-v100:1.1.1 \
   ... (same as above, set --tensor-split for the GPU count)
 ```
 
@@ -346,7 +349,7 @@ The `llama-quantize` in the image can also convert the draft model to F16:
 
 ```bash
 docker run --rm --entrypoint /app/llama-quantize -v /path/to/models:/models \
-  ghcr.io/1115714829/llama.cpp-v100:1.1.0 \
+  ghcr.io/1115714829/llama.cpp-v100:1.1.1 \
   /models/Qwen3.8-27B-DFlash2-BF16.gguf /models/Qwen3.8-27B-DFlash2-F16.gguf F16
 ```
 
@@ -520,6 +523,10 @@ CUDA_VISIBLE_DEVICES=0,1 numactl --membind=0,8 ./build/bin/llama-server \
 | `-mmdev <device>` | put the vision module on one given GPU only (see `--list-devices` for device names, e.g. `CUDA0`); `-mmdev none` is the same as CPU |
 | `--temp`, `--top-p`, `--top-k`, `--min-p`, `--chat-template-kwargs` | default sampling parameters and thinking mode switch (the values above are the model card's thinking mode parameters) |
 | `--metrics` | Prometheus metrics (optional) |
+| `--cache-ram <MiB>` | Upper limit of the prompt cache kept in host memory (upstream parameter, default 8192). When several conversations take turns, their state can be restored from host memory instead of being recomputed. Choose it from the host memory size: host memory use is roughly base use + `--cache-ram` + slots × `--ctx-checkpoints` × checkpoint size; going over the host memory gets the process killed by the system |
+| `--ctx-checkpoints <N>` | Recurrent-state checkpoints kept per slot (upstream parameter, default 32), used to reuse prefixes; each checkpoint takes one recurrent state of host memory (size depends on the model), multiplied by the number of slots |
+| `reasoning_effort` (request parameter) | Thinking effort, interpreted by the model's chat template. The Qwen3.8 template accepts `low`, `medium`, `high`, `xhigh` (default), and `none` turns thinking off; `--chat-template-kwargs '{"reasoning_effort":"medium"}'` sets a server default |
+| `NCCL_P2P_LEVEL` (environment variable) | On ppc64le the program sets it to `SYS` before initializing NCCL so that GPUs on different CPU sockets also use P2P; a value you set yourself is not overridden |
 
 Sampling: when `top_k ≤ 64` and only top-k, top-p, min-p, and temperature are used, the top-k candidates are selected on the device; repeat/presence/frequency penalties also select top-k candidates on the device (candidate count = `top_k` plus the tokens inside the penalty window, capped at 256); when DRY or other samplers are used, or `top_k` is larger, sampling over the full vocabulary is still done on the host.
 
@@ -527,6 +534,7 @@ Sampling: when `top_k ≤ 64` and only top-k, top-p, min-p, and temperature are 
 
 ## Next steps
 
+- **Large MoE (2.0.0)**: V100-specific work for large MoE models such as Qwen3.8-Flash-Next: expert matrix multiply, multi-GPU expert parallelism, expert storage across GPU memory → host memory → disk (experts that do not fit in GPU memory are read by the GPU directly from host memory), and MTP speculative decoding, so that a complete large MoE can be loaded and run efficiently with limited GPU memory.
 - **Multi-GPU splitting**: the load is already balanced on 3 GPUs in 1.0.7; with 6 GPUs and long context (above 32768) the 2 idle GPUs now share the attention (1.0.8); on 5 GPUs, and on 6 GPUs with short context, 1-2 GPUs are still idle in each attention layer, to be continued.
 - **Long context**: the prefill K/V copy is now windowed (1.0.7); next are long-context decode (the speculative verification attention kernel) and the speed of appending to the prefill.
 - **Concurrent requests**: the total throughput of concurrent requests is still about the same as processing them one after another. Future work will improve the time per round when multiple requests decode at the same time, and prefix cache reuse between concurrent requests.
