@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstring>
 #include <stdexcept>
 #include <cinttypes>
 #include <set>
@@ -170,10 +171,13 @@ static int common_expert_tensor_layer(const std::string & name) {
 }
 
 // pure placement plan of the expert tensors of one device (backend proc): the same store
-// function that the expert buffer allocation uses, so the fit budgets match the allocation
+// function that the expert buffer allocation uses, so the fit budgets match the allocation.
+// host_each, when not null, receives the host complement bytes of every tensor in allocation
+// order (used by the NUMA check of the host complement).
 static bool common_expert_plan(ggml_backend_buffer_type_t buft,
         const std::vector<common_expert_tensor> & tensors, size_t slot_budget,
-        size_t * slot_bytes, size_t * host_bytes, size_t * host_peak) {
+        size_t * slot_bytes, size_t * host_bytes, size_t * host_peak,
+        std::vector<size_t> * host_each = nullptr) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
     if (dev == nullptr) {
         return false;
@@ -183,7 +187,7 @@ static bool common_expert_plan(ggml_backend_buffer_type_t buft,
         return false;
     }
     typedef void (*ggml_backend_expert_plan_t)(ggml_backend_buffer_type_t,
-        const int *, const int64_t *, const size_t *, size_t, size_t, size_t *, size_t *, size_t *);
+        const int *, const int64_t *, const size_t *, size_t, size_t, size_t *, size_t *, size_t *, size_t *);
     auto plan = (ggml_backend_expert_plan_t)
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_plan");
     if (plan == nullptr) {
@@ -202,9 +206,46 @@ static bool common_expert_plan(ggml_backend_buffer_type_t buft,
         blobs.push_back(t.blob_bytes);
     }
 
+    if (host_each != nullptr) {
+        host_each->assign(tensors.size(), 0);
+    }
     plan(buft, layers.data(), n_experts.data(), blobs.data(), tensors.size(),
-        slot_budget, slot_bytes, host_bytes, host_peak);
+        slot_budget, slot_bytes, host_bytes, host_peak, host_each != nullptr ? host_each->data() : nullptr);
     return true;
+}
+
+// NUMA check of the expert host arenas: hand the host complement allocations of all devices
+// to the backend in the order the real load performs them (the model tensor order), the
+// backend simulates the node selection of the real allocations against the per-node
+// available memory (MemFree plus reclaimable file pages minus the margin, the same figures
+// the real selection uses). Returns 1 when the placement fits, -1 when some node cannot hold
+// its planned bytes (the failing node, allocation size and available memory are returned),
+// and 0 when there is no NUMA information at all; the caller then falls back to a plain
+// total check.
+static int common_expert_check_host_nodes(
+        const std::vector<ggml_backend_dev_t> & devs,
+        const std::vector<int> & seq_dev,
+        const std::vector<size_t> & seq_size,
+        int * fail_node, size_t * fail_bytes, int64_t * fail_avail) {
+    if (seq_dev.empty()) {
+        return 1; // no expert host arena at all
+    }
+    if (seq_dev[0] < 0 || (size_t) seq_dev[0] >= devs.size() || devs[(size_t) seq_dev[0]] == nullptr) {
+        return 0;
+    }
+    ggml_backend_dev_t dev = devs[(size_t) seq_dev[0]];
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return 0;
+    }
+    typedef int (*ggml_backend_expert_check_host_nodes_t)(
+        const int *, const size_t *, size_t, int *, size_t *, int64_t *);
+    auto check = (ggml_backend_expert_check_host_nodes_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_check_host_nodes");
+    if (check == nullptr) {
+        return 0;
+    }
+    return check(seq_dev.data(), seq_size.data(), seq_dev.size(), fail_node, fail_bytes, fail_avail);
 }
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
@@ -1160,14 +1201,12 @@ static void common_params_fit_impl(
         }
 
         int64_t host_complement = 0;
+        // host complement bytes of every tensor of each device, in allocation order: the
+        // NUMA check needs the same sequence of allocations the real store will perform
+        std::vector<std::vector<size_t>> host_each(nd);
         for (size_t id = 0; id < nd; id++) {
             if (!common_buft_is_device_expert(moe_bufts[id])) {
                 continue;
-            }
-            // the whole expert set of the device: the host complement when no slot fits
-            int64_t expert_bytes_card = 0;
-            for (const common_expert_tensor & t : dev_tensors[id]) {
-                expert_bytes_card += t.n_expert * (int64_t) t.blob_bytes;
             }
 
             int64_t surplus;
@@ -1177,8 +1216,16 @@ static void common_params_fit_impl(
                 surplus = dmds_cpu_moe[id].free - int64_t(dmds_cpu_moe[id].mb.total()) - margins[id];
             }
             if (surplus <= 0) {
+                // no slot fits: the whole expert set stays in the host arena
+                size_t slot_used_none = 0;
+                size_t host_bytes_none = 0;
+                size_t host_peak_none = 0;
+                if (!common_expert_plan(moe_bufts[id], dev_tensors[id], 0, &slot_used_none, &host_bytes_none,
+                        &host_peak_none, &host_each[id])) {
+                    return;
+                }
                 common_expert_set_budget(moe_bufts[id], 0, 0);
-                host_complement += expert_bytes_card; // no slot fits: the whole set stays in host
+                host_complement += (int64_t) host_bytes_none;
                 const llama_memory_breakdown_data & mb = all_expert_store ? dmds_last[id].mb : dmds_cpu_moe[id].mb;
                 LOG_INF("%s: device %zu: dense %.0f MiB, context %.0f MiB, compute %.0f MiB, no expert VRAM surplus: all experts stay in host memory\n",
                     __func__, id, (double) mb.model/MiB, (double) mb.context/MiB, (double) mb.compute/MiB);
@@ -1206,7 +1253,7 @@ static void common_params_fit_impl(
                 stage_bytes = next;
                 slot_budget = (size_t) surplus - stage_bytes;
             }
-            if (!common_expert_plan(moe_bufts[id], dev_tensors[id], slot_budget, &slot_used, &host_bytes, &stage_peak)) {
+            if (!common_expert_plan(moe_bufts[id], dev_tensors[id], slot_budget, &slot_used, &host_bytes, &stage_peak, &host_each[id])) {
                 return;
             }
             common_expert_set_budget(moe_bufts[id], slot_budget, stage_bytes);
@@ -1230,17 +1277,59 @@ static void common_params_fit_impl(
             host_complement += (int64_t) host_bytes;
         }
 
-        // the host complement of the expert store lives in host memory
+        // the host complement of the expert store lives in host memory: check its NUMA
+        // placement node by node with the same selection and the same availability figures
+        // the real allocation uses; a plain total check remains as fallback when the backend
+        // has no NUMA information (single node machines, unsupported platforms)
         if (all_expert_store) {
-            const int64_t host_free   = dmds_full.back().free;
-            const int64_t host_margin = nd < llama_max_devices() ? (int64_t) margins_s[nd] : 0;
-            LOG_TRC("%s: expert store host complement %" PRId64 " MiB, %" PRId64 " MiB free, margin %" PRId64 " MiB\n",
-                __func__, host_complement/MiB, host_free/MiB, host_margin/MiB);
-            if (host_complement + host_margin > host_free) {
+            // the real load walks the per-buft contexts in buft name order
+            // (llama_model_loader::ctx_key_comparator) and every device has its own expert
+            // buffer type; within one context the tensors keep the model order. Rebuild that
+            // allocation sequence so the node simulation follows the real order.
+            std::vector<int> order(nd);
+            for (size_t id = 0; id < nd; id++) {
+                order[id] = (int) id;
+            }
+            std::sort(order.begin(), order.end(), [&](int a, int b) {
+                return strcmp(ggml_backend_buft_name(moe_bufts[(size_t) a]),
+                              ggml_backend_buft_name(moe_bufts[(size_t) b])) < 0;
+            });
+            std::vector<int>    seq_dev;
+            std::vector<size_t> seq_size;
+            for (int id : order) {
+                if (!common_buft_is_device_expert(moe_bufts[(size_t) id])) {
+                    continue;
+                }
+                for (const size_t bytes : host_each[(size_t) id]) {
+                    seq_dev.push_back(id);
+                    seq_size.push_back(bytes);
+                }
+            }
+
+            int     fail_node  = -1;
+            size_t  fail_bytes = 0;
+            int64_t fail_avail = 0;
+            const int check = common_expert_check_host_nodes(devs, seq_dev, seq_size, &fail_node, &fail_bytes, &fail_avail);
+            if (check < 0) {
                 throw common_params_fit_exception(
-                    "the expert complement that does not fit in the device slots needs " + std::to_string((host_complement + host_margin)/MiB) +
-                    " MiB of host memory, but only " + std::to_string(host_free/MiB) +
-                    " MiB is available; reduce the context size, use more devices or a lower quantization");
+                    "a host arena slice of " + std::to_string(fail_bytes/MiB) + " MiB of the expert complement does not fit on the best NUMA node " +
+                    std::to_string(fail_node) + ", which has only " + std::to_string(fail_avail/MiB) +
+                    " MiB available (MemFree plus reclaimable page cache, minus the reserved margin); reduce the context size, use more devices or a lower quantization");
+            }
+            if (check == 0) {
+                const int64_t host_free   = dmds_full.back().free;
+                const int64_t host_margin = nd < llama_max_devices() ? (int64_t) margins_s[nd] : 0;
+                LOG_TRC("%s: expert store host complement %" PRId64 " MiB, %" PRId64 " MiB free, margin %" PRId64 " MiB\n",
+                    __func__, host_complement/MiB, host_free/MiB, host_margin/MiB);
+                if (host_complement + host_margin > host_free) {
+                    throw common_params_fit_exception(
+                        "the expert complement that does not fit in the device slots needs " + std::to_string((host_complement + host_margin)/MiB) +
+                        " MiB of host memory, but only " + std::to_string(host_free/MiB) +
+                        " MiB is available; reduce the context size, use more devices or a lower quantization");
+                }
+            } else {
+                LOG_TRC("%s: expert store host complement %" PRId64 " MiB fits the per-node availability\n",
+                    __func__, host_complement/MiB);
             }
         }
     };

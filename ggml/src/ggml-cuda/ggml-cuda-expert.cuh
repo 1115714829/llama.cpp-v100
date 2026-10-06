@@ -98,13 +98,15 @@ void ggml_cuda_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_by
 // pure placement plan of the expert tensors of one device: the same store function that
 // alloc_buffer_n uses, so fit sizes the staging area without a trial load. The tensors arrive
 // as parallel arrays (layer, n_expert, blob_bytes). slot_budget is the VRAM budget for the
-// slots. Outputs: slot bytes, host complement bytes, and the largest single-tensor host
-// complement (the staging requirement of one prefill batch).
+// slots. Outputs: slot bytes, host complement bytes, the largest single-tensor host
+// complement (the staging requirement of one prefill batch), and, when host_bytes_each is
+// not null, the host complement bytes of every tensor in allocation order (the fit code
+// checks their NUMA placement against the nodes).
 void ggml_cuda_expert_plan(
         ggml_backend_buffer_type_t buft,
         const int * layer, const int64_t * n_expert, const size_t * blob_bytes, size_t n_tensors,
         size_t slot_budget,
-        size_t * slot_bytes, size_t * host_bytes, size_t * host_peak);
+        size_t * slot_bytes, size_t * host_bytes, size_t * host_peak, size_t * host_bytes_each);
 
 // actual allocation of the most recent expert buffer on the device of buft, for the fit
 // memory accounting: slot_bytes is real VRAM, host_bytes host memory, stage_bytes VRAM.
@@ -123,3 +125,27 @@ bool ggml_backend_cuda_expert_get_host_peak(ggml_backend_buffer_type_t buft, siz
 // cap the VRAM slot budget of one expert buffer type in bytes (0 = automatic). Exposed for
 // test-backend-ops through a backend proc address, and reserved for --expert-vram-gib later.
 void ggml_cuda_expert_set_slot_limit(ggml_backend_buffer_type_t buft, size_t bytes);
+
+// Host NUMA placement of the expert host arena, shared with the CUDA<n>_Mapped buffer type
+// (defined in ggml-cuda.cu): the same one-time bandwidth probe and the same cudaHostAlloc
+// path, so both halves of the host tier follow one placement. The node of every tensor arena
+// is picked from the measured bandwidth matrix: the best node of the device first, then the
+// next best node when a node cannot hold the arena (the nodes fill up in bandwidth order).
+// The return values of ggml_cuda_numa_reserve() that are not a node number:
+#define GGML_CUDA_NUMA_NODE_ANY  (-2) // no NUMA node information: allocate with no policy
+#define GGML_CUDA_NUMA_NODE_FAIL (-1) // no candidate node has enough available memory
+
+// reserve `size` bytes on a node for the device and return it (or GGML_CUDA_NUMA_NODE_ANY /
+// GGML_CUDA_NUMA_NODE_FAIL). The bytes count as placed while the allocation is live; a
+// failed allocation must call ggml_cuda_numa_release().
+int ggml_cuda_numa_reserve(int device, size_t size);
+
+// release a reservation of ggml_cuda_numa_reserve(), e.g. when cudaHostAlloc failed
+void ggml_cuda_numa_release(int device, int node, size_t size);
+
+// allocate pinned mapped host memory on the node, nullptr when the allocation fails
+void * ggml_cuda_numa_host_alloc(size_t size, int node);
+
+// startup log: the live host arena bytes of one device per NUMA node and the measured
+// read bandwidth for those nodes (one line)
+void ggml_cuda_numa_log_placement(int device, const char * what);

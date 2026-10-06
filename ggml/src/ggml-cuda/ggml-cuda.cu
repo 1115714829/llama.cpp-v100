@@ -1846,9 +1846,8 @@ static void ggml_cuda_mapped_buffer_verify_numa(void * ptr, size_t size, int nod
 #define GGML_CUDA_MAPPED_PROBE_REPS  3              // reads per pair, the median is kept
 #define GGML_CUDA_MAPPED_NUMA_MARGIN (4ull << 30)   // host memory kept free on every node
 
-// return values of ggml_cuda_mapped_buffer_numa_node that are not a NUMA node number
-#define GGML_CUDA_MAPPED_NUMA_NODE_ANY  (-2) // no candidate node information: allocate with no policy
-#define GGML_CUDA_MAPPED_NUMA_NODE_FAIL (-1) // no candidate node can hold the allocation
+// return values that are not a NUMA node number (GGML_CUDA_NUMA_NODE_ANY / _FAIL) are
+// defined in ggml-cuda-expert.cuh and shared with the expert host arena
 
 // read the buffer with 16-byte loads; one xor per block keeps the loads alive
 static __global__ void ggml_cuda_mapped_probe_read_kernel(const uint4 * __restrict__ src, size_t n_vec, unsigned int * __restrict__ sink) {
@@ -1881,8 +1880,13 @@ struct ggml_cuda_mapped_numa_state {
     std::vector<int> nodes;              // host NUMA nodes with memory and CPUs
     std::vector<std::vector<double>> bw; // [device][node] read bandwidth in GB/s, -1 if unknown
 
-    std::vector<int>    node;            // [device] node the mapped buffers go to, or a GGML_CUDA_MAPPED_NUMA_NODE_* value
-    std::vector<size_t> placed;          // [device] bytes of live mapped allocations
+    std::vector<int>    node;            // [device] node the mapped buffers go to, or a GGML_CUDA_NUMA_NODE_* value
+    std::vector<size_t> placed;          // [device] bytes of live device-readable host allocations
+    // the mapped buffers and the expert host arenas share the nodes, so all live
+    // allocations are accounted per node as well; placed_node holds the cross-device total
+    // used by the node selection, placed_dev_node the per-device bytes for the logs
+    std::vector<size_t> placed_node;                  // [node index]
+    std::vector<std::vector<size_t>> placed_dev_node; // [device][node index]
 };
 
 static ggml_cuda_mapped_numa_state ggml_cuda_mapped_numa;
@@ -1987,6 +1991,8 @@ static void ggml_cuda_mapped_numa_probe() {
     state.bw.assign(device_count, std::vector<double>(state.nodes.size(), -1.0));
     state.node.assign(device_count, -1);
     state.placed.assign(device_count, 0);
+    state.placed_node.assign(state.nodes.size(), 0);
+    state.placed_dev_node.assign(device_count, std::vector<size_t>(state.nodes.size(), 0));
 
     if (state.nodes.empty()) {
         GGML_LOG_WARN("%s: no NUMA node holds host memory, mapped host buffers get no NUMA policy\n", __func__);
@@ -2041,73 +2047,87 @@ static void ggml_cuda_mapped_numa_probe() {
     state.probed = true;
 }
 
-// choose the node of a new mapped allocation of `device`; the available memory of the nodes
-// (MemFree plus the reclaimable page cache, minus the margin) and the memory already placed
-// there are the constraints. The device picks the candidate with the best measured bandwidth;
-// when that node cannot hold the allocation the device moves to the best node that can.
-// A device memory node is never a candidate. Returns -1 when none of the candidates has
-// enough memory, -2 when there is no candidate information at all.
+// node index of one allocation of `device`, given the per-node available bytes: the device
+// keeps its current node while that node still has room (keep_current), otherwise the node
+// with the best measured bandwidth that can hold the allocation is chosen. *current is
+// updated to the chosen node; returns the node index, -1 when no node has enough room.
+// Both the real allocation and the fit-side simulation call this, so they agree.
 // the caller holds the mutex
-static int ggml_cuda_mapped_numa_select(int device, size_t size) {
+static int ggml_cuda_numa_pick(const std::vector<int64_t> & avail, int device, size_t size, bool keep_current, int * current) {
+    const ggml_cuda_mapped_numa_state & state = ggml_cuda_mapped_numa;
+    const size_t n_nodes = state.nodes.size();
+
+    const int cur = ggml_cuda_mapped_numa_index(*current);
+    if (keep_current && cur >= 0 && avail[cur] >= (int64_t) size) {
+        return cur;
+    }
+
+    int    best    = -1;
+    double best_bw = -1.0;
+    for (size_t n = 0; n < n_nodes; n++) {
+        const double bw = state.bw[device][n];
+        if (bw < 0 || avail[n] < (int64_t) size) {
+            continue;
+        }
+        if (best < 0 || bw > best_bw) {
+            best    = (int) n;
+            best_bw = bw;
+        }
+    }
+    if (best >= 0) {
+        *current = state.nodes[best];
+    }
+    return best;
+}
+
+// choose the node of a new device-readable host allocation of `device`; the available memory
+// of the nodes (MemFree plus the reclaimable page cache, minus the margin and the memory
+// placed by all devices) is the constraint. The device picks the candidate with the best
+// measured bandwidth; when that node cannot hold the allocation the device moves to the best
+// node that can, so a host arena that outgrows the best node spills to the next best node.
+// A device memory node is never a candidate. Returns -1 when none of the candidates has
+// enough memory, -2 when there is no candidate information at all. verbose logs the chosen
+// node; the expert host arena allocates one arena per tensor and logs per device instead.
+// the caller holds the mutex
+static int ggml_cuda_mapped_numa_select(int device, size_t size, bool verbose) {
     ggml_cuda_mapped_numa_state & state = ggml_cuda_mapped_numa;
     const size_t n_nodes = state.nodes.size();
     if (n_nodes == 0) {
-        return GGML_CUDA_MAPPED_NUMA_NODE_ANY;
+        return GGML_CUDA_NUMA_NODE_ANY;
     }
 
-    // available memory of every node minus the margin and minus the buffers placed by all
-    // devices; the available memory is unknown when the meminfo file cannot be read, then the
-    // node is not limited by the planning
+    // available memory of every node minus the margin and minus the host memory placed by
+    // all devices; the available memory is unknown when the meminfo file cannot be read, then
+    // the node is not limited by the planning
     std::vector<int64_t> avail(n_nodes, std::numeric_limits<int64_t>::max());
     for (size_t n = 0; n < n_nodes; n++) {
         const int64_t avail_mem = ggml_cuda_numa_mem_available(state.nodes[n]);
         if (avail_mem >= 0) {
-            avail[n] = avail_mem - (int64_t) GGML_CUDA_MAPPED_NUMA_MARGIN;
-        }
-    }
-    for (int d = 0; d < (int) state.placed.size(); d++) {
-        if (state.placed[d] == 0) {
-            continue;
-        }
-        const int n = ggml_cuda_mapped_numa_index(state.node[d]);
-        if (n >= 0) {
-            avail[n] -= (int64_t) state.placed[d];
+            avail[n] = avail_mem - (int64_t) GGML_CUDA_MAPPED_NUMA_MARGIN - (int64_t) state.placed_node[n];
         }
     }
 
-    // a device with existing allocations keeps its node while the node still has room
-    const int current = ggml_cuda_mapped_numa_index(state.node[device]);
-    if (current >= 0 && state.placed[device] > 0 && avail[current] >= (int64_t) size) {
-        return state.node[device];
-    }
+    int current = state.node[device];
+    const int best = ggml_cuda_numa_pick(avail, device, size, state.placed[device] > 0, &current);
 
-    int    best    = -1; // best node that can hold the allocation
-    double best_bw = -1.0;
-    int    top     = -1; // best node by bandwidth, for the log
-    double top_bw  = -1.0;
+    int    top    = -1; // best node by bandwidth, for the log
+    double top_bw = -1.0;
     for (size_t n = 0; n < n_nodes; n++) {
         const double bw = state.bw[device][n];
-        if (bw < 0) {
-            continue;
-        }
-        if (top < 0 || bw > top_bw) {
+        if (bw >= 0 && (top < 0 || bw > top_bw)) {
             top    = (int) n;
             top_bw = bw;
-        }
-        if (avail[n] >= (int64_t) size && (best < 0 || bw > best_bw)) {
-            best    = (int) n;
-            best_bw = bw;
         }
     }
 
     if (top < 0) {
         GGML_LOG_ERROR("%s: device %d: the bandwidth probe found no usable NUMA node\n", __func__, device);
-        return GGML_CUDA_MAPPED_NUMA_NODE_FAIL;
+        return GGML_CUDA_NUMA_NODE_FAIL;
     }
 
     if (best < 0) {
         // no candidate has enough memory: fail instead of spilling to a device memory node
-        GGML_LOG_ERROR("%s: device %d: no NUMA node has enough available memory for the %.2f MiB mapped allocation\n",
+        GGML_LOG_ERROR("%s: device %d: no NUMA node has enough available memory for the %.2f MiB host allocation\n",
                        __func__, device, size / 1024.0 / 1024.0);
         for (size_t n = 0; n < n_nodes; n++) {
             if (avail[n] == std::numeric_limits<int64_t>::max()) {
@@ -2117,16 +2137,19 @@ static int ggml_cuda_mapped_numa_select(int device, size_t size) {
                                __func__, state.nodes[n], avail[n] / 1024.0 / 1024.0 / 1024.0);
             }
         }
-        return GGML_CUDA_MAPPED_NUMA_NODE_FAIL;
+        return GGML_CUDA_NUMA_NODE_FAIL;
     }
 
-    if (best == top) {
-        GGML_LOG_INFO("%s: device %d: %.2f MiB on NUMA node %d (best read bandwidth %.1f GB/s)\n",
-                      __func__, device, size / 1024.0 / 1024.0, state.nodes[best], best_bw);
-    } else {
-        GGML_LOG_INFO("%s: device %d: %.2f MiB on NUMA node %d (%.1f GB/s; node %d with %.1f GB/s does not have enough available memory)\n",
-                      __func__, device, size / 1024.0 / 1024.0, state.nodes[best], best_bw,
-                      state.nodes[top], top_bw);
+    if (verbose) {
+        if (best == top) {
+            GGML_LOG_INFO("%s: device %d: %.2f MiB on NUMA node %d (best read bandwidth %.1f GB/s)\n",
+                          __func__, device, size / 1024.0 / 1024.0, state.nodes[best],
+                          state.bw[device][best]);
+        } else {
+            GGML_LOG_INFO("%s: device %d: %.2f MiB on NUMA node %d (%.1f GB/s; node %d with %.1f GB/s does not have enough available memory)\n",
+                          __func__, device, size / 1024.0 / 1024.0, state.nodes[best],
+                          state.bw[device][best], state.nodes[top], top_bw);
+        }
     }
 
     state.node[device] = state.nodes[best];
@@ -2141,36 +2164,67 @@ static int ggml_cuda_mapped_buffer_numa_node(int device, size_t size) {
         ggml_cuda_mapped_numa_probe();
     }
 
-    return ggml_cuda_mapped_numa_select(device, size);
+    return ggml_cuda_mapped_numa_select(device, size, true);
 }
 
-// account a live mapped allocation of `device`
-static void ggml_cuda_mapped_numa_commit(int device, size_t size) {
-    std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
-
+// account a live device-readable host allocation of `device` on `node`
+// the caller holds the mutex
+static void ggml_cuda_numa_commit_locked(int device, int node, size_t size) {
     ggml_cuda_mapped_numa_state & state = ggml_cuda_mapped_numa;
-    if (state.probed) {
-        state.placed[device] += size;
+    if (!state.probed) {
+        return;
+    }
+    state.placed[device] += size;
+    const int n = ggml_cuda_mapped_numa_index(node);
+    if (n >= 0) {
+        state.placed_node[n] += size;
+        state.placed_dev_node[device][n] += size;
     }
 }
 
-// release the accounting of a freed mapped allocation of `device`
-static void ggml_cuda_mapped_numa_unplace(int device, size_t size) {
-    std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
-
+// release the accounting of a freed allocation of `device` on `node`
+// the caller holds the mutex
+static void ggml_cuda_numa_unplace_locked(int device, int node, size_t size) {
+    if (node == GGML_CUDA_NUMA_NODE_FAIL) {
+        return; // a failed reservation was never accounted
+    }
     ggml_cuda_mapped_numa_state & state = ggml_cuda_mapped_numa;
-    if (state.probed && state.placed[device] >= size) {
+    if (!state.probed) {
+        return;
+    }
+    if (state.placed[device] >= size) {
         state.placed[device] -= size;
     }
+    const int n = ggml_cuda_mapped_numa_index(node);
+    if (n >= 0) {
+        if (state.placed_node[n] >= size) {
+            state.placed_node[n] -= size;
+        }
+        if (state.placed_dev_node[device][n] >= size) {
+            state.placed_dev_node[device][n] -= size;
+        }
+    }
+}
+
+// account a live mapped buffer of `device`
+static void ggml_cuda_mapped_numa_commit(int device, int node, size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
+    ggml_cuda_numa_commit_locked(device, node, size);
+}
+
+// release the accounting of a freed mapped buffer of `device`
+static void ggml_cuda_mapped_numa_unplace(int device, int node, size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
+    ggml_cuda_numa_unplace_locked(device, node, size);
 }
 
 // allocate mapped host memory on the given NUMA node: cudaHostAlloc is called under a memory
 // policy bound to that node, which places the pages there, and the placement is verified.
-// GGML_CUDA_MAPPED_NUMA_NODE_FAIL means that no candidate node has enough memory; the
-// allocation then fails (the caller has logged the details) instead of landing on an unknown
-// node, which could be the device memory of another GPU
+// GGML_CUDA_NUMA_NODE_FAIL means that no candidate node has enough memory; the allocation
+// then fails (the caller has logged the details) instead of landing on an unknown node,
+// which could be the device memory of another GPU
 static void * ggml_backend_cuda_mapped_buffer_alloc_numa(size_t size, int node) {
-    if (node == GGML_CUDA_MAPPED_NUMA_NODE_FAIL) {
+    if (node == GGML_CUDA_NUMA_NODE_FAIL) {
         return nullptr;
     }
 
@@ -2197,7 +2251,209 @@ static void * ggml_backend_cuda_mapped_buffer_alloc_numa(size_t size, int node) 
     return ptr;
 }
 
+// the shared entry points of the host NUMA placement, used by the expert host arena
+// (ggml-cuda-expert.cu) so that both halves of the host tier follow one probe and one
+// allocation path
+
+// reserve `size` bytes of device-readable host memory for `device`: run the one-time probe
+// when needed, pick the node with the shared policy and account the bytes there. Returns a
+// node number, GGML_CUDA_NUMA_NODE_ANY when there is no node information (allocate with no
+// policy) or GGML_CUDA_NUMA_NODE_FAIL when no node has enough available memory. The caller
+// releases the reservation with ggml_cuda_numa_release() when the allocation fails.
+int ggml_cuda_numa_reserve(int device, size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
+
+    if (!ggml_cuda_mapped_numa.probed) {
+        ggml_cuda_mapped_numa_probe();
+    }
+
+    const int node = ggml_cuda_mapped_numa_select(device, size, false);
+    if (node != GGML_CUDA_NUMA_NODE_FAIL) {
+        ggml_cuda_numa_commit_locked(device, node, size);
+    }
+    return node;
+}
+
+// release a reservation made by ggml_cuda_numa_reserve()
+void ggml_cuda_numa_release(int device, int node, size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
+    ggml_cuda_numa_unplace_locked(device, node, size);
+}
+
+// allocate pinned mapped host memory on the given node, with the same cudaHostAlloc path as
+// the CUDA<n>_Mapped buffer type
+void * ggml_cuda_numa_host_alloc(size_t size, int node) {
+    return ggml_backend_cuda_mapped_buffer_alloc_numa(size, node);
+}
+
+// log the live host arena of one device: the bytes per NUMA node and the measured read
+// bandwidth of the device for each of those nodes, one line
+void ggml_cuda_numa_log_placement(int device, const char * what) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
+
+    const ggml_cuda_mapped_numa_state & state = ggml_cuda_mapped_numa;
+    if (!state.probed || device < 0 || device >= (int) state.placed.size()) {
+        return;
+    }
+    if (state.nodes.empty()) {
+        if (state.placed[device] > 0) {
+            GGML_LOG_INFO("%s: device %d: %s %.1f MiB without a NUMA policy\n",
+                __func__, device, what, state.placed[device] / 1024.0 / 1024.0);
+        }
+        return;
+    }
+
+    std::string line;
+    size_t total = 0;
+    for (size_t n = 0; n < state.nodes.size(); n++) {
+        const size_t bytes = state.placed_dev_node[device][n];
+        if (bytes == 0) {
+            continue;
+        }
+        total += bytes;
+        char cell[96];
+        const double bw = state.bw[device][n];
+        if (bw >= 0) {
+            snprintf(cell, sizeof(cell), " node %d: %.1f MiB (%.1f GB/s),", state.nodes[n], bytes / 1024.0 / 1024.0, bw);
+        } else {
+            snprintf(cell, sizeof(cell), " node %d: %.1f MiB,", state.nodes[n], bytes / 1024.0 / 1024.0);
+        }
+        line += cell;
+    }
+    if (line.empty()) {
+        GGML_LOG_INFO("%s: device %d: %s none (every expert is in a VRAM slot)\n", __func__, device, what);
+        return;
+    }
+    line.pop_back(); // trailing comma
+    GGML_LOG_INFO("%s: device %d: %s %.1f MiB on%s\n", __func__, device, what, total / 1024.0 / 1024.0, line.c_str());
+}
+
+// fit-side check of the expert host arenas over the host NUMA nodes: given the host
+// complement allocations of all devices in the order the real load performs them (the model
+// tensor order), simulate the node selection of the real allocations and compare the result
+// against the per-node available memory (MemFree plus reclaimable file pages minus the
+// margin, the same figure the real selection uses). Returns 1 when the placement fits, -1
+// when some node cannot hold its planned bytes (the first failing allocation names the
+// node), and 0 when there is no NUMA information at all (the caller then falls back to a
+// plain total check). The simulation shares ggml_cuda_numa_pick() with the real allocation,
+// so a fit that passes does not fail later.
+static int ggml_backend_cuda_expert_check_host_nodes(
+        const int * devices, const size_t * sizes, size_t n_alloc,
+        int * fail_node, size_t * fail_bytes, int64_t * fail_avail) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
+
+    if (!ggml_cuda_mapped_numa.probed) {
+        ggml_cuda_mapped_numa_probe();
+    }
+    const ggml_cuda_mapped_numa_state & state = ggml_cuda_mapped_numa;
+    const size_t n_nodes = state.nodes.size();
+    if (n_nodes == 0) {
+        return 0;
+    }
+
+    std::vector<int64_t> avail(n_nodes, std::numeric_limits<int64_t>::max());
+    for (size_t n = 0; n < n_nodes; n++) {
+        const int64_t avail_mem = ggml_cuda_numa_mem_available(state.nodes[n]);
+        if (avail_mem >= 0) {
+            avail[n] = avail_mem - (int64_t) GGML_CUDA_MAPPED_NUMA_MARGIN - (int64_t) state.placed_node[n];
+        }
+    }
+
+    const size_t n_devices = state.placed.size();
+    std::vector<int>    current = state.node;  // [device] node the device currently uses
+    std::vector<size_t> placed  = state.placed; // [device] bytes already accounted
+
+    for (size_t i = 0; i < n_alloc; i++) {
+        const int    device = devices[i];
+        const size_t size   = sizes[i];
+        GGML_ASSERT(device >= 0 && (size_t) device < n_devices);
+
+        const int node = ggml_cuda_numa_pick(avail, device, size, placed[device] > 0, &current[device]);
+        if (node < 0) {
+            // the highest-bandwidth node of the device is the one that would have to hold
+            // the allocation; report it with its available memory
+            int    top    = -1;
+            double top_bw = -1.0;
+            for (size_t n = 0; n < n_nodes; n++) {
+                const double bw = state.bw[device][n];
+                if (bw >= 0 && (top < 0 || bw > top_bw)) {
+                    top    = (int) n;
+                    top_bw = bw;
+                }
+            }
+            if (fail_node  != nullptr) {
+                *fail_node = top >= 0 ? state.nodes[top] : -1;
+            }
+            if (fail_bytes != nullptr) {
+                *fail_bytes = size;
+            }
+            if (fail_avail != nullptr) {
+                *fail_avail = top >= 0 ? std::max<int64_t>(avail[top], 0) : 0;
+            }
+            return -1;
+        }
+        placed[device] += size;
+        avail[node] = std::max<int64_t>(avail[node] - (int64_t) size, 0);
+    }
+
+    return 1;
+}
+
 #endif // !defined(GGML_USE_MUSA) && defined(GGML_CUDA_MAPPED_NUMA)
+
+// stubs when the host NUMA planning is not compiled in (non-Linux, HIP, MUSA): the expert
+// host arenas then fall back to plain cudaHostAlloc without a node policy
+#if !defined(GGML_CUDA_MAPPED_NUMA)
+int ggml_cuda_numa_reserve(int device, size_t size) {
+    GGML_UNUSED(device);
+    GGML_UNUSED(size);
+    return GGML_CUDA_NUMA_NODE_ANY;
+}
+
+void ggml_cuda_numa_release(int device, int node, size_t size) {
+    GGML_UNUSED(device);
+    GGML_UNUSED(node);
+    GGML_UNUSED(size);
+}
+
+void * ggml_cuda_numa_host_alloc(size_t size, int node) {
+    if (node == GGML_CUDA_NUMA_NODE_FAIL) {
+        return nullptr;
+    }
+#if defined(GGML_USE_MUSA)
+    // MUSA has no host-mapped memory APIs; the expert store is not compiled there either
+    GGML_UNUSED(size);
+    return nullptr;
+#else
+    void * host_ptr = nullptr;
+    cudaError_t err = cudaHostAlloc(&host_ptr, size, cudaHostAllocMapped | cudaHostAllocPortable);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: cudaHostAlloc of %.2f MiB failed: %s\n",
+                       __func__, size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return nullptr;
+    }
+    return host_ptr;
+#endif
+}
+
+void ggml_cuda_numa_log_placement(int device, const char * what) {
+    GGML_UNUSED(device);
+    GGML_UNUSED(what);
+}
+
+static int ggml_backend_cuda_expert_check_host_nodes(
+        const int * devices, const size_t * sizes, size_t n_alloc,
+        int * fail_node, size_t * fail_bytes, int64_t * fail_avail) {
+    GGML_UNUSED(devices);
+    GGML_UNUSED(sizes);
+    GGML_UNUSED(n_alloc);
+    GGML_UNUSED(fail_node);
+    GGML_UNUSED(fail_bytes);
+    GGML_UNUSED(fail_avail);
+    return 0;
+}
+#endif // !defined(GGML_CUDA_MAPPED_NUMA)
 
 // mapped host buffer type
 //
@@ -2211,12 +2467,13 @@ static void * ggml_backend_cuda_mapped_buffer_alloc_numa(size_t size, int node) 
 
 struct ggml_backend_cuda_mapped_buffer_context {
     int device;
+    int numa_node = GGML_CUDA_NUMA_NODE_ANY; // node the allocation was placed on
     void * host_ptr = nullptr;
     void * dev_ptr  = nullptr;
     std::string name;
 
-    ggml_backend_cuda_mapped_buffer_context(int device, void * host_ptr, void * dev_ptr) :
-        device(device), host_ptr(host_ptr), dev_ptr(dev_ptr),
+    ggml_backend_cuda_mapped_buffer_context(int device, int numa_node, void * host_ptr, void * dev_ptr) :
+        device(device), numa_node(numa_node), host_ptr(host_ptr), dev_ptr(dev_ptr),
         name(GGML_CUDA_NAME + std::to_string(device) + "_Mapped") {
     }
 
@@ -2236,7 +2493,7 @@ static const char * ggml_backend_cuda_mapped_buffer_type_name(ggml_backend_buffe
 static void ggml_backend_cuda_mapped_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *)buffer->context;
 #if defined(GGML_CUDA_MAPPED_NUMA)
-    ggml_cuda_mapped_numa_unplace(ctx->device, buffer->size);
+    ggml_cuda_mapped_numa_unplace(ctx->device, ctx->numa_node, buffer->size);
 #endif
     delete ctx;
 }
@@ -2330,10 +2587,11 @@ static ggml_backend_buffer_t ggml_backend_cuda_mapped_buffer_type_alloc_buffer(g
 
     void * host_ptr = nullptr;
     cudaError_t err = cudaSuccess;
+    int node = GGML_CUDA_NUMA_NODE_ANY;
 #if defined(GGML_CUDA_MAPPED_NUMA)
     // allocate on the NUMA node selected from the measured bandwidth matrix; the probe runs on
     // the first allocation and may leave another device current, hence the set_device below
-    const int node = ggml_cuda_mapped_buffer_numa_node(buft_ctx->device, size);
+    node = ggml_cuda_mapped_buffer_numa_node(buft_ctx->device, size);
     ggml_cuda_set_device(buft_ctx->device);
     host_ptr = ggml_backend_cuda_mapped_buffer_alloc_numa(size, node);
 #else
@@ -2359,9 +2617,9 @@ static ggml_backend_buffer_t ggml_backend_cuda_mapped_buffer_type_alloc_buffer(g
         return nullptr;
     }
 
-    ggml_backend_cuda_mapped_buffer_context * ctx = new ggml_backend_cuda_mapped_buffer_context(buft_ctx->device, host_ptr, dev_ptr);
+    ggml_backend_cuda_mapped_buffer_context * ctx = new ggml_backend_cuda_mapped_buffer_context(buft_ctx->device, node, host_ptr, dev_ptr);
 #if defined(GGML_CUDA_MAPPED_NUMA)
-    ggml_cuda_mapped_numa_commit(buft_ctx->device, size);
+    ggml_cuda_mapped_numa_commit(buft_ctx->device, node, size);
     if (node >= 0) {
         GGML_LOG_INFO("%s: mapped host buffer for device %d: %.2f MiB on NUMA node %d\n",
                       __func__, buft_ctx->device, size / 1024.0 / 1024.0, node);
@@ -8558,13 +8816,16 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_expert_get_allocation;
     }
     if (strcmp(name, "ggml_backend_cuda_expert_get_host_peak") == 0) {
-        return (void *)ggml_cuda_expert_get_host_peak;
+        return (void *)ggml_backend_cuda_expert_get_host_peak;
     }
     if (strcmp(name, "ggml_backend_cuda_expert_reset_allocation") == 0) {
         return (void *)ggml_cuda_expert_reset_allocation;
     }
     if (strcmp(name, "ggml_backend_cuda_expert_plan") == 0) {
         return (void *)ggml_cuda_expert_plan;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_check_host_nodes") == 0) {
+        return (void *)ggml_backend_cuda_expert_check_host_nodes;
     }
     if (strcmp(name, "ggml_backend_expert_store_model_loaded") == 0) {
         return (void *)ggml_backend_cuda_expert_verify_all;

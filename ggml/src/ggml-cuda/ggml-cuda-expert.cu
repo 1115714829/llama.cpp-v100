@@ -15,6 +15,11 @@
 #include <mutex>
 #include <vector>
 
+#if defined(__linux__)
+#include <cerrno>
+#include <sys/mman.h>
+#endif
+
 #if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
 
 // CUDA implementation of the expert store memory operations. The store itself keeps the
@@ -57,23 +62,39 @@ static void ggml_cuda_expert_free_device(void * user, void * ptr) {
     CUDA_CHECK(cudaFree(ptr));
 }
 
+// node and size of every live host arena allocation, for the NUMA accounting and for the
+// page drop on free; keyed by the host pointer
+static std::mutex g_expert_host_mutex;
+static std::map<void *, std::pair<int, size_t>> g_expert_host_alloc;
+
 static void * ggml_cuda_expert_alloc_host(void * user, size_t size, void ** dev_ptr) {
     const int device = (int) (intptr_t) user;
     ggml_cuda_set_device(device);
 
-    void * host_ptr = nullptr;
-    cudaError_t err = cudaHostAlloc(&host_ptr, size, cudaHostAllocMapped | cudaHostAllocPortable);
-    if (err != cudaSuccess) {
-        (void) cudaGetLastError();
-        GGML_LOG_ERROR("%s: cudaHostAlloc of %.2f MiB failed on device %d: %s\n",
-            __func__, size / 1024.0 / 1024.0, device, cudaGetErrorString(err));
+    // the host arena follows the same NUMA placement as the CUDA<n>_Mapped buffer type:
+    // reserve picks the best measured node of the device; when that node cannot hold the
+    // arena, the next best node with room takes it, so the arena spills in bandwidth order
+    const int node = ggml_cuda_numa_reserve(device, size);
+    ggml_cuda_set_device(device); // the probe may have left another device current
+
+    void * host_ptr = ggml_cuda_numa_host_alloc(size, node);
+    if (host_ptr == nullptr) {
+        if (node != GGML_CUDA_NUMA_NODE_FAIL) {
+            ggml_cuda_numa_release(device, node, size);
+        }
         return nullptr;
     }
-    err = cudaHostGetDevicePointer(dev_ptr, host_ptr, 0);
+    cudaError_t err = cudaHostGetDevicePointer(dev_ptr, host_ptr, 0);
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
+        ggml_cuda_numa_release(device, node, size);
         CUDA_CHECK(cudaFreeHost(host_ptr));
         return nullptr;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_expert_host_mutex);
+        g_expert_host_alloc[host_ptr] = { node, size };
     }
     return host_ptr;
 }
@@ -81,6 +102,30 @@ static void * ggml_cuda_expert_alloc_host(void * user, size_t size, void ** dev_
 static void ggml_cuda_expert_free_host(void * user, void * ptr) {
     const int device = (int) (intptr_t) user;
     ggml_cuda_set_device(device);
+
+    int    node = GGML_CUDA_NUMA_NODE_ANY;
+    size_t size = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_expert_host_mutex);
+        const auto it = g_expert_host_alloc.find(ptr);
+        if (it != g_expert_host_alloc.end()) {
+            node = it->second.first;
+            size = it->second.second;
+            g_expert_host_alloc.erase(it);
+        }
+    }
+    if (size > 0) {
+        ggml_cuda_numa_release(device, node, size);
+    }
+
+    // Strata A9: an arena that is no longer needed only drops its physical pages first
+    // (MADV_DONTNEED), cudaFreeHost then returns the pinned mapping itself
+#if defined(MADV_DONTNEED)
+    if (ptr != nullptr && size > 0 && madvise(ptr, size, MADV_DONTNEED) != 0) {
+        GGML_LOG_DEBUG("%s: MADV_DONTNEED of %.2f MiB failed: %s\n",
+            __func__, size / 1024.0 / 1024.0, strerror(errno));
+    }
+#endif
     CUDA_CHECK(cudaFreeHost(ptr));
 }
 
@@ -1046,6 +1091,10 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
         GGML_LOG_INFO("%s: device %d: expert store: slots %.2f MiB, host complement %.2f MiB, staging %.2f MiB, prefill direct-read %.0f%%\n",
             __func__, device, plan.slot_used / 1024.0 / 1024.0, plan.host_bytes / 1024.0 / 1024.0,
             stage_budget / 1024.0 / 1024.0, direct);
+
+        // host arena placement: the NUMA nodes, the bytes on each of them and the measured
+        // read bandwidth of this device for those nodes, one line per device
+        ggml_cuda_numa_log_placement(device, "expert host complement");
     }
 
     // plain tensors: one block of device memory, laid out like the regular CUDA buffer type
@@ -1139,12 +1188,14 @@ void ggml_backend_cuda_expert_verify_all(void) {
 
 // pure placement plan for the fit code: the same store function that alloc_buffer_n uses, so
 // the fit estimate and the real allocation match byte for byte. The tensors arrive as
-// parallel arrays to keep the interface free of internal store types.
+// parallel arrays to keep the interface free of internal store types. host_bytes_each, when
+// not null, receives the host complement bytes of every tensor in allocation order (the fit
+// code checks their NUMA placement against the nodes).
 void ggml_cuda_expert_plan(
         ggml_backend_buffer_type_t buft,
         const int * layer, const int64_t * n_expert, const size_t * blob_bytes, size_t n_tensors,
         size_t slot_budget,
-        size_t * slot_bytes, size_t * host_bytes, size_t * host_peak) {
+        size_t * slot_bytes, size_t * host_bytes, size_t * host_peak, size_t * host_bytes_each) {
     if (buft == nullptr || !ggml_cuda_expert_buft_is_expert(buft)) {
         return;
     }
@@ -1166,6 +1217,11 @@ void ggml_cuda_expert_plan(
     }
     if (host_peak != nullptr) {
         *host_peak = (size_t) plan.host_peak;
+    }
+    if (host_bytes_each != nullptr) {
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            host_bytes_each[i] = (size_t) plan.host_used[i];
+        }
     }
 }
 
@@ -1304,7 +1360,7 @@ void ggml_cuda_expert_plan(
         ggml_backend_buffer_type_t buft,
         const int * layer, const int64_t * n_expert, const size_t * blob_bytes, size_t n_tensors,
         size_t slot_budget,
-        size_t * slot_bytes, size_t * host_bytes, size_t * host_peak) {
+        size_t * slot_bytes, size_t * host_bytes, size_t * host_peak, size_t * host_bytes_each) {
     GGML_UNUSED(buft);
     GGML_UNUSED(layer);
     GGML_UNUSED(n_expert);
@@ -1314,6 +1370,7 @@ void ggml_cuda_expert_plan(
     GGML_UNUSED(slot_bytes);
     GGML_UNUSED(host_bytes);
     GGML_UNUSED(host_peak);
+    GGML_UNUSED(host_bytes_each);
 }
 
 void ggml_cuda_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t stage_bytes) {
