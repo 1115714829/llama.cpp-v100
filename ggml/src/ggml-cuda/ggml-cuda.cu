@@ -91,11 +91,34 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <cerrno>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
+
+#if defined(__linux__)
+#include <dirent.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+// MPOL_BIND / MPOL_DEFAULT from <linux/mempolicy.h>; defined here to avoid pulling in kernel headers
+#ifndef MPOL_BIND
+#define MPOL_BIND 2
+#endif
+#ifndef MPOL_DEFAULT
+#define MPOL_DEFAULT 0
+#endif
+
+// on Linux the CUDA mapped host memory is allocated with cudaHostAlloc under a
+// set_mempolicy(MPOL_BIND) policy on the allocating thread, which pins the pages to the
+// NUMA node selected by a one-time bandwidth probe; HIP and MUSA keep using plain cudaHostAlloc
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && defined(__linux__)
+#define GGML_CUDA_MAPPED_NUMA
+#endif
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -1586,6 +1609,833 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 //}
 
+// NUMA helpers for the mapped host buffer
+//
+// The mapped host memory of a device should be allocated on the host NUMA node with the best
+// measured read bandwidth for that device. The bandwidth matrix of all (device, node) pairs is
+// measured once on the first mapped allocation and the node of each device is planned from it
+// under the available memory of the nodes. The memory itself comes from cudaHostAlloc called under a
+// set_mempolicy(MPOL_BIND) policy on the allocating thread.
+
+#if !defined(GGML_USE_MUSA) && defined(GGML_CUDA_MAPPED_NUMA)
+
+// list of online NUMA nodes
+static const std::vector<int> & ggml_cuda_online_numa_nodes() {
+    static const std::vector<int> nodes = []() {
+        std::vector<int> ret;
+
+        FILE * f = fopen("/sys/devices/system/node/online", "r");
+        if (f == nullptr) {
+            return ret;
+        }
+
+        // the file holds a CPU list such as "0-1" or "0,8"
+        char buf[256] = {};
+        if (fgets(buf, sizeof(buf), f) != nullptr) {
+            for (char * tok = strtok(buf, ",\n"); tok != nullptr; tok = strtok(nullptr, ",\n")) {
+                int first = -1;
+                int last  = -1;
+                if (sscanf(tok, "%d-%d", &first, &last) == 2) {
+                    for (int n = first; n <= last && n - first < 1024; n++) {
+                        ret.push_back(n);
+                    }
+                } else if (sscanf(tok, "%d", &first) == 1) {
+                    ret.push_back(first);
+                }
+            }
+        }
+        fclose(f);
+        return ret;
+    }();
+    return nodes;
+}
+
+// a host NUMA node has CPUs and host memory; on POWER9 the device memory nodes of the GPUs
+// (e.g. 250-255) show up in sysfs as well: their cpulist file exists but is empty, and a
+// mapped host buffer must never be placed there. Two independent checks reject them: the
+// cpulist must name at least one CPU, and the node directory must hold cpu<n> links. The
+// links come from the CPU topology, the cpulist from the node mask, so a device memory node
+// fails both even if one of the two files has unexpected content.
+static bool ggml_cuda_numa_node_is_host(int node, const char ** reason) {
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
+
+    FILE * f = fopen(path, "r");
+    if (f == nullptr) {
+        *reason = "no cpulist file";
+        return false;
+    }
+
+    char buf[256] = {};
+    const bool has_cpu = fgets(buf, sizeof(buf), f) != nullptr && strspn(buf, " \t\r\n") < strlen(buf);
+    fclose(f);
+    if (!has_cpu) {
+        *reason = "empty cpulist (device memory node)";
+        return false;
+    }
+
+    snprintf(path, sizeof(path), "/sys/devices/system/node/node%d", node);
+    DIR * dir = opendir(path);
+    if (dir != nullptr) {
+        bool has_cpu_links = false;
+        while (const struct dirent * entry = readdir(dir)) {
+            if (strncmp(entry->d_name, "cpu", 3) == 0 && entry->d_name[3] >= '0' && entry->d_name[3] <= '9') {
+                has_cpu_links = true;
+                break;
+            }
+        }
+        closedir(dir);
+        if (!has_cpu_links) {
+            *reason = "no cpu<n> links (device memory node)";
+            return false;
+        }
+    }
+
+    snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/meminfo", node);
+    if (access(path, R_OK) != 0) {
+        *reason = "meminfo not readable";
+        return false;
+    }
+
+    *reason = nullptr;
+    return true;
+}
+
+// available host memory of a NUMA node in bytes, -1 if unknown
+//
+// The per-node meminfo has no MemAvailable, so estimate it the way the kernel does: free
+// memory plus the reclaimable page cache (Active(file) + Inactive(file), i.e. FilePages).
+// The page cache of the model file fills the host nodes at startup but is evictable, so
+// counting only MemFree would reject nodes that can hold the mapped buffers.
+static int64_t ggml_cuda_numa_mem_available(int node) {
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/meminfo", node);
+
+    FILE * f = fopen(path, "r");
+    if (f == nullptr) {
+        return -1;
+    }
+
+    int64_t free_kb = -1;
+    int64_t file_kb = 0;
+    char line[256] = {};
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        long long kb = 0;
+        if (sscanf(line, "Node %*d MemFree: %lld kB", &kb) == 1) {
+            free_kb = (int64_t) kb;
+        } else if (sscanf(line, "Node %*d Active(file): %lld kB", &kb) == 1 ||
+                   sscanf(line, "Node %*d Inactive(file): %lld kB", &kb) == 1) {
+            file_kb += (int64_t) kb;
+        }
+    }
+    fclose(f);
+
+    return free_kb >= 0 ? (free_kb + file_kb) * 1024 : -1;
+}
+
+// highest NUMA node number in /sys/devices/system/node/possible, used to size the node mask.
+// The file holds a node list such as "0,8,250-255". A single unsigned long only covers nodes
+// 0..63, and this machine has GPU memory nodes up to 255, so the mask must be an array.
+static int ggml_cuda_numa_max_node() {
+    FILE * f = fopen("/sys/devices/system/node/possible", "r");
+    if (f == nullptr) {
+        return 1023;
+    }
+
+    int max_node = -1;
+    char buf[256] = {};
+    if (fgets(buf, sizeof(buf), f) != nullptr) {
+        for (char * tok = strtok(buf, ",\n"); tok != nullptr; tok = strtok(nullptr, ",\n")) {
+            int first = -1;
+            int last  = -1;
+            if (sscanf(tok, "%d-%d", &first, &last) == 2) {
+                max_node = std::max(max_node, last);
+            } else if (sscanf(tok, "%d", &first) == 1) {
+                max_node = std::max(max_node, first);
+            }
+        }
+    }
+    fclose(f);
+
+    return max_node >= 0 ? max_node : 1023;
+}
+
+// build a one-node node mask for set_mempolicy; returns the maxnode the kernel expects
+static unsigned long ggml_cuda_nodemask_one(int node, std::vector<unsigned long> & nodemask) {
+    const int bits = 8 * (int) sizeof(unsigned long);
+    const int max_node = ggml_cuda_numa_max_node();
+
+    // the kernel subtracts one from maxnode before reading the mask, so maxnode is the
+    // number of mask bits plus one; the extra word keeps the target bit out of the last word
+    nodemask.assign(max_node/bits + 2, 0);
+    nodemask[node/bits] |= 1ul << (node % bits);
+    return (unsigned long) nodemask.size() * bits + 1;
+}
+
+// bind the memory policy of the calling thread to one NUMA node; cudaHostAlloc allocations made
+// by the thread then come from that node
+static bool ggml_cuda_set_mempolicy_node(int node) {
+    std::vector<unsigned long> nodemask;
+    const unsigned long maxnode = ggml_cuda_nodemask_one(node, nodemask);
+
+    if (syscall(SYS_set_mempolicy, MPOL_BIND, nodemask.data(), maxnode) != 0) {
+        GGML_LOG_WARN("%s: failed to bind the memory policy to NUMA node %d (maxnode %lu): %s\n",
+                      __func__, node, maxnode, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+static void ggml_cuda_reset_mempolicy() {
+    if (syscall(SYS_set_mempolicy, MPOL_DEFAULT, (const unsigned long *) nullptr, 0) != 0) {
+        GGML_LOG_WARN("%s: failed to restore the default memory policy: %s\n", __func__, strerror(errno));
+    }
+}
+
+// verify that the pages of a faulted range are on the requested node; samples at most 16 pages
+static void ggml_cuda_mapped_buffer_verify_numa(void * ptr, size_t size, int node) {
+#if defined(SYS_move_pages)
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    const size_t n_pages = size / page;
+    if (n_pages == 0) {
+        return;
+    }
+
+    // spread the samples over the whole range instead of checking only the first page
+    const size_t n_samples = std::min<size_t>(n_pages, 16);
+    std::vector<void *> pages(n_samples);
+    std::vector<int>    status(n_samples, -1);
+    for (size_t i = 0; i < n_samples; i++) {
+        pages[i] = (char *) ptr + (n_pages/n_samples)*i*page;
+    }
+
+    // a null nodes array makes the call return the node of each page in status
+    if (syscall(SYS_move_pages, 0, n_samples, pages.data(), nullptr, status.data(), 0) != 0) {
+        GGML_LOG_WARN("%s: failed to query the NUMA node of %.2f MiB of host memory: %s\n",
+                      __func__, size / 1024.0 / 1024.0, strerror(errno));
+        return;
+    }
+
+    size_t on_node = 0;
+    for (size_t i = 0; i < n_samples; i++) {
+        on_node += status[i] == node;
+    }
+    if (on_node == n_samples) {
+        GGML_LOG_INFO("%s: verified %.2f MiB of host memory on NUMA node %d (%zu/%zu sampled pages)\n",
+                      __func__, size / 1024.0 / 1024.0, node, on_node, n_samples);
+    } else {
+        GGML_LOG_WARN("%s: %.2f MiB of host memory is only partly on NUMA node %d (%zu/%zu sampled pages)\n",
+                      __func__, size / 1024.0 / 1024.0, node, on_node, n_samples);
+    }
+#else
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    GGML_UNUSED(node);
+#endif
+}
+
+// bandwidth probe and placement of the mapped host buffers
+//
+// The read bandwidth of a GPU to a host NUMA node cannot be derived from the PCI topology: on
+// AC922 some GPUs read the second CPU faster than the first one, and "local" is not always the
+// best node. The bandwidth is measured instead: a small pinned buffer is placed on every
+// (device, node) pair with the same allocation path as the real buffers and read with a wide
+// load kernel. The node of each device is planned from the matrix and moved to the next best
+// node when a node does not have enough available memory for all the allocations that want it.
+// When no candidate node fits, the allocation fails instead of spilling to a device memory node.
+
+#define GGML_CUDA_MAPPED_PROBE_SIZE  (128ull << 20) // bytes of the probe buffer per (device, node)
+#define GGML_CUDA_MAPPED_PROBE_REPS  3              // reads per pair, the median is kept
+#define GGML_CUDA_MAPPED_NUMA_MARGIN (4ull << 30)   // host memory kept free on every node
+
+// return values of ggml_cuda_mapped_buffer_numa_node that are not a NUMA node number
+#define GGML_CUDA_MAPPED_NUMA_NODE_ANY  (-2) // no candidate node information: allocate with no policy
+#define GGML_CUDA_MAPPED_NUMA_NODE_FAIL (-1) // no candidate node can hold the allocation
+
+// read the buffer with 16-byte loads; one xor per block keeps the loads alive
+static __global__ void ggml_cuda_mapped_probe_read_kernel(const uint4 * __restrict__ src, size_t n_vec, unsigned int * __restrict__ sink) {
+    const size_t tid    = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = (size_t) gridDim.x  * blockDim.x;
+
+    unsigned int acc = 0;
+    for (size_t i = tid; i < n_vec; i += stride) {
+        const uint4 v = src[i];
+        acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+
+    __shared__ unsigned int sdata[256];
+    sdata[threadIdx.x] = acc;
+    __syncthreads();
+    for (int s = blockDim.x/2; s > 0; s >>= 1) {
+        if ((int) threadIdx.x < s) {
+            sdata[threadIdx.x] ^= sdata[threadIdx.x + s];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        atomicXor(sink, sdata[0]);
+    }
+}
+
+struct ggml_cuda_mapped_numa_state {
+    bool probed = false;
+
+    std::vector<int> nodes;              // host NUMA nodes with memory and CPUs
+    std::vector<std::vector<double>> bw; // [device][node] read bandwidth in GB/s, -1 if unknown
+
+    std::vector<int>    node;            // [device] node the mapped buffers go to, or a GGML_CUDA_MAPPED_NUMA_NODE_* value
+    std::vector<size_t> placed;          // [device] bytes of live mapped allocations
+};
+
+static ggml_cuda_mapped_numa_state ggml_cuda_mapped_numa;
+static std::mutex ggml_cuda_mapped_numa_mutex;
+
+// index of a node in the state, -1 if absent
+static int ggml_cuda_mapped_numa_index(int node) {
+    const std::vector<int> & nodes = ggml_cuda_mapped_numa.nodes;
+    const auto it = std::find(nodes.begin(), nodes.end(), node);
+    return it == nodes.end() ? -1 : (int) (it - nodes.begin());
+}
+
+// measure the bandwidth one device reads one node with
+static double ggml_cuda_mapped_probe_bw(int device, int node) {
+    ggml_cuda_set_device(device);
+
+    void * host_ptr = nullptr;
+    if (!ggml_cuda_set_mempolicy_node(node)) {
+        // the node is not usable, report no bandwidth instead of a misleading value
+        return -1.0;
+    }
+    cudaError_t err = cudaHostAlloc(&host_ptr, GGML_CUDA_MAPPED_PROBE_SIZE, cudaHostAllocMapped | cudaHostAllocPortable);
+    ggml_cuda_reset_mempolicy();
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: device %d, node %d: cudaHostAlloc failed: %s\n",
+                      __func__, device, node, cudaGetErrorString(err));
+        return -1.0;
+    }
+
+    void * dev_ptr = nullptr;
+    err = cudaHostGetDevicePointer(&dev_ptr, host_ptr, 0);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: device %d, node %d: cudaHostGetDevicePointer failed: %s\n",
+                      __func__, device, node, cudaGetErrorString(err));
+        CUDA_CHECK(cudaFreeHost(host_ptr));
+        return -1.0;
+    }
+
+    unsigned int * sink = nullptr;
+    cudaEvent_t ev_start = nullptr;
+    cudaEvent_t ev_stop  = nullptr;
+    if (cudaMalloc((void **) &sink, sizeof(unsigned int)) != cudaSuccess ||
+        cudaEventCreate(&ev_start) != cudaSuccess ||
+        cudaEventCreate(&ev_stop) != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: device %d, node %d: probe setup failed\n", __func__, device, node);
+        (void) cudaFree(sink);
+        (void) cudaEventDestroy(ev_start);
+        (void) cudaEventDestroy(ev_stop);
+        CUDA_CHECK(cudaFreeHost(host_ptr));
+        return -1.0;
+    }
+
+    CUDA_CHECK(cudaMemset(sink, 0, sizeof(unsigned int)));
+
+    // enough blocks to cover the device, each thread then walks the buffer with a fixed stride
+    const int    nsm   = std::max(1, ggml_cuda_info().devices[device].nsm);
+    const size_t n_vec = GGML_CUDA_MAPPED_PROBE_SIZE / sizeof(uint4);
+
+    std::vector<float> ms;
+    ms.reserve(GGML_CUDA_MAPPED_PROBE_REPS);
+    for (int r = 0; r < GGML_CUDA_MAPPED_PROBE_REPS; r++) {
+        CUDA_CHECK(cudaEventRecord(ev_start, cudaStreamPerThread));
+        ggml_cuda_mapped_probe_read_kernel<<<nsm * 8, 256, 0, cudaStreamPerThread>>>((const uint4 *) dev_ptr, n_vec, sink);
+        CUDA_CHECK(cudaEventRecord(ev_stop, cudaStreamPerThread));
+        CUDA_CHECK(cudaEventSynchronize(ev_stop));
+
+        float t = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&t, ev_start, ev_stop));
+        ms.push_back(t);
+    }
+    std::sort(ms.begin(), ms.end());
+
+    CUDA_CHECK(cudaFree(sink));
+    CUDA_CHECK(cudaEventDestroy(ev_start));
+    CUDA_CHECK(cudaEventDestroy(ev_stop));
+    CUDA_CHECK(cudaFreeHost(host_ptr));
+
+    return (double) GGML_CUDA_MAPPED_PROBE_SIZE / (ms[ms.size() / 2] * 1e6);
+}
+
+// measure the full bandwidth matrix and print it; the caller holds the mutex and has not probed
+static void ggml_cuda_mapped_numa_probe() {
+    ggml_cuda_mapped_numa_state & state = ggml_cuda_mapped_numa;
+
+    // only nodes that are known to hold host memory are candidates; device memory nodes are
+    // listed with the reason for their rejection, and the bandwidth matrix only covers the
+    // candidates, so no device can ever be placed on a device memory node
+    for (int node : ggml_cuda_online_numa_nodes()) {
+        const char * reason = nullptr;
+        if (ggml_cuda_numa_node_is_host(node, &reason)) {
+            GGML_LOG_INFO("%s: NUMA node %d: candidate (CPUs and host memory)\n", __func__, node);
+            state.nodes.push_back(node);
+        } else {
+            GGML_LOG_INFO("%s: NUMA node %d: excluded (%s)\n", __func__, node, reason);
+        }
+    }
+
+    const int device_count = ggml_backend_cuda_get_device_count();
+    state.bw.assign(device_count, std::vector<double>(state.nodes.size(), -1.0));
+    state.node.assign(device_count, -1);
+    state.placed.assign(device_count, 0);
+
+    if (state.nodes.empty()) {
+        GGML_LOG_WARN("%s: no NUMA node holds host memory, mapped host buffers get no NUMA policy\n", __func__);
+        state.probed = true;
+        return;
+    }
+
+    GGML_LOG_INFO("%s: probing the mapped host buffer read bandwidth of %d device(s) from %zu NUMA node(s)\n",
+                  __func__, device_count, state.nodes.size());
+
+    // virtual devices that share a physical GPU have the same bandwidth: measure every
+    // physical device once and copy the row to the other virtual devices
+    std::vector<int> probed_physical;
+    for (int device = 0; device < device_count; device++) {
+        const int physical = ggml_cuda_get_physical_device(device);
+        const auto it = std::find(probed_physical.begin(), probed_physical.end(), physical);
+        if (it != probed_physical.end()) {
+            state.bw[device] = state.bw[(size_t) (it - probed_physical.begin())];
+            continue;
+        }
+        probed_physical.push_back(physical);
+
+        for (size_t n = 0; n < state.nodes.size(); n++) {
+            state.bw[device][n] = ggml_cuda_mapped_probe_bw(device, state.nodes[n]);
+        }
+    }
+
+    GGML_LOG_INFO("%s: mapped host buffer read bandwidth in GB/s, rows: device, columns: node\n", __func__);
+    for (int device = 0; device < device_count; device++) {
+        std::string row = "  CUDA" + std::to_string(device) + ":";
+        for (size_t n = 0; n < state.nodes.size(); n++) {
+            char cell[32];
+            if (state.bw[device][n] >= 0) {
+                snprintf(cell, sizeof(cell), " node %d: %.1f", state.nodes[n], state.bw[device][n]);
+            } else {
+                snprintf(cell, sizeof(cell), " node %d: n/a", state.nodes[n]);
+            }
+            row += cell;
+        }
+        GGML_LOG_INFO("%s:%s\n", __func__, row.c_str());
+    }
+    for (size_t n = 0; n < state.nodes.size(); n++) {
+        const int64_t avail_mem = ggml_cuda_numa_mem_available(state.nodes[n]);
+        if (avail_mem >= 0) {
+            GGML_LOG_INFO("%s: NUMA node %d: %.1f GiB available (MemFree plus reclaimable page cache)\n",
+                          __func__, state.nodes[n], avail_mem / 1024.0 / 1024.0 / 1024.0);
+        } else {
+            GGML_LOG_INFO("%s: NUMA node %d: available memory unknown\n", __func__, state.nodes[n]);
+        }
+    }
+
+    state.probed = true;
+}
+
+// choose the node of a new mapped allocation of `device`; the available memory of the nodes
+// (MemFree plus the reclaimable page cache, minus the margin) and the memory already placed
+// there are the constraints. The device picks the candidate with the best measured bandwidth;
+// when that node cannot hold the allocation the device moves to the best node that can.
+// A device memory node is never a candidate. Returns -1 when none of the candidates has
+// enough memory, -2 when there is no candidate information at all.
+// the caller holds the mutex
+static int ggml_cuda_mapped_numa_select(int device, size_t size) {
+    ggml_cuda_mapped_numa_state & state = ggml_cuda_mapped_numa;
+    const size_t n_nodes = state.nodes.size();
+    if (n_nodes == 0) {
+        return GGML_CUDA_MAPPED_NUMA_NODE_ANY;
+    }
+
+    // available memory of every node minus the margin and minus the buffers placed by all
+    // devices; the available memory is unknown when the meminfo file cannot be read, then the
+    // node is not limited by the planning
+    std::vector<int64_t> avail(n_nodes, std::numeric_limits<int64_t>::max());
+    for (size_t n = 0; n < n_nodes; n++) {
+        const int64_t avail_mem = ggml_cuda_numa_mem_available(state.nodes[n]);
+        if (avail_mem >= 0) {
+            avail[n] = avail_mem - (int64_t) GGML_CUDA_MAPPED_NUMA_MARGIN;
+        }
+    }
+    for (int d = 0; d < (int) state.placed.size(); d++) {
+        if (state.placed[d] == 0) {
+            continue;
+        }
+        const int n = ggml_cuda_mapped_numa_index(state.node[d]);
+        if (n >= 0) {
+            avail[n] -= (int64_t) state.placed[d];
+        }
+    }
+
+    // a device with existing allocations keeps its node while the node still has room
+    const int current = ggml_cuda_mapped_numa_index(state.node[device]);
+    if (current >= 0 && state.placed[device] > 0 && avail[current] >= (int64_t) size) {
+        return state.node[device];
+    }
+
+    int    best    = -1; // best node that can hold the allocation
+    double best_bw = -1.0;
+    int    top     = -1; // best node by bandwidth, for the log
+    double top_bw  = -1.0;
+    for (size_t n = 0; n < n_nodes; n++) {
+        const double bw = state.bw[device][n];
+        if (bw < 0) {
+            continue;
+        }
+        if (top < 0 || bw > top_bw) {
+            top    = (int) n;
+            top_bw = bw;
+        }
+        if (avail[n] >= (int64_t) size && (best < 0 || bw > best_bw)) {
+            best    = (int) n;
+            best_bw = bw;
+        }
+    }
+
+    if (top < 0) {
+        GGML_LOG_ERROR("%s: device %d: the bandwidth probe found no usable NUMA node\n", __func__, device);
+        return GGML_CUDA_MAPPED_NUMA_NODE_FAIL;
+    }
+
+    if (best < 0) {
+        // no candidate has enough memory: fail instead of spilling to a device memory node
+        GGML_LOG_ERROR("%s: device %d: no NUMA node has enough available memory for the %.2f MiB mapped allocation\n",
+                       __func__, device, size / 1024.0 / 1024.0);
+        for (size_t n = 0; n < n_nodes; n++) {
+            if (avail[n] == std::numeric_limits<int64_t>::max()) {
+                GGML_LOG_ERROR("%s:   NUMA node %d: available memory unknown\n", __func__, state.nodes[n]);
+            } else {
+                GGML_LOG_ERROR("%s:   NUMA node %d: %.1f GiB available\n",
+                               __func__, state.nodes[n], avail[n] / 1024.0 / 1024.0 / 1024.0);
+            }
+        }
+        return GGML_CUDA_MAPPED_NUMA_NODE_FAIL;
+    }
+
+    if (best == top) {
+        GGML_LOG_INFO("%s: device %d: %.2f MiB on NUMA node %d (best read bandwidth %.1f GB/s)\n",
+                      __func__, device, size / 1024.0 / 1024.0, state.nodes[best], best_bw);
+    } else {
+        GGML_LOG_INFO("%s: device %d: %.2f MiB on NUMA node %d (%.1f GB/s; node %d with %.1f GB/s does not have enough available memory)\n",
+                      __func__, device, size / 1024.0 / 1024.0, state.nodes[best], best_bw,
+                      state.nodes[top], top_bw);
+    }
+
+    state.node[device] = state.nodes[best];
+    return state.node[device];
+}
+
+// choose the node of a new mapped allocation; runs the one-time bandwidth probe first
+static int ggml_cuda_mapped_buffer_numa_node(int device, size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
+
+    if (!ggml_cuda_mapped_numa.probed) {
+        ggml_cuda_mapped_numa_probe();
+    }
+
+    return ggml_cuda_mapped_numa_select(device, size);
+}
+
+// account a live mapped allocation of `device`
+static void ggml_cuda_mapped_numa_commit(int device, size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
+
+    ggml_cuda_mapped_numa_state & state = ggml_cuda_mapped_numa;
+    if (state.probed) {
+        state.placed[device] += size;
+    }
+}
+
+// release the accounting of a freed mapped allocation of `device`
+static void ggml_cuda_mapped_numa_unplace(int device, size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
+
+    ggml_cuda_mapped_numa_state & state = ggml_cuda_mapped_numa;
+    if (state.probed && state.placed[device] >= size) {
+        state.placed[device] -= size;
+    }
+}
+
+// allocate mapped host memory on the given NUMA node: cudaHostAlloc is called under a memory
+// policy bound to that node, which places the pages there, and the placement is verified.
+// GGML_CUDA_MAPPED_NUMA_NODE_FAIL means that no candidate node has enough memory; the
+// allocation then fails (the caller has logged the details) instead of landing on an unknown
+// node, which could be the device memory of another GPU
+static void * ggml_backend_cuda_mapped_buffer_alloc_numa(size_t size, int node) {
+    if (node == GGML_CUDA_MAPPED_NUMA_NODE_FAIL) {
+        return nullptr;
+    }
+
+    const bool bind = node >= 0 && ggml_cuda_set_mempolicy_node(node);
+
+    void * ptr = nullptr;
+    cudaError_t err = cudaHostAlloc(&ptr, size, cudaHostAllocMapped | cudaHostAllocPortable);
+
+    if (bind) {
+        ggml_cuda_reset_mempolicy();
+    }
+
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: allocating %.2f MiB of mapped host memory on NUMA node %d: cudaHostAlloc failed: %s\n",
+                       __func__, size / 1024.0 / 1024.0, node, cudaGetErrorString(err));
+        return nullptr;
+    }
+
+    if (bind) {
+        ggml_cuda_mapped_buffer_verify_numa(ptr, size, node);
+    }
+
+    return ptr;
+}
+
+#endif // !defined(GGML_USE_MUSA) && defined(GGML_CUDA_MAPPED_NUMA)
+
+// mapped host buffer type
+//
+// Pinned host memory that the device can read directly through its device pointer
+// (cudaHostAllocMapped). The scheduler treats it as a device buffer type so that ops
+// using it stay on the CUDA backend, and the kernels read the weights in place.
+//
+// MUSA lacks the host-mapped pinned-memory APIs, so the type is unavailable there.
+
+#if !defined(GGML_USE_MUSA)
+
+struct ggml_backend_cuda_mapped_buffer_context {
+    int device;
+    void * host_ptr = nullptr;
+    void * dev_ptr  = nullptr;
+    std::string name;
+
+    ggml_backend_cuda_mapped_buffer_context(int device, void * host_ptr, void * dev_ptr) :
+        device(device), host_ptr(host_ptr), dev_ptr(dev_ptr),
+        name(GGML_CUDA_NAME + std::to_string(device) + "_Mapped") {
+    }
+
+    ~ggml_backend_cuda_mapped_buffer_context() {
+        if (host_ptr != nullptr) {
+            CUDA_CHECK(cudaFreeHost(host_ptr));
+        }
+    }
+};
+
+static const char * ggml_backend_cuda_mapped_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    ggml_backend_cuda_buffer_type_context * ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
+
+    return ctx->name.c_str();
+}
+
+static void ggml_backend_cuda_mapped_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *)buffer->context;
+#if defined(GGML_CUDA_MAPPED_NUMA)
+    ggml_cuda_mapped_numa_unplace(ctx->device, buffer->size);
+#endif
+    delete ctx;
+}
+
+static void * ggml_backend_cuda_mapped_buffer_get_base(ggml_backend_buffer_t buffer) {
+    ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *)buffer->context;
+    return ctx->dev_ptr;
+}
+
+// host pointer of a tensor in a mapped buffer; the device and host pointers refer to the
+// same allocation with the same offset, so the offset is recovered from the device pointer
+static char * ggml_backend_cuda_mapped_buffer_host_ptr(ggml_backend_cuda_mapped_buffer_context * ctx, const ggml_tensor * tensor) {
+    return (char *) ctx->host_ptr + ((const char *) tensor->data - (const char *) ctx->dev_ptr);
+}
+
+static enum ggml_status ggml_backend_cuda_mapped_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
+
+    if (tensor->view_src != NULL) {
+        assert(tensor->view_src->buffer->buft == buffer->buft);
+        return GGML_STATUS_SUCCESS;
+    }
+
+    // quantized weights may be padded by get_alloc_size; zero the padding like the device buffer
+    if (ggml_is_quantized(tensor->type) && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        const size_t original_size = ggml_nbytes(tensor);
+        const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
+
+        if (padded_size > original_size) {
+            memset(ggml_backend_cuda_mapped_buffer_host_ptr(ctx, tensor) + original_size, 0, padded_size - original_size);
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+static void ggml_backend_cuda_mapped_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
+
+    memset(ggml_backend_cuda_mapped_buffer_host_ptr(ctx, tensor) + offset, value, size);
+}
+
+static void ggml_backend_cuda_mapped_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
+
+    memcpy(ggml_backend_cuda_mapped_buffer_host_ptr(ctx, tensor) + offset, data, size);
+}
+
+static void ggml_backend_cuda_mapped_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
+
+    memcpy(data, ggml_backend_cuda_mapped_buffer_host_ptr(ctx, tensor) + offset, size);
+}
+
+static bool ggml_backend_cuda_mapped_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
+
+    if (ggml_backend_buffer_is_cuda(src->buffer)) {
+        ggml_cuda_set_device(ctx->device);
+        CUDA_CHECK(cudaMemcpyAsync(ggml_backend_cuda_mapped_buffer_host_ptr(ctx, dst), src->data, ggml_nbytes(src),
+                                   cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+        return true;
+    }
+    return false;
+}
+
+static void ggml_backend_cuda_mapped_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
+
+    memset(ctx->host_ptr, value, buffer->size);
+}
+
+static const ggml_backend_buffer_i ggml_backend_cuda_mapped_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_cuda_mapped_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cuda_mapped_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_cuda_mapped_buffer_init_tensor,
+    /* .memset_tensor   = */ ggml_backend_cuda_mapped_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_cuda_mapped_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cuda_mapped_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
+    /* .cpy_tensor      = */ ggml_backend_cuda_mapped_buffer_cpy_tensor,
+    /* .clear           = */ ggml_backend_cuda_mapped_buffer_clear,
+    /* .reset           = */ NULL,
+};
+
+static ggml_backend_buffer_t ggml_backend_cuda_mapped_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
+
+    ggml_cuda_set_device(buft_ctx->device);
+
+    void * host_ptr = nullptr;
+    cudaError_t err = cudaSuccess;
+#if defined(GGML_CUDA_MAPPED_NUMA)
+    // allocate on the NUMA node selected from the measured bandwidth matrix; the probe runs on
+    // the first allocation and may leave another device current, hence the set_device below
+    const int node = ggml_cuda_mapped_buffer_numa_node(buft_ctx->device, size);
+    ggml_cuda_set_device(buft_ctx->device);
+    host_ptr = ggml_backend_cuda_mapped_buffer_alloc_numa(size, node);
+#else
+    err = cudaHostAlloc((void **) &host_ptr, size, cudaHostAllocMapped | cudaHostAllocPortable);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        GGML_LOG_ERROR("%s: allocating %.2f MiB of mapped host memory for device %d: cudaHostAlloc failed: %s\n",
+                       __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
+        return nullptr;
+    }
+#endif
+    if (host_ptr == nullptr) {
+        return nullptr;
+    }
+
+    void * dev_ptr = nullptr;
+    err = cudaHostGetDevicePointer(&dev_ptr, host_ptr, 0);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        CUDA_CHECK(cudaFreeHost(host_ptr));
+        GGML_LOG_ERROR("%s: device pointer for mapped host memory on device %d: cudaHostGetDevicePointer failed: %s\n",
+                       __func__, buft_ctx->device, cudaGetErrorString(err));
+        return nullptr;
+    }
+
+    ggml_backend_cuda_mapped_buffer_context * ctx = new ggml_backend_cuda_mapped_buffer_context(buft_ctx->device, host_ptr, dev_ptr);
+#if defined(GGML_CUDA_MAPPED_NUMA)
+    ggml_cuda_mapped_numa_commit(buft_ctx->device, size);
+    if (node >= 0) {
+        GGML_LOG_INFO("%s: mapped host buffer for device %d: %.2f MiB on NUMA node %d\n",
+                      __func__, buft_ctx->device, size / 1024.0 / 1024.0, node);
+    } else {
+        GGML_LOG_INFO("%s: mapped host buffer for device %d: %.2f MiB without a NUMA policy\n",
+                      __func__, buft_ctx->device, size / 1024.0 / 1024.0);
+    }
+#endif
+
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_mapped_buffer_interface, ctx, size);
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_cuda_mapped_buffer_type_interface = {
+    /* .get_name            = */ ggml_backend_cuda_mapped_buffer_type_name,
+    /* .alloc_buffer        = */ ggml_backend_cuda_mapped_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n      = */ NULL,
+    /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
+    /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
+    /* .get_alloc_size      = */ ggml_backend_cuda_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n    = */ NULL,
+    /* .is_host             = */ NULL, // not a host buffer: the scheduler keeps ops using it on the CUDA backend
+};
+
+ggml_backend_buffer_type_t ggml_backend_cuda_mapped_buffer_type(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type ggml_backend_cuda_mapped_buffer_types[GGML_CUDA_MAX_DEVICES];
+
+    static bool ggml_backend_cuda_mapped_buffer_type_initialized = false;
+
+    if (!ggml_backend_cuda_mapped_buffer_type_initialized) {
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            ggml_backend_cuda_mapped_buffer_types[i] = {
+                /* .iface    = */ ggml_backend_cuda_mapped_buffer_type_interface,
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i) + "_Mapped"},
+            };
+        }
+        ggml_backend_cuda_mapped_buffer_type_initialized = true;
+    }
+
+    return &ggml_backend_cuda_mapped_buffer_types[device];
+}
+
+#else // defined(GGML_USE_MUSA)
+
+ggml_backend_buffer_type_t ggml_backend_cuda_mapped_buffer_type(int device) {
+    GGML_UNUSED(device);
+    return nullptr;
+}
+
+#endif // !defined(GGML_USE_MUSA)
+
+static bool ggml_backend_buft_is_cuda_mapped(ggml_backend_buffer_type_t buft) {
+#if defined(GGML_USE_MUSA)
+    GGML_UNUSED(buft);
+    return false;
+#else
+    return buft->iface.get_name == ggml_backend_cuda_mapped_buffer_type_name;
+#endif
+}
+
+// a tensor whose weights live in device-readable host memory and must be read in place
+static bool ggml_cuda_tensor_is_mapped(const ggml_tensor * t) {
+    return t != nullptr && t->buffer != nullptr && ggml_backend_buft_is_cuda_mapped(t->buffer->buft);
+}
+
 /// kernels
 
 typedef void (*ggml_cuda_op_mul_mat_t)(
@@ -2225,6 +3075,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    // A device-mapped weight must be read in place: cuBLAS would dequantize the whole tensor
+    // into device memory. MMQ reads src0->data directly.
+    if (ggml_cuda_tensor_is_mapped(src0) && ggml_cuda_mmq_supports_type(src0->type)) {
+        ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
@@ -2318,6 +3174,11 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return false;
     }
 
+    // a device-mapped weight is read in place by the MMQ path (see ggml_cuda_mul_mat_id)
+    if (ggml_cuda_tensor_is_mapped(src0) && ggml_cuda_mmq_supports_type(src0->type)) {
+        return false;
+    }
+
     return true;
 }
 
@@ -2358,6 +3219,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
             ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+            return;
+        }
+
+        // A device-mapped weight must be read in place. The fallback path below computes each
+        // expert with ggml_cuda_mul_mat(), which for quantized weights can dequantize the whole
+        // expert into device memory via cuBLAS. MMQ reads src0->data directly and computes only
+        // the experts that have tokens (via expert_bounds), so keep mapped weights on it.
+        if (ggml_cuda_tensor_is_mapped(src0) && ggml_cuda_mmq_supports_type(src0->type)) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
     }
@@ -5987,7 +6857,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
+                        // mapped host memory is readable by the device, so it is allowed here
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                               ggml_backend_buft_is_cuda_mapped(node->src[j]->buffer->buft) ||
                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }
@@ -6877,7 +7749,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 
     // check if all the sources are allocated on this device
     for (int i = 0; i < GGML_MAX_SRC; i++) {
-        if (op->src[i] && op->src[i]->buffer && ggml_backend_buft_is_cuda(op->src[i]->buffer->buft)) {
+        if (op->src[i] && op->src[i]->buffer &&
+                (ggml_backend_buft_is_cuda(op->src[i]->buffer->buft) || ggml_backend_buft_is_cuda_mapped(op->src[i]->buffer->buft))) {
             ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)op->src[i]->buffer->buft->context;
             if (buft_ctx->device != dev_ctx->device) {
                 return false;
@@ -7356,7 +8229,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) ||
+           (ggml_backend_buft_is_cuda_mapped(buft) && buft->device == dev) ||
+           (integrated && ggml_backend_buft_is_cuda_host(buft));
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -7435,6 +8310,28 @@ struct ggml_backend_cuda_reg_context {
     std::vector<ggml_backend_dev_t> devices;
 };
 
+// extra buffer types of a CUDA device: one mapped host buffer type per device
+static ggml_backend_buffer_type_t * ggml_backend_cuda_device_get_extra_bufts(ggml_backend_dev_t dev) {    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    static std::vector<ggml_backend_buffer_type_t> extra_bufts[GGML_CUDA_MAX_DEVICES];
+    static bool initialized[GGML_CUDA_MAX_DEVICES] = {};
+
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *) dev->context;
+    const int device = ctx->device;
+
+    if (!initialized[device]) {
+        ggml_backend_buffer_type_t mapped_buft = ggml_backend_cuda_mapped_buffer_type(device);
+        if (mapped_buft != nullptr) {
+            extra_bufts[device].push_back(mapped_buft);
+        }
+        extra_bufts[device].push_back(nullptr);
+        initialized[device] = true;
+    }
+
+    return extra_bufts[device].data();
+}
+
 static const char * ggml_backend_cuda_reg_get_name(ggml_backend_reg_t reg) {
     GGML_UNUSED(reg);
     return GGML_CUDA_NAME;
@@ -7510,6 +8407,12 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
+        return (void *)ggml_backend_cuda_device_get_extra_bufts;
+    }
+    if (strcmp(name, "ggml_backend_buft_is_device_mapped") == 0) {
+        return (void *)ggml_backend_buft_is_cuda_mapped;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

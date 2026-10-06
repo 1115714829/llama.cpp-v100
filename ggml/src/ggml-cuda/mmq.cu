@@ -316,13 +316,7 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
 
-bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
-#ifdef GGML_CUDA_FORCE_CUBLAS
-    return false;
-#endif // GGML_CUDA_FORCE_CUBLAS
-
-    bool mmq_supported;
-
+bool ggml_cuda_mmq_supports_type(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
@@ -349,14 +343,18 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 // -------------------------------------------------
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
-            mmq_supported = true;
-            break;
+            return true;
         default:
-            mmq_supported = false;
-            break;
+            return false;
     }
+}
 
-    if (!mmq_supported) {
+bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+#ifdef GGML_CUDA_FORCE_CUBLAS
+    return false;
+#endif // GGML_CUDA_FORCE_CUBLAS
+
+    if (!ggml_cuda_mmq_supports_type(type)) {
         return false;
     }
 

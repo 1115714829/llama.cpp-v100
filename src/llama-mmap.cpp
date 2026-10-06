@@ -594,6 +594,27 @@ struct llama_mmap::impl {
         mapped_fragments = std::move(new_mapped_fragments);
     }
 
+    // drop the page cache of [first, last); used after a fragment has been copied out of the mapping
+    void drop_page_cache(size_t first, size_t last) {
+#ifdef __linux__
+        if (fd_own == -1) {
+            return;
+        }
+        const size_t page_size = sysconf(_SC_PAGESIZE);
+        first = first & ~(page_size - 1);
+        last  = std::min((last + page_size - 1) & ~(page_size - 1), size);
+        if (first >= last) {
+            return;
+        }
+        if (posix_fadvise(fd_own, first, last - first, POSIX_FADV_DONTNEED)) {
+            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n", strerror(errno));
+        }
+#else
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+#endif
+    }
+
     ~impl() {
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
@@ -663,6 +684,11 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    void drop_page_cache(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -693,6 +719,11 @@ struct llama_mmap::impl {
 
         throw std::runtime_error("mmap not supported");
     }
+
+    void drop_page_cache(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
 #endif
 
     void * addr;
@@ -705,6 +736,8 @@ llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
+
+void llama_mmap::drop_page_cache(size_t first, size_t last) { pimpl->drop_page_cache(first, last); }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 

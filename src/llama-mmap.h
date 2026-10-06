@@ -58,6 +58,9 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
+    // drop the page cache of [first, last) of the file (Linux only, no-op elsewhere)
+    void drop_page_cache(size_t first, size_t last);
+
     static const bool SUPPORTED;
 
 private:

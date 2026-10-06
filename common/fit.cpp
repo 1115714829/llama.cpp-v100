@@ -5,6 +5,7 @@
 
 #include "../src/llama-ext.h"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <stdexcept>
@@ -26,6 +27,45 @@ enum common_layer_fraction_t {
 class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
+
+// a device-readable host buffer (e.g. the CUDA mapped host buffer) keeps the weights in host
+// memory while the device reads them in place; such buffers are not device memory
+static bool common_buft_is_device_mapped(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return false;
+    }
+    typedef bool (*ggml_backend_buft_is_mapped_t)(ggml_backend_buffer_type_t);
+    auto is_mapped = (ggml_backend_buft_is_mapped_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_mapped");
+    return is_mapped != nullptr && is_mapped(buft);
+}
+
+// the device-readable host buffer type of a device, or nullptr if the device has none
+static ggml_backend_buffer_type_t common_dev_mapped_buft(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t);
+    auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    if (get_extra == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t * extra = get_extra(dev);
+    while (extra != nullptr && *extra != nullptr) {
+        if (common_buft_is_device_mapped(*extra)) {
+            return *extra;
+        }
+        ++extra;
+    }
+    return nullptr;
+}
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const char * path_model,
@@ -76,7 +116,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
 
     for (const auto & [buft, mb] : memory_breakdown) {
-        if (ggml_backend_buft_is_host(buft)) {
+        if (ggml_backend_buft_is_host(buft) || common_buft_is_device_mapped(buft)) {
+            // a device-readable host buffer is host memory, not device memory
             ret.back().mb.model   += mb.model;
             ret.back().mb.context += mb.context;
             ret.back().mb.compute += mb.compute;
@@ -181,6 +222,8 @@ static void common_params_fit_impl(
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        // in tensor mode every layer runs on every device, so there is no layer-to-device
+        // mapping that the MoE overrides could follow; keep the upstream abort
         throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
     }
     constexpr int64_t MiB = 1024*1024;
@@ -544,58 +587,141 @@ static void common_params_fit_impl(
 
     const size_t ntbo = llama_max_tensor_buft_overrides();
 
+    // per-device buffer for the MoE weights that do not fit in device memory:
+    // use the device-readable host buffer when the device has one, otherwise the CPU
+    std::vector<ggml_backend_buffer_type_t> moe_bufts;
+    moe_bufts.reserve(nd);
+    for (size_t id = 0; id < nd; id++) {
+        ggml_backend_buffer_type_t mapped = common_dev_mapped_buft(devs[id]);
+        if (mapped != nullptr && ggml_backend_buft_get_device(mapped) != devs[id]) {
+            LOG_ERR("%s: mapped buffer type %s does not belong to device %s\n",
+                __func__, ggml_backend_buft_name(mapped), ggml_backend_dev_name(devs[id]));
+            throw common_params_fit_exception("mapped buffer type does not belong to the device, abort");
+        }
+        moe_bufts.push_back(mapped != nullptr ? mapped : ggml_backend_cpu_buffer_type());
+    }
+
+    // work buffers for the trial configurations: the real tensor_split and tensor_buft_overrides
+    // arrays are only written once the fit succeeded, so a failed fit cannot leave a partial
+    // configuration behind for the real model load
+    std::vector<float> ts_work(nd > 0 ? nd : 1, 0.0f);
+    std::vector<llama_model_tensor_buft_override> tbo_work(ntbo);
+
     // utility function to set n_gpu_layers and tensor_split
     auto set_ngl_tensor_split_tbo = [&](
             const std::vector<ngl_t> & ngl_per_device,
             const std::vector<ggml_backend_buffer_type_t> & overflow_bufts,
-            llama_model_params & mparams) {
+            llama_model_params & mparams,
+            float * ts_out,
+            llama_model_tensor_buft_override * tbo_out) {
         mparams.n_gpu_layers = 0;
         for (size_t id = 0; id < nd; id++) {
             mparams.n_gpu_layers += ngl_per_device[id].n_layer;
             if (nd > 1) {
-                tensor_split[id] = ngl_per_device[id].n_layer;
+                ts_out[id] = ngl_per_device[id].n_layer;
             }
         }
         assert(uint32_t(mparams.n_gpu_layers) <= hp_ngl + 1);
-        uint32_t il0 = hp_ngl + 1 - mparams.n_gpu_layers; // start index for tensor buft overrides
 
-        mparams.tensor_split = tensor_split;
+        // the layer-to-device mapping must match llama_model::load_tensors: the GPU layers are
+        // split by the normalized cumulative tensor_split. any MoE weights that overflow to host
+        // memory must use the device-readable host buffer of the device that computes the layer
+        const uint32_t n_gpu       = uint32_t(mparams.n_gpu_layers);
+        const uint32_t i_gpu_start = hp_ngl + 1 > n_gpu ? hp_ngl + 1 - n_gpu : 0;
+        const uint32_t act_gpu     = n_gpu < hp_ngl + 1 ? n_gpu : hp_ngl + 1;
+
+        std::vector<float> split_points(nd);
+        float split_sum = 0.0f;
+        for (size_t id = 0; id < nd; id++) {
+            split_sum += ts_out[id];
+            split_points[id] = split_sum;
+        }
+        if (split_sum > 0.0f) {
+            for (size_t id = 0; id < nd; id++) {
+                split_points[id] /= split_sum;
+            }
+        }
+
+        auto get_layer_dev = [&](uint32_t il) -> size_t {
+            if (nd == 1 || act_gpu == 0) {
+                return 0;
+            }
+            GGML_ASSERT(il >= i_gpu_start && il - i_gpu_start < act_gpu);
+            return std::upper_bound(split_points.begin(), split_points.end(), float(il - i_gpu_start)/act_gpu) - split_points.begin();
+        };
+
+        uint32_t il0 = i_gpu_start; // start index for tensor buft overrides
+
+        mparams.tensor_split = ts_out;
 
         size_t itbo = 0;
         for (size_t id = 0; id < nd; id++) {
             il0 += ngl_per_device[id].n_full();
             for (uint32_t il = il0; il < il0 + ngl_per_device[id].n_part; il++) {
-                if (itbo + 1 >= ntbo) {
-                    tensor_buft_overrides[itbo].pattern = nullptr;
-                    tensor_buft_overrides[itbo].buft    = nullptr;
+                if (itbo + 2 >= ntbo) {
+                    tbo_out[itbo].pattern = nullptr;
+                    tbo_out[itbo].buft    = nullptr;
                     itbo++;
-                    mparams.tensor_buft_overrides = tensor_buft_overrides;
+                    mparams.tensor_buft_overrides = tbo_out;
                     throw common_params_fit_exception("llama_max_tensor_buft_overrides() == "
                         + std::to_string(ntbo) + " is insufficient for model");
                 }
-                tensor_buft_overrides[itbo].pattern = get_overflow_pattern(il, il == il0 ? ngl_per_device[id].overflow_type : LAYER_FRACTION_MOE);
-                tensor_buft_overrides[itbo].buft = il == il0 ? overflow_bufts[id] : ggml_backend_cpu_buffer_type();
+
+                const size_t id_dev = get_layer_dev(il);
+                if (id_dev != id) {
+                    LOG_ERR("%s: layer %" PRIu32 " is computed on device %s, but its overflowing weights would be placed on device %s\n",
+                        __func__, il, ggml_backend_dev_name(devs[id]), id_dev < nd ? ggml_backend_dev_name(devs[id_dev]) : "out of range");
+                    tbo_out[itbo].pattern = nullptr;
+                    tbo_out[itbo].buft    = nullptr;
+                    itbo++;
+                    mparams.tensor_buft_overrides = tbo_out;
+                    throw common_params_fit_exception("layer-to-device mapping does not match llama_model::load_tensors, abort");
+                }
+
+                const common_layer_fraction_t lf = il == il0 ? ngl_per_device[id].overflow_type : LAYER_FRACTION_MOE;
+
+                // the MoE weights that do not fit in device memory go to the device-readable host
+                // buffer of the device; this override comes first so it wins over the fraction below
+                tbo_out[itbo].pattern = get_overflow_pattern(il, LAYER_FRACTION_MOE);
+                tbo_out[itbo].buft    = moe_bufts[id_dev];
                 itbo++;
+
+                if (common_buft_is_device_mapped(moe_bufts[id_dev])) {
+                    LOG_TRC("%s: layer %" PRIu32 " (compute device %s): MoE weights on %s (device %s)\n",
+                        __func__, il, ggml_backend_dev_name(devs[id]),
+                        ggml_backend_buft_name(moe_bufts[id_dev]),
+                        ggml_backend_dev_name(ggml_backend_buft_get_device(moe_bufts[id_dev])));
+                }
+
+                // the other fractions of the first partial layer keep overflowing to the configured buffer
+                if (lf != LAYER_FRACTION_MOE) {
+                    tbo_out[itbo].pattern = get_overflow_pattern(il, lf);
+                    tbo_out[itbo].buft    = overflow_bufts[id];
+                    itbo++;
+                }
             }
             il0 += ngl_per_device[id].n_part;
         }
-        tensor_buft_overrides[itbo].pattern = nullptr;
-        tensor_buft_overrides[itbo].buft    = nullptr;
+        tbo_out[itbo].pattern = nullptr;
+        tbo_out[itbo].buft    = nullptr;
         itbo++;
-        mparams.tensor_buft_overrides = tensor_buft_overrides;
+        mparams.tensor_buft_overrides = tbo_out;
     };
 
     // utility function that returns the memory use per device for given numbers of layers per device
+    int64_t host_used = 0; // host memory of the last measurement, updated by get_memory_for_layers
     auto get_memory_for_layers = [&](
             const char * func_name,
             const std::vector<ngl_t> & ngl_per_device,
             const std::vector<ggml_backend_buffer_type_t> & overflow_bufts) -> std::vector<int64_t> {
         llama_model_params mparams_copy = *mparams;
-        set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
+        set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy, ts_work.data(), tbo_work.data());
 
         dmds_t dmd_nl = common_get_device_memory_data_impl(
             path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         add_extra_memory(dmd_nl);
+
+        host_used = dmd_nl.back().mb.total();
 
         LOG_TRC("%s: memory for test allocation by device:\n", func_name);
         for (size_t id = 0; id < nd; id++) {
@@ -613,17 +739,53 @@ static void common_params_fit_impl(
         return ret;
     };
 
+    // the device-readable host buffers hold the weights in host memory, which fit does not account
+    // for; check the final placement and fail with a clear error instead of silently falling back
+    auto check_host_memory = [&](
+            const std::vector<ngl_t> & ngl_per_device,
+            const std::vector<ggml_backend_buffer_type_t> & overflow_bufts) {
+        // only relevant for MoE models whose expert weights actually overflow to host memory
+        if (hp_nex == 0) {
+            return;
+        }
+        bool uses_mapped = false;
+        for (size_t id = 0; id < nd; id++) {
+            // the MoE tensors of every partial layer overflow to the device-readable host buffer
+            if (ngl_per_device[id].n_part > 0 && common_buft_is_device_mapped(moe_bufts[id])) {
+                uses_mapped = true;
+                break;
+            }
+        }
+        if (!uses_mapped) {
+            return;
+        }
+        get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
+
+        const int64_t host_free   = dmds_full.back().free;
+        const int64_t host_margin = nd < llama_max_devices() ? (int64_t) margins_s[nd] : 0;
+        LOG_TRC("%s: mapped MoE weights use %" PRId64 " MiB of host memory, %" PRId64 " MiB free, margin %" PRId64 " MiB\n",
+            __func__, host_used/MiB, host_free/MiB, host_margin/MiB);
+        if (host_used + host_margin > host_free) {
+            throw common_params_fit_exception(
+                "the expert weights that do not fit in device memory need " + std::to_string((host_used + host_margin)/MiB) +
+                " MiB of host memory, but only " + std::to_string(host_free/MiB) +
+                " MiB is available; reduce the context size, use more devices or a lower quantization");
+        }
+    };
+
     int64_t global_surplus_cpu_moe = 0;
     if (hp_nex > 0) {
         const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
-        tensor_buft_overrides[0] = {pattern_moe_all.c_str(), cpu_buft};
-        tensor_buft_overrides[1] = {nullptr, nullptr};
-        mparams->tensor_buft_overrides = tensor_buft_overrides;
+        tbo_work[0] = {pattern_moe_all.c_str(), cpu_buft};
+        tbo_work[1] = {nullptr, nullptr};
+
+        llama_model_params mparams_copy = *mparams;
+        mparams_copy.tensor_buft_overrides = tbo_work.data();
 
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
         dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
-            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         add_extra_memory(dmds_cpu_moe);
 
         for (size_t id = 0; id < nd; id++) {
@@ -640,8 +802,7 @@ static void common_params_fit_impl(
         }
 
         // reset
-        tensor_buft_overrides[0] = {nullptr, nullptr};
-        mparams->tensor_buft_overrides = tensor_buft_overrides;
+        tbo_work[0] = {nullptr, nullptr};
     }
 
     std::vector<int64_t> targets; // maximum acceptable memory use per device
@@ -728,7 +889,8 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
-        set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+        check_host_memory(ngl_per_device, overflow_bufts);
+        set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams, tensor_split, tensor_buft_overrides);
         return;
     }
 
@@ -873,7 +1035,8 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
     }
 
-    set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+    check_host_memory(ngl_per_device, overflow_bufts);
+    set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams, tensor_split, tensor_buft_overrides);
 }
 
 enum common_params_fit_status common_fit_params(
@@ -938,7 +1101,8 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
     for (const auto & buft_mb : memory_breakdown) {
         ggml_backend_buffer_type_t          buft = buft_mb.first;
         const llama_memory_breakdown_data & mb   = buft_mb.second;
-        if (ggml_backend_buft_is_host(buft)) {
+        if (ggml_backend_buft_is_host(buft) || common_buft_is_device_mapped(buft)) {
+            // a device-readable host buffer is host memory, not device memory
             mb_host.model   += mb.model;
             mb_host.context += mb.context;
             mb_host.compute += mb.compute;

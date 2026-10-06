@@ -1419,6 +1419,15 @@ struct test_case {
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
+    // optional buffer type for the weight context; when null the backend default is used
+    virtual ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) {
+        GGML_UNUSED(backend);
+        return nullptr;
+    }
+
+    // when true, the test is skipped if weight_buffer_type() returns null for the backend
+    virtual bool requires_weight_buffer_type() { return false; }
+
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
 
@@ -1569,9 +1578,19 @@ struct test_case {
             add_sentinel(ctx_weights.get());
         }
 
+        ggml_backend_buffer_type_t weight_buft = use_weights ? weight_buffer_type(backend1) : nullptr;
+        if (use_weights && requires_weight_buffer_type() && weight_buft == nullptr) {
+            test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test",
+                             false, false, "no weight buffer type");
+            print_test_result_locked(output_printer, result);
+            return test_status_t::SKIPPED;
+        }
+
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
+            buf_weights.reset(weight_buft != nullptr
+                ? ggml_backend_alloc_ctx_tensors_from_buft(ctx_weights.get(), weight_buft)
+                : ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors [%s] ", ggml_backend_name(backend1));
                 return test_status_t::FAIL;
@@ -6057,6 +6076,64 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_W4A4";
+    }
+};
+
+// MUL_MAT_ID with the expert weights in a device-readable host buffer type (e.g. the CUDA mapped
+// host buffer). The kernel reads the weights through the device pointer, so the result must match
+// the same weights in the device buffer, which the plain test_mul_mat_id covers against the CPU.
+struct test_mul_mat_id_mapped : public test_mul_mat_id {
+    test_mul_mat_id_mapped(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 32, int n_used = 4, int64_t m = 640, int64_t n = 8, int64_t k = 2560)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_MAPPED";
+    }
+
+    bool use_weight_context() override { return true; }
+    bool requires_weight_buffer_type() override { return true; }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            return nullptr;
+        }
+        auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra == nullptr) {
+            return nullptr;
+        }
+        for (ggml_backend_buffer_type_t * extra = get_extra(dev); extra && *extra; ++extra) {
+            const std::string name = ggml_backend_buft_name(*extra);
+            if (name.size() >= 7 && name.compare(name.size() - 7, 7, "_Mapped") == 0) {
+                return *extra;
+            }
+        }
+        return nullptr;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        // C^T = A * B^T: (k, m) * (k, n) => (m, n)
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
     }
 };
 
@@ -11693,6 +11770,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n : {1, 8, 64}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
+    }
+
+    // expert weights in a device-readable host buffer type (CUDA mapped host memory).
+    // n covers every dispatch path: MMVQ (1, 8), the grouped kernel (9..64), MMQ prefill (65+)
+    // and the large prefill batches (512, 2048). On a mapped weight none of these may allocate
+    // a full expert tensor in device memory; the mapped-MMQ path reads the weights in place.
+    // The framework does not expose the CUDA pool high-water mark, so on a machine verify with
+    // the CUDA pool peak logged at exit or by watching nvidia-smi during a 16K prefill: the
+    // mapped weight must not add an expert-sized allocation.
+    for (int n : {1, 8, 16, 64, 512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_id_mapped(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 4, 640, n, 2560));
     }
 
     // Unsloth Qwen3.8-Flash-Next UD-Q4_K_XL expert projections: 512 experts, top-10,
