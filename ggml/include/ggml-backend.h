@@ -195,6 +195,10 @@ extern "C" {
     GGML_API bool                          ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
     GGML_API bool                          ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
 
+    // true if the device has native BF16 support; devices without it are expected to be given
+    // F16 weights instead (BF16 -> F16 is exact inside the F16 range)
+    GGML_API bool                          ggml_backend_dev_supports_bf16(ggml_backend_dev_t device);
+
     //
     // Backend (reg)
     //

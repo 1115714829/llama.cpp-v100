@@ -6892,6 +6892,14 @@ static void ggml_backend_cuda_device_get_props(ggml_backend_dev_t dev, ggml_back
     };
 }
 
+// True if the device has native BF16 support. On devices without it BF16 weights should be
+// converted to F16 when loading a model, see llama_model_loader.
+static bool ggml_backend_cuda_device_supports_bf16(ggml_backend_dev_t dev) {
+    ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
+
+    return fast_bf16_hardware_available(ggml_cuda_info().devices[ctx->device].cc);
+}
+
 static ggml_backend_t ggml_backend_cuda_device_init_backend(ggml_backend_dev_t dev, const char * params) {
     GGML_UNUSED(params);
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
@@ -7547,6 +7555,9 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_dev_supports_bf16") == 0) {
+        return (void *)ggml_backend_cuda_device_supports_bf16;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

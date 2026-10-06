@@ -140,6 +140,10 @@ struct llama_model_loader {
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
 
+    // BF16 weights loaded as F16 on devices without native BF16 support
+    size_t n_bf16_converted = 0; // elements
+    size_t n_bf16_clamped   = 0; // elements clamped to +-65504
+
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
@@ -233,6 +237,12 @@ struct llama_model_loader {
             const std::vector<int64_t> & ne,
             bool required,
             bool allow_reshape) const;
+
+    // true if the devices in the list have no native BF16 support, so BF16 weights should be loaded as F16
+    static bool bf16_weights_as_f16(const buft_list_t * buft_list);
+
+    // true if the tensor is a BF16 weight that is loaded as F16
+    bool is_bf16_as_f16(const struct ggml_tensor * tensor) const;
 
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
