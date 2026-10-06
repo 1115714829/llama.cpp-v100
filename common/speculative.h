@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "common.h"
+#include "sampling.h"
 
 struct common_speculative;
 
@@ -79,6 +80,13 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // rejection sampling (draft-dflash with a selector lattice only)
+    bool use_rejection = false;
+
+    // proposal distribution of each token in `result`, enabled with use_rejection;
+    // separate from `result_q`, which carries the candidate distributions of draft-simple/draft-mtp
+    std::vector<common_sampler_draft_q> * result_q_dflash = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
