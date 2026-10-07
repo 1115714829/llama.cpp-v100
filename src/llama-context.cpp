@@ -483,6 +483,9 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+        if (memory) {
+            memory->set_owner(this);
+        }
     }
 
     // init backends
@@ -948,10 +951,22 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+void llama_context::pipeline_drain() {
+    if (!sched) {
+        return;
+    }
+
+    ggml_backend_sched_pipeline_advance(sched.get());
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
     }
+
+    // drain any in-flight prefill pipeline: callers synchronize to read outputs or to touch shared
+    // state, so the pipeline must not keep writing while they do
+    pipeline_drain();
 
     // the schedulers are built on the same set of backends, synchronizing one of them is enough;
     // the extra schedulers are only synchronized to reset their copy index for pipeline parallelism
@@ -1044,7 +1059,9 @@ bool llama_context::memory_update(bool optimize) {
         switch (mctx->get_status()) {
             case LLAMA_MEMORY_STATUS_SUCCESS:
                 {
-                    // noop
+                    // an update will be applied: drain the prefill pipeline so no in-flight ubatch
+                    // is still writing the cache while the module shifts or copies cells
+                    ggml_backend_sched_pipeline_advance(sched.get());
                 } break;
             case LLAMA_MEMORY_STATUS_NO_UPDATE:
                 {
@@ -2015,9 +2032,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     ggml_status status;
     if (pipeline) {
         // enqueue all splits of this ubatch without waiting. the caller extracts the outputs right
-        // after (ordered on the device streams) and drains the pipeline with
-        // ggml_backend_sched_pipeline_advance at the end of the batch. threadpools are set here
-        // since graph_compute_impl is bypassed on this path
+        // after (ordered on the device streams) and the pipeline stays in flight across decode()
+        // calls until a caller drains it. threadpools are set here since graph_compute_impl is
+        // bypassed on this path
         graph_set_threads(ubatch.n_tokens > 1);
         status = ggml_backend_sched_pipeline_submit(sched_cur, ubatch_id);
     } else {
@@ -2047,6 +2064,9 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     }
 
     const auto & hparams = model.hparams;
+
+    // drain any in-flight prefill pipeline before the encoder graph touches the shared backends
+    ggml_backend_sched_pipeline_advance(sched.get());
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != hparams.n_embd_inp_enc()) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the encoder input %u\n",
@@ -2638,8 +2658,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
-        // in pipeline mode the ubatch is submitted to the prefill pipeline without synchronizing
-        const bool ubatch_pipeline = use_pipeline && sched_for_slot(gf_res_slot(ubatch)) == sched.get();
+        // only prefill-scale ubatches go through the pipeline: decode-sized ubatches keep the
+        // original graph-reuse path, which is faster for them (no per-ubatch graph rebuild)
+        const bool ubatch_pipeline = use_pipeline &&
+            ubatch.n_tokens > n_dec_max &&
+            sched_for_slot(gf_res_slot(ubatch)) == sched.get();
 
         // a ubatch on another scheduler (e.g. the decode scheduler) must not read memory that an
         // in-flight prefill ubatch may still be writing: drain the prefill pipeline first
@@ -2647,8 +2670,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             ggml_backend_sched_pipeline_advance(sched.get());
         }
 
+        const int64_t ubatch_id = pipeline_ubatch_id++;
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status, (size_t) n_tokens_prev,
-                ubatch_pipeline, n_tokens_prev);
+                ubatch_pipeline, ubatch_id);
 
         if (!res) {
             // drain any in-flight prefill ubatches before touching the memory module
@@ -2712,10 +2736,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
 
-    if (use_pipeline) {
-        // all ubatches of this batch are complete; wait and reset the pipeline ring for the next one
-        ggml_backend_sched_pipeline_advance(sched.get());
-    }
+    // the prefill pipeline is intentionally left in flight: the server chunks one prompt across
+    // multiple decode() calls and the next call keeps overlapping. it is drained only when a
+    // caller needs the results or mutates shared state (synchronize, memory ops, state, encode)
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -4166,6 +4189,9 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 size_t llama_context::state_write_data(llama_io_write_i & io) {
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
+    // drain the prefill pipeline before reading the memory state off the devices
+    ggml_backend_sched_pipeline_advance(sched.get());
+
     // write model info
     {
         LLAMA_LOG_DEBUG("%s: - writing model info\n", __func__);
@@ -4185,6 +4211,9 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
+
+    // drain the prefill pipeline before overwriting the memory state on the devices
+    ggml_backend_sched_pipeline_advance(sched.get());
 
     // read model info
     {
@@ -4210,6 +4239,10 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // drain the prefill pipeline before reading the sequence state off the devices. this covers the
+    // mid-prefill GDN checkpoints of the server, which call llama_state_seq_get_data_ext
+    ggml_backend_sched_pipeline_advance(sched.get());
+
     if (memory) {
         memory->state_write(io, seq_id, flags);
     }
@@ -4218,6 +4251,9 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // drain the prefill pipeline before overwriting the sequence state on the devices
+    ggml_backend_sched_pipeline_advance(sched.get());
+
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }
@@ -4981,10 +5017,20 @@ int32_t llama_set_adapter_cvec(
 // memory
 //
 
+// drain the prefill pipeline of the owning context before the memory is mutated, so no in-flight
+// ubatch is still writing the cache. the memory API has no context argument, hence the owner
+static void llama_memory_drain(llama_memory_t mem) {
+    if (llama_context * ctx = mem->get_owner()) {
+        ctx->pipeline_drain();
+    }
+}
+
 void llama_memory_clear(llama_memory_t mem, bool data) {
     if (!mem) {
         return;
     }
+
+    llama_memory_drain(mem);
 
     mem->clear(data);
 }
@@ -4997,6 +5043,8 @@ bool llama_memory_seq_rm(
     if (!mem) {
         return true;
     }
+
+    llama_memory_drain(mem);
 
     return mem->seq_rm(seq_id, p0, p1);
 }
@@ -5011,6 +5059,8 @@ void llama_memory_seq_cp(
         return;
     }
 
+    llama_memory_drain(mem);
+
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
@@ -5020,6 +5070,8 @@ void llama_memory_seq_keep(
     if (!mem) {
         return;
     }
+
+    llama_memory_drain(mem);
 
     mem->seq_keep(seq_id);
 }
@@ -5034,6 +5086,8 @@ void llama_memory_seq_add(
         return;
     }
 
+    llama_memory_drain(mem);
+
     mem->seq_add(seq_id, p0, p1, delta);
 }
 
@@ -5046,6 +5100,8 @@ void llama_memory_seq_div(
     if (!mem) {
         return;
     }
+
+    llama_memory_drain(mem);
 
     mem->seq_div(seq_id, p0, p1, d);
 }

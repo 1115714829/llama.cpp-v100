@@ -74,6 +74,10 @@ struct llama_context {
 
     void synchronize();
 
+    // wait for all in-flight prefill pipeline ubatches without touching the scheduler copy index
+    // or the perf counters. callers use it before mutating state the pipeline may still be writing
+    void pipeline_drain();
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -447,6 +451,10 @@ private:
 
     // max tokens of a batch that sched_dec accepts and is reserved for, set once in the constructor
     uint32_t n_dec_max = 0;
+
+    // monotonic id of the prefill ubatches submitted to the pipeline. it spans decode() calls so
+    // the pipeline can stay in flight across the n_batch-sized chunks of one prompt
+    int64_t pipeline_ubatch_id = 0;
 
     bool sched_need_reserve = true;
 

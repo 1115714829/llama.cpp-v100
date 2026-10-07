@@ -14,6 +14,10 @@
 // Cross-device activation copies are chained by events inside the CUDA backend, and consecutive
 // ubatches on the same device are ordered by the device stream FIFO. The only scheduler-level waits
 // are the stage reuse (ring wrap-around) and the output reads.
+//
+// The host inputs of a pipeline ubatch are copied synchronously in ggml_backend_sched_compute_splits,
+// so once submit() returns the caller can overwrite the host input tensors for the next ubatch
+// without waiting for the device.
 
 void ggml_backend_sched_set_n_stages(ggml_backend_sched_t sched, int n_stages) {
     GGML_ASSERT(sched);
@@ -40,21 +44,6 @@ static void ggml_backend_sched_pipeline_wait_stage(ggml_backend_sched_t sched, i
     stage->in_flight = false;
 }
 
-// wait until the host inputs of the previous ubatch have been copied on all backends. the host input
-// tensors are shared by all ubatches, so this must run before the caller overwrites them
-static void ggml_backend_sched_pipeline_wait_input(ggml_backend_sched_t sched) {
-    if (!sched->input_events_valid) {
-        return;
-    }
-
-    for (int b = 0; b < sched->n_backends; b++) {
-        ggml_backend_event_t ev = sched->input_events[b];
-        if (ev != NULL) {
-            ggml_backend_event_synchronize(ev);
-        }
-    }
-}
-
 // split and allocate the graph on the next pipeline stage, without computing it
 bool ggml_backend_sched_pipeline_begin(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
@@ -68,10 +57,6 @@ bool ggml_backend_sched_pipeline_begin(ggml_backend_sched_t sched, struct ggml_c
     if (stage->in_flight) {
         ggml_backend_sched_pipeline_wait_stage(sched, s);
     }
-
-    // the host input tensors are shared by all ubatches; wait until the previous ubatch has copied
-    // them to the devices before the caller overwrites them
-    ggml_backend_sched_pipeline_wait_input(sched);
 
     // each stage uses its own input copy, so in-flight ubatches never share device input buffers
     const int copy_id = s % sched->n_copies;

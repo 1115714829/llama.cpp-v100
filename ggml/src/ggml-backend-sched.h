@@ -102,12 +102,6 @@ struct ggml_backend_sched {
     int pipeline_stage;              // stage prepared by ggml_backend_sched_pipeline_begin, or -1
     int64_t pipeline_last_ubatch_id; // last submitted ubatch id, for ordering checks
 
-    // events recorded after the host input copies of the submitting ubatch are enqueued on each
-    // backend. the host input tensors are rebuilt in the same arena every ubatch, so the next
-    // ubatch waits on these before the caller overwrites them
-    ggml_backend_event_t input_events[GGML_SCHED_MAX_BACKENDS];
-    bool input_events_valid; // false until a pipeline submit has recorded them
-
     struct ggml_context * ctx;
 
     ggml_backend_sched_eval_callback callback_eval;

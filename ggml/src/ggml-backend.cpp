@@ -1785,7 +1785,10 @@ enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-                if (sched->async_inputs && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer)) {
+                // pipeline stages share the host input tensors, so their copies must be complete before
+                // the caller overwrites them for the next ubatch. copy synchronously instead of queueing
+                // the copy on the compute stream, otherwise the host waits on the whole pipeline depth
+                if (sched->async_inputs && sched->n_stages == 1 && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer)) {
                     // the caller synchronizes the scheduler before writing the input data again,
                     // so the copy can be queued on the split backend without waiting for it to finish
                     ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
@@ -1911,14 +1914,6 @@ enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
             }
         }
 
-        // in pipeline mode, record that the host inputs of this ubatch have been enqueued on this
-        // backend. gallocr may place the next ubatch's host inputs on the same memory, so the next
-        // ubatch waits on this event before the caller overwrites them
-        if (sched->n_stages > 1 && sched->input_events[split_backend_id] != NULL) {
-            ggml_backend_event_record(sched->input_events[split_backend_id], split_backend);
-            sched->input_events_valid = true;
-        }
-
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -2037,7 +2032,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
-            sched->input_events[b] = ggml_backend_event_new(backends[b]->device);
         }
     }
 
@@ -2057,7 +2051,6 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
         }
-        ggml_backend_event_free(sched->input_events[b]);
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
