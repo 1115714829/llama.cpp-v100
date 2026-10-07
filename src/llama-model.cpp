@@ -2907,8 +2907,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         if (arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
                             filter_recr = [&](uint32_t)    { return false; };
-                            if (filter_idx) {
+                            // the indexer cache only serves QSA blocks (compress ratio > 0): a dense MTP block keeps
+                            // no indexer cache and no k-pool, which a windowed (ring) attention cache could not track
+                            bool mtp_qsa = false;
+                            for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+                                mtp_qsa = mtp_qsa || hparams.dsv4_compress_ratios[il] > 0;
+                            }
+                            if (filter_idx && mtp_qsa) {
                                 filter_idx = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            } else {
+                                filter_idx = nullptr;
                             }
                         }
                     }
