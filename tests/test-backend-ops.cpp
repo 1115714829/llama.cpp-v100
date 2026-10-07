@@ -6274,6 +6274,114 @@ struct test_mul_mat_id_mapped : public test_mul_mat_id {
     }
 };
 
+// MUL_MAT_ID with the expert weights in the plain device buffer, as model loading allocates
+// them. The skinny prepass scans such buffers and repacks eligible Q8_0/Q4_K weights in place,
+// so this verifies that the 3D expert tensors pass the repack admission untouched (the
+// MUL_MAT_ID kernels read the original layout) and still match the CPU. Regression guard for
+// reading a repacked tensor with the original layout, which yields garbage or NaN.
+struct test_mul_mat_id_wctx : public test_mul_mat_id {
+    test_mul_mat_id_wctx(ggml_type type_a = GGML_TYPE_Q8_0, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 512, int n_used = 1, int64_t m = 640, int64_t n = 1, int64_t k = 2560)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k) {}
+
+    bool use_weight_context() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_WCTX";
+    }
+};
+
+// GLM-style shared expert next to a routed MUL_MAT_ID MoE: the routed gate/up pair plus GLU is
+// fused with the shared expert gate/up pair plus GLU into one mul_mat_vec_q launch. The shared
+// weights are 2D and meet the Q8_0 repack admission, so the prepass repacks them before the
+// fusion decision; the fused kernel reads the original layout, so a repacked shared weight must
+// disqualify the fusion instead of being read as garbage.
+struct test_mul_mat_id_shared_expert : public test_case {
+    const ggml_type type_w;
+    const int n_mats;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR10(type_w, n_mats, n_used, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * (n_used + 1);
+    }
+
+    test_mul_mat_id_shared_expert(ggml_type type_w = GGML_TYPE_Q8_0,
+            int n_mats = 8, int n_used = 8, int64_t m = 640, int64_t n = 1, int64_t k = 2560)
+        : type_w(type_w), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k) {
+        GGML_ASSERT(n_used <= n_mats);
+    }
+
+    bool use_weight_context() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_SHARED_EXPERT";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        // node order matters: [MUL_MAT_ID, MUL_MAT_ID, GLU, MUL_MAT, MUL_MAT, GLU] is the
+        // pattern match_shared_expert() looks for, the shared MUL_MAT pair must sit at
+        // routed_idx + 3
+        ggml_tensor * gate_exps  = ggml_new_tensor_3d(ctx_weights, type_w, k, m, n_mats);
+        ggml_set_name(gate_exps, "gate_exps");
+        ggml_tensor * up_exps    = ggml_new_tensor_3d(ctx_weights, type_w, k, m, n_mats);
+        ggml_set_name(up_exps, "up_exps");
+        ggml_tensor * gate_shexp = ggml_new_tensor_2d(ctx_weights, type_w, k, m);
+        ggml_set_name(gate_shexp, "gate_shexp");
+        ggml_tensor * up_shexp   = ggml_new_tensor_2d(ctx_weights, type_w, k, m);
+        ggml_set_name(up_shexp, "up_shexp");
+
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(cur, "cur");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * cur_r = ggml_reshape_3d(ctx, cur, k, 1, n);
+        ggml_set_name(cur_r, "cur_reshaped");
+
+        ggml_tensor * up_id = ggml_mul_mat_id(ctx, up_exps, cur_r, ids);
+        ggml_set_name(up_id, "ffn_moe_up");
+        ggml_tensor * gate_id = ggml_mul_mat_id(ctx, gate_exps, cur_r, ids);
+        ggml_set_name(gate_id, "ffn_moe_gate");
+        ggml_tensor * glu_r = ggml_swiglu_split(ctx, gate_id, up_id);
+        ggml_set_name(glu_r, "ffn_moe_swiglu");
+
+        ggml_tensor * up_s = ggml_mul_mat(ctx, up_shexp, cur);
+        ggml_set_name(up_s, "ffn_shexp_up");
+        ggml_tensor * gate_s = ggml_mul_mat(ctx, gate_shexp, cur);
+        ggml_set_name(gate_s, "ffn_shexp_gate");
+        ggml_tensor * glu_s = ggml_swiglu_split(ctx, gate_s, up_s);
+        ggml_set_name(glu_s, "ffn_shexp_swiglu");
+
+        // keep both GLU nodes alive in one output: the fused kernel writes them directly
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_2d(ctx, glu_r, m, n_used * n), glu_s, 1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
 // expert parallelism: the same weights are split along the expert dim and each part is
 // computed with its own expert_offset. The per-shard outputs cover disjoint slots (the other
 // devices' slots are zero) and their sum must equal the full computation.
@@ -12219,6 +12327,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // mapped weight must not add an expert-sized allocation.
     for (int n : {1, 8, 16, 64, 512, 2048}) {
         test_cases.emplace_back(new test_mul_mat_id_mapped(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 4, 640, n, 2560));
+    }
+
+    // the expert weights in a plain device weight buffer, exactly as model loading leaves them:
+    // the skinny prepass repacks eligible 2D Q8_0 weights in that buffer, so the 3D expert
+    // tensors must pass the repack admission untouched. n covers the MMVQ mmid paths (1, 2, 4, 8).
+    for (int n : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id_wctx(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10,  640, n, 2560)); // gate/up
+        test_cases.emplace_back(new test_mul_mat_id_wctx(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, 2560, n,  640)); // down
+    }
+
+    // the shared-expert fusion must reject a repacked shared weight: the prepass repacks the
+    // 2D Q8_0 shexp pair before the fusion decision, and the fused kernel reads the original
+    // layout. Real Flash-Next shapes: m = 640, k = 2560, 512 experts rounded down to keep the
+    // weights small.
+    for (int n : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id_shared_expert(GGML_TYPE_Q8_0, 8, 8, 640, n, 2560));
     }
 
     // Unsloth Qwen3.8-Flash-Next UD-Q4_K_XL expert projections: 512 experts, top-10,
