@@ -117,6 +117,15 @@ struct llama_model_loader {
         std::set<std::string>                  tensors;
     } lazy;
 
+    // target model a draft head borrows the shared tensors from, see borrow_shared_tensor()
+    // from unsloth PR #142
+    const struct llama_model * model_shared = nullptr;
+
+    // true when the file's metadata says it left the shared tensors to the target
+    // (nextn_shared_target_tensors). a draft that ships its own tokens or does not set the
+    // key keeps its own tensors, see borrow_shared_tensor()
+    bool nextn_shared_target_tensors = false;
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;
@@ -247,6 +256,12 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // a draft head that shares the target's embeddings does not carry its own token_embd,
+    // output or output_norm; take them from the target model instead. returns null unless the
+    // file is missing token_embd, so a model that ships its own tensors is never affected
+    // from unsloth PR #142
+    struct ggml_tensor * borrow_shared_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne);
 
     void done_getting_tensors(bool partial = false) const;
 

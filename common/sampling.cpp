@@ -718,6 +718,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
+        if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+            LOG_INF("spec %12.*s: verify pos=%zu draft=%d target=%d %s\n",
+                    (int) strlen(__func__), __func__, i, draft[i], id, draft[i] == id ? "ACCEPT" : "REJECT");
+        }
+
         // do not accept draft tokens after an EOG - they are not output but would stay in the context
         // on replay the last token is from the target and can be EOG, so a trailing EOG is still accepted
         if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
@@ -731,6 +736,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         common_sampler_accept(gsmpl, id, true);
 
         result.push_back(id);
+
+        if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+            LOG_INF("spec %12.*s: verify final=%d\n", (int) strlen(__func__), __func__, id);
+        }
     }
 
     return result;

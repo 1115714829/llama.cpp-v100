@@ -389,6 +389,11 @@ int main() {
             { 0.00f, 0.00f, 0.00f, 1.00f, 0.00f, 0.00f, 0.00f, 0.00f },
             { 0.00f, 0.00f, 0.00f, 1.00f, 0.00f, 0.00f, 0.00f, 0.00f }, 5);
 
+    // q is a top-k truncated proposal (its support is a subset of p's), as draft-mtp/dflash report it
+    test_single_step(
+            { 0.20f, 0.20f, 0.15f, 0.15f, 0.10f, 0.10f, 0.05f, 0.05f },
+            { 0.00f, 0.00f, 0.00f, 0.30f, 0.25f, 0.20f, 0.15f, 0.10f }, 6);
+
     test_multi_step();
     test_sparse_penalties();
     test_sparse_penalty_draft_in_window();

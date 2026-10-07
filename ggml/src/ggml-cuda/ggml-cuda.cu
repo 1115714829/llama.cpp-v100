@@ -3197,9 +3197,11 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
 
     GGML_ASSERT(ffn_up && ffn_gate && glu);
 
-    // the mul_mat_vec fusions cannot read a repacked Q4_K weight; a plain pair is fused by
-    // the skinny gated kernel instead (see ggml_cuda_can_fuse and ggml_cuda_try_fuse)
-    if (ggml_cuda_q4k_skinny_is_repacked(ffn_up->src[0]) || ggml_cuda_q4k_skinny_is_repacked(ffn_gate->src[0])) {
+    // the mul_mat_vec fusions read repacked-eligible weights in their original layout, so a
+    // repacked weight must not enter them; the MUL_MAT_ID callers have no gated fallback, the
+    // plain MUL_MAT pair falls back to the skinny gated kernel (see ggml_cuda_can_fuse)
+    if (ggml_cuda_q8_skinny_is_repacked(ffn_up->src[0]) || ggml_cuda_q8_skinny_is_repacked(ffn_gate->src[0]) ||
+            ggml_cuda_q4k_skinny_is_repacked(ffn_up->src[0]) || ggml_cuda_q4k_skinny_is_repacked(ffn_gate->src[0])) {
         return false;
     }
 
@@ -5590,11 +5592,11 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }
 
-        // a repacked Q4_K SwiGLU pair is fused by the skinny gated kernel in the caller
+        // a repacked Q8_0/Q4_K SwiGLU pair is fused by the skinny gated kernel in the caller
         if (ops.begin()[0] == GGML_OP_MUL_MAT &&
                 ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU && !ggml_get_op_params_i32(glu, 1) &&
-                ggml_cuda_q4k_skinny_is_repacked(ffn_gate->src[0]) &&
-                ggml_cuda_q4k_skinny_is_repacked(ffn_up->src[0])) {
+                ((ggml_cuda_q4k_skinny_is_repacked(ffn_gate->src[0]) && ggml_cuda_q4k_skinny_is_repacked(ffn_up->src[0])) ||
+                 (ggml_cuda_q8_skinny_is_repacked(ffn_gate->src[0]) && ggml_cuda_q8_skinny_is_repacked(ffn_up->src[0])))) {
             int out_nodes[] = { node_idx + 2 };
             return ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, (int)ops.size(), out_nodes, 1);
         }

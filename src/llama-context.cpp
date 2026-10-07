@@ -34,6 +34,12 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+// MTP diagnostics: the MTP head fails silently when the hidden state it reads is zero, stale or
+// misaligned, so log the scheduler/reuse decision and the nextn extraction metadata. emitted at
+// INFO: the log callback maps INFO to trace verbosity, so `-lv 4` shows these and `-lv 3` hides
+// them. gated on the nextn output being on, so ordinary runs never reach the formatting.
+#define LLAMA_LOG_MTP(...) LLAMA_LOG_INFO(__VA_ARGS__)
+
 // the DFlash2 link pairs devices by index, so both contexts must use the same device set in the same
 // order; the meta device name lists its simple devices in order and meta devices are created per model
 static bool llm_devices_compatible(ggml_backend_t a, ggml_backend_t b) {
@@ -223,6 +229,18 @@ llama_context::llama_context(
             }
             cparams.ctx_other = params.ctx_other;
         }
+    }
+
+    // not via ctx_other: for draft-mtp that means the draft shares the target's memory
+    // from unsloth PR #240
+    cparams.model_tgt = nullptr;
+    if (model.arch == LLM_ARCH_QWEN4EXP && (model.tok_embd == nullptr || model.output == nullptr)) {
+        const llama_model * tgt = params.ctx_other ? llama_get_model(params.ctx_other) : nullptr;
+        if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || !tgt || !tgt->tok_embd || !tgt->output ||
+            tgt->hparams.n_embd != model.hparams.n_embd || tgt->vocab.n_tokens() != model.vocab.n_tokens()) {
+            throw std::runtime_error(model.arch_name() + " head without token_embd/output only works as an MTP draft (--spec-type draft-mtp) of a matching target (this warning is normal during memory fitting)");
+        }
+        cparams.model_tgt = tgt;
     }
 
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
@@ -1541,6 +1559,13 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // enabling the nextn output adds t_h_nextn to the graph; without the reserve the scheduler
+    // keeps the shape it was built with before the flag was set (same class as set_embeddings_layer_inp)
+    sched_need_reserve = true;
+
+    LLAMA_LOG_MTP("%s: ctx=%s value=%d masked=%d -> sched_need_reserve\n",
+            __func__, cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "dft" : "tgt", (int) value, (int) masked);
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -1894,6 +1919,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         n_reused++;
+
+        if (cparams.embeddings_nextn) {
+            LLAMA_LOG_MTP("%s: ctx=%s slot=%d sched=%s gtype=%d n_tokens=%u n_outputs=%d embd_nextn=%d REUSED graph\n",
+                    __func__, cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "dft" : "tgt",
+                    slot, sched_cur == sched_dec.get() ? "sched_dec" : (sched_slot0 && sched_cur == sched_slot0.get() ? "sched_slot0" : "sched"),
+                    (int) gtype, ubatch.n_tokens, n_outputs, (int) cparams.embeddings_nextn);
+        }
     } else {
         // allocating on a scheduler invalidates the previous graphs held by that scheduler
         for (int i = 0; i < (sched_dec ? 3 : 2); ++i) {
@@ -1905,6 +1937,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         ggml_backend_sched_reset(sched_cur);
         ggml_backend_sched_set_eval_callback(sched_cur, cparams.cb_eval, cparams.cb_eval_user_data);
+
+        if (cparams.embeddings_nextn) {
+            LLAMA_LOG_MTP("%s: ctx=%s slot=%d sched=%s gtype=%d n_tokens=%u n_outputs=%d embd_nextn=%d REBUILD graph\n",
+                    __func__, cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "dft" : "tgt",
+                    slot, sched_cur == sched_dec.get() ? "sched_dec" : (sched_slot0 && sched_cur == sched_slot0.get() ? "sched_slot0" : "sched"),
+                    (int) gtype, ubatch.n_tokens, n_outputs, (int) cparams.embeddings_nextn);
+        }
 
         //const auto t_start_us = ggml_time_us();
 
@@ -2569,6 +2608,14 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
+            if (cparams.embeddings_nextn &&
+                    !(embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE)) {
+                // the MTP draft reads nothing useful if any of these is false - surface which one
+                LLAMA_LOG_MTP("%s: ctx=%s nextn extract SKIPPED: embd_nextn.data=%d t_h_nextn=%d n_rows=%" PRId64 " pooling=%d\n",
+                        __func__, cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "dft" : "tgt",
+                        embd_nextn.data != nullptr, t_h_nextn != nullptr, n_rows, (int) cparams.pooling_type);
+            }
+
             if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched_res, t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
@@ -2579,6 +2626,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
                 extract_all_idxs = extract_all_idxs || !masked;
+
+                if (cparams.embeddings_nextn) {
+                    const char * sched_name = sched_res == sched_dec.get() ? "sched_dec" :
+                                              (sched_slot0 && sched_res == sched_slot0.get()) ? "sched_slot0" : "sched";
+                    // metadata only: the caller (speculative process) synchronizes and reads the values
+                    LLAMA_LOG_MTP("%s: ctx=%s nextn extract: sched=%s n_tokens=%u n_outputs=%d masked=%d n_rows=%" PRId64 " offset=%" PRId64 " t_h_nextn=[%" PRId64 ",%" PRId64 "]\n",
+                            __func__, cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "dft" : "tgt",
+                            sched_name, ubatch.n_tokens, n_outputs, (int) masked, n_rows, offset,
+                            t_h_nextn->ne[0], t_h_nextn->ne[1]);
+                }
             }
         }
 

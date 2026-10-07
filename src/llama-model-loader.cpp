@@ -714,6 +714,8 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    get_key(llm_kv(LLM_KV_NEXTN_SHARED_TARGET_TENSORS), nextn_shared_target_tensors, false);
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
@@ -1160,6 +1162,79 @@ static bool llm_tensor_is_expert_weight(const LLM_TN_IMPL & tn) {
     }
 }
 
+// declared in llama-model.h, which this file does not include
+const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
+
+// from unsloth PR #142
+struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne) {
+    // only the tensors a draft head is allowed to leave out, checked first so no other
+    // tensor in any model costs a metadata lookup
+    if (tn.tensor != LLM_TENSOR_TOKEN_EMBD && tn.tensor != LLM_TENSOR_OUTPUT && tn.tensor != LLM_TENSOR_OUTPUT_NORM) {
+        return nullptr;
+    }
+
+    // a file that ships the tensor keeps its own copy
+    const std::string name = tn.str();
+    if (get_weight(name.c_str()) != nullptr) {
+        return nullptr;
+    }
+
+    // a file that left the shared tensors to the target says so in its metadata; without that
+    // key a missing token_embd means the arch takes it from ctx_other at graph time (dflash,
+    // eagle3), so borrowing here would take that branch away and point the draft at a tensor
+    // on the wrong device
+    if (!nextn_shared_target_tensors) {
+        return nullptr;
+    }
+
+    // a draft that left out its embeddings left out the whole set, so the missing token_embd is
+    // what marks one. without this an arch that ties the head to its own token_embd when
+    // output.weight is absent (qwen3.5, qwen3-next) would borrow the target's head instead
+    if (get_weight("token_embd.weight") != nullptr) {
+        return nullptr;
+    }
+
+    if (model_shared == nullptr) {
+        throw std::runtime_error(format("%s: missing tensor '%s'; if this is a draft head that shares "
+                    "the target's embeddings, load it as a draft of its target model, not on its own",
+                    __func__, name.c_str()));
+    }
+
+    ggml_tensor * src = nullptr;
+    for (const auto & [n, t] : llama_internal_get_tensor_map(model_shared)) {
+        if (n == name) {
+            src = t;
+            break;
+        }
+    }
+    if (src == nullptr) {
+        throw std::runtime_error(format("%s: draft needs tensor '%s' from the target, which does not have it",
+                    __func__, name.c_str()));
+    }
+
+    // the draft uses the tensor directly, so the shapes must agree exactly
+    size_t dim = 0;
+    for (const int64_t n : ne) {
+        if (dim >= GGML_MAX_DIMS || src->ne[dim] != n) {
+            throw std::runtime_error(format("%s: draft and target disagree on '%s': target has %s, draft wants %s",
+                        __func__, name.c_str(), llama_format_tensor_shape(src).c_str(), llama_format_tensor_shape(ne).c_str()));
+        }
+        dim++;
+    }
+    for (; dim < GGML_MAX_DIMS; dim++) {
+        if (src->ne[dim] != 1) {
+            throw std::runtime_error(format("%s: draft and target disagree on '%s': target has %s, draft wants %s",
+                        __func__, name.c_str(), llama_format_tensor_shape(src).c_str(), llama_format_tensor_shape(ne).c_str()));
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: tensor %s taken from the target model\n", __func__, name.c_str());
+
+    // not counted in n_created or size_data: the tensor is not in this file and is neither
+    // allocated nor freed here
+    return src;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1398,6 +1473,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_set_name(ret, tn.str().c_str());
         mark_expert_tensor(ret);
         return ret;
+    }
+
+    // must run before check_tensor_dims: the tensor is absent from this file by design, and for
+    // the lm head it must also win over the arch fallback that ties the head to token_embd
+    // from unsloth PR #142
+    if (ggml_tensor * shared = borrow_shared_tensor(tn, ne)) {
+        return shared;
     }
 
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());

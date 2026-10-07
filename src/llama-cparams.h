@@ -76,4 +76,7 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+    // target lending token_embd/output to a draft head without them, set from ctx_other
+    // from unsloth PR #240
+    const llama_model * model_tgt = nullptr;
 };

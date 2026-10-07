@@ -28,6 +28,35 @@
 #define SPC_ERR(fmt, ...) LOG_ERR("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SPC_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
 
+// MTP diagnostics: log the hidden state the draft reads and the token it proposes, so a
+// zero/stale/misaligned h is visible in one run. shown at `-lv 4` (LOG_INF maps to trace verbosity).
+// the norm loop is skipped unless trace logging is on, so the hot path pays nothing at -lv 3.
+#define SPC_MTP(fmt, ...) \
+    do { \
+        if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) { \
+            LOG_INF("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__); \
+        } \
+    } while (0)
+
+// log the L2 norm and the first values of one h row
+static void spc_mtp_h_stats(const char * tag, const float * h, int64_t n_embd) {
+    if (common_log_get_verbosity_thold() < LOG_LEVEL_TRACE) {
+        return;
+    }
+
+    if (h == nullptr) {
+        SPC_MTP("%s: <null>\n", tag);
+        return;
+    }
+
+    double acc = 0.0;
+    for (int64_t k = 0; k < n_embd; ++k) {
+        acc += (double) h[k]*h[k];
+    }
+    SPC_MTP("%s: n_embd=%" PRId64 " l2=%10.4f head=[%9.5f %9.5f %9.5f %9.5f]\n",
+            tag, n_embd, sqrt(acc), h[0], h[1], h[2], h[3]);
+}
+
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
 #define SPEC_VOCAB_CHECK_START_TOKEN_ID 5
 
@@ -1861,6 +1890,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
+        // the backend chain only holds top-k, while spec_retune puts the target temperature on the CPU
+        // chain; a probabilistic draft must sample and report q from one chain, so keep it on the CPU
+        if (this->params.probabilistic) {
+            this->params.backend_sampling = false;
+        }
+
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
@@ -1903,6 +1938,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
+
+        if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+            SPC_MTP("cfg: n_embd=%d n_mtp_layers=%d is_mem_shared=%d chain_heads=%d n_max=%d backend_sampling=%d probabilistic=%d\n",
+                    n_embd, n_mtp_layers, (int) is_mem_shared, (int) chain_heads, this->params.n_max,
+                    (int) this->params.backend_sampling, (int) this->params.probabilistic);
+        }
 
         if (chain_heads) {
             this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
@@ -2003,6 +2044,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // TODO:this is generally true, but would be nice to assert it
             const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
 
+            if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+                SPC_MTP("process: ctx_tgt nextn rows=%d\n", n_tokens);
+                spc_mtp_h_stats("process h_tgt row 0", h_tgt, n_embd);
+                if (n_tokens > 1) {
+                    spc_mtp_h_stats("process h_tgt last row", h_tgt + (size_t) (n_tokens - 1) * n_embd, n_embd);
+                }
+            }
+
             for (int k = 0; k < n_tokens; ++k) {
                 const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
 
@@ -2061,6 +2110,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
+            if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+                SPC_MTP("accept-state: seq=%d verify rows=%d (i_batch=[%d..%d])\n",
+                        (int) seq_id, n_rows, i_batch_beg[seq_id], i_batch_end[seq_id]);
+                spc_mtp_h_stats("verify_h row 0", verify_h[seq_id].data(), n_embd);
+                spc_mtp_h_stats("verify_h last", verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, n_embd);
+            }
+
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
         }
@@ -2103,6 +2159,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
             batch.set_embd(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+
+            if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+                SPC_MTP("draft start: seq=%d id_last=%d pos0=%d\n", (int) seq_id, dp.id_last, dp.pos0);
+                spc_mtp_h_stats("draft pending_h", pending_h[seq_id].data(), n_embd);
+            }
 
             i_last[seq_id] = idx;
 
@@ -2153,6 +2214,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
+                if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+                    SPC_MTP("draft step=%d seq=%d id_last=%d sampled=%d top1=%d p=%.4f\n",
+                            i, (int) seq_id, dparams[seq_id].id_last, id_sampled,
+                            cur_p->size > 0 ? cur_p->data[0].id : -1, cur_p->size > 0 ? cur_p->data[0].p : 0.0f);
+                    spc_mtp_h_stats("draft h_row", h_row, n_embd);
+                }
+
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
                             seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
@@ -2179,6 +2247,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                }
+
+                // the sparse rejection verifier reads the proposal as a common_sampler_draft_q; on the
+                // CPU chain dist filled .p with the top-k normalized proposal the draft sampled from
+                if (dp.use_rejection && params.probabilistic) {
+                    GGML_ASSERT(dp.result_q_dflash);
+
+                    common_sampler_draft_q q;
+                    q.ids.reserve(cur_p->size);
+                    q.q.reserve(cur_p->size);
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        q.ids.push_back(cur_p->data[k].id);
+                        q.q.push_back(cur_p->data[k].p);
+                    }
+                    dp.result_q_dflash->push_back(std::move(q));
                 }
 
                 if (params.n_max <= (int) result.size()) {
@@ -2247,6 +2330,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+
+        if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+            SPC_MTP("accept: seq=%d n_accepted=%u verify_rows=%d -> pending_h row %d\n",
+                    (int) seq_id, n_accepted, n_rows, i_h);
+            spc_mtp_h_stats("accept pending_h", pending_h[seq_id].data(), n_embd);
+        }
     }
 };
 
@@ -3042,6 +3131,10 @@ common_speculative_init_result::common_speculative_init_result(
     if (has_draft) {
         model_path = params.speculative.draft.mparams.path;
         LOG_INF("%s: loading draft model '%s'\n", __func__, model_path.c_str());
+
+        // a draft head can leave out the embeddings and lm head and use the target's
+        // from unsloth PR #142
+        mparams.model_shared = model_tgt;
 
         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
