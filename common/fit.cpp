@@ -218,16 +218,21 @@ static bool common_expert_plan(ggml_backend_buffer_type_t buft,
 // to the backend in the order the real load performs them (the model tensor order), the
 // backend simulates the node selection of the real allocations against the per-node
 // available memory (MemFree plus reclaimable file pages minus the margin, the same figures
-// the real selection uses). Returns 1 when the placement fits, -1 when some node cannot hold
-// its planned bytes (the failing node, allocation size and available memory are returned),
-// and 0 when there is no NUMA information at all; the caller then falls back to a plain
-// total check.
+// the real selection uses). On success the bytes placed on every node are written to
+// node_bytes/node_ids (up to the capacity in *n_nodes, which receives the actual number of
+// nodes). Returns 1 when the placement fits, -1 when some node cannot hold its planned
+// bytes (the failing node, allocation size and available memory are returned), and 0 when
+// there is no NUMA information at all; the caller then falls back to a plain total check.
 static int common_expert_check_host_nodes(
         const std::vector<ggml_backend_dev_t> & devs,
         const std::vector<int> & seq_dev,
         const std::vector<size_t> & seq_size,
+        int64_t * node_bytes, int * node_ids, size_t * n_nodes,
         int * fail_node, size_t * fail_bytes, int64_t * fail_avail) {
     if (seq_dev.empty()) {
+        if (n_nodes != nullptr) {
+            *n_nodes = 0;
+        }
         return 1; // no expert host arena at all
     }
     if (seq_dev[0] < 0 || (size_t) seq_dev[0] >= devs.size() || devs[(size_t) seq_dev[0]] == nullptr) {
@@ -239,13 +244,14 @@ static int common_expert_check_host_nodes(
         return 0;
     }
     typedef int (*ggml_backend_expert_check_host_nodes_t)(
-        const int *, const size_t *, size_t, int *, size_t *, int64_t *);
+        const int *, const size_t *, size_t, int64_t *, int *, size_t *, int *, size_t *, int64_t *);
     auto check = (ggml_backend_expert_check_host_nodes_t)
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_check_host_nodes");
     if (check == nullptr) {
         return 0;
     }
-    return check(seq_dev.data(), seq_size.data(), seq_dev.size(), fail_node, fail_bytes, fail_avail);
+    return check(seq_dev.data(), seq_size.data(), seq_dev.size(),
+        node_bytes, node_ids, n_nodes, fail_node, fail_bytes, fail_avail);
 }
 
 static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
@@ -732,9 +738,11 @@ static void common_params_fit_impl(
         throw common_params_fit_exception("was unable to fit model into system memory by reducing context, abort");
     }
 
-    if (mparams->n_gpu_layers != default_mparams.n_gpu_layers) {
-        throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
-    }
+    // a user-provided layer assignment stays untouched: fit then only budgets the expert
+    // store from the resulting layer-to-device map. Without the expert store there is
+    // nothing fit could add, keep the abort of the previous rounds.
+    const bool user_ngl = mparams->n_gpu_layers != default_mparams.n_gpu_layers;
+    bool user_ts = false;
     if (nd > 1) {
         if (!tensor_split) {
             throw common_params_fit_exception("did not provide a buffer to write the tensor_split to, abort");
@@ -742,7 +750,8 @@ static void common_params_fit_impl(
         if (mparams->tensor_split) {
             for (size_t id = 0; id < nd; id++) {
                 if (mparams->tensor_split[id] != 0.0f) {
-                    throw common_params_fit_exception("model_params::tensor_split already set by user, abort");
+                    user_ts = true;
+                    break;
                 }
             }
         }
@@ -854,6 +863,12 @@ static void common_params_fit_impl(
     if (hp_nex > 0 && !all_expert_store) {
         LOG_WRN("%s: not every device supports the expert store, keeping the per-layer MoE overflow placement\n", __func__);
     }
+    if ((user_ngl || user_ts) && !all_expert_store) {
+        if (user_ngl) {
+            throw common_params_fit_exception("n_gpu_layers already set by user to " + std::to_string(mparams->n_gpu_layers) + ", abort");
+        }
+        throw common_params_fit_exception("model_params::tensor_split already set by user, abort");
+    }
 
     // work buffers for the trial configurations: the real tensor_split and tensor_buft_overrides
     // arrays are only written once the fit succeeded, so a failed fit cannot leave a partial
@@ -867,16 +882,21 @@ static void common_params_fit_impl(
             const std::vector<ggml_backend_buffer_type_t> & overflow_bufts,
             llama_model_params & mparams,
             float * ts_out,
-            llama_model_tensor_buft_override * tbo_out) {
+            llama_model_tensor_buft_override * tbo_out,
+            bool keep_split = false) {
         // every trial rebuilds the overrides from scratch: clear the whole array, so no
         // pattern of an earlier trial can survive behind the terminator
         std::fill(tbo_out, tbo_out + ntbo, llama_model_tensor_buft_override{nullptr, nullptr});
 
-        mparams.n_gpu_layers = 0;
-        for (size_t id = 0; id < nd; id++) {
-            mparams.n_gpu_layers += ngl_per_device[id].n_layer;
-            if (nd > 1) {
-                ts_out[id] = ngl_per_device[id].n_layer;
+        // a user-provided layer split stays untouched: only the expert overrides are
+        // rebuilt from the resulting layer-to-device map
+        if (!keep_split) {
+            mparams.n_gpu_layers = 0;
+            for (size_t id = 0; id < nd; id++) {
+                mparams.n_gpu_layers += ngl_per_device[id].n_layer;
+                if (nd > 1) {
+                    ts_out[id] = ngl_per_device[id].n_layer;
+                }
             }
         }
         assert(uint32_t(mparams.n_gpu_layers) <= hp_ngl + 1);
@@ -1145,6 +1165,8 @@ static void common_params_fit_impl(
         // layer -> device of the MoE placement, the same mapping that set_ngl_tensor_split_tbo
         // wrote into the tensor buft overrides
         std::vector<int> layer_dev((size_t) hp_ngl + 2, -1);
+        std::vector<int> dev_first(nd, -1);
+        std::vector<int> dev_last(nd, -1);
         uint32_t i_gpu_start = 0;
         uint32_t act_gpu     = 0;
         {
@@ -1173,8 +1195,6 @@ static void common_params_fit_impl(
                     std::upper_bound(split_points.begin(), split_points.end(), float(il - i_gpu_start)/act_gpu) - split_points.begin();
             };
 
-            std::vector<int> dev_first(nd, -1);
-            std::vector<int> dev_last(nd, -1);
             for (uint32_t il = i_gpu_start; il < i_gpu_start + act_gpu && (size_t) il < layer_dev.size(); il++) {
                 const size_t id_dev = get_layer_dev(il);
                 if (id_dev < nd) {
@@ -1238,6 +1258,9 @@ static void common_params_fit_impl(
         }
 
         int64_t host_complement = 0;
+        // expert slot budget of every device that has experts, for the balance report below
+        std::vector<size_t> slot_budgets(nd, 0);
+        bool has_experts = false;
         // host complement bytes of every tensor of each device, in allocation order: the
         // NUMA check needs the same sequence of allocations the real store will perform
         std::vector<std::vector<size_t>> host_each(nd);
@@ -1264,8 +1287,14 @@ static void common_params_fit_impl(
                 common_expert_set_budget(moe_bufts[id], 0, 0);
                 host_complement += (int64_t) host_bytes_none;
                 const llama_memory_breakdown_data & mb = all_expert_store ? dmds_last[id].mb : dmds_cpu_moe[id].mb;
-                LOG_INF("%s: device %zu: dense %.0f MiB, context %.0f MiB, compute %.0f MiB, no expert VRAM surplus: all experts stay in host memory\n",
-                    __func__, id, (double) mb.model/MiB, (double) mb.context/MiB, (double) mb.compute/MiB);
+                const std::string range = dev_first[id] < 0 ? "none" :
+                    std::to_string(dev_first[id]) + ".." + std::to_string(dev_last[id]) +
+                    (dev_last[id] == (int) hp_ngl ? " (out)" : "");
+                LOG_INF("%s: device %zu (layers %s): dense %.0f MiB, context %.0f MiB, compute %.0f MiB, no expert VRAM surplus: all experts stay in host memory\n",
+                    __func__, id, range.c_str(), (double) mb.model/MiB, (double) mb.context/MiB, (double) mb.compute/MiB);
+                if (!dev_tensors[id].empty()) {
+                    has_experts = true;
+                }
                 continue;
             }
             if (dev_tensors[id].empty()) {
@@ -1295,14 +1324,18 @@ static void common_params_fit_impl(
             }
             common_expert_set_budget(moe_bufts[id], slot_budget, stage_bytes);
 
-            // one line per device: what the dense weights, the context (KV cache) and the
-            // compute buffers take, how the surplus is split into slots and staging, and how
-            // much of the expert set stays in host memory (a uniform routing estimate)
+            // one line per device: the layer range, what the dense weights, the context
+            // (KV cache) and the compute buffers take, how the surplus is split into slots
+            // and staging, and how much of the expert set stays in host memory (a uniform
+            // routing estimate)
             const llama_memory_breakdown_data & mb = all_expert_store ? dmds_last[id].mb : dmds_cpu_moe[id].mb;
             const double hit = slot_used + host_bytes > 0
                 ? 100.0 * (double) slot_used / (double) (slot_used + host_bytes) : 0.0;
-            LOG_INF("%s: device %zu: dense %.0f MiB, context %.0f MiB, compute %.0f MiB, expert slots %.0f MiB (planned %.0f MiB), staging %.0f MiB, host complement %.0f MiB, decode hit %.0f%% (uniform)\n",
-                __func__, id,
+            const std::string range = dev_first[id] < 0 ? "none" :
+                std::to_string(dev_first[id]) + ".." + std::to_string(dev_last[id]) +
+                (dev_last[id] == (int) hp_ngl ? " (out)" : "");
+            LOG_INF("%s: device %zu (layers %s): dense %.0f MiB, context %.0f MiB, compute %.0f MiB, expert slots %.0f MiB (planned %.0f MiB), staging %.0f MiB, host complement %.0f MiB, decode hit %.0f%% (uniform)\n",
+                __func__, id, range.c_str(),
                 (double) mb.model/MiB, (double) mb.context/MiB, (double) mb.compute/MiB,
                 slot_budget/1024.0/1024.0, slot_used/1024.0/1024.0, stage_bytes/1024.0/1024.0,
                 host_bytes/1024.0/1024.0, hit);
@@ -1311,7 +1344,30 @@ static void common_params_fit_impl(
                     __func__, id, stage_peak/1024.0/1024.0, stage_bytes/1024.0/1024.0,
                     100.0 * (double) (stage_peak - stage_bytes) / (double) stage_peak);
             }
+            slot_budgets[id] = slot_budget;
+            has_experts = true;
             host_complement += (int64_t) host_bytes;
+        }
+
+        // balance metric of the expert slots: the user wants to see the peak and the spread
+        if (has_experts) {
+            size_t min_slot = SIZE_MAX;
+            size_t max_slot = 0;
+            size_t min_id   = 0;
+            size_t max_id   = 0;
+            for (size_t id = 0; id < nd; id++) {
+                if (slot_budgets[id] < min_slot) {
+                    min_slot = slot_budgets[id];
+                    min_id   = id;
+                }
+                if (slot_budgets[id] > max_slot) {
+                    max_slot = slot_budgets[id];
+                    max_id   = id;
+                }
+            }
+            LOG_INF("%s: expert slot budgets: min %.0f MiB (device %zu), max %.0f MiB (device %zu), difference %.0f MiB\n",
+                __func__, min_slot/1024.0/1024.0, min_id, max_slot/1024.0/1024.0, max_id,
+                (max_slot - min_slot)/1024.0/1024.0);
         }
 
         // the host complement of the expert store lives in host memory: check its NUMA
@@ -1343,33 +1399,252 @@ static void common_params_fit_impl(
                 }
             }
 
+            constexpr size_t max_nodes = 64;
+            int64_t node_bytes[max_nodes] = {};
+            int     node_ids  [max_nodes] = {};
+            size_t  n_nodes   = max_nodes;
             int     fail_node  = -1;
             size_t  fail_bytes = 0;
             int64_t fail_avail = 0;
-            const int check = common_expert_check_host_nodes(devs, seq_dev, seq_size, &fail_node, &fail_bytes, &fail_avail);
+            const int check = common_expert_check_host_nodes(devs, seq_dev, seq_size,
+                node_bytes, node_ids, &n_nodes, &fail_node, &fail_bytes, &fail_avail);
             if (check < 0) {
-                throw common_params_fit_exception(
-                    "a host arena slice of " + std::to_string(fail_bytes/MiB) + " MiB of the expert complement does not fit on the best NUMA node " +
+                // a physical limit, not a fallback: report the deficit at error level
+                const int64_t deficit = (int64_t) fail_bytes - fail_avail;
+                throw std::runtime_error(
+                    "expert store host complement: a slice of " + std::to_string(fail_bytes/MiB) + " MiB does not fit on NUMA node " +
                     std::to_string(fail_node) + ", which has only " + std::to_string(fail_avail/MiB) +
-                    " MiB available (MemFree plus reclaimable page cache, minus the reserved margin); reduce the context size, use more devices or a lower quantization");
+                    " MiB available (MemFree plus reclaimable page cache, minus the reserved margin; short by " +
+                    std::to_string((deficit > 0 ? deficit : 0)/MiB) + " MiB); reduce the context size, use more devices or a lower quantization");
             }
             if (check == 0) {
                 const int64_t host_free   = dmds_full.back().free;
                 const int64_t host_margin = nd < llama_max_devices() ? (int64_t) margins_s[nd] : 0;
+                const int64_t host_needed = host_complement + host_margin;
                 LOG_TRC("%s: expert store host complement %" PRId64 " MiB, %" PRId64 " MiB free, margin %" PRId64 " MiB\n",
                     __func__, host_complement/MiB, host_free/MiB, host_margin/MiB);
-                if (host_complement + host_margin > host_free) {
-                    throw common_params_fit_exception(
-                        "the expert complement that does not fit in the device slots needs " + std::to_string((host_complement + host_margin)/MiB) +
+                if (host_needed > host_free) {
+                    // a physical limit, not a fallback: report the deficit at error level
+                    throw std::runtime_error(
+                        "expert store host complement needs " + std::to_string(host_needed/MiB) +
                         " MiB of host memory, but only " + std::to_string(host_free/MiB) +
-                        " MiB is available; reduce the context size, use more devices or a lower quantization");
+                        " MiB is available (short by " + std::to_string((host_needed - host_free)/MiB) +
+                        " MiB); reduce the context size, use more devices or a lower quantization");
                 }
             } else {
-                LOG_TRC("%s: expert store host complement %" PRId64 " MiB fits the per-node availability\n",
-                    __func__, host_complement/MiB);
+                // one INFO line with the bytes the store places on every NUMA node
+                std::string per_node;
+                int64_t     total = 0;
+                for (size_t n = 0; n < n_nodes; n++) {
+                    if (node_bytes[n] == 0) {
+                        continue;
+                    }
+                    total += node_bytes[n];
+                    per_node += " node " + std::to_string(node_ids[n]) + ": " + std::to_string(node_bytes[n]/MiB) + " MiB,";
+                }
+                if (per_node.empty()) {
+                    per_node = " none";
+                }
+                LOG_INF("%s: expert store host complement %" PRId64 " MiB fits, per NUMA node:%s\n",
+                    __func__, total/MiB, per_node.c_str());
             }
         }
     };
+
+    // with the expert store all layers run on the GPU and the layer split only decides how
+    // much of each device memory is left for the expert slots: distribute the layers in
+    // proportion to the memory that remains after the dense weights, the KV cache and the
+    // compute buffers, so the devices end up with about equal slot budgets. The first guess
+    // uses the target memory, the fixed cost then comes from the same measurement the real
+    // load uses, until the split stops changing. Integer layers use the largest remainder
+    // method; the output layer is computed by the last device and counts as part of its
+    // fixed cost. Returns false when the dense weights alone do not fit on the devices.
+    auto balanced_expert_split = [&](std::vector<ngl_t> & ngl_out, std::vector<int64_t> & mem_out) -> bool {
+        const uint32_t n_gpu_layers = hp_ngl + 1;
+
+        // largest remainder method: n_gpu_layers split by the given weights, the last device
+        // keeps at least one layer (the output layer)
+        auto split_layers = [&](const std::vector<int64_t> & weight, std::vector<uint32_t> & out) -> bool {
+            int64_t sum = 0;
+            for (size_t id = 0; id < nd; id++) {
+                sum += std::max<int64_t>(weight[id], 0);
+            }
+            if (sum <= 0) {
+                return false;
+            }
+            std::vector<int64_t> rem(nd, 0);
+            uint32_t assigned = 0;
+            for (size_t id = 0; id < nd; id++) {
+                const int64_t scaled = (int64_t) n_gpu_layers * std::max<int64_t>(weight[id], 0);
+                out[id] = (uint32_t) (scaled / sum);
+                rem[id] = scaled % sum;
+                assigned += out[id];
+            }
+            while (assigned < n_gpu_layers) {
+                size_t best_id = nd;
+                for (size_t id = 0; id < nd; id++) {
+                    if (rem[id] > 0 && (best_id == nd || rem[id] > rem[best_id])) {
+                        best_id = id;
+                    }
+                }
+                if (best_id == nd) {
+                    break;
+                }
+                out[best_id]++;
+                rem[best_id] = 0;
+                assigned++;
+            }
+            if (nd > 1 && out[nd - 1] == 0) {
+                size_t best_id = 0;
+                for (size_t id = 1; id + 1 < nd; id++) {
+                    if (out[id] > out[best_id]) {
+                        best_id = id;
+                    }
+                }
+                if (out[best_id] == 0) {
+                    return false;
+                }
+                out[best_id]--;
+                out[nd - 1] = 1;
+            }
+            return true;
+        };
+
+        std::vector<int64_t> weight(targets.begin(), targets.end());
+        std::vector<uint32_t> layers(nd);
+        if (!split_layers(weight, layers)) {
+            return false;
+        }
+
+        std::vector<uint32_t> best = layers;
+        std::vector<int64_t> best_mem;
+        int64_t best_min = INT64_MIN;
+        bool measured = false;
+
+        for (int round = 0; round < 8; round++) {
+            for (size_t id = 0; id < nd; id++) {
+                ngl_out[id].n_layer = layers[id];
+                ngl_out[id].n_part  = 0;
+            }
+            mem_out = get_memory_for_layers(__func__, ngl_out, overflow_bufts);
+
+            bool fits = true;
+            for (size_t id = 0; id < nd; id++) {
+                if (mem_out[id] > targets[id]) {
+                    fits = false;
+                }
+            }
+            if (fits) {
+                // keep the split with the largest minimum expert budget: the integer layer
+                // count can make the iteration oscillate between two neighbors
+                int64_t worst = INT64_MAX;
+                for (size_t id = 0; id < nd; id++) {
+                    worst = std::min(worst, targets[id] - mem_out[id]);
+                }
+                if (!measured || worst > best_min) {
+                    best_min = worst;
+                    best     = layers;
+                    best_mem = mem_out;
+                    measured = true;
+                }
+            }
+
+            std::vector<int64_t> avail(nd);
+            for (size_t id = 0; id < nd; id++) {
+                avail[id] = std::max<int64_t>(targets[id] - mem_out[id], 0);
+            }
+            std::vector<uint32_t> next;
+            if (!split_layers(avail, next) || next == layers) {
+                break;
+            }
+            layers = next;
+        }
+
+        if (!measured) {
+            return false;
+        }
+        for (size_t id = 0; id < nd; id++) {
+            ngl_out[id].n_layer = best[id];
+            ngl_out[id].n_part  = 0;
+        }
+        mem_out = best_mem;
+        return true;
+    };
+
+    // a user-provided layer assignment: fit leaves it untouched and only budgets the expert
+    // store from the resulting layer-to-device map (the same math as llama_model::load_tensors)
+    if (user_ngl || user_ts) {
+        int64_t n_gpu = mparams->n_gpu_layers;
+        if (n_gpu < 0 || n_gpu > (int64_t) hp_ngl + 1) {
+            n_gpu = (int64_t) hp_ngl + 1; // auto or "all": every layer runs on the GPU
+        }
+        mparams->n_gpu_layers = (int) n_gpu;
+
+        std::vector<float> split(nd, 1.0f);
+        if (nd > 1) {
+            for (size_t id = 0; id < nd; id++) {
+                split[id] = user_ts ? mparams->tensor_split[id] : (float) dmds_full[id].free;
+            }
+        }
+        // the user did not set a split: write the one load_tensors uses (by free memory)
+        if (!user_ts && nd > 1) {
+            for (size_t id = 0; id < nd; id++) {
+                tensor_split[id] = split[id];
+            }
+        }
+
+        // number of GPU layers per device: walk the layers in the order load_tensors assigns
+        // them; the count per device reproduces the same mapping through tensor_split
+        std::vector<ngl_t> ngl_user(nd);
+        {
+            const uint32_t n_all       = hp_ngl + 1;
+            const uint32_t i_gpu_start = n_all > uint32_t(n_gpu) ? n_all - uint32_t(n_gpu) : 0;
+            const uint32_t act_gpu     = std::min(uint32_t(n_gpu), n_all);
+
+            float split_sum = 0.0f;
+            for (size_t id = 0; id < nd; id++) {
+                split_sum += split[id];
+                split[id] = split_sum;
+            }
+            if (split_sum > 0.0f) {
+                for (size_t id = 0; id < nd; id++) {
+                    split[id] /= split_sum;
+                }
+            }
+            for (uint32_t il = i_gpu_start; il < i_gpu_start + act_gpu; il++) {
+                const size_t id_dev = nd == 1 ? 0 :
+                    std::upper_bound(split.begin(), split.end(), float(il - i_gpu_start)/act_gpu) - split.begin();
+                ngl_user[id_dev].n_layer++;
+            }
+        }
+
+        check_host_memory(ngl_user, overflow_bufts);
+        set_ngl_tensor_split_tbo(ngl_user, overflow_bufts, *mparams, tensor_split, tensor_buft_overrides, /*keep_split=*/true);
+        apply_expert_budgets();
+        return;
+    }
+
+    // expert store: all layers run on the GPU and the split is chosen for equal expert
+    // slot budgets, so no device keeps most of its experts in host memory while others
+    // stay empty. Only when the dense weights alone do not fit anywhere fall back to the
+    // per-layer overflow placement below.
+    if (all_expert_store && global_surplus_cpu_moe > 0) {
+        // the back-to-front search below starts from zero layers on every device
+        const std::vector<int64_t> mem_zero = mem;
+        if (balanced_expert_split(ngl_per_device, mem)) {
+            check_host_memory(ngl_per_device, overflow_bufts);
+            set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams, tensor_split, tensor_buft_overrides);
+            apply_expert_budgets();
+            return;
+        }
+        for (size_t id = 0; id < nd; id++) {
+            ngl_per_device[id] = ngl_t();
+        }
+        mem = mem_zero;
+        LOG_WRN("%s: the dense weights do not fit on the devices with an even expert split, falling back to the per-layer overflow placement\n", __func__);
+    } else if (all_expert_store) {
+        LOG_WRN("%s: the dense weights alone do not fit into device memory, keeping the per-layer overflow placement\n", __func__);
+    }
 
     // optimize the number of layers per device using the method of false position:
     //   - ngl_per_device has 0 layers for each device, lower bound

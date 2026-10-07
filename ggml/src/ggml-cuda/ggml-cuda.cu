@@ -2332,13 +2332,16 @@ void ggml_cuda_numa_log_placement(int device, const char * what) {
 // complement allocations of all devices in the order the real load performs them (the model
 // tensor order), simulate the node selection of the real allocations and compare the result
 // against the per-node available memory (MemFree plus reclaimable file pages minus the
-// margin, the same figure the real selection uses). Returns 1 when the placement fits, -1
-// when some node cannot hold its planned bytes (the first failing allocation names the
-// node), and 0 when there is no NUMA information at all (the caller then falls back to a
-// plain total check). The simulation shares ggml_cuda_numa_pick() with the real allocation,
-// so a fit that passes does not fail later.
+// margin, the same figure the real selection uses). On success the bytes placed on every
+// node are written to node_bytes/node_ids (up to the capacity in *n_nodes, which receives
+// the actual number of nodes). Returns 1 when the placement fits, -1 when some node cannot
+// hold its planned bytes (the first failing allocation names the node), and 0 when there is
+// no NUMA information at all (the caller then falls back to a plain total check). The
+// simulation shares ggml_cuda_numa_pick() with the real allocation, so a fit that passes
+// does not fail later.
 static int ggml_backend_cuda_expert_check_host_nodes(
         const int * devices, const size_t * sizes, size_t n_alloc,
+        int64_t * node_bytes, int * node_ids, size_t * n_nodes,
         int * fail_node, size_t * fail_bytes, int64_t * fail_avail) {
     std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
 
@@ -2346,13 +2349,16 @@ static int ggml_backend_cuda_expert_check_host_nodes(
         ggml_cuda_mapped_numa_probe();
     }
     const ggml_cuda_mapped_numa_state & state = ggml_cuda_mapped_numa;
-    const size_t n_nodes = state.nodes.size();
-    if (n_nodes == 0) {
+    const size_t n_nodes_all = state.nodes.size();
+    if (n_nodes_all == 0) {
+        if (n_nodes != nullptr) {
+            *n_nodes = 0;
+        }
         return 0;
     }
 
-    std::vector<int64_t> avail(n_nodes, std::numeric_limits<int64_t>::max());
-    for (size_t n = 0; n < n_nodes; n++) {
+    std::vector<int64_t> avail(n_nodes_all, std::numeric_limits<int64_t>::max());
+    for (size_t n = 0; n < n_nodes_all; n++) {
         const int64_t avail_mem = ggml_cuda_numa_mem_available(state.nodes[n]);
         if (avail_mem >= 0) {
             avail[n] = avail_mem - (int64_t) GGML_CUDA_MAPPED_NUMA_MARGIN - (int64_t) state.placed_node[n];
@@ -2360,8 +2366,9 @@ static int ggml_backend_cuda_expert_check_host_nodes(
     }
 
     const size_t n_devices = state.placed.size();
-    std::vector<int>    current = state.node;  // [device] node the device currently uses
-    std::vector<size_t> placed  = state.placed; // [device] bytes already accounted
+    std::vector<int>     current = state.node;   // [device] node the device currently uses
+    std::vector<size_t>  placed  = state.placed; // [device] bytes already accounted
+    std::vector<int64_t> used(n_nodes_all, 0);   // [node] bytes of this plan
 
     for (size_t i = 0; i < n_alloc; i++) {
         const int    device = devices[i];
@@ -2374,7 +2381,7 @@ static int ggml_backend_cuda_expert_check_host_nodes(
             // the allocation; report it with its available memory
             int    top    = -1;
             double top_bw = -1.0;
-            for (size_t n = 0; n < n_nodes; n++) {
+            for (size_t n = 0; n < n_nodes_all; n++) {
                 const double bw = state.bw[device][n];
                 if (bw >= 0 && (top < 0 || bw > top_bw)) {
                     top    = (int) n;
@@ -2394,6 +2401,21 @@ static int ggml_backend_cuda_expert_check_host_nodes(
         }
         placed[device] += size;
         avail[node] = std::max<int64_t>(avail[node] - (int64_t) size, 0);
+        used[node] += (int64_t) size;
+    }
+
+    if (n_nodes != nullptr) {
+        const size_t cap = *n_nodes;
+        const size_t n_out = std::min(cap, n_nodes_all);
+        for (size_t n = 0; n < n_out; n++) {
+            if (node_bytes != nullptr) {
+                node_bytes[n] = used[n];
+            }
+            if (node_ids != nullptr) {
+                node_ids[n] = state.nodes[n];
+            }
+        }
+        *n_nodes = n_out;
     }
 
     return 1;
@@ -2444,13 +2466,19 @@ void ggml_cuda_numa_log_placement(int device, const char * what) {
 
 static int ggml_backend_cuda_expert_check_host_nodes(
         const int * devices, const size_t * sizes, size_t n_alloc,
+        int64_t * node_bytes, int * node_ids, size_t * n_nodes,
         int * fail_node, size_t * fail_bytes, int64_t * fail_avail) {
     GGML_UNUSED(devices);
     GGML_UNUSED(sizes);
     GGML_UNUSED(n_alloc);
+    GGML_UNUSED(node_bytes);
+    GGML_UNUSED(node_ids);
     GGML_UNUSED(fail_node);
     GGML_UNUSED(fail_bytes);
     GGML_UNUSED(fail_avail);
+    if (n_nodes != nullptr) {
+        *n_nodes = 0;
+    }
     return 0;
 }
 #endif // !defined(GGML_CUDA_MAPPED_NUMA)
