@@ -48,11 +48,56 @@
 // llama.cpp graph a copy of layer L+1 can never overlap the compute of layer L (the ids of
 // L+1 are computed from the output of L).
 
+// free and total device memory of one device: the input of the allocation logs and of the
+// pre-allocation invariant check. The free memory the fit measured must still be there when
+// the expert slots are allocated, otherwise the cudaMalloc below would fail without saying
+// how much was needed or missing.
+static void ggml_cuda_expert_get_mem(int device, size_t * free_bytes, size_t * total_bytes) {
+    ggml_cuda_set_device(device);
+    cudaError_t err = cudaMemGetInfo(free_bytes, total_bytes);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        *free_bytes  = 0;
+        *total_bytes = 0;
+    }
+}
+
+// device context ready: touch the device so its CUDA context and the peer mappings of the
+// device exist, exactly like the real load does when it walks the devices. fit samples the
+// free memory of the devices; a device whose context was never built still lacks that
+// driver bookkeeping in the sample, so its free memory reads too large and the slot budget
+// derived from it over-commits the device. Building the context before the sample makes the
+// measured state and the allocation-time state the same.
+void ggml_backend_cuda_expert_device_ready(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr || buft->context == nullptr || !ggml_cuda_expert_buft_is_expert(buft)) {
+        return;
+    }
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+    ggml_cuda_set_device(buft_ctx->device);
+    // cudaFree(nullptr) is the CUDA recommended way to force the primary context to exist
+    CUDA_CHECK(cudaFree(nullptr));
+}
+
 static void * ggml_cuda_expert_alloc_device(void * user, size_t size) {
     const int device = (int) (intptr_t) user;
     ggml_cuda_set_device(device);
+
+    size_t free_before = 0;
+    size_t total       = 0;
+    ggml_cuda_expert_get_mem(device, &free_before, &total);
+
     void * ptr = nullptr;
-    CUDA_CHECK(cudaMalloc(&ptr, size));
+    cudaError_t err = cudaMalloc(&ptr, size);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: device %d: cudaMalloc of %.2f MiB failed (%s), %.2f MiB free of %.2f MiB\n",
+            __func__, device, size / 1024.0 / 1024.0, cudaGetErrorString(err),
+            free_before / 1024.0 / 1024.0, total / 1024.0 / 1024.0);
+        return nullptr;
+    }
+    GGML_LOG_DEBUG("%s: device %d: cudaMalloc %.2f MiB, free %.2f -> %.2f MiB of %.2f MiB\n",
+        __func__, device, size / 1024.0 / 1024.0,
+        free_before / 1024.0 / 1024.0, (free_before - size) / 1024.0 / 1024.0, total / 1024.0 / 1024.0);
     return ptr;
 }
 
@@ -1057,6 +1102,31 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
         return nullptr;
     }
 
+    // invariant before the first cudaMalloc of this buffer: the bytes this buffer still has to
+    // allocate (slots + staging + the plain block of the non-expert tensors of the same load)
+    // must be present as free device memory right now. fit planned them from a free-memory
+    // sample of the same state; if the state changed in between (a context or a workspace of
+    // the runtime was built after the sample), the numbers here diverge and the cudaMalloc
+    // below would fail with a bare OOM. Report need, available and the shortfall instead.
+    {
+        size_t free_now  = 0;
+        size_t total_now = 0;
+        ggml_cuda_expert_get_mem(device, &free_now, &total_now);
+        const size_t need_now = (size_t) plan.slot_used + stage_budget + plain_size;
+        GGML_LOG_DEBUG("%s: device %d: expert buffer needs %.2f MiB (slots %.2f + staging %.2f + dense %.2f), %.2f MiB free of %.2f MiB\n",
+            __func__, device, need_now / 1024.0 / 1024.0, plan.slot_used / 1024.0 / 1024.0,
+            stage_budget / 1024.0 / 1024.0, plain_size / 1024.0 / 1024.0,
+            free_now / 1024.0 / 1024.0, total_now / 1024.0 / 1024.0);
+        if (need_now > free_now) {
+            GGML_LOG_ERROR("%s: device %d: the expert buffer needs %.2f MiB (slots %.2f + staging %.2f + dense %.2f), but only %.2f MiB are free; short by %.2f MiB. The fit budget was planned from a different free-memory state.\n",
+                __func__, device, need_now / 1024.0 / 1024.0, plan.slot_used / 1024.0 / 1024.0,
+                stage_budget / 1024.0 / 1024.0, plain_size / 1024.0 / 1024.0,
+                free_now / 1024.0 / 1024.0, (need_now - free_now) / 1024.0 / 1024.0);
+            delete ctx;
+            return nullptr;
+        }
+    }
+
     CUDA_CHECK(cudaMalloc((void **) &ctx->usage_dev, 4 * sizeof(unsigned long long)));
     CUDA_CHECK(cudaMemset(ctx->usage_dev, 0, 4 * sizeof(unsigned long long)));
     CUDA_CHECK(cudaHostAlloc((void **) &ctx->usage_host, 4 * sizeof(unsigned long long), cudaHostAllocDefault));
@@ -1175,7 +1245,13 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
 
     // plain tensors: one block of device memory, laid out like the regular CUDA buffer type
     if (plain_size > 0) {
+        size_t free_before = 0;
+        size_t total       = 0;
+        ggml_cuda_expert_get_mem(device, &free_before, &total);
         CUDA_CHECK(cudaMalloc(&ctx->plain_dev, plain_size));
+        GGML_LOG_DEBUG("%s: device %d: dense block cudaMalloc %.2f MiB, free %.2f -> %.2f MiB of %.2f MiB\n",
+            __func__, device, plain_size / 1024.0 / 1024.0,
+            free_before / 1024.0 / 1024.0, (free_before - plain_size) / 1024.0 / 1024.0, total / 1024.0 / 1024.0);
         ctx->plain_size = plain_size;
         for (int i = 0; i < n_tensors; ++i) {
             if (!plain_alloc[i]) {

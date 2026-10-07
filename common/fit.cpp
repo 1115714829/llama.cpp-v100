@@ -104,6 +104,27 @@ static void common_expert_reset_allocation(ggml_backend_buffer_type_t buft) {
     }
 }
 
+// build the CUDA context of the device behind this buffer type (through the backend proc),
+// so the driver bookkeeping the real load pays for is already present when fit samples the
+// free memory. This makes the sampled free memory the same state the expert slots are
+// allocated in; without it the first sample of an untouched device is too large.
+static void common_expert_device_ready(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return;
+    }
+    typedef void (*ggml_backend_expert_device_ready_t)(ggml_backend_buffer_type_t);
+    auto ready = (ggml_backend_expert_device_ready_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_device_ready");
+    if (ready != nullptr) {
+        ready(buft);
+    }
+}
+
 // set the expert VRAM budget (slots + staging) of one buffer type before the model loads
 static void common_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t stage_bytes) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
@@ -942,6 +963,22 @@ static void common_params_fit_impl(
     for (size_t id = 0; id < nd; id++) {
         common_expert_reset_allocation(moe_bufts[id]);
     }
+
+    // build the CUDA context of every device before any measurement below. The free memory
+    // a device reports without its context is larger than at allocation time, so budgeting
+    // the expert slots from such a sample over-commits the device. The context lives for the
+    // whole process, so every later trial and the real load measure the same state.
+    for (size_t id = 0; id < nd; id++) {
+        common_expert_device_ready(moe_bufts[id]);
+    }
+    // the first sample (dmds_full) was taken before the contexts existed; re-measure so the
+    // per-device targets of the layer split use the same free-memory state as everything else.
+    // The stage series restarts here: the runtime growth of the later stages is measured from
+    // the state the expert slots are allocated in, not from the pre-context sample.
+    dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    add_extra_memory(dmds_full);
+    common_fit_log_memory_stage_devs(nullptr, 0, nullptr); // restart the stage series at the new baseline
+    common_fit_log_memory_stage_devs(devs.data(), (int) nd, "fit_ready");
 
     // expert store (the MoE tiered cache): when every device supports it, all MoE expert
     // tensors are routed to the expert buffer type of the device that computes the layer, not

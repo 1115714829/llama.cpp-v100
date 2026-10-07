@@ -906,14 +906,30 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     ggml_cuda_set_device(buft_ctx->device);
 
+    // free memory before/after every large allocation (dense weights, KV cache, compute
+    // buffers): the runtime adds device memory after the fit measured it, so these lines
+    // show which allocation ate what the fit did not account for
+    size_t free_before = 0;
+    size_t total       = 0;
+    if (cudaMemGetInfo(&free_before, &total) != cudaSuccess) {
+        (void) cudaGetLastError();
+        free_before = 0;
+        total       = 0;
+    }
+
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
-        GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
+        GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s (%.2f MiB free of %.2f MiB)\n",
+            __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err),
+            free_before / 1024.0 / 1024.0, total / 1024.0 / 1024.0);
         return nullptr;
     }
+    GGML_LOG_DEBUG("%s: device %d: cudaMalloc %.2f MiB, free %.2f -> %.2f MiB of %.2f MiB\n",
+        __func__, buft_ctx->device, size / 1024.0 / 1024.0,
+        free_before / 1024.0 / 1024.0, (free_before - size) / 1024.0 / 1024.0, total / 1024.0 / 1024.0);
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
 
@@ -8890,6 +8906,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_expert_reset_allocation") == 0) {
         return (void *)ggml_cuda_expert_reset_allocation;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_device_ready") == 0) {
+        return (void *)ggml_backend_cuda_expert_device_ready;
     }
     if (strcmp(name, "ggml_backend_cuda_expert_plan") == 0) {
         return (void *)ggml_cuda_expert_plan;

@@ -136,6 +136,12 @@ bool ggml_backend_cuda_expert_get_allocation(
 // trials so that a model loaded earlier in the process does not leak into the measurements
 void ggml_cuda_expert_reset_allocation(ggml_backend_buffer_type_t buft);
 
+// build or touch the CUDA context of the device of this buffer type, so that the driver
+// bookkeeping the real load pays for (context, peer mappings) is present when fit samples
+// the free memory. Without this the sample of a device that no trial touched reads too
+// large and the slot budget derived from it over-commits the device.
+void ggml_backend_cuda_expert_device_ready(ggml_backend_buffer_type_t buft);
+
 // largest host complement of a single expert tensor in the most recent allocation on the
 // device of buft. Returns false when no expert buffer was allocated yet.
 bool ggml_backend_cuda_expert_get_host_peak(ggml_backend_buffer_type_t buft, size_t * peak_bytes);
