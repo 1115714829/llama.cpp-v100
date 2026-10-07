@@ -3104,8 +3104,12 @@ llm_graph_result * llama_context::get_gf_res_prev(int slot) {
 }
 
 int llama_context::gf_res_slot(const llama_ubatch & ubatch) const {
-    // verification/single-token decode batches of regular contexts get the dedicated decode scheduler
-    if (sched_dec && ubatch.embd == nullptr && n_outputs == ubatch.n_tokens && ubatch.n_tokens <= n_dec_max) {
+    // verification/single-token decode batches of regular contexts get the dedicated decode scheduler.
+    // embd batches stay off it because an embd injection pass (DFlash, EAGLE) builds a different graph;
+    // an MTP draft context builds the same graph with or without the target hidden state in embd, so its
+    // single-token draft steps take the decode scheduler too and no longer evict the catch-up graph
+    const bool embd_same_graph = ubatch.embd == nullptr || cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+    if (sched_dec && embd_same_graph && n_outputs == ubatch.n_tokens && ubatch.n_tokens <= n_dec_max) {
         return 2;
     }
 
