@@ -250,19 +250,6 @@ static int ggml_cuda_parse_id(char devName[]) {
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
-    // Kernel modules and their constants are device memory. The CUDA runtime loads them
-    // lazily by default: a module only takes its device memory when one of its kernels first
-    // runs. The fit sizes the expert slot budget from the free memory it reads before any
-    // kernel ran, so that lazy code and constants are missing from the accounting and the
-    // slots can be over-sized past the real free memory. Load the modules eagerly so the
-    // memory is resident before the fit measures. This is a runtime loading policy, not a
-    // fallback; an explicit user value is respected.
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && !defined(_WIN32)
-    if (getenv("CUDA_MODULE_LOADING") == nullptr) {
-        setenv("CUDA_MODULE_LOADING", "EAGER", /*overwrite =*/ 0);
-    }
-#endif
-
     cudaError_t err = cudaGetDeviceCount(&info.physical_device_count);
     if (err != cudaSuccess) {
         GGML_LOG_ERROR("%s: failed to initialize " GGML_CUDA_NAME ": %s\n", __func__, cudaGetErrorString(err));
@@ -8891,6 +8878,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_expert_set_budget") == 0) {
         return (void *)ggml_cuda_expert_set_budget;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_record_plan") == 0) {
+        return (void *)ggml_cuda_expert_record_plan;
     }
     if (strcmp(name, "ggml_backend_cuda_expert_get_allocation") == 0) {
         return (void *)ggml_backend_cuda_expert_get_allocation;

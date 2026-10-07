@@ -150,21 +150,22 @@ struct common_expert_tensor {
 };
 
 // layer index of a tensor name "blk.<n>...", -1 for anything else. Used on tensors that
-// already carry the expert mark, so the name is metadata and not recognition.
+// already carry the expert mark, so the name is metadata and not recognition. The exact
+// parse mirrors ggml_cuda_expert_tensor_layer(): the fit plan and the real allocation must
+// see the same layer number for every tensor, otherwise the two plans differ.
 static int common_expert_tensor_layer(const std::string & name) {
-    if (name.compare(0, 4, "blk.") != 0) {
+    const size_t pos = name.find("blk.");
+    if (pos == std::string::npos) {
         return -1;
     }
-    const size_t dot = name.find('.', 4);
-    if (dot == std::string::npos || dot == 4) {
+    size_t p = pos + 4;
+    if (p >= name.size() || name[p] < '0' || name[p] > '9') {
         return -1;
     }
     int layer = 0;
-    for (size_t i = 4; i < dot; ++i) {
-        if (name[i] < '0' || name[i] > '9') {
-            return -1;
-        }
-        layer = layer * 10 + (name[i] - '0');
+    while (p < name.size() && name[p] >= '0' && name[p] <= '9') {
+        layer = layer * 10 + (name[p] - '0');
+        p++;
     }
     return layer;
 }
@@ -218,6 +219,26 @@ static bool common_expert_plan(ggml_backend_buffer_type_t buft,
     plan(buft, layers.data(), n_experts.data(), blobs.data(), types.data(), ne0s.data(), tensors.size(),
         slot_budget, slot_bytes, host_bytes, host_peak, host_each != nullptr ? host_each->data() : nullptr);
     return true;
+}
+
+// record the placement plan fit computed for one device (slot and host bytes). The real
+// allocation replans from the same tensors and the same budget and must come out at exactly
+// these bytes; it aborts when it does not.
+static void common_expert_record_plan(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t host_bytes) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return;
+    }
+    typedef void (*ggml_backend_expert_record_plan_t)(ggml_backend_buffer_type_t, size_t, size_t);
+    auto record = (ggml_backend_expert_record_plan_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_record_plan");
+    if (record != nullptr) {
+        record(buft, slot_bytes, host_bytes);
+    }
 }
 
 // NUMA check of the expert host arenas: hand the host complement allocations of all devices
@@ -1346,7 +1367,11 @@ static void common_params_fit_impl(
 
             int64_t surplus;
             if (all_expert_store) {
-                surplus = dmds_full[id].free - mem_final[id] - margins[id];
+                // basis: the free memory of the same measurement that produced mem_final (the
+                // last trial, right before the real load), not the first measurement of the fit.
+                // The trials themselves create contexts and load device code, so the first free
+                // reading is stale and larger; budgeting from it would over-commit the device.
+                surplus = dmds_last[id].free - mem_final[id] - margins[id];
             } else {
                 surplus = dmds_cpu_moe[id].free - int64_t(dmds_cpu_moe[id].mb.total()) - margins[id];
             }
@@ -1410,34 +1435,37 @@ static void common_params_fit_impl(
                     " MiB); reduce the context size, use more devices or a lower quantization");
             }
             common_expert_set_budget(moe_bufts[id], slot_budget, stage_bytes);
+            // hand the same plan to the backend: the real allocation replans from the same
+            // tensors and the same budget and aborts when it comes out at different bytes
+            common_expert_record_plan(moe_bufts[id], slot_used, host_bytes);
 
             // one line per device: the layer range, what the dense weights, the context
             // (KV cache) and the compute buffers take, how the surplus is split into slots
             // and staging, and how much of the expert set stays in host memory (a uniform
-            // routing estimate)
+            // routing estimate). The slot figure is the plan the allocation must reproduce
+            // byte for byte; it is always <= the budget.
             const llama_memory_breakdown_data & mb = all_expert_store ? dmds_last[id].mb : dmds_cpu_moe[id].mb;
             const double hit = slot_used + host_bytes > 0
                 ? 100.0 * (double) slot_used / (double) (slot_used + host_bytes) : 0.0;
             const std::string range = dev_first[id] < 0 ? "none" :
                 std::to_string(dev_first[id]) + ".." + std::to_string(dev_last[id]) +
                 (dev_last[id] == (int) hp_ngl ? " (out)" : "");
-            LOG_INF("%s: device %zu (layers %s): dense %.0f MiB, context %.0f MiB, compute %.0f MiB, expert slots %.0f MiB (planned %.0f MiB), staging %.0f MiB, host complement %.0f MiB, decode hit %.0f%% (uniform)\n",
+            LOG_INF("%s: device %zu (layers %s): dense %.0f MiB, context %.0f MiB, compute %.0f MiB, expert slots %.0f MiB (budget %.0f MiB), staging %.0f MiB, host complement %.0f MiB, decode hit %.0f%% (uniform)\n",
                 __func__, id, range.c_str(),
                 (double) mb.model/MiB, (double) mb.context/MiB, (double) mb.compute/MiB,
-                slot_budget/1024.0/1024.0, slot_used/1024.0/1024.0, stage_bytes/1024.0/1024.0,
+                slot_used/1024.0/1024.0, slot_budget/1024.0/1024.0, stage_bytes/1024.0/1024.0,
                 host_bytes/1024.0/1024.0, hit);
-            // runtime growth reserve of this device and its basis: the surplus is real free
-            // device memory at the fit measurement (the CUDA runtime has already loaded the
-            // kernel modules and their constants, see ggml_cuda_init), minus the dense
-            // weights, the KV cache and the compute buffers, minus the user margin. What the
-            // slots and the staging area do not consume is left for what the runtime adds
-            // afterwards. This is a measurement, not a guess.
+            // budget accounting of this device: the surplus is real free device memory at the
+            // measurement that produced mem_final, minus the dense weights, the KV cache and
+            // the compute buffers, minus the user margin. The slots are planned with whole
+            // experts only, so the plan uses as much of the budget as whole experts allow and
+            // never more; the remainder stays free for what the runtime adds after the fit.
             const size_t slot_slack    = slot_budget > slot_used  ? slot_budget - slot_used  : 0;
             const size_t staging_slack = stage_bytes > stage_peak ? stage_bytes - stage_peak : 0;
-            LOG_TRC("%s: device %zu runtime growth reserve: margin %.0f MiB (user target), slot slack %.0f MiB (whole-expert rounding), staging slack %.0f MiB; basis surplus %.0f MiB = free %.0f - accounted %.0f - margin %.0f\n",
+            LOG_TRC("%s: device %zu budget: margin %.0f MiB (user target), slot remainder %.0f MiB (whole experts), staging slack %.0f MiB; basis surplus %.0f MiB = free %.0f - accounted %.0f - margin %.0f\n",
                 __func__, id,
                 margins[id]/1024.0/1024.0, slot_slack/1024.0/1024.0, staging_slack/1024.0/1024.0,
-                surplus/1024.0/1024.0, dmds_full[id].free/1024.0/1024.0, mem_final[id]/1024.0/1024.0, margins[id]/1024.0/1024.0);
+                surplus/1024.0/1024.0, dmds_last[id].free/1024.0/1024.0, mem_final[id]/1024.0/1024.0, margins[id]/1024.0/1024.0);
             slot_budgets[id] = slot_budget;
             has_experts = true;
             host_complement += (int64_t) host_bytes;

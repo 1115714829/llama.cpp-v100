@@ -106,6 +106,12 @@ const char * ggml_backend_cuda_expert_buffer_type_name(ggml_backend_buffer_type_
 // could not be staged without a staging area.
 void ggml_cuda_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t stage_bytes);
 
+// record the placement plan fit computed for the budget of this buffer type. The store
+// allocation replans from the same tensors and the same budget, so it must come out at these
+// bytes; the allocation aborts when it does not. Called by fit right after ggml_cuda_expert_plan
+// and before the model loads.
+void ggml_cuda_expert_record_plan(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t host_bytes);
+
 // pure placement plan of the expert tensors of one device: the same store function that
 // alloc_buffer_n uses, so fit sizes the staging area without a trial load. The tensors arrive
 // as parallel arrays (layer, n_expert, blob_bytes). slot_budget is the VRAM budget for the

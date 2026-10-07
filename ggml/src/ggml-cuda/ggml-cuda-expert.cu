@@ -391,10 +391,29 @@ static size_t g_expert_alloc_stage[GGML_CUDA_MAX_DEVICES] = {};
 // which fit uses to size the staging area
 static size_t g_expert_alloc_host_peak[GGML_CUDA_MAX_DEVICES] = {};
 
+// plan the fit computed for the same budget and the same tensors as the real allocation. The
+// plan is a pure function of (tensors, slot budget), so the allocation must reproduce these
+// values byte for byte; it aborts when it does not. valid is false until fit records a plan
+// (and after a new budget), so an allocation without a fit plan is not compared against a
+// stale one.
+static size_t g_expert_plan_slot[GGML_CUDA_MAX_DEVICES] = {};
+static size_t g_expert_plan_host[GGML_CUDA_MAX_DEVICES] = {};
+static bool   g_expert_plan_valid[GGML_CUDA_MAX_DEVICES] = {};
+
 static void ggml_cuda_expert_set_budget_impl(int device, size_t slot_bytes, size_t stage_bytes) {
     std::lock_guard<std::mutex> lock(g_expert_budget_mutex);
     g_expert_slot_budget [device] = slot_bytes;
     g_expert_stage_budget[device] = stage_bytes;
+    g_expert_plan_valid[device] = false;
+}
+
+// record the fit plan (slot and host bytes) of one device: the allocation of the same budget
+// must come out at exactly these bytes
+static void ggml_cuda_expert_set_plan_impl(int device, size_t slot_bytes, size_t host_bytes) {
+    std::lock_guard<std::mutex> lock(g_expert_budget_mutex);
+    g_expert_plan_slot[device] = slot_bytes;
+    g_expert_plan_host[device] = host_bytes;
+    g_expert_plan_valid[device] = true;
 }
 
 static size_t ggml_cuda_expert_get_slot_budget(int device) {
@@ -427,6 +446,7 @@ void ggml_cuda_expert_reset_allocation(ggml_backend_buffer_type_t buft) {
         g_expert_alloc_host [i] = 0;
         g_expert_alloc_stage[i] = 0;
         g_expert_alloc_host_peak[i] = 0;
+        g_expert_plan_valid[i] = false;
     }
 }
 
@@ -1116,6 +1136,28 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
     }
 
     if (expert_bytes > 0) {
+        // invariant: this allocation must match the plan fit computed for the same budget and
+        // the same tensors byte for byte. The plan is a pure function of the two, so a mismatch
+        // means the budget would be exceeded and the device runs out of memory later; fail now
+        // and print both sides. No plan was recorded when the buffer is not loaded by a fit
+        // (tests, direct backend use): the allocation stands on its own then.
+        {
+            std::lock_guard<std::mutex> lock(g_expert_budget_mutex);
+            if (g_expert_plan_valid[device] &&
+                ((size_t) ctx->store->slot_used != g_expert_plan_slot[device] ||
+                 (size_t) ctx->store->host_used != g_expert_plan_host[device])) {
+                GGML_ABORT("%s: device %d: expert placement (slots %.2f MiB, host %.2f MiB) differs from the fit plan"
+                    " (slots %.2f MiB, host %.2f MiB) for slot budget %.2f MiB\n",
+                    __func__, device,
+                    (double) ctx->store->slot_used / 1024.0 / 1024.0, (double) ctx->store->host_used / 1024.0 / 1024.0,
+                    (double) g_expert_plan_slot[device] / 1024.0 / 1024.0, (double) g_expert_plan_host[device] / 1024.0 / 1024.0,
+                    slot_budget / 1024.0 / 1024.0);
+            }
+            // one allocation per budget: a second buffer of the same device must record its own
+            // plan before it can be checked
+            g_expert_plan_valid[device] = false;
+        }
+
         ggml_expert_store_print_plan(ctx->store);
         ggml_cuda_expert_set_allocation(device, (size_t) ctx->store->slot_used, (size_t) ctx->store->host_used,
             stage_budget, (size_t) plan.host_peak);
@@ -1271,6 +1313,14 @@ void ggml_cuda_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_by
     ggml_cuda_expert_set_budget_impl(buft_ctx->device, slot_bytes, stage_bytes);
 }
 
+void ggml_cuda_expert_record_plan(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t host_bytes) {
+    if (buft == nullptr || buft->context == nullptr) {
+        return;
+    }
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+    ggml_cuda_expert_set_plan_impl(buft_ctx->device, slot_bytes, host_bytes);
+}
+
 void ggml_cuda_expert_set_slot_limit(ggml_backend_buffer_type_t buft, size_t bytes) {
     if (buft == nullptr || buft->context == nullptr) {
         return;
@@ -1418,6 +1468,12 @@ void ggml_cuda_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_by
     GGML_UNUSED(buft);
     GGML_UNUSED(slot_bytes);
     GGML_UNUSED(stage_bytes);
+}
+
+void ggml_cuda_expert_record_plan(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t host_bytes) {
+    GGML_UNUSED(buft);
+    GGML_UNUSED(slot_bytes);
+    GGML_UNUSED(host_bytes);
 }
 
 void ggml_cuda_expert_set_slot_limit(ggml_backend_buffer_type_t buft, size_t bytes) {
