@@ -40,7 +40,7 @@ MOE_GROUPED_TRAITS(GGML_TYPE_Q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ, block_q8_0,
 // groups of at most CT, each group staged into shared memory. Warp w takes rows w, w+nwarps, ...
 // For a row the lane loads its weight blocks once into registers and dots them against every
 // staged entry, so the weight row is read from global memory once per group.
-template <ggml_type type, int ROWS, int CT>
+template <ggml_type type, int ROWS, int CT, bool expert_store>
 __launch_bounds__(256, 1)
 static __global__ void moe_grouped_kernel(
         const char * __restrict__ vx, const int32_t * __restrict__ expert_bounds,
@@ -61,6 +61,15 @@ static __global__ void moe_grouped_kernel(
     const int col_diff  = expert_bounds[expert + 1] - col_start;
     if (col_diff <= 0) {
         return;
+    }
+
+    // Expert store: the expert base comes from the device pointer table, which may point at
+    // a VRAM slot or at the mapped host arena. Read it once per block, not per row group.
+    const char * expert_base;
+    if constexpr (expert_store) {
+        expert_base = expert_ptrs[expert];
+    } else {
+        expert_base = vx + (size_t) expert * nb02;
     }
 
     const int lane   = threadIdx.x % 32;
@@ -91,9 +100,7 @@ static __global__ void moe_grouped_kernel(
             if (r >= nrows_x) {
                 break;
             }
-            // expert store: the expert base comes from the device pointer table, which may
-            // point at a VRAM slot or at the mapped host arena
-            const char * wrow = (expert_ptrs != nullptr ? expert_ptrs[expert] : vx + (size_t) expert * nb02) + (size_t) r * nb01;
+            const char * wrow = expert_base + (size_t) r * nb01;
 
             float acc[CT] = {0.0f};
             for (int kbx = kbx0; kbx < nblocks_weight; kbx += blocks_per_iter) {
@@ -178,7 +185,7 @@ bool ggml_cuda_moe_grouped_mul_mat_id_supported(const ggml_tensor * dst, const i
     return true;
 }
 
-template <ggml_type type>
+template <ggml_type type, bool expert_store>
 static void moe_grouped_launch(
         const char * vx, const int32_t * expert_bounds, const int32_t * ids_dst, const int32_t * ids_src1,
         const block_q8_1 * xq, float * dst, const int64_t nrows_x, const int64_t nblocks_weight, const int64_t nblocks_row_q8,
@@ -194,13 +201,30 @@ static void moe_grouped_launch(
 
     // nbytes_shared depends on K, so the opt-in limit is raised on every launch rather than once.
 #if !defined(GGML_USE_HIP)
-    CUDA_CHECK(cudaFuncSetAttribute((moe_grouped_kernel<type, ROWS, CT>),
+    CUDA_CHECK(cudaFuncSetAttribute((moe_grouped_kernel<type, ROWS, CT, expert_store>),
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int) nbytes_shared));
 #endif
 
-    moe_grouped_kernel<type, ROWS, CT><<<grid, block, nbytes_shared, stream>>>(
+    moe_grouped_kernel<type, ROWS, CT, expert_store><<<grid, block, nbytes_shared, stream>>>(
         vx, expert_bounds, ids_dst, ids_src1, xq, dst,
         (int) nrows_x, (int) nblocks_weight, (int) nblocks_row_q8, nb01, nb02, dst_stride_col, expert_ptrs);
+}
+
+// Dispatch to the pointer-table kernel for expert store weights, to the src0 kernel otherwise.
+// The choice is made here so the kernel does not test expert_ptrs at run time.
+template <ggml_type type>
+static void moe_grouped_launch_dispatch(
+        const char * vx, const int32_t * expert_bounds, const int32_t * ids_dst, const int32_t * ids_src1,
+        const block_q8_1 * xq, float * dst, const int64_t nrows_x, const int64_t nblocks_weight, const int64_t nblocks_row_q8,
+        const int64_t nb01, const int64_t nb02, const int64_t dst_stride_col, const int n_experts, cudaStream_t stream,
+        const char * const * expert_ptrs) {
+    if (expert_ptrs != nullptr) {
+        moe_grouped_launch<type, true>(vx, expert_bounds, ids_dst, ids_src1, xq, dst, nrows_x, nblocks_weight,
+            nblocks_row_q8, nb01, nb02, dst_stride_col, n_experts, stream, expert_ptrs);
+    } else {
+        moe_grouped_launch<type, false>(vx, expert_bounds, ids_dst, ids_src1, xq, dst, nrows_x, nblocks_weight,
+            nblocks_row_q8, nb01, nb02, dst_stride_col, n_experts, stream, expert_ptrs);
+    }
 }
 
 bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const char * const * expert_ptrs) {
@@ -277,23 +301,23 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
 
     switch (src0->type) {
         case GGML_TYPE_Q4_K:
-            moe_grouped_launch<GGML_TYPE_Q4_K>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
+            moe_grouped_launch_dispatch<GGML_TYPE_Q4_K>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
                 xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
             break;
         case GGML_TYPE_Q5_K:
-            moe_grouped_launch<GGML_TYPE_Q5_K>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
+            moe_grouped_launch_dispatch<GGML_TYPE_Q5_K>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
                 xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
             break;
         case GGML_TYPE_Q6_K:
-            moe_grouped_launch<GGML_TYPE_Q6_K>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
+            moe_grouped_launch_dispatch<GGML_TYPE_Q6_K>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
                 xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
             break;
         case GGML_TYPE_Q5_1:
-            moe_grouped_launch<GGML_TYPE_Q5_1>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
+            moe_grouped_launch_dispatch<GGML_TYPE_Q5_1>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
                 xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
             break;
         case GGML_TYPE_Q8_0:
-            moe_grouped_launch<GGML_TYPE_Q8_0>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
+            moe_grouped_launch_dispatch<GGML_TYPE_Q8_0>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
                 xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
             break;
         default:
