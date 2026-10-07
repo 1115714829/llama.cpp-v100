@@ -1465,6 +1465,9 @@ static void common_params_fit_impl(
         // largest remainder method: n_gpu_layers split by the given weights, the last device
         // keeps at least one layer (the output layer)
         auto split_layers = [&](const std::vector<int64_t> & weight, std::vector<uint32_t> & out) -> bool {
+            // the caller may pass a fresh vector: size it before the loop below writes out[id]
+            out.assign(nd, 0);
+
             int64_t sum = 0;
             for (size_t id = 0; id < nd; id++) {
                 sum += std::max<int64_t>(weight[id], 0);
