@@ -151,7 +151,10 @@ bool ggml_cuda_moe_grouped_mul_mat_id_supported(const ggml_tensor * dst, const i
         default:
             return false;
     }
-    if (dst->ne[2] < 9 || dst->ne[2] > 64) {
+    // T = 1..8 is the decode and verify window. The entries of one expert are staged into
+    // shared memory and the weight row is read once for all of them, exactly like the
+    // prefill batches, so the same kernel serves both ranges.
+    if (dst->ne[2] < 1 || dst->ne[2] > 64) {
         return false;
     }
     if (src1->ne[3] != 1 || src0->ne[3] != 1) {

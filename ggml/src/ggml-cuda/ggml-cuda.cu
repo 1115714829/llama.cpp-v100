@@ -3572,15 +3572,17 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
+    // the grouped kernel is a plain launch that builds its tables on the device, so it can be
+    // recorded into a CUDA graph. Check it before MMVQ so the order matches the dispatch.
+    if (ggml_cuda_moe_grouped_mul_mat_id_supported(dst, cc)) {
+        return false;
+    }
+
     if (ggml_is_quantized(src0->type)) {
         if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
             return false;
         }
     } else if (dst->ne[2] <= MMVF_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
-        return false;
-    }
-
-    if (ggml_cuda_moe_grouped_mul_mat_id_supported(dst, cc)) {
         return false;
     }
 
@@ -3628,6 +3630,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         if (ggml_is_quantized(src0->type)) {
+            // Decode and verify windows (T <= 8) take the grouped kernel: it stages every
+            // entry routed to one expert and reads the weight row once, while the MMVQ MoE
+            // kernel gives one warp per token and re-reads the weight for each routed token.
+            // The gate/up fusion of separate gate/up weights stays on MMVQ (the target model
+            // merges them into one gate_up tensor, so its gate/up is a plain MUL_MAT_ID).
+            if (ne2 <= MOE_GROUPED_MAX_TOKENS &&
+                    ggml_cuda_moe_grouped_mul_mat_id(ctx, dst, is_expert_store ? ex_table.main : nullptr)) {
+                return;
+            }
             // The MMVQ mmid kernel is a separate kernel whose block width is the token count,
             // so on Volta it can go past MMVQ_MAX_BATCH_SIZE.
             if (ne2 <= get_mmvq_mmid_max_batch(src0->type, cc)) {

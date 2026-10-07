@@ -13025,6 +13025,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
+    // Decode and verify windows (T = 1..8) take the Volta grouped expert kernel: every entry
+    // routed to one expert is staged once and the weight row is read once, instead of one warp
+    // per token re-reading it (the MMVQ MoE kernel). Real UD-Q4_K_XL shapes and types.
+    for (int n : {1, 2, 4, 8}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, n, 2560)); // gate/up
+        }
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, n, 2560)); // gate/up
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n, 640)); // down
+        }
+        // merged gate_up: one MUL_MAT_ID over the (k, 2*n_ff) tensor, split into gate/up views
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560));
+    }
+
     // multiple blocks per row: exercises the block-stride loop and the
     // per-expert base offset, which k == 256 alone leaves untested
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
@@ -14846,9 +14861,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Unsloth Qwen3.8-Flash-Next UD-Q4_K_XL expert projections: 512 experts, top-10,
     // Q4_K/Q5_K gate/up and Q5_1/Q8_0 down (K = 640 is not a multiple of QK_K, so the K-quant
-    // types cannot be used for down). n covers the MMVQ -> grouped-kernel boundary
-    // (8/16/32/64) and the prefill path (128/512/2048).
-    for (int64_t n : {1, 8, 16, 32, 64, 128, 512, 2048}) {
+    // types cannot be used for down). n covers the grouped decode/verify window (1/2/4/8),
+    // the MMVQ -> grouped-kernel boundary (16/32/64) and the prefill path (128/512/2048).
+    for (int64_t n : {1, 2, 4, 8, 16, 32, 64, 128, 512, 2048}) {
         for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // gate/up
         }
@@ -14856,6 +14871,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // gate/up
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640)); // down
         }
+    }
+
+    // the merged gate_up tensor (k = 2560, m = 1280) at the verify window width: one grouped
+    // MUL_MAT_ID, then the graph splits the result into gate and up views
+    for (int64_t n : {1, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560));
     }
 
     return test_cases;
