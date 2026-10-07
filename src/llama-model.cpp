@@ -1367,11 +1367,6 @@ struct llama_model::impl {
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
 
-    // metadata-only contexts of borrowed shared tensors from a no_alloc measurement pass,
-    // moved here from the loader in load_tensors: they hold no buffers and are excluded from
-    // the memory breakdown, but the tensors must outlive the loader (see borrow_shared_tensor)
-    std::vector<ggml_context_ptr> ctxs_borrowed;
-
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
 
@@ -1951,10 +1946,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     ml.done_getting_tensors();
-
-    // the loader dies before the model is used, so the metadata-only contexts of borrowed
-    // shared tensors (no_alloc measurement pass) move here; they hold no buffers on purpose
-    pimpl->ctxs_borrowed = std::move(ml.contexts_borrowed);
 
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);

@@ -1195,45 +1195,6 @@ struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL 
     }
 
     if (model_shared == nullptr) {
-        if (no_alloc) {
-            // Capability branch of the measurement mode, not a fallback: the memory fit loads
-            // the draft with no_alloc and without the target model, so there is nothing to
-            // borrow from. The shared tensors belong to the target and must not be counted
-            // into the memory of the draft, so a metadata-only tensor (no data, no bytes)
-            // keeps the model build and the graph sizing going. The real load below still
-            // borrows from model_shared, which also checks the shapes against the target.
-            // The context moves to the model (see llama_model_base::load_tensors), the
-            // no_alloc model outlives the loader.
-            ggml_init_params ctx_params = {
-                /*.mem_size   =*/ ggml_tensor_overhead()*2,
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-
-            ggml_context_ptr ctx(ggml_init(ctx_params));
-            if (!ctx) {
-                throw std::runtime_error(format("%s: failed to create the measurement context for '%s'", __func__, name.c_str()));
-            }
-
-            int64_t dims[GGML_MAX_DIMS] = {1, 1, 1, 1};
-            for (size_t dim = 0; dim < ne.size() && dim < GGML_MAX_DIMS; dim++) {
-                dims[dim] = ne.begin()[dim];
-            }
-
-            // the type is unknown without the target: F32 needs no dequant workspace and no
-            // bytes are counted, so the graph sizing of the measurement stays conservative
-            ggml_tensor * t_meta = ggml_new_tensor_4d(ctx.get(), GGML_TYPE_F32, dims[0], dims[1], dims[2], dims[3]);
-            ggml_set_name(t_meta, name.c_str());
-            contexts_borrowed.emplace_back(std::move(ctx));
-
-            LLAMA_LOG_INFO("%s: tensor %s measured as metadata-only (the real load borrows it from the target model)\n",
-                    __func__, name.c_str());
-
-            // not counted in n_created or size_data: the tensor is not in this file and is
-            // neither allocated nor freed here
-            return t_meta;
-        }
-
         throw std::runtime_error(format("%s: missing tensor '%s'; if this is a draft head that shares "
                     "the target's embeddings, load it as a draft of its target model, not on its own",
                     __func__, name.c_str()));

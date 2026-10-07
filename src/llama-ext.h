@@ -91,6 +91,11 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
+// the devices llama uses when no explicit device list is given: RPC servers first, then
+// discrete GPUs, integrated GPUs only when no discrete GPU exists. Same selection as the
+// model load applies, so callers can match where a model will run without its own rules.
+LLAMA_API std::vector<ggml_backend_dev_t> llama_default_devices();
+
 // all tensors of the loaded model, by name; the fit code reads the expert tensor metadata
 // (name and shape) from it to plan the expert store without another trial load. Matches the
 // declaration in llama-model.h, the function itself is internal to libllama.

@@ -142,11 +142,6 @@ struct llama_model_loader {
     void * set_tensor_data_ud;
     std::vector<ggml_context_ptr> contexts;
 
-    // metadata-only contexts of borrowed shared tensors in a no_alloc measurement pass
-    // (memory fit), see borrow_shared_tensor(). Must move to the model before the loader
-    // dies, the no_alloc model keeps using the tensors after the load.
-    std::vector<ggml_context_ptr> contexts_borrowed;
-
     std::string arch_name;
     LLM_KV      llm_kv    = LLM_KV(LLM_ARCH_UNKNOWN);
 

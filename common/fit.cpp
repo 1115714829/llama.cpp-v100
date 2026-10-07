@@ -302,52 +302,12 @@ static int common_expert_check_host_nodes(
         node_bytes, node_ids, n_nodes, fail_node, fail_bytes, fail_avail);
 }
 
-static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
-        const char * path_model,
-        const llama_model_params * mparams,
-        const llama_context_params * cparams,
-        std::vector<ggml_backend_dev_t> & devs,
-        uint32_t & hp_ngl,
-        uint32_t & hp_n_ctx_train,
-        uint32_t & hp_n_expert,
-        ggml_log_level log_level,
-        std::vector<common_expert_tensor> * expert_tensors = nullptr) {
-    struct user_data_t {
-        struct {
-            ggml_log_callback callback;
-            void * user_data;
-        } original_logger;
-        ggml_log_level min_level; // prints below this log level go to debug log
-    };
-    user_data_t ud;
-    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
-    ud.min_level = log_level;
-
-    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
-        const user_data_t * ud = (const user_data_t *) user_data;
-        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
-        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
-    }, &ud);
-
-    llama_model_params mparams_copy = *mparams;
-    mparams_copy.no_alloc  = true;
-    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
-
-    llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
-    if (model == nullptr) {
-        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
-        throw std::runtime_error("failed to load model");
-    }
-
-    llama_context * ctx = llama_init_from_model(model, *cparams);
-    if (ctx == nullptr) {
-        llama_model_free(model);
-        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
-        throw std::runtime_error("failed to create llama_context from model");
-    }
-
+// collect the per-device memory breakdown of one loaded model: one entry per device of
+// the model plus the host entry at the back
+static void collect_device_memory_breakdown(
+        const llama_model * model, const llama_context * ctx, std::vector<llama_device_memory_data> & ret) {
     const size_t nd = llama_model_n_devices(model);
-    std::vector<llama_device_memory_data> ret(nd + 1);
+    GGML_ASSERT(ret.size() == nd + 1);
 
     llama_memory_breakdown memory_breakdown = llama_get_memory_breakdown(ctx);
 
@@ -399,6 +359,59 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             }
         }
     }
+}
+
+static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        std::vector<ggml_backend_dev_t> & devs,
+        uint32_t & hp_ngl,
+        uint32_t & hp_n_ctx_train,
+        uint32_t & hp_n_expert,
+        ggml_log_level log_level,
+        std::vector<common_expert_tensor> * expert_tensors = nullptr,
+        const common_fit_extra_model * extra = nullptr,
+        std::vector<llama_device_memory_data> * extra_mem = nullptr,
+        std::vector<ggml_backend_dev_t> * extra_devs = nullptr) {
+    struct user_data_t {
+        struct {
+            ggml_log_callback callback;
+            void * user_data;
+        } original_logger;
+        ggml_log_level min_level; // prints below this log level go to debug log
+    };
+    user_data_t ud;
+    llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
+    ud.min_level = log_level;
+
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const user_data_t * ud = (const user_data_t *) user_data;
+        const ggml_log_level level_eff = level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+        ud->original_logger.callback(level_eff, text, ud->original_logger.user_data);
+    }, &ud);
+
+    llama_model_params mparams_copy = *mparams;
+    mparams_copy.no_alloc  = true;
+    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+
+    llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
+    if (model == nullptr) {
+        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+        throw std::runtime_error("failed to load model");
+    }
+
+    llama_context * ctx = llama_init_from_model(model, *cparams);
+    if (ctx == nullptr) {
+        llama_model_free(model);
+        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+        throw std::runtime_error("failed to create llama_context from model");
+    }
+
+    const size_t nd = llama_model_n_devices(model);
+    std::vector<llama_device_memory_data> ret(nd + 1);
+
+    collect_device_memory_breakdown(model, ctx, ret);
 
     {
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -475,6 +488,48 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     }
 
     llama_free(ctx);
+
+    // measure the extra model while the target model is still alive: a draft head borrows
+    // its shared tensors from the target (borrow_shared_tensor), so the measurement graph
+    // matches the real load - real tensor types, real devices, and the borrowed tensors
+    // add no bytes to the model breakdown of the extra model (they are counted in the
+    // target measurement above).
+    if (extra != nullptr && extra_mem != nullptr) {
+        llama_model_params mparams_extra = *extra->mparams;
+        mparams_extra.no_alloc      = true;
+        mparams_extra.load_mode     = LLAMA_LOAD_MODE_NONE;
+        mparams_extra.model_shared  = model;
+
+        llama_model * model_extra = llama_model_load_from_file(extra->path_model, mparams_extra);
+        if (model_extra == nullptr) {
+            llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+            throw std::runtime_error(std::string("failed to load the extra model '") + extra->path_model + "'");
+        }
+
+        llama_context * ctx_extra = llama_init_from_model(model_extra, *extra->cparams);
+        if (ctx_extra == nullptr) {
+            llama_model_free(model_extra);
+            llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+            throw std::runtime_error(std::string("failed to create llama_context from the extra model '") + extra->path_model + "'");
+        }
+
+        const size_t nd_extra = llama_model_n_devices(model_extra);
+        std::vector<llama_device_memory_data> ret_extra(nd_extra + 1);
+
+        collect_device_memory_breakdown(model_extra, ctx_extra, ret_extra);
+
+        llama_free(ctx_extra);
+        if (extra_devs != nullptr) {
+            extra_devs->clear();
+            for (size_t i = 0; i < nd_extra; i++) {
+                extra_devs->push_back(llama_model_get_device(model_extra, i));
+            }
+        }
+        llama_model_free(model_extra);
+
+        *extra_mem = std::move(ret_extra);
+    }
+
     llama_model_free(model);
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 
@@ -590,45 +645,24 @@ static void common_params_fit_impl(
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
     uint32_t n_ctx_extra = 0;  // context that memory was measured at
 
-    // the extra model competes for the same memory as the main model, add it to every measurement
-    // its memory is measured again whenever the context it follows changes
-    auto add_extra_memory = [&](dmds_t & dmds) {
+    // the extra model competes for the same memory as the main model, add it to every
+    // measurement. The fresh measurement comes from the same common_get_device_memory_data_impl
+    // call that measured the main model (with the main model still alive, so the extra model
+    // can borrow its shared tensors); it is empty when the cached values are still valid.
+    auto add_extra_memory = [&](dmds_t & dmds, const dmds_t & measured_extra, const std::vector<ggml_backend_dev_t> & devs_extra) {
         if (extra == nullptr) {
             return;
         }
 
-        if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx) {
-            std::vector<ggml_backend_dev_t> devs_extra;
-            uint32_t ngl_extra = 0;
-            uint32_t nct_extra = 0;
-            uint32_t nex_extra = 0;
-
-            extra->cparams->n_ctx = cparams->n_ctx;
-
-            LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 ":\n",
-                __func__, cparams->n_ctx);
-
-            dmds_t measured;
-            try {
-                measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
-            } catch (const std::runtime_error & e) {
-                // the user asked to fit this model alongside the main one: leaving it out
-                // would over-commit the devices and the real load would fail later, so this
-                // is an error, not an optional extra. The detailed loader error of the
-                // measurement is logged above by the model load.
-                throw std::runtime_error(std::string("failed to measure the memory of the extra model '")
-                    + extra->path_model + "': " + e.what());
-            }
-
+        if (!measured_extra.empty()) {
             dmds_extra = dmds_t(devs.size() + 1);
-            dmds_extra.back().mb = measured.back().mb;
+            dmds_extra.back().mb = measured_extra.back().mb;
             for (size_t je = 0; je < devs_extra.size(); je++) {
                 for (size_t id = 0; id < devs.size(); id++) {
                     if (devs_extra[je] == devs[id]) {
-                        dmds_extra[id].mb.model   += measured[je].mb.model;
-                        dmds_extra[id].mb.context += measured[je].mb.context;
-                        dmds_extra[id].mb.compute += measured[je].mb.compute;
+                        dmds_extra[id].mb.model   += measured_extra[je].mb.model;
+                        dmds_extra[id].mb.context += measured_extra[je].mb.context;
+                        dmds_extra[id].mb.compute += measured_extra[je].mb.compute;
                         break;
                     }
                 }
@@ -639,8 +673,9 @@ static void common_params_fit_impl(
                 }
             }
 
-            // one INFO line per startup: what the extra model adds on every device and on
-            // the host. This is the budget the expert slots and the layer split compete with.
+            // one INFO line per (re)measurement: what the extra model adds on every device
+            // and on the host. This is the budget the expert slots and the layer split
+            // compete with.
             std::string per_dev;
             for (size_t id = 0; id < devs.size(); id++) {
                 const llama_memory_breakdown_data & mb = dmds_extra[id].mb;
@@ -664,10 +699,34 @@ static void common_params_fit_impl(
         }
     };
 
+    // measure the main model and account the extra model on top of it. The extra model is
+    // never measured on its own: borrowing its shared tensors needs the main model alive,
+    // so it is measured by the same impl call whenever its cached memory is stale (the
+    // context it follows changed).
+    auto measure_main = [&](dmds_t & dmds, std::vector<common_expert_tensor> * expert_tensors = nullptr,
+            const llama_model_params * mparams_over = nullptr) {
+        const bool need_extra = extra != nullptr && (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx);
+        dmds_t measured_extra;
+        std::vector<ggml_backend_dev_t> devs_extra;
+        if (need_extra) {
+            extra->cparams->n_ctx = cparams->n_ctx;
+
+            LOG_TRC("%s: getting device memory data for the extra model at a context size of %" PRIu32 ":\n",
+                __func__, cparams->n_ctx);
+        }
+
+        dmds = common_get_device_memory_data_impl(
+            path_model, mparams_over != nullptr ? mparams_over : mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
+            expert_tensors, extra, need_extra ? &measured_extra : nullptr, need_extra ? &devs_extra : nullptr);
+
+        add_extra_memory(dmds, measured_extra, devs_extra);
+    };
+
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
-    dmds_t dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    dmds_t dmds_full;
+    measure_main(dmds_full);
 
     // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
@@ -679,10 +738,9 @@ static void common_params_fit_impl(
         if (n_streams > 1) {
             LOG_TRC("%s: context size unset and KV cache not unified -> using %" PRIu32 " for %" PRIu32 " sequences:\n",
                 __func__, n_ctx_max, n_streams);
-            dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+            measure_main(dmds_full);
         }
     }
-    add_extra_memory(dmds_full);
 
     const size_t nd = devs.size(); // number of devices
 
@@ -823,8 +881,8 @@ static void common_params_fit_impl(
 
                     int64_t sum_projected_used_min_ctx = 0;
                     cparams->n_ctx = n_ctx_min_total;
-                    dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-                    add_extra_memory(dmds_min_ctx);
+                    dmds_t dmds_min_ctx;
+                    measure_main(dmds_min_ctx);
                     if (nd == 0) {
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
                     } else {
@@ -991,8 +1049,7 @@ static void common_params_fit_impl(
     // per-device targets of the layer split use the same free-memory state as everything else.
     // The stage series restarts here: the runtime growth of the later stages is measured from
     // the state the expert slots are allocated in, not from the pre-context sample.
-    dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-    add_extra_memory(dmds_full);
+    measure_main(dmds_full);
     common_fit_log_memory_stage_devs(nullptr, 0, nullptr); // restart the stage series at the new baseline
     common_fit_log_memory_stage_devs(devs.data(), (int) nd, "fit_ready");
 
@@ -1186,9 +1243,8 @@ static void common_params_fit_impl(
         llama_model_params mparams_copy = *mparams;
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy, ts_work.data(), tbo_work.data());
 
-        dmds_t dmd_nl = common_get_device_memory_data_impl(
-            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-        add_extra_memory(dmd_nl);
+        dmds_t dmd_nl;
+        measure_main(dmd_nl, nullptr, &mparams_copy);
 
         host_used = dmd_nl.back().mb.total();
 
@@ -1260,9 +1316,7 @@ static void common_params_fit_impl(
         mparams_copy.tensor_buft_overrides = tbo_work.data();
 
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
-        dmds_cpu_moe = common_get_device_memory_data_impl(
-            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level, &moe_expert_tensors);
-        add_extra_memory(dmds_cpu_moe);
+        measure_main(dmds_cpu_moe, &moe_expert_tensors, &mparams_copy);
 
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;

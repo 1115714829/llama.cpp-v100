@@ -3049,6 +3049,31 @@ common_params common_base_params_to_speculative(const common_params & params) {
         // default to global devices value
         if (!params_spec.devices.empty()) {
             result.devices           = params_spec.devices;
+        } else if (params.split_mode == LLAMA_SPLIT_MODE_LAYER &&
+                std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end()) {
+            // an MTP draft head consumes the hidden state of the target's last layer and
+            // borrows the target's embeddings/output, so it runs on the last device of the
+            // target. Pinning the draft there is the root fix for the fit mismatch: the fit
+            // measures the draft from these params (common_fit_extra_model) and the real
+            // draft load goes through the same function, so both agree on the devices and
+            // the free memory split cannot drift between the two.
+            std::vector<ggml_backend_dev_t> tgt_devices;
+            if (!params.devices.empty()) {
+                tgt_devices = params.devices;
+                if (tgt_devices.back() == nullptr) {
+                    tgt_devices.pop_back(); // the device list is null-terminated
+                }
+            } else {
+                // same devices the target model load would pick without an explicit list
+                tgt_devices = llama_default_devices();
+            }
+            // an empty list means the target runs on the CPU only (-dev none): the draft
+            // inherits that global value unchanged, so it stays on the CPU with it
+            if (!tgt_devices.empty()) {
+                result.devices      = {tgt_devices.back(), nullptr};
+                result.split_mode   = LLAMA_SPLIT_MODE_LAYER;
+            }
         }
         result.model                 = params_spec.mparams;
         result.n_gpu_layers          = params_spec.n_gpu_layers;

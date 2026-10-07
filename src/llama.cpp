@@ -2,6 +2,7 @@
 
 #include "llama-impl.h"
 #include "llama-version.h"
+#include "llama-ext.h"
 
 #include "llama-chat.h"
 #include "llama-context.h"
@@ -154,6 +155,79 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
+// the devices llama uses when no explicit device list is given: RPC servers first, then
+// discrete GPUs, integrated GPUs only when no discrete GPU exists. Same selection as the
+// model load applies, exposed so callers that need to know where a model will run (e.g.
+// the speculative draft params) can match it without duplicating the rules.
+std::vector<ggml_backend_dev_t> llama_default_devices() {
+    std::vector<ggml_backend_dev_t> rpc_servers;
+    std::vector<ggml_backend_dev_t> gpus;
+    std::vector<ggml_backend_dev_t> igpus;
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        switch (ggml_backend_dev_type(dev)) {
+            case GGML_BACKEND_DEVICE_TYPE_CPU:
+            case GGML_BACKEND_DEVICE_TYPE_ACCEL:
+                // skip CPU backends since they are handled separately
+                break;
+
+            case GGML_BACKEND_DEVICE_TYPE_GPU: {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                if (ggml_backend_reg_name(reg) == std::string("RPC")) {
+                    rpc_servers.push_back(dev);
+                } else {
+                    // check if there is already a GPU with the same device id
+                    ggml_backend_dev_props props;
+                    ggml_backend_dev_get_props(dev, &props);
+                    auto it = std::find_if(gpus.begin(), gpus.end(), [&props](const ggml_backend_dev_t d) {
+                        ggml_backend_dev_props d_props;
+                        ggml_backend_dev_get_props(d, &d_props);
+                        if (props.device_id && d_props.device_id) {
+                            return strcmp(props.device_id, d_props.device_id) == 0;
+                        }
+                        return false;
+                    });
+
+                    if (it != gpus.end()) {
+                        LLAMA_LOG_INFO("%s: skipping device %s (%s) with id %s - already using device %s (%s) with the same id\n",
+                                __func__,
+                                ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                                props.device_id ? props.device_id : "unknown id",
+                                ggml_backend_dev_name(*it), ggml_backend_dev_description(*it));
+                    } else {
+                        gpus.push_back(dev);
+                    }
+                }
+                break;
+            }
+
+            case GGML_BACKEND_DEVICE_TYPE_IGPU:
+                // igpus.empty() - workaround for integrated devices seen by multiple backends
+                // ref: https://github.com/ggml-org/llama.cpp/pull/23897
+                // ggml_backend_dev_backend_reg - allow devices of the same backend regardless if integrated
+                // ref: https://github.com/ggml-org/llama.cpp/pull/23897#issuecomment-5264222997
+                if (igpus.empty() || ggml_backend_dev_backend_reg(dev) == ggml_backend_dev_backend_reg(igpus.back())) {
+                    igpus.push_back(dev);
+                }
+                break;
+            case GGML_BACKEND_DEVICE_TYPE_META:
+                GGML_ABORT("fatal error");
+        }
+    }
+
+    std::vector<ggml_backend_dev_t> ret;
+    // RPC servers at the front of the list to minimize network transfers
+    ret.insert(ret.end(), rpc_servers.begin(), rpc_servers.end());
+    ret.insert(ret.end(), gpus.begin(), gpus.end());
+    // integrated GPUs only if no discrete GPUs were found
+    // (RPC servers do not count, otherwise the local iGPU would be dropped on iGPU+RPC setups)
+    if (gpus.empty()) {
+        ret.insert(ret.end(), igpus.begin(), igpus.end());
+    }
+    return ret;
+}
+
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
@@ -184,12 +258,6 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         }
     } else {
         // default device selection
-
-        // build list of available devices
-        std::vector<llama_device> gpus;
-        std::vector<llama_device> igpus;
-        std::vector<llama_device> rpc_servers;
-
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
             std::vector<ggml_backend_dev_t> devs;
             devs.reserve(ggml_backend_dev_count());
@@ -214,74 +282,14 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             GGML_ASSERT(!devs.empty());
             model->get_split_state_ud.n_devices = devs.size();
             model->get_split_state_ud.model     = model;
-            gpus.push_back({
+            model->devices.push_back({
                 true, ggml_backend_meta_device(
                 devs.data(), devs.size(), llama_meta_device_get_split_state, &model->get_split_state_ud)
             });
         } else {
-            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
-                switch (ggml_backend_dev_type(dev)) {
-                    case GGML_BACKEND_DEVICE_TYPE_CPU:
-                    case GGML_BACKEND_DEVICE_TYPE_ACCEL:
-                        // skip CPU backends since they are handled separately
-                        break;
-
-                    case GGML_BACKEND_DEVICE_TYPE_GPU: {
-                        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-                        if (ggml_backend_reg_name(reg) == std::string("RPC")) {
-                            rpc_servers.push_back({false, dev});
-                        } else {
-                            // check if there is already a GPU with the same device id
-                            ggml_backend_dev_props props;
-                            ggml_backend_dev_get_props(dev, &props);
-                            auto it = std::find_if(gpus.begin(), gpus.end(), [&props](const llama_device & d) {
-                                ggml_backend_dev_props d_props;
-                                ggml_backend_dev_get_props(d.dev, &d_props);
-                                if (props.device_id && d_props.device_id) {
-                                    return strcmp(props.device_id, d_props.device_id) == 0;
-                                }
-                                return false;
-                            });
-
-                            if (it != gpus.end()) {
-                                LLAMA_LOG_INFO("%s: skipping device %s (%s) with id %s - already using device %s (%s) with the same id\n",
-                                        __func__,
-                                        ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
-                                        props.device_id ? props.device_id : "unknown id",
-                                        ggml_backend_dev_name(it->dev), ggml_backend_dev_description(it->dev));
-                            } else {
-                                gpus.push_back({false, dev});
-                            }
-                        }
-                        break;
-                    }
-
-                    case GGML_BACKEND_DEVICE_TYPE_IGPU:
-                        // igpus.empty() - workaround for integrated devices seen by multiple backends
-                        // ref: https://github.com/ggml-org/llama.cpp/pull/23897
-                        // ggml_backend_dev_backend_reg - allow devices of the same backend regardless if integrated
-                        // ref: https://github.com/ggml-org/llama.cpp/pull/23897#issuecomment-5264222997
-                        if (igpus.empty() || ggml_backend_dev_backend_reg(dev) == ggml_backend_dev_backend_reg(igpus.back().dev)) {
-                            igpus.push_back({false, dev});
-                        }
-                        break;
-                    case GGML_BACKEND_DEVICE_TYPE_META:
-                        GGML_ABORT("fatal error");
-                }
+            for (ggml_backend_dev_t dev : llama_default_devices()) {
+                model->devices.push_back({false, dev});
             }
-        }
-
-        // add RPC servers at the front of the list to minimize network transfers
-        model->devices.insert(model->devices.begin(), rpc_servers.begin(), rpc_servers.end());
-
-        // add GPUs
-        model->devices.insert(model->devices.end(), gpus.begin(), gpus.end());
-
-        // add integrated GPUs only if no discrete GPUs were found
-        // (RPC servers do not count, otherwise the local iGPU would be dropped on iGPU+RPC setups)
-        if (gpus.empty()) {
-            model->devices.insert(model->devices.end(), igpus.begin(), igpus.end());
         }
     }
 
