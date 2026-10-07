@@ -336,6 +336,8 @@ struct common_params_speculative_draft {
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
+    int32_t window = 32768; // the MTP draft layer attends to the last N positions (0 = attend every position)
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

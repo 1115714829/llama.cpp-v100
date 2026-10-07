@@ -2934,16 +2934,32 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else if (needs_mem_idx) {
+                        // a dense MTP draft layer only proposes tokens that the target then verifies, so it can
+                        // attend a bounded window of recently written cells; the caches are sized to that window
+                        const bool mtp_window = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && cparams.n_swa_mtp > 0;
+
+                        uint32_t       attn_kv_size = cparams.n_ctx_seq;
+                        uint32_t       attn_n_swa   = hparams.n_swa;
+                        llama_swa_type attn_swa     = hparams.swa_type;
+
+                        if (mtp_window) {
+                            attn_n_swa = cparams.n_swa_mtp;
+                            attn_swa   = LLAMA_SWA_TYPE_STANDARD;
+                            // same bound as the SWA cache of llama_kv_cache_iswa: the window plus one ubatch of slack
+                            attn_kv_size = GGML_PAD(std::min(cparams.n_ctx_seq,
+                                    attn_n_swa*(cparams.kv_unified ? cparams.n_seq_max : 1) + cparams.n_ubatch), 256);
+                        }
+
                         // sparse attention over a per-token indexer cache, in its own memory type
-                        res = new llama_memory_hybrid_idx(
+                        auto * mem = new llama_memory_hybrid_idx(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ attn_kv_size,
                             /* attn_n_pad        */ 1,
-                            /* attn_n_swa        */ hparams.n_swa,
-                            /* attn_swa_type     */ hparams.swa_type,
+                            /* attn_n_swa        */ attn_n_swa,
+                            /* attn_swa_type     */ attn_swa,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
@@ -2954,6 +2970,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));
+
+                        if (mtp_window) {
+                            // a bounded cache views the whole cache for 2+ token ubatches: the window mask hides the
+                            // out-of-window cells and the graph no longer depends on the used length
+                            mem->get_mem_attn()->set_view_full(true);
+
+                            if (llama_kv_cache * mem_idx = mem->get_mem_idx()) {
+                                // the indexer cache tracks the attention cache cell for cell
+                                mem_idx->set_view_full(true);
+                            }
+                        }
+
+                        res = mem;
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
