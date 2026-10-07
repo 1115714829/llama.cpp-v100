@@ -162,9 +162,7 @@ static ggml_expert_store_backend ggml_cuda_expert_backend(int device) {
 
 // parsing helpers: expert tensors are 3D weight tensors, one expert per ne[2] slice
 
-// shape and type of a tensor that the store can place. The name is not part of this check:
-// the caller may mark a tensor explicitly (GGML_TENSOR_FLAG_EXPERT), and the llama name
-// pattern is only a fallback for tensors that arrive without a mark.
+// shape and type of a tensor that the store can place
 static bool ggml_cuda_expert_layout_ok(const ggml_tensor * t) {
     if (t == nullptr || t->view_src != nullptr || t->op != GGML_OP_NONE) {
         return false;
@@ -175,12 +173,14 @@ static bool ggml_cuda_expert_layout_ok(const ggml_tensor * t) {
     return ggml_is_quantized(t->type) || t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_BF16;
 }
 
+// expert weight of the store: the caller marked it explicitly (GGML_TENSOR_FLAG_EXPERT; the
+// llama loader sets the flag from the tensor role, test-backend-ops uses the backend proc)
+// and the layout matches. The tensor name plays no part.
 static bool ggml_cuda_expert_tensor_is_expert(const ggml_tensor * t) {
     if (!ggml_cuda_expert_layout_ok(t)) {
         return false;
     }
-    // marked by the caller, or named like the llama MoE expert weights blk.<l>.<name>_exps.weight
-    return (t->flags & GGML_TENSOR_FLAG_EXPERT) != 0 || strstr(t->name, "_exps.weight") != nullptr;
+    return (t->flags & GGML_TENSOR_FLAG_EXPERT) != 0;
 }
 
 void ggml_cuda_expert_mark_tensor(ggml_backend_buffer_type_t buft, ggml_tensor * t) {
@@ -257,14 +257,15 @@ static __global__ void expert_routing_kernel(
 
 // Assigns the routed host experts of this batch to staging slots and rewrites the staging
 // pointer table: staged address for the routed host experts, main table entry for everyone
-// else. The ranges use the global expert numbers of the store; the caller shifts the table
-// pointer for a view (expert_start).
+// else. fit sizes the staging area for the largest host complement of one tensor, so every
+// routed host expert of the launch always gets a slot. The ranges use the global expert
+// numbers of the store; the caller shifts the table pointer for a view (expert_start).
 static __global__ void expert_stage_plan_kernel(
         const uint32_t * __restrict__ bitmap, const int expert_lo, const int expert_hi,
-        const int32_t * __restrict__ residency, const int stage_cap,
+        const int32_t * __restrict__ residency,
         const char * const * __restrict__ table_main, const char ** __restrict__ table_stage,
         char * __restrict__ stage_dev, const size_t blob_aligned, const size_t blob_bytes,
-        int32_t * __restrict__ hit_list, int * __restrict__ n_hit, int * __restrict__ n_overflow,
+        int32_t * __restrict__ hit_list, int * __restrict__ n_hit,
         int * __restrict__ slot_counter, unsigned long long * __restrict__ counters) {
     const int stride = gridDim.x * blockDim.x;
     for (int x = expert_lo + (int) (blockIdx.x * blockDim.x + threadIdx.x); x < expert_hi; x += stride) {
@@ -272,14 +273,9 @@ static __global__ void expert_stage_plan_kernel(
         if (routed && residency[x] < 0) {
             atomicAdd(n_hit, 1);
             const int slot = atomicAdd(slot_counter, 1);
-            if (slot < stage_cap) {
-                hit_list[slot] = x;
-                table_stage[x] = stage_dev + (size_t) slot * blob_aligned;
-                atomicAdd(&counters[3], (unsigned long long) blob_bytes);
-            } else {
-                atomicAdd(n_overflow, 1);
-                table_stage[x] = table_main[x];
-            }
+            hit_list[slot] = x;
+            table_stage[x] = stage_dev + (size_t) slot * blob_aligned;
+            atomicAdd(&counters[3], (unsigned long long) blob_bytes);
         } else {
             table_stage[x] = table_main[x];
         }
@@ -289,11 +285,11 @@ static __global__ void expert_stage_plan_kernel(
 // Copies the routed host experts from the mapped host arena into their staging slots.
 // One block per hit entry, grid covers n_local (blocks beyond n_hit return at once).
 static __global__ void expert_stage_copy_kernel(
-        const int32_t * __restrict__ hit_list, const int * __restrict__ n_hit, const int stage_cap,
+        const int32_t * __restrict__ hit_list, const int * __restrict__ n_hit,
         const char * __restrict__ host_dev, const int64_t * __restrict__ host_offset,
         char * __restrict__ stage_dev, const size_t blob_aligned, const size_t blob_bytes) {
     const int slot = blockIdx.x;
-    if (slot >= *n_hit || slot >= stage_cap) {
+    if (slot >= *n_hit) {
         return;
     }
     const int64_t expert = hit_list[slot];
@@ -341,7 +337,7 @@ struct ggml_cuda_expert_stream_state {
     // per tensor: device pointer table through the staging area, and the copy plan buffers
     std::vector<const char **> tables;
     int32_t *              hit_list   = nullptr;
-    int *                  plan_state = nullptr; // [n_hit, n_overflow, slot_counter]
+    int *                  plan_state = nullptr; // [n_hit, slot_counter]
     int *                  plan_pinned = nullptr; // async readback of the last plan, logs only
     size_t                 hit_cap    = 0;       // == largest n_local of the tensors
 };
@@ -531,10 +527,10 @@ ggml_cuda_expert_stream_state & ggml_backend_cuda_expert_buffer_context::get_str
     }
     if (ss.hit_cap > 0) {
         CUDA_CHECK(cudaMalloc((void **) &ss.hit_list, ss.hit_cap * sizeof(int32_t)));
-        CUDA_CHECK(cudaMalloc((void **) &ss.plan_state, 3 * sizeof(int)));
-        CUDA_CHECK(cudaMemset(ss.plan_state, 0, 3 * sizeof(int)));
-        CUDA_CHECK(cudaHostAlloc((void **) &ss.plan_pinned, 3 * sizeof(int), cudaHostAllocDefault));
-        memset(ss.plan_pinned, 0, 3 * sizeof(int));
+        CUDA_CHECK(cudaMalloc((void **) &ss.plan_state, 2 * sizeof(int)));
+        CUDA_CHECK(cudaMemset(ss.plan_state, 0, 2 * sizeof(int)));
+        CUDA_CHECK(cudaHostAlloc((void **) &ss.plan_pinned, 2 * sizeof(int), cudaHostAllocDefault));
+        memset(ss.plan_pinned, 0, 2 * sizeof(int));
     }
     ss.tables.assign(tensors.size(), nullptr);
 
@@ -647,7 +643,7 @@ static void ggml_cuda_expert_stats_readback(ggml_backend_cuda_expert_buffer_cont
         CUDA_CHECK(cudaMemcpy(ctx->usage_host, ctx->usage_dev, 4 * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
         const unsigned long long total = ctx->usage_host[0] + ctx->usage_host[1];
         if (total > 0) {
-            GGML_LOG_DEBUG("%s: device %d: expert hits vram %llu / host %llu (%.2f%% vram), host read %.2f MiB, staged %.2f MiB\n",
+            GGML_LOG_DEBUG("%s: device %d: expert hits vram %llu / host %llu (%.2f%% vram), host hit %.2f MiB, staged %.2f MiB\n",
                 __func__, ctx->device, ctx->usage_host[0], ctx->usage_host[1],
                 100.0 * ctx->usage_host[0] / total, ctx->usage_host[2] / 1024.0 / 1024.0,
                 ctx->usage_host[3] / 1024.0 / 1024.0);
@@ -686,17 +682,15 @@ void ggml_cuda_expert_stats_tick(const ggml_tensor * src0, cudaStream_t stream) 
         __func__, ctx->device, s.tensor != nullptr ? s.tensor->name : "?", n_routed, s.n_expert);
 
     // staging plan of the last prefill batch of this stream: how many routed host experts
-    // were staged and how many overflowed to a direct host read (async readback, logs only)
+    // were staged (async readback, logs only)
     const auto it = ctx->streams.find(stream);
     if (it == ctx->streams.end() || it->second.plan_pinned == nullptr) {
         return;
     }
-    const int n_hit      = it->second.plan_pinned[0];
-    const int n_overflow = it->second.plan_pinned[1];
-    const int n_staged   = n_hit - n_overflow;
-    GGML_LOG_DEBUG("%s: device %d tensor %s: staging last batch: %d/%d host experts staged (%.2f MiB), %d overflow to direct host read\n",
+    const int n_hit = it->second.plan_pinned[0];
+    GGML_LOG_DEBUG("%s: device %d tensor %s: staging last batch: %d host experts staged (%.2f MiB)\n",
         __func__, ctx->device, s.tensor != nullptr ? s.tensor->name : "?",
-        n_staged, n_hit, (double) (n_staged * (int64_t) s.blob_bytes) / 1024.0 / 1024.0, n_overflow);
+        n_hit, (double) (n_hit * (int64_t) s.blob_bytes) / 1024.0 / 1024.0);
 }
 
 // prepare the staging area for one prefill launch: de-duplicate the routed experts of the
@@ -714,16 +708,22 @@ const char * const * ggml_cuda_expert_stage_prepare(
     ggml_cuda_expert_tensor_state & s = ctx->tensors[(size_t) ex_table.tensor_id];
     const ggml_expert_store_tensor * st = ggml_expert_store_tensor_at(ctx->store, ex_table.tensor_id);
 
-    // without a host tier there is nothing to stage: the main table is complete (every entry
-    // is a VRAM slot) and must be used as-is. A zero staging budget has the same effect.
-    if (!s.has_host || s.bitmap_dev == nullptr || ctx->stage_budget == 0 || ids == nullptr || ids->type != GGML_TYPE_I32) {
+    // without a host tier there is nothing to stage: the main table is complete (every
+    // entry is a VRAM slot) and is used as-is.
+    if (!s.has_host) {
         return s.table_main_dev + ex_table.expert_start;
     }
 
+    // fit sizes the staging area for the largest host complement of one tensor and refuses
+    // a load that cannot hold it (common_params_fit_impl reports the deficit), so the area
+    // of this tensor is always complete. Configuration invariants, not a fallback path.
+    GGML_ASSERT(ids != nullptr && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(s.bitmap_dev != nullptr);
+    GGML_ASSERT(ctx->stage_budget > 0 && ctx->stage_budget >= (size_t) st->host_used);
+
     ggml_cuda_expert_stream_state & ss = ctx->get_stream(stream);
-    if (ss.hit_list == nullptr || ss.stage_dev == nullptr || ss.stage_bytes < s.blob_aligned) {
-        return s.table_main_dev + ex_table.expert_start;
-    }
+    GGML_ASSERT(ss.hit_list != nullptr && ss.hit_cap >= (size_t) s.n_expert && ss.stage_dev != nullptr);
+    GGML_ASSERT(ss.stage_bytes >= s.blob_aligned && ss.stage_bytes >= (size_t) st->host_used);
 
     const char ** table_stage = ss.tables[(size_t) ex_table.tensor_id];
     if (table_stage == nullptr) {
@@ -736,15 +736,10 @@ const char * const * ggml_cuda_expert_stage_prepare(
     const int nthreads = 256;
     const int64_t n_entries = ggml_nelements(ids);
     const int n_words = (int) ((s.n_expert + 31) / 32);
-    // the block is sized for the largest host complement of one tensor: the worst tensor of
-    // the device fits completely, smaller tensors fit with room to spare. Beyond stage_cap
-    // routed host experts keep their main table entry and are read directly from host memory.
-    GGML_ASSERT(ss.hit_list != nullptr && ss.hit_cap >= (size_t) s.n_expert);
-    const int stage_cap = (int) std::min<size_t>(ss.stage_bytes / s.blob_aligned, ss.hit_cap);
     char * block_dev = ss.stage_dev;
 
-    // [n_hit, n_overflow, slot_counter]
-    CUDA_CHECK(cudaMemsetAsync(ss.plan_state, 0, 3 * sizeof(int), stream));
+    // [n_hit, slot_counter]
+    CUDA_CHECK(cudaMemsetAsync(ss.plan_state, 0, 2 * sizeof(int), stream));
     CUDA_CHECK(cudaMemsetAsync(s.bitmap_dev, 0, (size_t) n_words * sizeof(uint32_t), stream));
 
     if (n_entries > 0) {
@@ -761,21 +756,21 @@ const char * const * ggml_cuda_expert_stage_prepare(
     const int expert_hi = expert_lo + (int) ex_table.n_expert;
     const int plan_blocks = std::max(1, std::min((expert_hi - expert_lo + nthreads - 1) / nthreads, 1024));
     expert_stage_plan_kernel<<<plan_blocks, nthreads, 0, stream>>>(
-        s.bitmap_dev, expert_lo, expert_hi, s.residency_dev, stage_cap,
+        s.bitmap_dev, expert_lo, expert_hi, s.residency_dev,
         s.table_main_dev, table_stage, block_dev, s.blob_aligned, s.blob_bytes,
-        ss.hit_list, ss.plan_state, ss.plan_state + 1, ss.plan_state + 2, ctx->usage_dev);
+        ss.hit_list, ss.plan_state, ss.plan_state + 1, ctx->usage_dev);
     CUDA_CHECK(cudaGetLastError());
 
     expert_stage_copy_kernel<<<expert_hi - expert_lo, nthreads, 0, stream>>>(
-        ss.hit_list, ss.plan_state, stage_cap, st->host_dev, s.host_offset_dev,
+        ss.hit_list, ss.plan_state, st->host_dev, s.host_offset_dev,
         block_dev, s.blob_aligned, s.blob_bytes);
     CUDA_CHECK(cudaGetLastError());
 
     // read the bitmap and the copy plan back without waiting: the log shows how many experts
-    // the last batches staged and how many overflowed to a direct host read
+    // the last batches staged
     CUDA_CHECK(cudaMemcpyAsync(s.bitmap_pinned, s.bitmap_dev, (size_t) n_words * sizeof(uint32_t),
         cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(ss.plan_pinned, ss.plan_state, 3 * sizeof(int),
+    CUDA_CHECK(cudaMemcpyAsync(ss.plan_pinned, ss.plan_state, 2 * sizeof(int),
         cudaMemcpyDeviceToHost, stream));
 
     return table_stage + ex_table.expert_start;
@@ -987,14 +982,15 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
     }
 
     // VRAM budgets decided by fit (part of its device memory accounting): slot_bytes for the
-    // resident expert slots, stage_bytes for the per-stream prefill staging area. Without a
-    // budget the experts stay in the host arena, which is the safe fallback (the mapped
-    // buffer type behavior) instead of guessing a share of the currently free memory.
+    // resident expert slots, stage_bytes for the per-stream prefill staging area. fit refuses
+    // a configuration whose staging cannot hold the host complement of one tensor, so a load
+    // that reaches this point with host experts always has a complete staging area.
     const size_t slot_budget  = ggml_cuda_expert_get_slot_budget(device);
     const size_t stage_budget = ggml_cuda_expert_get_stage_budget(device);
     if (expert_bytes > 0 && slot_budget == 0 && stage_budget == 0) {
-        GGML_LOG_INFO("%s: device %d: no expert VRAM budget from fit, all experts stay in host memory\n",
+        GGML_LOG_ERROR("%s: device %d: no expert VRAM budget was set; the host experts of a prefill batch cannot be staged, refusing the buffer\n",
             __func__, device);
+        return nullptr;
     }
 
     ggml_backend_cuda_expert_buffer_context * ctx = new ggml_backend_cuda_expert_buffer_context();
@@ -1014,6 +1010,15 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
     }
     ggml_expert_store_placement plan;
     ggml_expert_store_plan(plan_in.data(), plan_in.size(), (int64_t) slot_budget, ctx->store->profile_path.c_str(), &plan);
+
+    // the staging area must hold the host complement of the largest tensor: fit sizes it that
+    // way and reports a deficit, so a smaller budget is a configuration error
+    if ((size_t) plan.host_peak > stage_budget) {
+        GGML_LOG_ERROR("%s: device %d: staging budget %.2f MiB is smaller than the host complement %.2f MiB of one tensor, refusing the buffer\n",
+            __func__, device, stage_budget / 1024.0 / 1024.0, plan.host_peak / 1024.0 / 1024.0);
+        delete ctx;
+        return nullptr;
+    }
 
     CUDA_CHECK(cudaMalloc((void **) &ctx->usage_dev, 4 * sizeof(unsigned long long)));
     CUDA_CHECK(cudaMemset(ctx->usage_dev, 0, 4 * sizeof(unsigned long long)));
@@ -1096,14 +1101,11 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
         ggml_cuda_expert_set_allocation(device, (size_t) ctx->store->slot_used, (size_t) ctx->store->host_used,
             stage_budget, (size_t) plan.host_peak);
 
-        // the staging area is sized for the host complement of the largest tensor; the part
-        // above it is read directly from host memory during prefill
-        const double direct = plan.host_peak > 0 && plan.host_peak > (int64_t) stage_budget
-            ? 100.0 * (double) (plan.host_peak - (int64_t) stage_budget) / (double) plan.host_peak
-            : 0.0;
-        GGML_LOG_INFO("%s: device %d: expert store: slots %.2f MiB, host complement %.2f MiB, staging %.2f MiB, prefill direct-read %.0f%%\n",
+        // the staging area is sized for the host complement of the largest tensor; fit refuses
+        // a configuration whose staging cannot hold it (see common_params_fit_impl)
+        GGML_LOG_INFO("%s: device %d: expert store: slots %.2f MiB, host complement %.2f MiB, staging %.2f MiB\n",
             __func__, device, plan.slot_used / 1024.0 / 1024.0, plan.host_bytes / 1024.0 / 1024.0,
-            stage_budget / 1024.0 / 1024.0, direct);
+            stage_budget / 1024.0 / 1024.0);
 
         // host arena placement: the NUMA nodes, the bytes on each of them and the measured
         // read bandwidth of this device for those nodes, one line per device

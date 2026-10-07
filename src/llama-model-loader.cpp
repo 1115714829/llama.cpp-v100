@@ -1113,25 +1113,40 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+// the merged expert weight itself, one expert per ne[2] slice: the tensors the expert store
+// places. The list is explicit, not a name pattern; the per-expert scale tensors share the
+// tensor id but not the "weight" suffix.
+static bool llm_tensor_is_expert_weight(const LLM_TN_IMPL & tn) {
+    if (tn.suffix == nullptr || strcmp(tn.suffix, "weight") != 0) {
+        return false;
+    }
+    switch (tn.tensor) {
+        case LLM_TENSOR_FFN_DOWN_EXPS:
+        case LLM_TENSOR_FFN_GATE_EXPS:
+        case LLM_TENSOR_FFN_UP_EXPS:
+        case LLM_TENSOR_FFN_GATE_UP_EXPS:
+        case LLM_TENSOR_FFN_DOWN_CHEXPS:
+        case LLM_TENSOR_FFN_GATE_CHEXPS:
+        case LLM_TENSOR_FFN_UP_CHEXPS:
+            return true;
+        default:
+            return false;
+    }
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
 
-    // Mark MoE expert weights explicitly so that the expert store does not have to rely on
-    // the tensor name. The backend decides whether the tensor matches the tiered layout and
-    // ignores the call for other buffer types.
-    auto mark_expert_tensor = [](ggml_tensor * tensor, ggml_backend_buffer_type_t buft) {
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
-        if (reg == nullptr) {
-            return;
-        }
-        typedef void (*mark_tensor_t)(ggml_backend_buffer_type_t, ggml_tensor *);
-        auto mark = (mark_tensor_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_expert_store_mark_tensor");
-        if (mark != nullptr) {
-            mark(buft, tensor);
+    // Mark the MoE expert weights explicitly while the tensor is created, so the expert store
+    // identifies them by the flag and never by the name. The flag is set for every load
+    // (device, host, and the no-alloc fit trials); the store decides from its own buffer type
+    // and the layout whether it can place the tensor.
+    auto mark_expert_tensor = [&](ggml_tensor * tensor) {
+        if (llm_tensor_is_expert_weight(tn)) {
+            tensor->flags |= GGML_TENSOR_FLAG_EXPERT;
         }
     };
 
@@ -1346,7 +1361,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
-        mark_expert_tensor(ret, buft);
+        mark_expert_tensor(ret);
         return ret;
     }
 
@@ -1396,7 +1411,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
-    mark_expert_tensor(tensor, buft);
+    mark_expert_tensor(tensor);
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);

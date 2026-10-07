@@ -40,10 +40,9 @@ struct ggml_cuda_expert_table {
 bool ggml_cuda_expert_buft_is_expert(ggml_backend_buffer_type_t buft);
 
 // Explicitly mark a tensor as an expert weight of the given buffer type: the store then
-// places it in the tiered layout (VRAM slots + host arena) even when its name does not
-// look like a llama MoE expert tensor. Callers that place MoE weights should call this
-// instead of relying on the "_exps.weight" name match. No-op for other buffer types or
-// tensors that are not a 3D expert weight layout.
+// places it in the tiered layout (VRAM slots + host arena). The llama loader sets the flag
+// while the tensor is created, test-backend-ops marks its tensors through this proc. No-op
+// for other buffer types or tensors that are not a 3D expert weight layout.
 void ggml_cuda_expert_mark_tensor(ggml_backend_buffer_type_t buft, ggml_tensor * t);
 
 // true when this tensor is registered in an expert store: its weights are then read through
@@ -91,8 +90,9 @@ const char * ggml_backend_cuda_expert_buffer_type_name(ggml_backend_buffer_type_
 
 // VRAM budget of one expert buffer type, set by fit before the model loads. slot_bytes is
 // the VRAM reserved for resident expert slots, stage_bytes the VRAM reserved per stream for
-// the prefill staging area; both are part of the fit device memory accounting. The budget
-// (0, 0) keeps all experts in the host arena.
+// the prefill staging area; both are part of the fit device memory accounting. A buffer
+// with expert tensors and no budget at all is refused: the host experts of a prefill batch
+// could not be staged without a staging area.
 void ggml_cuda_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t stage_bytes);
 
 // pure placement plan of the expert tensors of one device: the same store function that
