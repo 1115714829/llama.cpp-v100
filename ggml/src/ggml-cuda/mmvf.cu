@@ -871,7 +871,9 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                 if (cc >= GGML_CUDA_CC_TURING) {
                     return ne11 <= 4;
                 }
-                return ne11 <= 3;
+                // Volta and older: cuBLAS has no fp32 tensor-core path, so small batches fall back to SIMT SGEMM
+                // plus a split-K reduction; MMVF stays bandwidth-bound for every batch size it supports
+                return ne11 <= MMVF_MAX_BATCH_SIZE;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (fp32_mma_hardware_available(cc)) {
                     return ne11 <= 3;
