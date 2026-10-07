@@ -1748,6 +1748,11 @@ bool llama_model_loader::load_all_data(
 
             ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
 
+            // the weights are now in a buffer the device reads directly, drop the page cache
+            if ((use_mmap || lazy.has(cur)) && cur->buffer != nullptr && is_device_readable_buft(ggml_backend_buffer_get_type(cur->buffer))) {
+                mappings.at(weight->idx)->drop_page_cache(weight->offs, weight->offs + n_size);
+            }
+
             size_done += n_size;
             continue;
         }
