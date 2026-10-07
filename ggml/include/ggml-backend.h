@@ -354,6 +354,7 @@ extern "C" {
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
+    GGML_API int                  ggml_backend_sched_get_n_stages(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
@@ -374,8 +375,11 @@ extern "C" {
     // n_stages is the pipeline depth: the number of ubatches that may be in flight at once.
     // n_stages == 1 means no overlap, equivalent to ggml_backend_sched_graph_compute_async.
     GGML_API void                 ggml_backend_sched_set_n_stages(ggml_backend_sched_t sched, int n_stages);
-    // Submit one ubatch graph without waiting for it to finish. ubatch_id must increase across calls.
-    GGML_API enum ggml_status     ggml_backend_sched_pipeline_submit(ggml_backend_sched_t sched, struct ggml_cgraph * graph, int64_t ubatch_id);
+    // Split and allocate one ubatch graph on the next stage's input copy, without computing it.
+    GGML_API bool                 ggml_backend_sched_pipeline_begin(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    // Enqueue all splits of the graph prepared by ggml_backend_sched_pipeline_begin, without waiting.
+    // ubatch_id must increase across calls.
+    GGML_API enum ggml_status     ggml_backend_sched_pipeline_submit(ggml_backend_sched_t sched, int64_t ubatch_id);
     // Wait for the ubatch with this ubatch_id to complete on all backends.
     GGML_API void                 ggml_backend_sched_pipeline_wait(ggml_backend_sched_t sched, int64_t ubatch_id);
     // Wait for all in-flight ubatches and reset the pipeline ring.

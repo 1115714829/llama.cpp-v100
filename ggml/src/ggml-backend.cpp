@@ -1753,7 +1753,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -1911,6 +1911,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // in pipeline mode, record that the host inputs of this ubatch have been enqueued on this
+        // backend. gallocr may place the next ubatch's host inputs on the same memory, so the next
+        // ubatch waits on this event before the caller overwrites them
+        if (sched->n_stages > 1 && sched->input_events[split_backend_id] != NULL) {
+            ggml_backend_event_record(sched->input_events[split_backend_id], split_backend);
+            sched->input_events_valid = true;
+        }
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1991,6 +1999,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->n_stages = 1;
     sched->next_stage = 0;
     sched->oldest_stage = 0;
+    sched->pipeline_stage = -1;
+    sched->pipeline_last_ubatch_id = -1;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -2027,6 +2037,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
             }
+            sched->input_events[b] = ggml_backend_event_new(backends[b]->device);
         }
     }
 
@@ -2046,6 +2057,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
         }
+        ggml_backend_event_free(sched->input_events[b]);
     }
     ggml_gallocr_free(sched->galloc);
     ggml_free(sched->ctx);
@@ -2182,6 +2194,11 @@ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_copies;
+}
+
+int ggml_backend_sched_get_n_stages(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->n_stages;
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {

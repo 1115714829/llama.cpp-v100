@@ -40,14 +40,18 @@ struct ggml_backend_sched_split {
 };
 
 // one in-flight ubatch of a pipeline-parallel prefill
+//
+// every ubatch has its own graph (the caller rebuilds it), so a later ubatch can be split and
+// allocated while the earlier ones are still running. each stage owns an input copy, so the host
+// inputs of a later ubatch never overwrite the device inputs of an in-flight one.
 struct ggml_backend_sched_stage {
-    struct ggml_cgraph * graph;                          // this stage's expanded graph (one ubatch)
-    struct ggml_backend_sched_split * splits;            // this stage's splits
-    int n_splits;
-    ggml_backend_event_t done[GGML_SCHED_MAX_BACKENDS];  // per-backend completion event
-    int64_t ubatch_id;                                   // logical batch index, for ordering checks
+    int copy_id;       // input copy used by this stage
+    int64_t ubatch_id; // logical batch index, for ordering checks
     bool in_flight;
 };
+
+// shared with ggml-backend-pipeline.cpp: enqueue the splits of the currently allocated graph
+enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched);
 
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
@@ -92,6 +96,17 @@ struct ggml_backend_sched {
     struct ggml_backend_sched_stage stages[GGML_SCHED_MAX_STAGES];
     int next_stage;   // ring index for submission
     int oldest_stage; // ring index of the oldest in-flight batch
+
+    // pipeline state; each in-flight ubatch has its own freshly built graph and input copy, so the
+    // scheduler only tracks which stage is being prepared and the submission order
+    int pipeline_stage;              // stage prepared by ggml_backend_sched_pipeline_begin, or -1
+    int64_t pipeline_last_ubatch_id; // last submitted ubatch id, for ordering checks
+
+    // events recorded after the host input copies of the submitting ubatch are enqueued on each
+    // backend. the host input tensors are rebuilt in the same arena every ubatch, so the next
+    // ubatch waits on these before the caller overwrites them
+    ggml_backend_event_t input_events[GGML_SCHED_MAX_BACKENDS];
+    bool input_events_valid; // false until a pipeline submit has recorded them
 
     struct ggml_context * ctx;
 

@@ -2,10 +2,18 @@
 
 // Pipeline parallelism primitives for multi-ubatch prefill.
 //
-// n_stages is the pipeline depth: the number of ubatches that may be in flight at once.
-// This first version supports n_stages == 1, where submit/wait/advance are equivalent to
-// ggml_backend_sched_graph_compute_async / ggml_backend_sched_synchronize. The multi-stage
-// overlap path is added on top of these primitives in a later step.
+// n_stages is the pipeline depth: the number of ubatches that may be in flight at once. The caller
+// builds a distinct graph per ubatch, so the scheduler can split and allocate a ubatch independently
+// while the previous ones keep running on the devices:
+//
+//   begin():  wait until the stage is reusable, split+allocate the graph on the stage's input copy
+//   submit(): enqueue all splits of the stage without waiting
+//   wait():   wait for one ubatch (before reading its outputs)
+//   advance(): wait for all in-flight ubatches and reset the ring
+//
+// Cross-device activation copies are chained by events inside the CUDA backend, and consecutive
+// ubatches on the same device are ordered by the device stream FIFO. The only scheduler-level waits
+// are the stage reuse (ring wrap-around) and the output reads.
 
 void ggml_backend_sched_set_n_stages(ggml_backend_sched_t sched, int n_stages) {
     GGML_ASSERT(sched);
@@ -15,31 +23,95 @@ void ggml_backend_sched_set_n_stages(ggml_backend_sched_t sched, int n_stages) {
     sched->n_stages = n_stages;
     sched->next_stage = 0;
     sched->oldest_stage = 0;
+    sched->pipeline_stage = -1;
+    sched->pipeline_last_ubatch_id = -1;
 }
 
-enum ggml_status ggml_backend_sched_pipeline_submit(ggml_backend_sched_t sched, struct ggml_cgraph * graph, int64_t ubatch_id) {
+static void ggml_backend_sched_pipeline_wait_stage(ggml_backend_sched_t sched, int stage_id) {
+    struct ggml_backend_sched_stage * stage = &sched->stages[stage_id];
+
+    for (int b = 0; b < sched->n_backends; b++) {
+        ggml_backend_event_t ev = sched->events[b][stage->copy_id];
+        if (ev != NULL) {
+            ggml_backend_event_synchronize(ev);
+        }
+    }
+
+    stage->in_flight = false;
+}
+
+// wait until the host inputs of the previous ubatch have been copied on all backends. the host input
+// tensors are shared by all ubatches, so this must run before the caller overwrites them
+static void ggml_backend_sched_pipeline_wait_input(ggml_backend_sched_t sched) {
+    if (!sched->input_events_valid) {
+        return;
+    }
+
+    for (int b = 0; b < sched->n_backends; b++) {
+        ggml_backend_event_t ev = sched->input_events[b];
+        if (ev != NULL) {
+            ggml_backend_event_synchronize(ev);
+        }
+    }
+}
+
+// split and allocate the graph on the next pipeline stage, without computing it
+bool ggml_backend_sched_pipeline_begin(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
     GGML_ASSERT(graph);
-    GGML_ASSERT(sched->n_stages == 1); // multi-stage submission is added in a later step
+    GGML_ASSERT(sched->n_stages > 1);
 
     const int s = sched->next_stage;
     struct ggml_backend_sched_stage * stage = &sched->stages[s];
 
-    // a stage can only be reused after the previous batch on it has completed
+    // the stage can only be reused after its previous ubatch completed
     if (stage->in_flight) {
-        ggml_backend_sched_pipeline_wait(sched, stage->ubatch_id);
+        ggml_backend_sched_pipeline_wait_stage(sched, s);
     }
 
-    const enum ggml_status status = ggml_backend_sched_graph_compute_async(sched, graph);
+    // the host input tensors are shared by all ubatches; wait until the previous ubatch has copied
+    // them to the devices before the caller overwrites them
+    ggml_backend_sched_pipeline_wait_input(sched);
+
+    // each stage uses its own input copy, so in-flight ubatches never share device input buffers
+    const int copy_id = s % sched->n_copies;
+    ggml_backend_sched_reset(sched);
+    sched->next_copy = copy_id;
+
+    if (!ggml_backend_sched_alloc_graph(sched, graph)) {
+        return false;
+    }
+
+    stage->copy_id = sched->cur_copy;
+    sched->pipeline_stage = s;
+
+    return true;
+}
+
+enum ggml_status ggml_backend_sched_pipeline_submit(ggml_backend_sched_t sched, int64_t ubatch_id) {
+    GGML_ASSERT(sched);
+
+    if (sched->n_stages == 1) {
+        // single stage: the caller computed the graph through ggml_backend_sched_graph_compute_async
+        return GGML_STATUS_SUCCESS;
+    }
+
+    GGML_ASSERT(sched->pipeline_stage >= 0);
+    GGML_ASSERT(ubatch_id > sched->pipeline_last_ubatch_id); // submission order follows the batch order
+    sched->pipeline_last_ubatch_id = ubatch_id;
+
+    const int s = sched->pipeline_stage;
+    struct ggml_backend_sched_stage * stage = &sched->stages[s];
+
+    const enum ggml_status status = ggml_backend_sched_compute_splits(sched);
     if (status != GGML_STATUS_SUCCESS) {
         return status;
     }
 
-    stage->graph     = &sched->graph;
-    stage->splits    = sched->splits;
-    stage->n_splits  = sched->n_splits;
+    // compute_splits records sched->events[b][cur_copy] at the end of each split; cur_copy == copy_id
     stage->ubatch_id = ubatch_id;
     stage->in_flight = true;
+    sched->pipeline_stage = -1;
 
     sched->next_stage = (s + 1) % sched->n_stages;
 
@@ -48,28 +120,44 @@ enum ggml_status ggml_backend_sched_pipeline_submit(ggml_backend_sched_t sched, 
 
 void ggml_backend_sched_pipeline_wait(ggml_backend_sched_t sched, int64_t ubatch_id) {
     GGML_ASSERT(sched);
-    GGML_ASSERT(sched->n_stages == 1);
 
-    struct ggml_backend_sched_stage * stage = &sched->stages[0];
-    if (!stage->in_flight || stage->ubatch_id != ubatch_id) {
+    for (int s = 0; s < sched->n_stages; s++) {
+        struct ggml_backend_sched_stage * stage = &sched->stages[s];
+        if (!stage->in_flight || stage->ubatch_id != ubatch_id) {
+            continue;
+        }
+
+        ggml_backend_sched_pipeline_wait_stage(sched, s);
         return;
     }
-
-    // with n_stages == 1 no other batch can be in flight, so a full synchronize is exact
-    ggml_backend_sched_synchronize(sched);
-    stage->in_flight = false;
 }
 
 void ggml_backend_sched_pipeline_advance(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
-    GGML_ASSERT(sched->n_stages == 1);
 
-    struct ggml_backend_sched_stage * stage = &sched->stages[0];
-    if (stage->in_flight) {
-        ggml_backend_sched_synchronize(sched);
-        stage->in_flight = false;
+    // nothing submitted through the pipeline since the last advance: no outputs to wait for. decode
+    // batches run on the other schedulers and must keep their host/device overlap
+    bool in_flight = false;
+    for (int s = 0; s < sched->n_stages; s++) {
+        in_flight = in_flight || sched->stages[s].in_flight;
+    }
+    if (!in_flight) {
+        return;
+    }
+
+    // the per-stage events only cover the compute, not the asynchronous copies of the outputs to
+    // the host. synchronize the backends so those reads complete before the host output buffers are
+    // reused by the next batch. this runs once per prefill, not per ubatch
+    for (int b = 0; b < sched->n_backends; b++) {
+        ggml_backend_synchronize(sched->backends[b]);
+    }
+
+    for (int s = 0; s < sched->n_stages; s++) {
+        sched->stages[s].in_flight = false;
     }
 
     sched->next_stage = 0;
     sched->oldest_stage = 0;
+    sched->pipeline_stage = -1;
+    sched->pipeline_last_ubatch_id = -1;
 }
