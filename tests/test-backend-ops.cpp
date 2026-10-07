@@ -6306,7 +6306,7 @@ struct test_mul_mat_id_shared_expert : public test_case {
     const int64_t k;
 
     std::string vars() override {
-        return VARS_TO_STR10(type_w, n_mats, n_used, m, n, k);
+        return VARS_TO_STR6(type_w, n_mats, n_used, m, n, k);
     }
 
     double max_nmse_err() override {
@@ -6329,6 +6329,10 @@ struct test_mul_mat_id_shared_expert : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_SHARED_EXPERT";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
