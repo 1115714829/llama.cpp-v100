@@ -906,14 +906,30 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 
     ggml_cuda_set_device(buft_ctx->device);
 
+    // free memory before/after every large allocation (dense weights, KV cache, compute
+    // buffers): the runtime adds device memory after the fit measured it, so these lines
+    // show which allocation ate what the fit did not account for
+    size_t free_before = 0;
+    size_t total       = 0;
+    if (cudaMemGetInfo(&free_before, &total) != cudaSuccess) {
+        (void) cudaGetLastError();
+        free_before = 0;
+        total       = 0;
+    }
+
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
-        GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
+        GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: cudaMalloc failed: %s (%.2f MiB free of %.2f MiB)\n",
+            __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err),
+            free_before / 1024.0 / 1024.0, total / 1024.0 / 1024.0);
         return nullptr;
     }
+    GGML_LOG_DEBUG("%s: device %d: cudaMalloc %.2f MiB, free %.2f -> %.2f MiB of %.2f MiB\n",
+        __func__, buft_ctx->device, size / 1024.0 / 1024.0,
+        free_before / 1024.0 / 1024.0, (free_before - size) / 1024.0 / 1024.0, total / 1024.0 / 1024.0);
 
     ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, dev_ptr);
 
@@ -1770,24 +1786,66 @@ static unsigned long ggml_cuda_nodemask_one(int node, std::vector<unsigned long>
     return (unsigned long) nodemask.size() * bits + 1;
 }
 
+// the memory policy of the calling thread saved by ggml_cuda_mempolicy_save(), restored by
+// ggml_cuda_mempolicy_restore()
+struct ggml_cuda_mempolicy_saved {
+    int mode = MPOL_DEFAULT;
+    std::vector<unsigned long> nodemask;
+    bool valid = false;
+};
+
+// read the memory policy of the calling thread. Restoring the exact policy matters: a thread
+// pinned by numactl --membind must not fall back to the default policy, or its later file
+// reads fill the page cache of the device memory NUMA nodes once the host nodes run full.
+static bool ggml_cuda_mempolicy_save(ggml_cuda_mempolicy_saved & saved) {
+    // the mask must cover every node the current policy can name (up to the max node here)
+    const int bits = 8 * (int) sizeof(unsigned long);
+    saved.nodemask.assign(ggml_cuda_numa_max_node()/bits + 2, 0);
+    const unsigned long maxnode = (unsigned long) saved.nodemask.size() * bits + 1;
+
+    if (syscall(SYS_get_mempolicy, &saved.mode, saved.nodemask.data(), maxnode, (void *) nullptr, 0) != 0) {
+        GGML_LOG_WARN("%s: failed to read the current memory policy: %s\n", __func__, strerror(errno));
+        return false;
+    }
+    saved.valid = true;
+    return true;
+}
+
+// restore a policy saved by ggml_cuda_mempolicy_save(); no-op when nothing was saved. The
+// caller must restore before any later allocation it does not want under the bound policy.
+static void ggml_cuda_mempolicy_restore(const ggml_cuda_mempolicy_saved & saved) {
+    if (!saved.valid) {
+        return;
+    }
+    // MPOL_DEFAULT takes an empty node mask, every other mode restores with the saved one
+    const bool plain = saved.mode == MPOL_DEFAULT;
+    const int bits = 8 * (int) sizeof(unsigned long);
+    const unsigned long maxnode = plain ? 0 : (unsigned long) saved.nodemask.size() * bits + 1;
+    if (syscall(SYS_set_mempolicy, saved.mode, plain ? (const unsigned long *) nullptr : saved.nodemask.data(), maxnode) != 0) {
+        GGML_LOG_WARN("%s: failed to restore the saved memory policy (mode %d): %s\n",
+                      __func__, saved.mode, strerror(errno));
+    }
+}
+
 // bind the memory policy of the calling thread to one NUMA node; cudaHostAlloc allocations made
-// by the thread then come from that node
-static bool ggml_cuda_set_mempolicy_node(int node) {
+// by the thread then come from that node. The previous policy is saved into `saved` and must be
+// restored with ggml_cuda_mempolicy_restore() after the allocation. When this returns false the
+// policy is unchanged and no restore is needed.
+static bool ggml_cuda_set_mempolicy_node(int node, ggml_cuda_mempolicy_saved & saved) {
+    if (!ggml_cuda_mempolicy_save(saved)) {
+        return false;
+    }
+
     std::vector<unsigned long> nodemask;
     const unsigned long maxnode = ggml_cuda_nodemask_one(node, nodemask);
 
     if (syscall(SYS_set_mempolicy, MPOL_BIND, nodemask.data(), maxnode) != 0) {
         GGML_LOG_WARN("%s: failed to bind the memory policy to NUMA node %d (maxnode %lu): %s\n",
                       __func__, node, maxnode, strerror(errno));
+        saved.valid = false; // the policy was not changed, nothing to restore
         return false;
     }
     return true;
-}
-
-static void ggml_cuda_reset_mempolicy() {
-    if (syscall(SYS_set_mempolicy, MPOL_DEFAULT, (const unsigned long *) nullptr, 0) != 0) {
-        GGML_LOG_WARN("%s: failed to restore the default memory policy: %s\n", __func__, strerror(errno));
-    }
 }
 
 // verify that the pages of a faulted range are on the requested node; samples at most 16 pages
@@ -1904,12 +1962,13 @@ static double ggml_cuda_mapped_probe_bw(int device, int node) {
     ggml_cuda_set_device(device);
 
     void * host_ptr = nullptr;
-    if (!ggml_cuda_set_mempolicy_node(node)) {
+    ggml_cuda_mempolicy_saved saved_policy;
+    if (!ggml_cuda_set_mempolicy_node(node, saved_policy)) {
         // the node is not usable, report no bandwidth instead of a misleading value
         return -1.0;
     }
     cudaError_t err = cudaHostAlloc(&host_ptr, GGML_CUDA_MAPPED_PROBE_SIZE, cudaHostAllocMapped | cudaHostAllocPortable);
-    ggml_cuda_reset_mempolicy();
+    ggml_cuda_mempolicy_restore(saved_policy);
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
         GGML_LOG_WARN("%s: device %d, node %d: cudaHostAlloc failed: %s\n",
@@ -2228,14 +2287,13 @@ static void * ggml_backend_cuda_mapped_buffer_alloc_numa(size_t size, int node) 
         return nullptr;
     }
 
-    const bool bind = node >= 0 && ggml_cuda_set_mempolicy_node(node);
+    ggml_cuda_mempolicy_saved saved_policy;
+    const bool bind = node >= 0 && ggml_cuda_set_mempolicy_node(node, saved_policy);
 
     void * ptr = nullptr;
     cudaError_t err = cudaHostAlloc(&ptr, size, cudaHostAllocMapped | cudaHostAllocPortable);
 
-    if (bind) {
-        ggml_cuda_reset_mempolicy();
-    }
+    ggml_cuda_mempolicy_restore(saved_policy);
 
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
@@ -8879,6 +8937,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_expert_set_budget") == 0) {
         return (void *)ggml_cuda_expert_set_budget;
     }
+    if (strcmp(name, "ggml_backend_cuda_expert_record_plan") == 0) {
+        return (void *)ggml_cuda_expert_record_plan;
+    }
     if (strcmp(name, "ggml_backend_cuda_expert_get_allocation") == 0) {
         return (void *)ggml_backend_cuda_expert_get_allocation;
     }
@@ -8887,6 +8948,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_expert_reset_allocation") == 0) {
         return (void *)ggml_cuda_expert_reset_allocation;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_device_ready") == 0) {
+        return (void *)ggml_backend_cuda_expert_device_ready;
     }
     if (strcmp(name, "ggml_backend_cuda_expert_plan") == 0) {
         return (void *)ggml_cuda_expert_plan;

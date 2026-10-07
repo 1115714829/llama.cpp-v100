@@ -4339,6 +4339,24 @@ private:
             }
         });
 
+        // measure the free VRAM after the first prefill / first decode of the process: the
+        // CUDA runtime grows the device memory up to the first real use (kernel modules from
+        // lazy loading, cuBLAS workspaces, CUDA graph instances, staging buffers). The fit
+        // ran before that growth, so its expert slot budget must leave room for it.
+        if (ret == 0) {
+            static bool logged_prefill = false;
+            static bool logged_decode  = false;
+            const bool has_output_any = batch.size() > 0;
+            if (has_output_any && batch.size() > 1 && !logged_prefill) {
+                logged_prefill = true;
+                common_fit_log_memory_stage(model_tgt, "first_prefill");
+            }
+            if (has_output_any && batch.size() == 1 && !logged_decode) {
+                logged_decode = true;
+                common_fit_log_memory_stage(model_tgt, "first_decode");
+            }
+        }
+
         if (ret != 0) {
             {
                 std::string err;

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -191,12 +192,98 @@ void ggml_expert_store_plan(
     placement->host_bytes = 0;
     placement->host_peak  = 0;
 
+    // per-expert span (data + row padding + alignment) and total span of every tensor. The
+    // quota of a tensor is proportional to its span, so the slot count of a layer is its
+    // quota divided by its stride, rounded down to whole experts.
+    std::vector<size_t> stride(n_tensors, 0);
+    std::vector<size_t> tensor_bytes(n_tensors, 0);
     size_t expert_bytes = 0;
     for (size_t i = 0; i < n_tensors; ++i) {
-        expert_bytes += (size_t) tensors[i].n_expert * ggml_expert_store_stride(tensors[i].blob_bytes, tensors[i].blob_pad);
+        stride[i] = ggml_expert_store_stride(tensors[i].blob_bytes, tensors[i].blob_pad);
+        tensor_bytes[i] = (size_t) tensors[i].n_expert * stride[i];
+        expert_bytes += tensor_bytes[i];
     }
     if (expert_bytes == 0) {
         return;
+    }
+
+    // canonical tensor order for the redistribution below: fit and the real allocation may
+    // collect the same tensors in a different order, but the plan must be byte-identical for
+    // both. The sort key uses only the tensor metadata, so the result does not depend on the
+    // input order.
+    std::vector<size_t> order_redist(n_tensors);
+    for (size_t i = 0; i < n_tensors; ++i) {
+        order_redist[i] = i;
+    }
+    std::stable_sort(order_redist.begin(), order_redist.end(), [&](size_t a, size_t b) {
+        if (tensors[a].layer     != tensors[b].layer)     return tensors[a].layer     < tensors[b].layer;
+        if (tensors[a].n_expert  != tensors[b].n_expert)  return tensors[a].n_expert  < tensors[b].n_expert;
+        if (stride[a]            != stride[b])            return stride[a]            < stride[b];
+        return tensor_bytes[a]   < tensor_bytes[b];
+    });
+
+    // slots per tensor. Whole experts only, so a byte share that does not hold a full
+    // expert is not used. The rounding is always DOWN (floor of the per-tensor quota), so
+    // the sum can never cross the budget. slot_budget < 0 means every expert gets a slot.
+    std::vector<int64_t> n_slots(n_tensors, 0);
+    size_t slot_used = 0;
+    if (slot_budget < 0) {
+        for (size_t i = 0; i < n_tensors; ++i) {
+            n_slots[i] = tensors[i].n_expert;
+            slot_used += (size_t) n_slots[i] * stride[i];
+        }
+    } else {
+        // floor(slot_budget * tensor_bytes[i] / expert_bytes / stride[i]); the 128-bit
+        // product keeps the division exact on the compilers that have it, the long double
+        // path is the same arithmetic on the ones that do not
+        for (size_t i = 0; i < n_tensors; ++i) {
+#if defined(__SIZEOF_INT128__)
+            const unsigned __int128 num = (unsigned __int128) slot_budget * (unsigned __int128) tensor_bytes[i];
+            int64_t n = (int64_t) (num / expert_bytes / stride[i]);
+#else
+            int64_t n = (int64_t) ((long double) slot_budget * (long double) tensor_bytes[i]
+                / (long double) expert_bytes / (long double) stride[i]);
+#endif
+            if (n > tensors[i].n_expert) {
+                n = tensors[i].n_expert;
+            }
+            // a rounding artifact must never push the running total past the budget: take
+            // whole experts off this layer until it fits (integer-safe by construction)
+            while (n > 0 && slot_used + (size_t) n * stride[i] > slot_budget) {
+                --n;
+            }
+            n_slots[i] = n;
+            slot_used += (size_t) n * stride[i];
+        }
+
+        // the bytes left by rounding down are given back as whole experts: every round adds
+        // one expert to the layer that is furthest below its exact byte share. The check on
+        // slot_budget keeps the running total within the budget, so the result uses as much
+        // of the budget as whole experts allow and never more.
+        while (true) {
+            size_t best = SIZE_MAX;
+            long double best_gap = 0.0L;
+            for (const size_t i : order_redist) {
+                if (n_slots[i] >= tensors[i].n_expert) {
+                    continue;
+                }
+                if (slot_used + stride[i] > (size_t) slot_budget) {
+                    continue;
+                }
+                const long double ideal = (long double) slot_budget * (long double) tensor_bytes[i]
+                    / (long double) expert_bytes;
+                const long double gap = ideal - (long double) n_slots[i] * (long double) stride[i];
+                if (best == SIZE_MAX || gap > best_gap) {
+                    best     = i;
+                    best_gap = gap;
+                }
+            }
+            if (best == SIZE_MAX) {
+                break;
+            }
+            n_slots[best]++;
+            slot_used += stride[best];
+        }
     }
 
     // static profile (Strata A3): experts with the highest hit counts get the slots. A profile
@@ -214,16 +301,8 @@ void ggml_expert_store_plan(
         const ggml_expert_store_plan_tensor & in = tensors[i];
         GGML_ASSERT(in.n_expert > 0 && in.blob_bytes > 0);
 
-        // per-layer quota: this tensor is one layer, so its slot budget is its byte share of
-        // the device budget; slot_budget < 0 means "all experts get a slot"
-        const size_t stride = ggml_expert_store_stride(in.blob_bytes, in.blob_pad);
-        const size_t tensor_bytes = (size_t) in.n_expert * stride;
-        int64_t quota = (int64_t) tensor_bytes;
-        if (slot_budget >= 0) {
-            quota = (int64_t) ((double) slot_budget * (double) tensor_bytes / (double) expert_bytes);
-        }
-        const int64_t n_slot = std::min<int64_t>(in.n_expert, quota / (int64_t) stride);
-        const int64_t aligned = (int64_t) stride;
+        const int64_t n_slot   = n_slots[i];
+        const int64_t aligned  = (int64_t) stride[i];
 
         std::vector<int64_t> order((size_t) in.n_expert);
         for (int64_t e = 0; e < in.n_expert; ++e) {

@@ -106,6 +106,12 @@ const char * ggml_backend_cuda_expert_buffer_type_name(ggml_backend_buffer_type_
 // could not be staged without a staging area.
 void ggml_cuda_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t stage_bytes);
 
+// record the placement plan fit computed for the budget of this buffer type. The store
+// allocation replans from the same tensors and the same budget, so it must come out at these
+// bytes; the allocation aborts when it does not. Called by fit right after ggml_cuda_expert_plan
+// and before the model loads.
+void ggml_cuda_expert_record_plan(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t host_bytes);
+
 // pure placement plan of the expert tensors of one device: the same store function that
 // alloc_buffer_n uses, so fit sizes the staging area without a trial load. The tensors arrive
 // as parallel arrays (layer, n_expert, blob_bytes). slot_budget is the VRAM budget for the
@@ -129,6 +135,12 @@ bool ggml_backend_cuda_expert_get_allocation(
 // drop the recorded allocation of all devices; the fit code calls this before its no-alloc
 // trials so that a model loaded earlier in the process does not leak into the measurements
 void ggml_cuda_expert_reset_allocation(ggml_backend_buffer_type_t buft);
+
+// build or touch the CUDA context of the device of this buffer type, so that the driver
+// bookkeeping the real load pays for (context, peer mappings) is present when fit samples
+// the free memory. Without this the sample of a device that no trial touched reads too
+// large and the slot budget derived from it over-commits the device.
+void ggml_backend_cuda_expert_device_ready(ggml_backend_buffer_type_t buft);
 
 // largest host complement of a single expert tensor in the most recent allocation on the
 // device of buft. Returns false when no expert buffer was allocated yet.

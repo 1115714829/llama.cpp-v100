@@ -6299,6 +6299,50 @@ static size_t expert_store_stride(ggml_type type, int64_t k, int64_t m) {
     return (blob + pad + 255) & ~(size_t) 255;
 }
 
+// ask the backend for the placement plan of the given expert tensors under the budget that
+// was set, and hand it back as the plan the real allocation must reproduce. The allocation
+// aborts when the two differ, so a test that records a plan covers the fit/allocation
+// invariant without loading a real model. specs are (layer, n_expert, blob_bytes, type, ne0).
+struct expert_plan_spec {
+    int     layer;
+    int64_t n_expert;
+    size_t  blob_bytes;
+    int     type;
+    int64_t ne0;
+};
+
+static void record_expert_plan(ggml_backend_reg_t reg, ggml_backend_buffer_type_t buft,
+        const std::vector<expert_plan_spec> & specs, size_t slot_budget) {
+    auto plan = (void (*)(ggml_backend_buffer_type_t, const int *, const int64_t *, const size_t *,
+            const int *, const int64_t *, size_t, size_t, size_t *, size_t *, size_t *, size_t *))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_plan");
+    auto record = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_record_plan");
+    if (plan == nullptr || record == nullptr) {
+        return;
+    }
+
+    std::vector<int>     layers;
+    std::vector<int64_t> n_experts;
+    std::vector<size_t>  blobs;
+    std::vector<int>     types;
+    std::vector<int64_t> ne0s;
+    for (const expert_plan_spec & s : specs) {
+        layers.push_back(s.layer);
+        n_experts.push_back(s.n_expert);
+        blobs.push_back(s.blob_bytes);
+        types.push_back(s.type);
+        ne0s.push_back(s.ne0);
+    }
+
+    size_t slot = 0;
+    size_t host = 0;
+    size_t peak = 0;
+    plan(buft, layers.data(), n_experts.data(), blobs.data(), types.data(), ne0s.data(), specs.size(),
+        slot_budget, &slot, &host, &peak, nullptr);
+    record(buft, slot, host);
+}
+
 // the expert store must place part of the experts in VRAM slots and the rest in the host
 // arena, and it must have room to stage the routed host experts during prefill. With
 // all_slot every expert is in a VRAM slot: no host arena, no staging area.
@@ -6377,6 +6421,8 @@ struct test_mul_mat_id_expert : public test_mul_mat_id {
                 if (set_budget != nullptr) {
                     set_budget(*extra, slot_bytes, stage_bytes);
                 }
+                // record the plan of this budget, so the allocation must reproduce it exactly
+                record_expert_plan(reg, *extra, {{ 0, n_mats, (size_t) ggml_row_size(type_a, k) * (size_t) m, (int) type_a, k }}, slot_bytes);
                 // explicit mark; the name of the tensor does not match the llama pattern
                 mark_expert_tensor(reg, *extra, expert_weight);
                 expert_buft = *extra;

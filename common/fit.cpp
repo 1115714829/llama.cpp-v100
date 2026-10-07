@@ -104,6 +104,27 @@ static void common_expert_reset_allocation(ggml_backend_buffer_type_t buft) {
     }
 }
 
+// build the CUDA context of the device behind this buffer type (through the backend proc),
+// so the driver bookkeeping the real load pays for is already present when fit samples the
+// free memory. This makes the sampled free memory the same state the expert slots are
+// allocated in; without it the first sample of an untouched device is too large.
+static void common_expert_device_ready(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return;
+    }
+    typedef void (*ggml_backend_expert_device_ready_t)(ggml_backend_buffer_type_t);
+    auto ready = (ggml_backend_expert_device_ready_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_device_ready");
+    if (ready != nullptr) {
+        ready(buft);
+    }
+}
+
 // set the expert VRAM budget (slots + staging) of one buffer type before the model loads
 static void common_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t stage_bytes) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
@@ -150,21 +171,22 @@ struct common_expert_tensor {
 };
 
 // layer index of a tensor name "blk.<n>...", -1 for anything else. Used on tensors that
-// already carry the expert mark, so the name is metadata and not recognition.
+// already carry the expert mark, so the name is metadata and not recognition. The exact
+// parse mirrors ggml_cuda_expert_tensor_layer(): the fit plan and the real allocation must
+// see the same layer number for every tensor, otherwise the two plans differ.
 static int common_expert_tensor_layer(const std::string & name) {
-    if (name.compare(0, 4, "blk.") != 0) {
+    const size_t pos = name.find("blk.");
+    if (pos == std::string::npos) {
         return -1;
     }
-    const size_t dot = name.find('.', 4);
-    if (dot == std::string::npos || dot == 4) {
+    size_t p = pos + 4;
+    if (p >= name.size() || name[p] < '0' || name[p] > '9') {
         return -1;
     }
     int layer = 0;
-    for (size_t i = 4; i < dot; ++i) {
-        if (name[i] < '0' || name[i] > '9') {
-            return -1;
-        }
-        layer = layer * 10 + (name[i] - '0');
+    while (p < name.size() && name[p] >= '0' && name[p] <= '9') {
+        layer = layer * 10 + (name[p] - '0');
+        p++;
     }
     return layer;
 }
@@ -218,6 +240,26 @@ static bool common_expert_plan(ggml_backend_buffer_type_t buft,
     plan(buft, layers.data(), n_experts.data(), blobs.data(), types.data(), ne0s.data(), tensors.size(),
         slot_budget, slot_bytes, host_bytes, host_peak, host_each != nullptr ? host_each->data() : nullptr);
     return true;
+}
+
+// record the placement plan fit computed for one device (slot and host bytes). The real
+// allocation replans from the same tensors and the same budget and must come out at exactly
+// these bytes; it aborts when it does not.
+static void common_expert_record_plan(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t host_bytes) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return;
+    }
+    typedef void (*ggml_backend_expert_record_plan_t)(ggml_backend_buffer_type_t, size_t, size_t);
+    auto record = (ggml_backend_expert_record_plan_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_record_plan");
+    if (record != nullptr) {
+        record(buft, slot_bytes, host_bytes);
+    }
 }
 
 // NUMA check of the expert host arenas: hand the host complement allocations of all devices
@@ -462,6 +504,66 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
+// free VRAM of every device of a loaded model, sampled at the startup stages. The CUDA
+// runtime adds device memory lazily (module code and constants, cuBLAS workspaces, CUDA
+// graphs, communication buffers), so the free memory of a device shrinks after the fit
+// measured it. The expert slot budget must leave room for that growth; these samples are
+// what it is measured from. One line per device shows the stage free memory; the growth per
+// stage and the total are printed alongside, all at trace level.
+void common_fit_log_memory_stage(const struct llama_model * model, const char * stage) {
+    if (model == nullptr || stage == nullptr) {
+        common_fit_log_memory_stage_devs(nullptr, 0, nullptr);
+        return;
+    }
+
+    const int nd = llama_model_n_devices(model);
+    if (nd <= 0) {
+        return;
+    }
+
+    std::vector<ggml_backend_dev_t> devs((size_t) nd);
+    for (int i = 0; i < nd; i++) {
+        devs[(size_t) i] = llama_model_get_device(model, i);
+    }
+    common_fit_log_memory_stage_devs(devs.data(), nd, stage);
+}
+
+void common_fit_log_memory_stage_devs(struct ggml_backend_device ** devs, int nd, const char * stage) {
+    static std::vector<size_t> prev_free;
+    static int64_t             sum_growth = 0;
+
+    if (devs == nullptr || stage == nullptr) {
+        prev_free.clear();
+        sum_growth = 0;
+        return;
+    }
+    if (nd <= 0) {
+        return;
+    }
+
+    std::vector<size_t> cur_free((size_t) nd, 0);
+    for (int i = 0; i < nd; i++) {
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(devs[i], &free, &total);
+        cur_free[(size_t) i] = free;
+    }
+
+    int64_t stage_growth = 0;
+    for (int i = 0; i < nd; i++) {
+        const int64_t growth = prev_free.size() == (size_t) nd ? (int64_t) prev_free[(size_t) i] - (int64_t) cur_free[(size_t) i] : 0;
+        stage_growth += growth;
+        LOG_TRC("%s: stage '%s' device %d (%s): free %.0f MiB, %+.0f MiB since the previous stage\n",
+            __func__, stage, i, ggml_backend_dev_name(devs[i]),
+            (double) cur_free[(size_t) i] / 1024.0 / 1024.0, (double) growth / 1024.0 / 1024.0);
+    }
+    sum_growth += stage_growth;
+    LOG_TRC("%s: stage '%s': device free memory changed by %+.0f MiB (%.0f MiB since the reference sample)\n",
+        __func__, stage, (double) stage_growth / 1024.0 / 1024.0, (double) sum_growth / 1024.0 / 1024.0);
+
+    prev_free = std::move(cur_free);
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
@@ -567,6 +669,11 @@ static void common_params_fit_impl(
     add_extra_memory(dmds_full);
 
     const size_t nd = devs.size(); // number of devices
+
+    // baseline of the startup memory sampling series: the free memory the fit measures with.
+    // model_loaded / sched_reserve / warmup / first_prefill / first_decode follow in the same
+    // process and are logged relative to it, so the runtime growth is visible per stage.
+    common_fit_log_memory_stage_devs(devs.data(), (int) nd, "fit");
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
@@ -856,6 +963,22 @@ static void common_params_fit_impl(
     for (size_t id = 0; id < nd; id++) {
         common_expert_reset_allocation(moe_bufts[id]);
     }
+
+    // build the CUDA context of every device before any measurement below. The free memory
+    // a device reports without its context is larger than at allocation time, so budgeting
+    // the expert slots from such a sample over-commits the device. The context lives for the
+    // whole process, so every later trial and the real load measure the same state.
+    for (size_t id = 0; id < nd; id++) {
+        common_expert_device_ready(moe_bufts[id]);
+    }
+    // the first sample (dmds_full) was taken before the contexts existed; re-measure so the
+    // per-device targets of the layer split use the same free-memory state as everything else.
+    // The stage series restarts here: the runtime growth of the later stages is measured from
+    // the state the expert slots are allocated in, not from the pre-context sample.
+    dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+    add_extra_memory(dmds_full);
+    common_fit_log_memory_stage_devs(nullptr, 0, nullptr); // restart the stage series at the new baseline
+    common_fit_log_memory_stage_devs(devs.data(), (int) nd, "fit_ready");
 
     // expert store (the MoE tiered cache): when every device supports it, all MoE expert
     // tensors are routed to the expert buffer type of the device that computes the layer, not
@@ -1281,7 +1404,11 @@ static void common_params_fit_impl(
 
             int64_t surplus;
             if (all_expert_store) {
-                surplus = dmds_full[id].free - mem_final[id] - margins[id];
+                // basis: the free memory of the same measurement that produced mem_final (the
+                // last trial, right before the real load), not the first measurement of the fit.
+                // The trials themselves create contexts and load device code, so the first free
+                // reading is stale and larger; budgeting from it would over-commit the device.
+                surplus = dmds_last[id].free - mem_final[id] - margins[id];
             } else {
                 surplus = dmds_cpu_moe[id].free - int64_t(dmds_cpu_moe[id].mb.total()) - margins[id];
             }
@@ -1345,22 +1472,37 @@ static void common_params_fit_impl(
                     " MiB); reduce the context size, use more devices or a lower quantization");
             }
             common_expert_set_budget(moe_bufts[id], slot_budget, stage_bytes);
+            // hand the same plan to the backend: the real allocation replans from the same
+            // tensors and the same budget and aborts when it comes out at different bytes
+            common_expert_record_plan(moe_bufts[id], slot_used, host_bytes);
 
             // one line per device: the layer range, what the dense weights, the context
             // (KV cache) and the compute buffers take, how the surplus is split into slots
             // and staging, and how much of the expert set stays in host memory (a uniform
-            // routing estimate)
+            // routing estimate). The slot figure is the plan the allocation must reproduce
+            // byte for byte; it is always <= the budget.
             const llama_memory_breakdown_data & mb = all_expert_store ? dmds_last[id].mb : dmds_cpu_moe[id].mb;
             const double hit = slot_used + host_bytes > 0
                 ? 100.0 * (double) slot_used / (double) (slot_used + host_bytes) : 0.0;
             const std::string range = dev_first[id] < 0 ? "none" :
                 std::to_string(dev_first[id]) + ".." + std::to_string(dev_last[id]) +
                 (dev_last[id] == (int) hp_ngl ? " (out)" : "");
-            LOG_INF("%s: device %zu (layers %s): dense %.0f MiB, context %.0f MiB, compute %.0f MiB, expert slots %.0f MiB (planned %.0f MiB), staging %.0f MiB, host complement %.0f MiB, decode hit %.0f%% (uniform)\n",
+            LOG_INF("%s: device %zu (layers %s): dense %.0f MiB, context %.0f MiB, compute %.0f MiB, expert slots %.0f MiB (budget %.0f MiB), staging %.0f MiB, host complement %.0f MiB, decode hit %.0f%% (uniform)\n",
                 __func__, id, range.c_str(),
                 (double) mb.model/MiB, (double) mb.context/MiB, (double) mb.compute/MiB,
-                slot_budget/1024.0/1024.0, slot_used/1024.0/1024.0, stage_bytes/1024.0/1024.0,
+                slot_used/1024.0/1024.0, slot_budget/1024.0/1024.0, stage_bytes/1024.0/1024.0,
                 host_bytes/1024.0/1024.0, hit);
+            // budget accounting of this device: the surplus is real free device memory at the
+            // measurement that produced mem_final, minus the dense weights, the KV cache and
+            // the compute buffers, minus the user margin. The slots are planned with whole
+            // experts only, so the plan uses as much of the budget as whole experts allow and
+            // never more; the remainder stays free for what the runtime adds after the fit.
+            const size_t slot_slack    = slot_budget > slot_used  ? slot_budget - slot_used  : 0;
+            const size_t staging_slack = stage_bytes > stage_peak ? stage_bytes - stage_peak : 0;
+            LOG_TRC("%s: device %zu budget: margin %.0f MiB (user target), slot remainder %.0f MiB (whole experts), staging slack %.0f MiB; basis surplus %.0f MiB = free %.0f - accounted %.0f - margin %.0f\n",
+                __func__, id,
+                margins[id]/1024.0/1024.0, slot_slack/1024.0/1024.0, staging_slack/1024.0/1024.0,
+                surplus/1024.0/1024.0, dmds_last[id].free/1024.0/1024.0, mem_final[id]/1024.0/1024.0, margins[id]/1024.0/1024.0);
             slot_budgets[id] = slot_budget;
             has_experts = true;
             host_complement += (int64_t) host_bytes;
@@ -1918,6 +2060,11 @@ enum common_params_fit_status common_fit_params(
         const common_fit_extra_model * extra,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
+
+    // start a fresh startup memory sampling series: the model/context stages below are
+    // logged relative to this fit measurement
+    common_fit_log_memory_stage(nullptr, nullptr);
+
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
         common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
