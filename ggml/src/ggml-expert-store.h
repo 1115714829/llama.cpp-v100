@@ -159,9 +159,22 @@ GGML_API void ggml_expert_store_set_profile(const char * path);
 // the one ggml_expert_store_set_profile() reads, so one run can produce the profile of the
 // next run. With more than one device the path gets a ".devN" suffix per store.
 GGML_API void ggml_expert_store_set_dump_path(const char * path);
+
+// per-token routing trace: when a path is set, every MUL_MAT_ID records the ids of the
+// launch into a device ring buffer and the CUDA backend drains it to this path. This is used
+// for the offline replay of mimo-runs/tools/expert-replay.py and for building a routing
+// profile from real traffic; see docs/design/r200-routing-trace.md.
+GGML_API void ggml_expert_store_set_trace_path(const char * path, int size_mib);
 #ifdef __cplusplus
 }
 #endif
+
+// trace path/size as set by the CLI layer, empty when the trace is disabled
+GGML_API std::string ggml_expert_store_get_trace_path();
+GGML_API int         ggml_expert_store_get_trace_size_mib();
+
+// true when a trace path is set; a lock-free check for the per-launch hot path
+GGML_API bool ggml_expert_store_trace_enabled();
 
 // write the per-expert routing statistics collected in the tensor (see stat_experts) in the
 // profile format. Called by the backend when the buffer is released.

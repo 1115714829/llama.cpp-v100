@@ -2828,6 +2828,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             ggml_expert_store_set_dump_path(params.dump_expert_routing.c_str());
         }
     ));
+    add_opt(common_arg(
+        {"--dump-routing-trace"}, "FILE",
+        "record the per-token top-k routing of every mul_mat_id (expert store and plain expert\n"
+        "tensors) to this binary trace, readable by mimo-runs/tools/expert-replay.py and\n"
+        "mimo-runs/tools/expert-replay.py --make-profile",
+        [](common_params & params, const std::string & value) {
+            params.dump_routing_trace = value;
+            ggml_expert_store_set_trace_path(params.dump_routing_trace.c_str(), params.dump_routing_trace_size);
+        }
+    ));
+    add_opt(common_arg(
+        {"--dump-routing-trace-size"}, "N",
+        "device ring size per device for --dump-routing-trace, in MiB (default: 4)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.dump_routing_trace_size = value;
+            ggml_expert_store_set_trace_path(params.dump_routing_trace.c_str(), params.dump_routing_trace_size);
+        }
+    ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
