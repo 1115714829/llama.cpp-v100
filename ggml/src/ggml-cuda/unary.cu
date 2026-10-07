@@ -1,3 +1,5 @@
+// The scale+silu fusion ports the scaled activation epilogue of Strata's fused_gr kernels
+// (MIT, refs/strata/src/kernels/cuda/fused_gr.cu).
 #include "unary.cuh"
 #include "convert.cuh"
 
@@ -698,6 +700,45 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
                              (float *) mul_node->data, k, nc,
                              unary_stride / sizeof(float), other_stride / sizeof(float), stream);
     }
+}
+
+/* fused scale + unary(silu) */
+
+// y = silu(x*scale). qwen4exp builds the hyper-connection mixer's low-rank activation this way
+// (src/models/qwen4exp.cpp: lo = silu(scale(lo, 1/hc))); the Strata fused_gr.cu down projection
+// folds the same 1/hc and silu into its epilogue (refs/strata/src/kernels/cuda/fused_gr.cu:102-103).
+static __global__ void scale_silu_kernel(const float * x, float * dst, const float scale, const int64_t k) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const float v = scale * x[i];
+    dst[i] = ggml_cuda_op_silu_single(v);
+}
+
+void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * silu_node) {
+    // scale_node: SCALE applied to scale_node->src[0]
+    // silu_node:  UNARY(SILU) applied to scale_node; the result goes to silu_node->data
+
+    const ggml_tensor * x = scale_node->src[0];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(silu_node->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(x));
+
+    float scale;
+    memcpy(&scale, scale_node->op_params, sizeof(float));
+
+    const int64_t k = ggml_nelements(silu_node);
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+
+    ggml_cuda_kernel_launch(scale_silu_kernel, launch_params, (const float *) x->data, (float *) silu_node->data, scale, k);
 }
 
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {

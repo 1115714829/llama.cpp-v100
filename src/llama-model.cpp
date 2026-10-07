@@ -2011,7 +2011,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        // BF16 weights converted to F16 are rewritten while loading, they cannot point into the mapping
+        bool ctx_has_bf16_as_f16 = false;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ml.is_bf16_as_f16(t)) {
+                ctx_has_bf16_as_f16 = true;
+                break;
+            }
+        }
+
+        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && !ctx_has_bf16_as_f16 && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer

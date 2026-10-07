@@ -4731,6 +4731,44 @@ struct test_unary_mul : public test_case {
     }
 };
 
+// GGML_OP_SCALE + GGML_OP_UNARY(SILU): silu(x*s), the hyper-connection mixer activation
+// (qwen4exp builds silu(scale(lo, 1/hc))). The backend may fold the scale of the first
+// node into the silu kernel; both nodes must then match the unfused chain.
+struct test_scale_silu : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SCALE_SILU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne, scale);
+    }
+
+    test_scale_silu(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = { 320, 1, 1, 1 },
+            float scale = 0.25f)
+        : type(type), ne(ne), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * scaled = ggml_scale(ctx, a, scale);
+        ggml_set_name(scaled, "scaled");
+
+        ggml_tensor * out = ggml_silu(ctx, scaled);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -5781,6 +5819,105 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+// Check the BF16 -> F16 conversion that llama_model_loader applies to BF16 weights on devices
+// without native BF16 support, and the MUL_MAT of the resulting F16 weight: exact inside the
+// F16 range, finite values beyond it clamp to +-65504 instead of becoming Inf (as in Strata's
+// bf16_to_f16_kernel).
+static void test_bf16_to_f16_exact() {
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
+
+    const ggml_bf16_t src[] = {
+        ggml_fp32_to_bf16( 1.0f + 1.0f/128.0f),
+        ggml_fp32_to_bf16( 65504.0f), // rounds up to 65536 in BF16 (7-bit mantissa), so it is clamped as well
+        ggml_fp32_to_bf16( 1e6f),
+        ggml_fp32_to_bf16( 65536.0f),
+        ggml_fp32_to_bf16(-1e30f),
+        ggml_fp32_to_bf16( INFINITY),
+    };
+    const int64_t n = sizeof(src)/sizeof(src[0]);
+
+    ggml_fp16_t dst[6];
+    const int64_t n_clamped = ggml_bf16_to_fp16_row(src, dst, n);
+
+    GGML_ASSERT(n_clamped == 4);
+    GGML_ASSERT(dst[0] == ggml_fp32_to_fp16(1.0f + 1.0f/128.0f)); // exact inside the F16 range
+    GGML_ASSERT(dst[1] == ggml_fp32_to_fp16(65504.0f));
+    GGML_ASSERT(dst[2] == ggml_fp32_to_fp16(65504.0f));           // clamped, not Inf
+    GGML_ASSERT(dst[3] == ggml_fp32_to_fp16(65504.0f));           // clamped, not Inf
+    GGML_ASSERT(dst[4] == ggml_fp32_to_fp16(-65504.0f));          // clamped, not Inf
+    GGML_ASSERT(dst[5] == ggml_fp32_to_fp16(INFINITY));           // Inf stays Inf
+}
+
+struct test_mul_mat_bf16_to_f16 : public test_case {
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR3(m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_bf16_to_f16(int64_t m = 160, int64_t n = 1, int64_t k = 256) : m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, m); // the converted weight
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_F16) {
+                init_tensor_uniform(t);
+                continue;
+            }
+
+            // as if the weight were BF16 in the file, with values beyond the F16 range in every row
+            const int64_t ne = ggml_nelements(t);
+            std::vector<ggml_bf16_t> data_bf16(ne);
+            for (int64_t i = 0; i < ne; i++) {
+                data_bf16[i] = ggml_fp32_to_bf16(
+                        i % k == 0 ?  1e6f :
+                        i % 16 == 0 ? -1e30f :
+                        (float) ((i % 7) - 3) / 8.0f);
+            }
+
+            std::vector<ggml_fp16_t> data_f16(ne);
+            const int64_t n_clamped = ggml_bf16_to_fp16_row(data_bf16.data(), data_f16.data(), ne);
+
+            GGML_ASSERT(n_clamped > 0);
+            for (int64_t i = 0; i < ne; i++) {
+                if (i % k == 0) {
+                    GGML_ASSERT(data_f16[i] == ggml_fp32_to_fp16( 65504.0f));
+                } else if (i % 16 == 0) {
+                    GGML_ASSERT(data_f16[i] == ggml_fp32_to_fp16(-65504.0f));
+                }
+            }
+
+            ggml_backend_tensor_set(t, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_BF16_TO_F16";
     }
 };
 
@@ -10934,6 +11071,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
 
+    test_bf16_to_f16_exact();
+
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int v : {0, 1}) {
@@ -11018,6 +11157,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    // production width: decode (n_tokens=1) and prefill (2048), the DSV4_HC_POST gate fused
+    // into the post kernel; identity comb, as qwen4exp builds the hyper-connection combine
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 2048, true, true));
+
+    // scale + unary(silu): decode and prefill shapes of the hyper-connection mixer activation
+    test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 320, 1, 1, 1 }));
+    test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 320, 2048, 1, 1 }));
+    test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 128, 2, 2, 2 }, -1.5f));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
@@ -12262,6 +12410,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 1, 256, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 1, 256, {3, 2}, {2, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 8, 256, {1, 1}, {1, 1}));
+
+    // BF16 weights in the decode (n = 1 and up to the MMVF batch limit of 8) and prefill
+    // (n = 16 and up) shapes of the hyper-connection and router weights (m = 160/256)
+    for (int64_t m : {160, 256}) {
+        for (int64_t n : {1, 8, 16, 512}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, m, n, 256, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 8, 8, false, m,  1, 256));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 8, 8, false, m, 16, 256));
+    }
+
+    // the same weight after the load-time BF16 -> F16 conversion, with BF16 data beyond the F16 range
+    test_cases.emplace_back(new test_mul_mat_bf16_to_f16(160,  1, 256));
+    test_cases.emplace_back(new test_mul_mat_bf16_to_f16(160,  8, 256));
+    test_cases.emplace_back(new test_mul_mat_bf16_to_f16(160, 16, 256));
+    test_cases.emplace_back(new test_mul_mat_bf16_to_f16(256,  1, 256));
+    test_cases.emplace_back(new test_mul_mat_bf16_to_f16(256, 16, 256));
 
     // token-tile boundary coverage. With n_used == n_mats every token routes to every expert, so
     // each expert receives exactly n rows, with no dependence on the random draw. mul_mm_id is used

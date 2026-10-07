@@ -380,6 +380,9 @@ extern "C" {
     GGML_API void        ggml_bf16_to_fp32_row(const ggml_bf16_t *, float *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row_ref(const float *, ggml_bf16_t *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
+    // BF16 -> F16: exact for values in the F16 range, finite values beyond it are clamped to +-65504
+    // returns the number of values that were clamped
+    GGML_API int64_t     ggml_bf16_to_fp16_row(const ggml_bf16_t *, ggml_fp16_t *, int64_t);
 
     struct ggml_object;
     struct ggml_context;
