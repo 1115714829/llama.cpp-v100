@@ -868,12 +868,12 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                 if (ampere_mma_available(cc)) {
                     return ne11 <= 3;
                 }
-                if (cc >= GGML_CUDA_CC_TURING) {
+                // Volta: a 4-token batch (speculative verify) on cuBLAS is a SIMT SGEMM plus a split-K
+                // reduction; MMVF beats it on small matrices and is within 10% on large ones up to 4 columns
+                if (cc >= GGML_CUDA_CC_VOLTA) {
                     return ne11 <= 4;
                 }
-                // Volta and older: cuBLAS has no fp32 tensor-core path, so small batches fall back to SIMT SGEMM
-                // plus a split-K reduction; MMVF stays bandwidth-bound for every batch size it supports
-                return ne11 <= MMVF_MAX_BATCH_SIZE;
+                return ne11 <= 3;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
                 if (fp32_mma_hardware_available(cc)) {
                     return ne11 <= 3;
