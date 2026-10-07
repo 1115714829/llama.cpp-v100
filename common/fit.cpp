@@ -647,7 +647,7 @@ static void common_params_fit_impl(
                 if (mb.total() == 0) {
                     continue;
                 }
-                per_dev += " " + ggml_backend_dev_name(devs[id]) + " "
+                per_dev += std::string(" ") + ggml_backend_dev_name(devs[id]) + " "
                     + std::to_string(mb.total()/MiB) + " MiB (model " + std::to_string(mb.model/MiB)
                     + ", context " + std::to_string(mb.context/MiB) + ", compute " + std::to_string(mb.compute/MiB) + "),";
             }
