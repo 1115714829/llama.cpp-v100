@@ -2,6 +2,7 @@
 #include "ggml-impl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cinttypes>
 #include <cstdint>
 #include <cstdio>
@@ -50,6 +51,9 @@ static bool ggml_expert_store_read_profile(const char * path, ggml_expert_store_
 static std::mutex g_profile_mutex;
 static std::string g_profile_path;
 static std::string g_dump_path;
+static std::string g_trace_path;
+static int         g_trace_size_mib = 4;
+static std::atomic<bool> g_trace_enabled{false};
 
 void ggml_expert_store_set_profile(const char * path) {
     std::lock_guard<std::mutex> lock(g_profile_mutex);
@@ -69,6 +73,27 @@ void ggml_expert_store_set_dump_path(const char * path) {
 static std::string ggml_expert_store_get_dump_path() {
     std::lock_guard<std::mutex> lock(g_profile_mutex);
     return g_dump_path;
+}
+
+void ggml_expert_store_set_trace_path(const char * path, int size_mib) {
+    std::lock_guard<std::mutex> lock(g_profile_mutex);
+    g_trace_path     = path != nullptr ? path : "";
+    g_trace_size_mib = size_mib > 0 ? size_mib : 4;
+    g_trace_enabled.store(!g_trace_path.empty(), std::memory_order_relaxed);
+}
+
+bool ggml_expert_store_trace_enabled() {
+    return g_trace_enabled.load(std::memory_order_relaxed);
+}
+
+std::string ggml_expert_store_get_trace_path() {
+    std::lock_guard<std::mutex> lock(g_profile_mutex);
+    return g_trace_path;
+}
+
+int ggml_expert_store_get_trace_size_mib() {
+    std::lock_guard<std::mutex> lock(g_profile_mutex);
+    return g_trace_size_mib;
 }
 
 void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_device) {

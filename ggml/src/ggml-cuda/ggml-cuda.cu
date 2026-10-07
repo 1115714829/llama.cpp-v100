@@ -31,6 +31,7 @@
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/ggml-cuda-expert.cuh"
+#include "ggml-cuda/ggml-cuda-routing-trace.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
@@ -3553,6 +3554,13 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
+    // the routing trace passes a per-launch ring offset as a kernel argument, so the launch
+    // cannot be recorded into a CUDA graph. This is a capability limit, not a fallback: with
+    // the trace off the graph path below is unchanged.
+    if (ggml_cuda_routing_trace_device_enabled()) {
+        return true;
+    }
+
     // expert store: the prefill staging has a host-side part (the stream state), so launches
     // that stage cannot be recorded into a CUDA graph
     ggml_cuda_expert_table ex_table;
@@ -3610,6 +3618,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ggml_cuda_expert_record_usage(src0, ids, ggml_mul_mat_id_get_expert_offset(dst), ctx.stream());
         ggml_cuda_expert_stats_tick(src0, ctx.stream());
     }
+
+    // routing trace: record the raw ids of every MUL_MAT_ID, expert store or plain CUDA tensor
+    ggml_cuda_routing_trace_record(src0, ids, ctx.stream());
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
@@ -4197,6 +4208,9 @@ static const char * ggml_backend_cuda_get_name(ggml_backend_t backend) {
 
 static void ggml_backend_cuda_free(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
+
+    // drain the routing trace of this device and close the file while the ring is still alive
+    ggml_cuda_routing_trace_shutdown_device(cuda_ctx->device);
 
     delete cuda_ctx;
     delete backend;
@@ -6261,6 +6275,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // while the routing trace is on, a MUL_MAT_ID must stay its own node: the fused MMVQ
+    // kernels take the ids directly and would bypass the trace hook in ggml_cuda_mul_mat_id
+    if (ggml_cuda_routing_trace_enabled() && node->op == GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
 
     // Expert parallelism: the fused kernels write the GLU or ADD node, which does not carry the
     // expert state of the MUL_MAT_ID nodes, so it is copied into the fusion arguments here.
@@ -8922,6 +8942,20 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+
+    // while the routing trace is on, the whole-graph capture of the meta backend must not be
+    // offered: the trace hook runs per MUL_MAT_ID dispatch, which a captured graph replays
+    // without calling. This is a capability branch for a debug feature, not a fallback path.
+    if (ggml_cuda_routing_trace_enabled()) {
+        if (strcmp(name, "ggml_backend_capture_begin")  == 0 ||
+            strcmp(name, "ggml_backend_capture_end")    == 0 ||
+            strcmp(name, "ggml_backend_capture_launch") == 0 ||
+            strcmp(name, "ggml_backend_capture_free")   == 0 ||
+            strcmp(name, "ggml_backend_comm_allreduce_rank_capturable") == 0) {
+            return nullptr;
+        }
+    }
+
     if (strcmp(name, "ggml_backend_dev_get_extra_bufts") == 0) {
         return (void *)ggml_backend_cuda_device_get_extra_bufts;
     }

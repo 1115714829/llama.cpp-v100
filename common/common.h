@@ -533,6 +533,8 @@ struct common_params {
 
     std::string expert_profile      = ""; // expert routing profile: decides which experts stay in device memory // NOLINT
     std::string dump_expert_routing = ""; // write the observed expert routing to this file when the model unloads // NOLINT
+    std::string dump_routing_trace  = ""; // per-token routing trace (RTRC) written by the CUDA backend // NOLINT
+    int dump_routing_trace_size     = 4;  // device ring size per device for the trace, MiB
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
