@@ -632,11 +632,17 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
+    // Expand the projections that share this input back to back, so that the CUDA backend can
+    // run them with one input conversion and one multi-weight kernel. ggml reuses compute
+    // buffers in node order, so a projection expanded apart from the others could have its
+    // output overwritten before its consumers read it.
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
+    ggml_build_forward_expand(gf, qkv_mixed);
+    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+    ggml_build_forward_expand(gf, z);
+
     qkv_mixed = ggml_reshape_3d(ctx0, qkv_mixed, qkv_mixed->ne[0], n_seq_tokens, n_seqs);
     cb(qkv_mixed, "linear_attn_qkv_mixed", il);
-
-    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
     cb(z, "z", il);
 
     return { qkv_mixed, z };
@@ -897,8 +903,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     ggml_tensor * sel = qsa ? build_qsa_sel(mctx_hyb, inp_kpool, cur, inp_pos, sections, il) : nullptr;
 
     // Qwen3Next uses a single Q projection that outputs query + gate
+    // Expand the projections that share this input back to back, so that the CUDA backend can
+    // run them with one input conversion and one multi-weight kernel. ggml reuses compute
+    // buffers in node order, so a projection expanded apart from the others could have its
+    // output overwritten before its consumers read it.
     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+    ggml_build_forward_expand(gf, Qcur_full);
+    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+    ggml_build_forward_expand(gf, Kcur);
+    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+    ggml_build_forward_expand(gf, Vcur);
+
     cb(Qcur_full, "Qcur_full", il);
+    cb(Kcur, "Kcur", il);
+    cb(Vcur, "Vcur", il);
 
     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
         ggml_element_size(Qcur_full) * n_embd_head * 2,
@@ -907,12 +925,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
-
-    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
-    cb(Kcur, "Kcur", il);
-
-    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
-    cb(Vcur, "Vcur", il);
 
     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
@@ -1329,8 +1341,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t hc      = hparams.dsv4_hc_mult;
     const int64_t hc_dim  = hc * n_embd;
 
+    // Expand the projections that share this input back to back, so that the CUDA backend can
+    // run them with one input conversion and one multi-weight kernel. ggml reuses compute
+    // buffers in node order, so a projection expanded apart from the others could have its
+    // output overwritten before its consumers read it.
     ggml_tensor * key   = build_lora_mm(model.layers[il].ple_key,   emb);
+    ggml_build_forward_expand(gf, key);
     ggml_tensor * value = build_lora_mm(model.layers[il].ple_value, emb);
+    ggml_build_forward_expand(gf, value);
 
     // both norms group over one hc stream, with a [n_embd, hc] weight
     auto grouped_norm = [&](ggml_tensor * x, ggml_tensor * w) {
