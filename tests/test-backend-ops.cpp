@@ -6595,6 +6595,10 @@ struct test_mul_mat_id_expert_ffn : public test_case {
         check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, /*all_slot=*/false);
     }
 
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         // gate/up: (k, m) x (k, 1, n) -> (m, n_used, n); down: (m, k) x (m, n_used, n) -> (k, n_used, n)
         gate_w = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
