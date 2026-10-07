@@ -205,14 +205,14 @@ void ggml_expert_store_plan(
         return;
     }
 
-    // static profile (Strata A3): experts with the highest hit counts get the slots.
-    // Without a profile the first experts by index are placed, which is the uniform
-    // fallback of the task description and is logged as such.
+    // static profile (Strata A3): experts with the highest hit counts get the slots. A profile
+    // that the user asked for but that cannot be read (or carries no entry) is a configuration
+    // error: loading it as a uniform placement would silently change where the experts live.
     const std::string path = profile_path != nullptr ? profile_path : ggml_expert_store_get_profile();
     ggml_expert_store_profile profile;
     const bool have_profile = !path.empty() && ggml_expert_store_read_profile(path.c_str(), profile);
-    if (!path.empty() && !have_profile) {
-        GGML_LOG_ERROR("%s: cannot read expert profile '%s', falling back to uniform placement\n",
+    if (!path.empty() && (!have_profile || profile.n_layer <= 0 || profile.n_expert <= 0)) {
+        GGML_ABORT("%s: cannot read expert profile '%s' (missing file or no entry)\n",
             __func__, path.c_str());
     }
 

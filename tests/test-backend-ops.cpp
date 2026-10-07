@@ -6501,6 +6501,146 @@ struct test_mul_mat_id_expert_ep : public test_mul_mat_id_ep {
     }
 };
 
+// MoE FFN built from the expert store: gate and up are separate store tensors that share the
+// routing of one batch, the GLU joins them and down runs on the gated activation. This is the
+// layout of a real MoE block, so the three MUL_MAT_ID launches of a layer run one after another
+// on the same stream and reuse the one per-stream staging area: a slot, table or lifetime
+// mistake between the tensors has to show up as a mismatch against the CPU reference. The
+// n = 2048 batch reaches the batched MMQ path and stages the host experts of every tensor;
+// n = 16 reaches the fused MMVQ gate/up kernel instead, which reads the two main tables.
+struct test_mul_mat_id_expert_ffn : public test_case {
+    const ggml_type type_a;    // gate/up type
+    const ggml_type type_down; // down type: k = m = 640 is not a multiple of QK_K for the K-quants
+    const int n_mats;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    ggml_tensor * gate_w = nullptr;
+    ggml_tensor * up_w   = nullptr;
+    ggml_tensor * down_w = nullptr;
+    ggml_backend_buffer_type_t expert_buft = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, type_down, n_mats, n_used, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        // two quantized projections in series (gate/up, then down)
+        return 1e-3;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        // gate + up + down
+        return 6 * m * k * n * n_used;
+    }
+
+    test_mul_mat_id_expert_ffn(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_down = GGML_TYPE_Q8_0,
+            int n_mats = 512, int n_used = 10,
+            int64_t m = 640, int64_t n = 2048, int64_t k = 2560)
+        : type_a(type_a), type_down(type_down), n_mats(n_mats), n_used(n_used),
+            m(m), n(n), k(k) {
+            GGML_ASSERT(n_used <= n_mats);
+        }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_FFN";
+    }
+
+    bool use_weight_context() override { return true; }
+    bool requires_weight_buffer_type() override { return true; }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            return nullptr;
+        }
+        auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra == nullptr) {
+            return nullptr;
+        }
+        for (ggml_backend_buffer_type_t * extra = get_extra(dev); extra && *extra; ++extra) {
+            const std::string name = ggml_backend_buft_name(*extra);
+            if (name.size() >= 8 && name.compare(name.size() - 8, 8, "_Experts") == 0) {
+                // three experts of every tensor in the VRAM slots, the complements in the host
+                // arena; the staging area covers the host complement of the largest tensor. The
+                // budgets use the 256-byte expert pitch of the store.
+                const size_t blob_gate = GGML_PAD(ggml_row_size(type_a, k) * (size_t) m, 256);
+                const size_t blob_down = GGML_PAD(ggml_row_size(type_down, m) * (size_t) k, 256);
+                const size_t slot_bytes  = 3 * (2 * blob_gate + blob_down);
+                const size_t stage_bytes = std::max(blob_gate, blob_down) * (size_t) n_mats;
+                auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
+                if (set_budget != nullptr) {
+                    set_budget(*extra, slot_bytes, stage_bytes);
+                }
+                // explicit mark of every weight tensor; the names mimic the llama tensors but
+                // play no part in the recognition
+                mark_expert_tensor(reg, *extra, gate_w);
+                mark_expert_tensor(reg, *extra, up_w);
+                mark_expert_tensor(reg, *extra, down_w);
+                expert_buft = *extra;
+                return *extra;
+            }
+        }
+        return nullptr;
+    }
+
+    void check_weight_alloc(ggml_backend_t backend) override {
+        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, /*all_slot=*/false);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        // gate/up: (k, m) x (k, 1, n) -> (m, n_used, n); down: (m, k) x (m, n_used, n) -> (k, n_used, n)
+        gate_w = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(gate_w, "blk.0.ffn_gate_exps.weight");
+        up_w = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(up_w, "blk.0.ffn_up_exps.weight");
+        down_w = ggml_new_tensor_3d(ctx_weights, type_down, m, k, n_mats);
+        ggml_set_name(down_w, "blk.0.ffn_down_exps.weight");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        // gate/up broadcast one activation row per token, like the real pre-FFN activation
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_w, b, ids);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * up = ggml_mul_mat_id(ctx, up_w, b, ids);
+        ggml_set_name(up, "up");
+
+        ggml_tensor * gated = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(gated, "gated");
+
+        // the same ids drive the down projection of the gated activation
+        ggml_tensor * out = ggml_mul_mat_id(ctx, down_w, gated, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+
+    bool run_whole_graph() override { return true; }
+};
+
 // expert parallelism with the gate/up GLU fusion: gate and up are each split along the expert
 // dim, fused with swiglu per shard, and the shard results sum to the full fused result.
 struct test_mul_mat_id_ep_fusion : public test_case {
@@ -12309,6 +12449,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 512, 10, 640, n, 2560, /*all_slot=*/false));
         }
     }
+
+    // MoE FFN of the expert store: gate/up/down as separate store tensors, one shared ids, the
+    // GLU between them. The MMQ prefill (n = 2048) stages the host experts of all three tensors
+    // through the one per-stream staging area, so the consecutive launches must not read a slot
+    // that a later prepare has overwritten; n = 16 checks the fused MMVQ gate/up path instead.
+    // down uses Q8_0: k = m = 640 is not a multiple of QK_K for the K-quants.
+    test_cases.emplace_back(new test_mul_mat_id_expert_ffn(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 512, 10, 640, 2048, 2560));
+    test_cases.emplace_back(new test_mul_mat_id_expert_ffn(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, 512, 10, 640, 2048, 2560));
+    test_cases.emplace_back(new test_mul_mat_id_expert_ffn(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 512, 10, 640, 16,   2560));
 
     // Unsloth Qwen3.8-Flash-Next UD-Q4_K_XL expert projections: 512 experts, top-10,
     // gate/up (m = 640, k = 2560) and fused gate/up (m = 1280, k = 2560) with the K-quant types,
