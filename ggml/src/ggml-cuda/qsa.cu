@@ -1,0 +1,1044 @@
+// QSA (Qwen sparse attention) selection and attention over the selected cells.
+//
+// Portions ported from Strata (https://github.com/Niko1221/strata), MIT License,
+// Copyright (c) 2026 Niko1221 and the Strata contributors:
+//   - qsa_topk_kernel:        src/kernels/cuda/qsa_select.cu, block_topk_kernel (radix select)
+//   - qsa_attn_chunk_kernel:  src/kernels/cuda/qsa_decode_attn.cu, attn_chunk_kernel_pre75, reduce12, head_of_lane
+//   - qsa_attn_merge_kernel:  src/kernels/cuda/qsa_decode_attn.cu, attn_merge_kernel
+//   - qsa_attn_prompt_kernel: src/kernels/cuda/qsa_prompt_attn.cu, prompt_attn_v70_kernel (mma.m8n8k4)
+// Adapted to ggml: K/V rows are read from the ggml cache (F16 or Q8_0, row strides per KV head, cell and
+// stream) instead of Strata's paged pools, the selection comes from QSA_SELECT, a cell id of -1 is skipped.
+
+#include "qsa.cuh"
+#include "lightning-indexer.cuh"
+
+#include <cfloat>
+
+#define QSA_HD 256  // head size
+#define QSA_G  12   // query heads per KV head
+
+// tokens scored per pass of QSA_SELECT: the score scratch is n_pool*QSA_SELECT_TILE floats, independent of the batch
+#define QSA_SELECT_TILE 64
+#define QSA_TOPK_THREADS 256
+
+// QSA_ATTN: batches up to this size take the chunked kernel, larger ones the prompt kernel
+#define QSA_ATTN_CHUNK_MAX_TOKENS 16
+#define QSA_CHUNK 64          // cells per block of the chunked kernel
+#define QSA_CHUNK_THREADS 256
+#define QSA_PROMPT_CH 32      // cells per step of the prompt kernel
+#define QSA_PROMPT_THREADS 128
+
+// ---------------------------------------------------------------------------------------------------------------------
+// selection
+
+static __global__ void qsa_fill_f32(float * dst, const int n, const float v) {
+    if ((int) threadIdx.x < n) {
+        dst[threadIdx.x] = v;
+    }
+}
+
+// total order of the scores as unsigned keys, NaN lowest
+static __device__ __forceinline__ uint32_t qsa_order_key(const float s) {
+    const float v = s + 0.0f;
+    if (!(v == v)) {
+        return 0u;
+    }
+    const uint32_t b = __float_as_uint(v);
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+// one block per token: keep the n_top highest scores of the pools [lo, hi), equal scores by ascending pool, and write
+// their cells in ascending pool order, then the tail cells, then -1
+static __global__ void __launch_bounds__(QSA_TOPK_THREADS) qsa_topk_kernel(
+        const float * __restrict__ scores, const int64_t n_pool,
+        const int32_t * __restrict__ rng, const int64_t s_rng,
+        const int32_t * __restrict__ pidx, const int kpool,
+        const int32_t * __restrict__ tidx, const int64_t s_tidx,
+        const int n_top, const int sentinel,
+        int32_t * __restrict__ out, const int n_sel) {
+    __shared__ int hist[256];
+    __shared__ int s_a[QSA_TOPK_THREADS];
+    __shared__ int s_b[QSA_TOPK_THREADS];
+    __shared__ int s_digit;
+    __shared__ int s_above;
+
+    const int qi = blockIdx.x;
+    const int t  = threadIdx.x;
+
+    const int64_t lo = rng[qi*s_rng + 0];
+    const int64_t hi = rng[qi*s_rng + 1];
+    const int64_t nv = hi - lo;
+
+    const float * sc = scores + qi*n_pool;
+    int32_t     * o  = out    + (int64_t) qi*n_sel;
+
+    // contiguous ranges of pools per thread, so a prefix over the threads keeps the pool order
+    const int64_t per = (nv + QSA_TOPK_THREADS - 1)/QSA_TOPK_THREADS;
+    const int64_t b0  = lo + t*per;
+    const int64_t b1  = min(b0 + per, hi);
+
+    const bool all = nv <= n_top;
+
+    uint32_t thr       = 0;
+    int64_t  eq_budget = 0;
+    if (!all) {
+        // radix select: the largest key thr with (pools with key >= thr) >= n_top, 8 bits at a time
+        uint32_t prefix = 0;
+        int above = 0; // pools strictly above the digits fixed so far
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            for (int i = t; i < 256; i += QSA_TOPK_THREADS) {
+                hist[i] = 0;
+            }
+            __syncthreads();
+            const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+            for (int64_t b = b0; b < b1; ++b) {
+                const uint32_t k = qsa_order_key(sc[b]);
+                if ((k & hi_mask) == (prefix & hi_mask)) {
+                    atomicAdd(&hist[(k >> shift) & 255], 1);
+                }
+            }
+            __syncthreads();
+            if (t == 0) {
+                int cum = above;
+                int d   = 255;
+                for (; d > 0; --d) {
+                    if (cum + hist[d] >= n_top) {
+                        break;
+                    }
+                    cum += hist[d];
+                }
+                s_digit = d;
+                s_above = cum;
+            }
+            __syncthreads();
+            prefix |= (uint32_t) s_digit << shift;
+            above = s_above;
+            __syncthreads();
+        }
+        thr       = prefix;
+        eq_budget = n_top - above; // pools equal to thr that fit, lowest index first
+    }
+
+    // per-thread counts above and at the threshold, then the exclusive prefixes
+    int gt = 0;
+    int eq = 0;
+    for (int64_t b = b0; b < b1; ++b) {
+        const uint32_t k = all ? 1u : qsa_order_key(sc[b]);
+        if (all || k > thr) {
+            gt++;
+        } else if (k == thr) {
+            eq++;
+        }
+    }
+    s_a[t] = gt;
+    s_b[t] = eq;
+    __syncthreads();
+    if (t == 0) {
+        int ag = 0;
+        int ae = 0;
+        for (int i = 0; i < QSA_TOPK_THREADS; ++i) {
+            const int g = s_a[i];
+            const int e = s_b[i];
+            s_a[i] = ag;
+            s_b[i] = ae;
+            ag += g;
+            ae += e;
+        }
+    }
+    __syncthreads();
+    int64_t my_eq = eq_budget - s_b[t];
+    my_eq = my_eq < 0 ? 0 : (my_eq > eq ? eq : my_eq);
+    const int sel = gt + (int) my_eq;
+    __syncthreads();
+    s_a[t] = sel;
+    __syncthreads();
+    if (t == 0) {
+        int a = 0;
+        for (int i = 0; i < QSA_TOPK_THREADS; ++i) {
+            const int c = s_a[i];
+            s_a[i] = a;
+            a += c;
+        }
+        s_digit = a; // the number of kept pools
+    }
+    __syncthreads();
+
+    int64_t wpos    = s_a[t];
+    int64_t eq_left = my_eq;
+    for (int64_t b = b0; b < b1; ++b) {
+        const uint32_t k = all ? 1u : qsa_order_key(sc[b]);
+        bool keep = all || k > thr;
+        if (!keep && k == thr && eq_left > 0) {
+            keep = true;
+            eq_left--;
+        }
+        if (keep) {
+            for (int c = 0; c < kpool; ++c) {
+                o[wpos*kpool + c] = pidx[b*kpool + c];
+            }
+            wpos++;
+        }
+    }
+    __syncthreads();
+
+    const int n_kept = s_digit;
+    if (t == 0) {
+        int n = n_kept*kpool;
+        for (int c = 0; c < kpool - 1; ++c) {
+            const int32_t cell = tidx[qi*s_tidx + c];
+            if (cell != sentinel) {
+                o[n++] = cell;
+            }
+        }
+        s_digit = n;
+    }
+    __syncthreads();
+    for (int i = s_digit + t; i < n_sel; i += QSA_TOPK_THREADS) {
+        o[i] = -1;
+    }
+}
+
+void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * pidx = dst->src[2];
+    const ggml_tensor * tidx = dst->src[3];
+    const ggml_tensor * prng = dst->src[4];
+
+    const float head_scale = ggml_get_op_params_f32(dst, 0);
+    const int   n_top      = ggml_get_op_params_i32(dst, 1);
+    const int   sentinel   = ggml_get_op_params_i32(dst, 2);
+
+    const int64_t n_head   = q->ne[1];
+    const int64_t n_tokens = q->ne[2];
+    const int64_t n_pool   = k->ne[2];
+    const int     kpool    = (int) pidx->ne[0];
+    const int     n_sel    = (int) dst->ne[0];
+
+    cudaStream_t stream = ctx.stream();
+
+    // every head weight is head_scale; one row shared by all tokens
+    ggml_cuda_pool_alloc<float> w(ctx.pool(), n_head);
+    qsa_fill_f32<<<1, 32, 0, stream>>>(w.get(), (int) n_head, head_scale);
+
+    const int64_t tile = std::min<int64_t>(n_tokens, QSA_SELECT_TILE);
+    ggml_cuda_pool_alloc<float> scores(ctx.pool(), n_pool*tile);
+
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += tile) {
+        const int64_t nt = std::min<int64_t>(tile, n_tokens - t0);
+
+        const float * q_d = (const float *) ((const char *) q->data + t0*q->nb[2]);
+        ggml_cuda_lightning_indexer_scores(q_d, q->nb[1], q->nb[2], nt, k, w.get(), scores.get(), n_pool*sizeof(float), stream);
+
+        qsa_topk_kernel<<<nt, QSA_TOPK_THREADS, 0, stream>>>(
+            scores.get(), n_pool,
+            (const int32_t *) ((const char *) prng->data + t0*prng->nb[1]), prng->nb[1]/sizeof(int32_t),
+            (const int32_t *) pidx->data, kpool,
+            (const int32_t *) ((const char *) tidx->data + t0*tidx->nb[1]), tidx->nb[1]/sizeof(int32_t),
+            n_top, sentinel,
+            (int32_t *) ((char *) dst->data + t0*dst->nb[1]), n_sel);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_qsa_select_supported(int device, const ggml_tensor * dst) {
+    GGML_UNUSED(device);
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * pidx = dst->src[2];
+    const ggml_tensor * tidx = dst->src[3];
+    const ggml_tensor * prng = dst->src[4];
+
+    // the scoring kernels are written for 128-wide keys and 4 heads
+    if (q->ne[0] != 128 || q->ne[1] != 4 || q->nb[0] != sizeof(float) || q->nb[1] % 16 != 0 || q->nb[2] % 16 != 0) {
+        return false;
+    }
+    switch (k->type) {
+        case GGML_TYPE_F32:
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_F16:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q4_0:
+            break;
+        default:
+            return false;
+    }
+    return ggml_is_contiguous(pidx) && tidx->nb[0] == sizeof(int32_t) && prng->nb[0] == sizeof(int32_t) &&
+        ggml_is_contiguous(dst);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// attention: K/V rows of the ggml cache
+
+struct qsa_kv {
+    const char * k;
+    const char * v;
+    int64_t nbk1, nbk2, nbk3;
+    int64_t nbv1, nbv2, nbv3;
+};
+
+// 8 consecutive values [d0, d0 + 8) of a row
+template <ggml_type T>
+static __device__ __forceinline__ void qsa_load8(const char * row, const int d0, float * out) {
+    if constexpr (T == GGML_TYPE_F16) {
+        const uint4 raw = *(const uint4 *) (row + d0*sizeof(half));
+        const half2 * h2 = (const half2 *) &raw;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float2 f = __half22float2(h2[j]);
+            out[2*j + 0] = f.x;
+            out[2*j + 1] = f.y;
+        }
+    } else {
+        static_assert(T == GGML_TYPE_Q8_0, "unsupported type");
+        const block_q8_0 * blk = (const block_q8_0 *) row + d0/QK8_0;
+        const float d = __half2float(blk->d);
+        const int8_t * qs = blk->qs + d0 % QK8_0;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            out[j] = (float) qs[j] * d;
+        }
+    }
+}
+
+// one value d of a row
+template <ggml_type T>
+static __device__ __forceinline__ float qsa_load1(const char * row, const int d) {
+    if constexpr (T == GGML_TYPE_F16) {
+        return __half2float(((const half *) row)[d]);
+    } else {
+        static_assert(T == GGML_TYPE_Q8_0, "unsupported type");
+        const block_q8_0 * blk = (const block_q8_0 *) row + d/QK8_0;
+        return (float) blk->qs[d % QK8_0] * __half2float(blk->d);
+    }
+}
+
+// a row widened to half precision, [0, QSA_HD), by the threads of a block
+template <ggml_type T>
+static __device__ __forceinline__ void qsa_row_to_half(const char * row, half * dst, const int lane, const int n_lanes) {
+    if constexpr (T == GGML_TYPE_F16) {
+        for (int i = lane; i < QSA_HD*(int) sizeof(half)/16; i += n_lanes) {
+            ((uint4 *) dst)[i] = ((const uint4 *) row)[i];
+        }
+    } else {
+        static_assert(T == GGML_TYPE_Q8_0, "unsupported type");
+        for (int b = lane; b < QSA_HD/QK8_0; b += n_lanes) {
+            const block_q8_0 * blk = (const block_q8_0 *) row + b;
+            const float d = __half2float(blk->d);
+#pragma unroll
+            for (int j = 0; j < QK8_0; ++j) {
+                dst[b*QK8_0 + j] = __float2half_rn((float) blk->qs[j] * d);
+            }
+        }
+    }
+}
+
+static __device__ __forceinline__ float qsa_warp_sum(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        v += __shfl_xor_sync(0xffffffffu, v, o);
+    }
+    return v;
+}
+
+static __device__ __forceinline__ float qsa_warp_max(float v) {
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    }
+    return v;
+}
+
+// The 12 heads' lane sums (part[12..15] zero), reduce-scattered with warp_sum's pairing order (xor 16, 8, 4, 2, 1).
+// Lane l ends holding head qsa_head_of_lane(l); lanes l and l^1 agree.
+static __device__ __forceinline__ float qsa_reduce12(const float (&part)[16], const int lane) {
+    float r8[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const bool hi = (lane & 16) != 0;
+        r8[i] = (hi ? part[i + 8] : part[i]) + __shfl_xor_sync(0xffffffffu, hi ? part[i] : part[i + 8], 16);
+    }
+    float r4[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const bool hi = (lane & 8) != 0;
+        r4[i] = (hi ? r8[i + 4] : r8[i]) + __shfl_xor_sync(0xffffffffu, hi ? r8[i] : r8[i + 4], 8);
+    }
+    float r2[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const bool hi = (lane & 4) != 0;
+        r2[i] = (hi ? r4[i + 2] : r4[i]) + __shfl_xor_sync(0xffffffffu, hi ? r4[i] : r4[i + 2], 4);
+    }
+    const bool hi2 = (lane & 2) != 0;
+    const float r1 = (hi2 ? r2[1] : r2[0]) + __shfl_xor_sync(0xffffffffu, hi2 ? r2[0] : r2[1], 2);
+    return r1 + __shfl_xor_sync(0xffffffffu, r1, 1);
+}
+
+static __device__ __forceinline__ int qsa_head_of_lane(const int lane) {
+    return ((lane >> 4) & 1)*8 + ((lane >> 3) & 1)*4 + ((lane >> 2) & 1)*2 + ((lane >> 1) & 1);
+}
+
+// chunked attention, one block per (chunk of QSA_CHUNK selected cells, KV head, token): partial accumulators,
+// maxima and sums per chunk, combined by qsa_attn_merge_kernel
+template <ggml_type TK, ggml_type TV>
+static __global__ void __launch_bounds__(QSA_CHUNK_THREADS) qsa_attn_chunk_kernel(
+        const float * __restrict__ q, const int64_t s_qh, const int64_t s_qt,
+        const qsa_kv kv, const int32_t * __restrict__ ids, const int n_sel, const int n_tps, const float scale,
+        float * __restrict__ part_acc, float * __restrict__ part_m, float * __restrict__ part_l,
+        const int n_chunks, const int64_t scratch_stride) {
+    constexpr int WARPS = QSA_CHUNK_THREADS/32;
+
+    const int qi    = blockIdx.z;
+    const int chunk = blockIdx.x;
+    const int kvh   = blockIdx.y;
+    const int t     = threadIdx.x;
+    const int lane  = t & 31;
+    const int warp  = t >> 5;
+
+    q        += qi*s_qt + (int64_t) kvh*QSA_G*s_qh;
+    ids      += (int64_t) qi*n_sel;
+    part_acc += qi*scratch_stride;
+    part_m   += qi*scratch_stride;
+    part_l   += qi*scratch_stride;
+
+    const int64_t s = qi / n_tps;
+    const char * k_base = kv.k + kvh*kv.nbk1 + s*kv.nbk3;
+    const char * v_base = kv.v + kvh*kv.nbv1 + s*kv.nbv3;
+
+    __shared__ __align__(16) float sq[QSA_G][QSA_HD]; // this KV head's query heads, then the probabilities
+    __shared__ float sp[QSA_G][QSA_CHUNK];            // scores
+    __shared__ int   scell[QSA_CHUNK];                // cell of each slot, -1 for none
+
+    // probabilities cell-major, sharing the storage of sq once the scores are done
+    float (*const spt)[QSA_G] = reinterpret_cast<float (*)[QSA_G]>(&sq[0][0]);
+    static_assert(QSA_CHUNK*QSA_G <= QSA_G*QSA_HD, "spt must fit in sq");
+
+    const int c0     = chunk*QSA_CHUNK;
+    const int n_here = min(QSA_CHUNK, n_sel - c0);
+    const int slot   = kvh*n_chunks + chunk;
+
+    if (t < QSA_CHUNK) {
+        scell[t] = t < n_here ? ids[c0 + t] : -1;
+    }
+    for (int i = t; i < QSA_G*QSA_HD; i += QSA_CHUNK_THREADS) {
+        sq[i / QSA_HD][i % QSA_HD] = q[(i / QSA_HD)*s_qh + i % QSA_HD];
+    }
+    __syncthreads();
+
+    // the valid ids are a prefix: a chunk that starts with -1 is empty
+    if (scell[0] < 0) {
+        if (t < QSA_G) {
+            part_m[slot*QSA_G + t] = -FLT_MAX;
+            part_l[slot*QSA_G + t] = 0.0f;
+        }
+        return;
+    }
+
+    // scores: each warp takes cells warp, warp+8, ...; each lane holds 8 of the 256 dimensions, NC cells per step
+    constexpr int NC = 2;
+    const int hd = qsa_head_of_lane(lane);
+    for (int i = 0; i < QSA_CHUNK/WARPS; i += NC) {
+        int cc[NC];
+        bool all_ok = true;
+#pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            cc[j] = warp + WARPS*(i + j);
+            all_ok = all_ok && scell[cc[j]] >= 0;
+        }
+        if (all_ok) {
+            float kk[NC][8];
+#pragma unroll
+            for (int j = 0; j < NC; ++j) {
+                qsa_load8<TK>(k_base + scell[cc[j]]*kv.nbk2, lane*8, kk[j]);
+            }
+            float pp[NC][16];
+#pragma unroll
+            for (int h = 0; h < QSA_G; ++h) {
+                const float4 qa = *reinterpret_cast<const float4 *>(&sq[h][lane*8]);
+                const float4 qb = *reinterpret_cast<const float4 *>(&sq[h][lane*8 + 4]);
+#pragma unroll
+                for (int j = 0; j < NC; ++j) {
+                    pp[j][h] = kk[j][0]*qa.x + kk[j][1]*qa.y + kk[j][2]*qa.z + kk[j][3]*qa.w +
+                               kk[j][4]*qb.x + kk[j][5]*qb.y + kk[j][6]*qb.z + kk[j][7]*qb.w;
+                }
+            }
+#pragma unroll
+            for (int j = 0; j < NC; ++j) {
+#pragma unroll
+                for (int h = QSA_G; h < 16; ++h) {
+                    pp[j][h] = 0.0f;
+                }
+                const float sj = qsa_reduce12(pp[j], lane);
+                if ((lane & 1) == 0 && hd < QSA_G) {
+                    sp[hd][cc[j]] = sj*scale;
+                }
+            }
+        } else {
+            for (int j = 0; j < NC; ++j) {
+                const int c = cc[j];
+                if (scell[c] < 0) {
+                    if (lane < QSA_G) {
+                        sp[lane][c] = -FLT_MAX;
+                    }
+                    continue;
+                }
+                float k8[8];
+                qsa_load8<TK>(k_base + scell[c]*kv.nbk2, lane*8, k8);
+                float part[16];
+#pragma unroll
+                for (int h = 0; h < QSA_G; ++h) {
+                    const float4 qa = *reinterpret_cast<const float4 *>(&sq[h][lane*8]);
+                    const float4 qb = *reinterpret_cast<const float4 *>(&sq[h][lane*8 + 4]);
+                    part[h] = k8[0]*qa.x + k8[1]*qa.y + k8[2]*qa.z + k8[3]*qa.w +
+                              k8[4]*qb.x + k8[5]*qb.y + k8[6]*qb.z + k8[7]*qb.w;
+                }
+#pragma unroll
+                for (int h = QSA_G; h < 16; ++h) {
+                    part[h] = 0.0f;
+                }
+                const float sj = qsa_reduce12(part, lane);
+                if ((lane & 1) == 0 && hd < QSA_G) {
+                    sp[hd][c] = sj*scale;
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // per-head chunk max and exp-sum: warp w handles heads w and w+8
+    for (int h = warp; h < QSA_G; h += WARPS) {
+        const float a = sp[h][lane];
+        const float b = sp[h][lane + 32];
+        const float m = qsa_warp_max(fmaxf(a, b));
+        const float ea = scell[lane]      >= 0 ? __expf(a - m) : 0.0f;
+        const float eb = scell[lane + 32] >= 0 ? __expf(b - m) : 0.0f;
+        spt[lane][h]      = ea;
+        spt[lane + 32][h] = eb;
+        const float l = qsa_warp_sum(ea + eb);
+        if (lane == 0) {
+            part_m[slot*QSA_G + h] = m;
+            part_l[slot*QSA_G + h] = l;
+        }
+    }
+    __syncthreads();
+
+    // values: thread t owns dimension t for all 12 heads, cells folded in ascending order
+    float acc[QSA_G];
+#pragma unroll
+    for (int h = 0; h < QSA_G; ++h) {
+        acc[h] = 0.0f;
+    }
+    const auto fold = [&](const int c, const float v) {
+        const float4 * w4 = reinterpret_cast<const float4 *>(spt[c]);
+        const float4 w0 = w4[0];
+        const float4 w1 = w4[1];
+        const float4 w2 = w4[2];
+        acc[0]  = fmaf(w0.x, v, acc[0]);  acc[1]  = fmaf(w0.y, v, acc[1]);
+        acc[2]  = fmaf(w0.z, v, acc[2]);  acc[3]  = fmaf(w0.w, v, acc[3]);
+        acc[4]  = fmaf(w1.x, v, acc[4]);  acc[5]  = fmaf(w1.y, v, acc[5]);
+        acc[6]  = fmaf(w1.z, v, acc[6]);  acc[7]  = fmaf(w1.w, v, acc[7]);
+        acc[8]  = fmaf(w2.x, v, acc[8]);  acc[9]  = fmaf(w2.y, v, acc[9]);
+        acc[10] = fmaf(w2.z, v, acc[10]); acc[11] = fmaf(w2.w, v, acc[11]);
+    };
+    int c = 0;
+    for (; c + 4 <= n_here; c += 4) {
+        const int r0 = scell[c];
+        const int r1 = scell[c + 1];
+        const int r2 = scell[c + 2];
+        const int r3 = scell[c + 3];
+        if ((r0 | r1 | r2 | r3) < 0) {
+            break;
+        }
+        const float v0 = qsa_load1<TV>(v_base + r0*kv.nbv2, t);
+        const float v1 = qsa_load1<TV>(v_base + r1*kv.nbv2, t);
+        const float v2 = qsa_load1<TV>(v_base + r2*kv.nbv2, t);
+        const float v3 = qsa_load1<TV>(v_base + r3*kv.nbv2, t);
+        fold(c + 0, v0);
+        fold(c + 1, v1);
+        fold(c + 2, v2);
+        fold(c + 3, v3);
+    }
+    for (; c < n_here; ++c) {
+        if (scell[c] < 0) {
+            continue;
+        }
+        fold(c, qsa_load1<TV>(v_base + scell[c]*kv.nbv2, t));
+    }
+#pragma unroll
+    for (int h = 0; h < QSA_G; ++h) {
+        part_acc[((int64_t) slot*QSA_G + h)*QSA_HD + t] = acc[h];
+    }
+}
+
+static __global__ void __launch_bounds__(QSA_HD) qsa_attn_merge_kernel(
+        const float * __restrict__ part_acc, const float * __restrict__ part_m, const float * __restrict__ part_l,
+        const int n_chunks, const int64_t scratch_stride,
+        float * __restrict__ dst, const int64_t s_dh, const int64_t s_dt) {
+    const int qi = blockIdx.y;
+    const int h  = blockIdx.x; // query head
+    const int d  = threadIdx.x;
+
+    part_acc += qi*scratch_stride;
+    part_m   += qi*scratch_stride;
+    part_l   += qi*scratch_stride;
+
+    const int kvh = h / QSA_G;
+    const int hl  = h % QSA_G;
+
+    float M = -FLT_MAX;
+    for (int c = 0; c < n_chunks; ++c) {
+        M = fmaxf(M, part_m[(kvh*n_chunks + c)*QSA_G + hl]);
+    }
+    float L   = 0.0f;
+    float acc = 0.0f;
+    for (int c = 0; c < n_chunks; ++c) {
+        const int slot = kvh*n_chunks + c;
+        const float m = part_m[slot*QSA_G + hl];
+        if (m == -FLT_MAX) {
+            continue;
+        }
+        const float w = __expf(m - M);
+        L   = fmaf(part_l[slot*QSA_G + hl], w, L);
+        acc = fmaf(part_acc[((int64_t) slot*QSA_G + hl)*QSA_HD + d], w, acc);
+    }
+    dst[qi*s_dt + h*s_dh + d] = L > 0.0f ? acc / L : 0.0f;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// attention, prompt kernel for Volta: mma.m8n8k4 (FP16 in, FP32 accumulate), one block per (token, KV head)
+//
+// Volta's tensor cores have m8n8k4 only: per warp four independent 8x8x4 products, one per quad-pair (QP q = lanes
+// 4q..4q+3 and 4q+16..4q+19; thread j = (lane & 3) + 4*(lane >> 4) within it). The thread holds row j of A (k 0..3 as
+// two registers) and column j of B; C register i is row (lane & 1) + 4*(lane >> 4) + 2*((i >> 1) & 1), column
+// (lane & 2) + 4*(i >> 2) + (i & 1) of its QP's 8x8 tile.
+//   q.k: warp w owns dims [64w, 64w+64); QP q takes cells 8q..8q+7 of the 32-cell chunk; 16 k-steps of 4 dims, two
+//        8-row blocks (12 heads + 4 zero rows), q as hi + lo halves.
+//   p.v: warp w owns dims [64w, 64w+64); QP q its 16 dims 64w+16q.. (two n-tiles of 8); k = the 32 cells in steps of
+//        4; p split into hi + lo halves.
+// The cache rows are widened to half when they are gathered.
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA && __CUDA_ARCH__ < GGML_CUDA_CC_TURING
+#define QSA_VOLTA_MMA 1
+#else
+#define QSA_VOLTA_MMA 0
+#endif
+
+static __device__ __forceinline__ void qsa_mma884(float * c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+#if QSA_VOLTA_MMA
+    asm volatile("mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+#else
+    GGML_UNUSED_VARS(c, a0, a1, b0, b1);
+    NO_DEVICE_CODE;
+#endif
+}
+
+static __device__ __forceinline__ uint32_t qsa_pack_h2(const float lo_k, const float hi_k) { // element k in the low half
+    half2 h = __floats2half2_rn(lo_k, hi_k);
+    return *reinterpret_cast<uint32_t *>(&h);
+}
+
+#define QSA_QS (QSA_HD + 8)    // q row stride in halves, bank-conflict-free fragment loads
+#define QSA_KVROW (QSA_HD + 8) // K/V row stride in halves
+
+struct qsa_prompt_smem {
+    half  qh[16][QSA_QS];
+    half  ql[16][QSA_QS];
+    half  k[QSA_PROMPT_CH][QSA_KVROW];
+    half  v[QSA_PROMPT_CH][QSA_KVROW];
+    float part[4][16][QSA_PROMPT_CH + 4]; // q.k per dim group
+    float s[16][QSA_PROMPT_CH + 4];       // the chunk's probabilities
+    float qmax[QSA_PROMPT_THREADS/32];
+    float alpha[16];
+    float lsum[16];
+    float mrow[16];
+    int   cell[QSA_PROMPT_CH];
+};
+
+template <ggml_type TK, ggml_type TV>
+static __global__ void __launch_bounds__(QSA_PROMPT_THREADS) qsa_attn_prompt_kernel(
+        const float * __restrict__ q, const int64_t s_qh, const int64_t s_qt,
+        const qsa_kv kv, const int32_t * __restrict__ ids, const int n_sel, const int n_tps, const float scale_log2,
+        float * __restrict__ dst, const int64_t s_dh, const int64_t s_dt) {
+#if QSA_VOLTA_MMA
+    constexpr int CH = QSA_PROMPT_CH;
+
+    extern __shared__ __align__(16) unsigned char qsa_smem_raw[];
+    qsa_prompt_smem & S = *reinterpret_cast<qsa_prompt_smem *>(qsa_smem_raw);
+
+    const int qi  = blockIdx.x;
+    const int kvh = blockIdx.y;
+
+    q   += qi*s_qt + (int64_t) kvh*QSA_G*s_qh;
+    dst += qi*s_dt + (int64_t) kvh*QSA_G*s_dh;
+    ids += (int64_t) qi*n_sel;
+
+    const int64_t s = qi / n_tps;
+    const char * k_base = kv.k + kvh*kv.nbk1 + s*kv.nbk3;
+    const char * v_base = kv.v + kvh*kv.nbv1 + s*kv.nbv3;
+
+    const int t    = threadIdx.x;
+    const int lane = t & 31;
+    const int warp = t >> 5;
+    const int qp   = (lane >> 2) & 3;                 // quad-pair
+    const int jj   = (lane & 3) + 4*(lane >> 4);      // thread within it
+    const int crow = (lane & 1) + 4*(lane >> 4);      // C row of register 0 (+2 per register pair)
+    const int ccol = lane & 2;                        // C column of register 0 (+4 per half, +1 per register)
+
+    // q: 12 heads + 4 zero rows, scaled by a power of two that puts its largest value near 2^14, split into hi + lo
+    float qm = 0.0f;
+    for (int i = t; i < QSA_G*QSA_HD; i += QSA_PROMPT_THREADS) {
+        qm = fmaxf(qm, fabsf(q[(i / QSA_HD)*s_qh + i % QSA_HD]));
+    }
+    qm = qsa_warp_max(qm);
+    if (lane == 0) {
+        S.qmax[warp] = qm;
+    }
+    __syncthreads();
+    qm = fmaxf(fmaxf(S.qmax[0], S.qmax[1]), fmaxf(S.qmax[2], S.qmax[3]));
+    int qe = 0;
+    if (qm > 0.0f) {
+        frexpf(qm, &qe); // qm < 2^qe
+    }
+    const float qup   = ldexpf(1.0f, 14 - qe);
+    const float qdown = ldexpf(scale_log2, qe - 14);
+    for (int i = t; i < 16*QSA_HD; i += QSA_PROMPT_THREADS) {
+        const int h = i / QSA_HD;
+        const int d = i % QSA_HD;
+        const float x = h < QSA_G ? q[h*s_qh + d]*qup : 0.0f;
+        const half hi = __float2half_rn(x);
+        S.qh[h][d] = hi;
+        S.ql[h][d] = __float2half_rn(x - __half2float(hi));
+    }
+    if (t < 16) {
+        S.mrow[t] = -INFINITY;
+        S.lsum[t] = 0.0f;
+    }
+
+    float acc[2][2][8];
+#pragma unroll
+    for (int rb = 0; rb < 2; ++rb) {
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                acc[rb][nt][i] = 0.0f;
+            }
+        }
+    }
+
+    // the V rows are half, their scale is 1: p carries 2^14, the accumulator 2^-14
+    constexpr float vup   = 16384.0f;
+    constexpr float vdown = 1.0f/16384.0f;
+
+    for (int c0 = 0; c0 < n_sel; c0 += CH) {
+        // the valid ids are a prefix: stop at the first chunk that starts with -1
+        if (__ldg(ids + c0) < 0) {
+            break;
+        }
+        const int nh = min(CH, n_sel - c0);
+        if (t < CH) {
+            S.cell[t] = t < nh ? ids[c0 + t] : -1;
+        }
+        __syncthreads(); // cells ready; the previous chunk's p.v is done with k, v, s
+
+        // gather the chunk's K and V rows, widened to half; a missing cell is zero and masked below
+        for (int i = t; i < CH*8; i += QSA_PROMPT_THREADS) {
+            const int c    = i / 8;
+            const int part = i % 8;
+            const int cell = S.cell[c];
+            if (cell >= 0) {
+                qsa_row_to_half<TK>(k_base + cell*kv.nbk2, S.k[c], part, 8);
+                qsa_row_to_half<TV>(v_base + cell*kv.nbv2, S.v[c], part, 8);
+            } else {
+                for (int d = part; d < QSA_HD/8; d += 8) {
+                    ((uint4 *) S.k[c])[d] = make_uint4(0, 0, 0, 0);
+                    ((uint4 *) S.v[c])[d] = make_uint4(0, 0, 0, 0);
+                }
+            }
+        }
+        __syncthreads();
+
+        // scores: warp w = dim group w (64 dims), QP q = cells 8q..8q+7
+        {
+            float tg[2][8];
+#pragma unroll
+            for (int rb = 0; rb < 2; ++rb) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    tg[rb][i] = 0.0f;
+                }
+            }
+            const int cell_b = qp*8 + jj;
+#pragma unroll
+            for (int ks = 0; ks < 16; ++ks) {
+                const int d0 = warp*64 + ks*4;
+                const uint2 raw = *reinterpret_cast<const uint2 *>(&S.k[cell_b][d0]);
+#pragma unroll
+                for (int rb = 0; rb < 2; ++rb) {
+                    const uint2 ah = *reinterpret_cast<const uint2 *>(&S.qh[rb*8 + jj][d0]);
+                    const uint2 al = *reinterpret_cast<const uint2 *>(&S.ql[rb*8 + jj][d0]);
+                    qsa_mma884(tg[rb], ah.x, ah.y, raw.x, raw.y);
+                    qsa_mma884(tg[rb], al.x, al.y, raw.x, raw.y);
+                }
+            }
+#pragma unroll
+            for (int rb = 0; rb < 2; ++rb) {
+#pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int row  = rb*8 + crow + 2*((i >> 1) & 1);
+                    const int cell = qp*8 + ccol + 4*(i >> 2) + (i & 1);
+                    S.part[warp][row][cell] = tg[rb][i];
+                }
+            }
+        }
+        __syncthreads();
+
+        // online softmax: row t/8, 4 cells per thread, 8 threads per row (lanes 8r..8r+7 of a warp)
+        {
+            constexpr int PER = CH/8;
+            const int r   = t >> 3;
+            const int sub = t & 7;
+            float x[PER];
+            float mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < PER; ++j) {
+                const int c = sub*PER + j;
+                const float sum4 = ((S.part[0][r][c] + S.part[1][r][c]) + S.part[2][r][c]) + S.part[3][r][c];
+                x[j] = c < nh && S.cell[c] >= 0 ? sum4*qdown : -INFINITY;
+                mx = fmaxf(mx, x[j]);
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) {
+                mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+            }
+            const float m_old = S.mrow[r];
+            const float m_new = fmaxf(m_old, mx);
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < PER; ++j) {
+                const float e = x[j] == -INFINITY ? 0.0f : exp2f(x[j] - m_new);
+                S.s[r][sub*PER + j] = e;
+                sum += e;
+            }
+#pragma unroll
+            for (int o = 1; o < 8; o <<= 1) {
+                sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            }
+            __syncwarp();
+            if (sub == 0) {
+                const float a = m_old == -INFINITY ? 0.0f : exp2f(m_old - m_new);
+                S.alpha[r] = a;
+                S.lsum[r]  = fmaf(S.lsum[r], a, sum);
+                S.mrow[r]  = m_new;
+            }
+        }
+        __syncthreads();
+
+        // p.v: warp w owns dims [64w, 64w+64), QP q its 16 dims 64w+16q..
+        {
+            float tmp[2][2][8];
+#pragma unroll
+            for (int rb = 0; rb < 2; ++rb) {
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        tmp[rb][nt][i] = 0.0f;
+                    }
+                }
+            }
+#pragma unroll
+            for (int ks = 0; ks < CH/4; ++ks) {
+                const int cs = ks*4;
+                uint2 ah[2];
+                uint2 al[2];
+#pragma unroll
+                for (int rb = 0; rb < 2; ++rb) {
+                    const float4 pv = *reinterpret_cast<const float4 *>(&S.s[rb*8 + jj][cs]);
+                    const float p0 = pv.x*vup;
+                    const float p1 = pv.y*vup;
+                    const float p2 = pv.z*vup;
+                    const float p3 = pv.w*vup;
+                    ah[rb].x = qsa_pack_h2(p0, p1);
+                    ah[rb].y = qsa_pack_h2(p2, p3);
+                    const float2 f01 = __half22float2(*reinterpret_cast<const half2 *>(&ah[rb].x));
+                    const float2 f23 = __half22float2(*reinterpret_cast<const half2 *>(&ah[rb].y));
+                    al[rb].x = qsa_pack_h2(p0 - f01.x, p1 - f01.y);
+                    al[rb].y = qsa_pack_h2(p2 - f23.x, p3 - f23.y);
+                }
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+                    const int d = warp*64 + qp*16 + nt*8 + jj;
+                    const half2 h0 = __halves2half2(S.v[cs + 0][d], S.v[cs + 1][d]);
+                    const half2 h1 = __halves2half2(S.v[cs + 2][d], S.v[cs + 3][d]);
+                    const uint32_t b0 = *reinterpret_cast<const uint32_t *>(&h0);
+                    const uint32_t b1 = *reinterpret_cast<const uint32_t *>(&h1);
+#pragma unroll
+                    for (int rb = 0; rb < 2; ++rb) {
+                        qsa_mma884(tmp[rb][nt], ah[rb].x, ah[rb].y, b0, b1);
+                        qsa_mma884(tmp[rb][nt], al[rb].x, al[rb].y, b0, b1);
+                    }
+                }
+            }
+#pragma unroll
+            for (int rb = 0; rb < 2; ++rb) {
+                const float a0 = S.alpha[rb*8 + crow];
+                const float a1 = S.alpha[rb*8 + crow + 2];
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        acc[rb][nt][i] = fmaf(acc[rb][nt][i], ((i >> 1) & 1) ? a1 : a0, tmp[rb][nt][i]*vdown);
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int rb = 0; rb < 2; ++rb) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = rb*8 + crow + 2*h;
+            if (row >= QSA_G) {
+                continue;
+            }
+            const float l   = S.lsum[row];
+            const float inv = l > 0.0f ? 1.0f/l : 0.0f;
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+#pragma unroll
+                for (int hh = 0; hh < 2; ++hh) {
+                    const int i = hh*4 + h*2; // registers i, i+1: row h, columns ccol + 4*hh + {0, 1}
+                    const int d = warp*64 + qp*16 + nt*8 + ccol + 4*hh;
+                    *reinterpret_cast<float2 *>(dst + row*s_dh + d) =
+                        make_float2(acc[rb][nt][i]*inv, acc[rb][nt][i + 1]*inv);
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(q, s_qh, s_qt, kv, ids, n_sel, n_tps, scale_log2, dst, s_dh, s_dt);
+    NO_DEVICE_CODE;
+#endif // QSA_VOLTA_MMA
+}
+
+template <ggml_type TK, ggml_type TV>
+static void qsa_attn_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * q   = dst->src[0];
+    const ggml_tensor * k   = dst->src[1];
+    const ggml_tensor * v   = dst->src[2];
+    const ggml_tensor * ids = dst->src[3];
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    const int64_t n_head    = q->ne[1];
+    const int64_t n_tokens  = q->ne[2];
+    const int64_t n_head_kv = k->ne[1];
+    const int64_t n_stream  = k->ne[3];
+    const int     n_sel     = (int) ids->ne[0];
+    const int     n_tps     = (int) (n_tokens/n_stream);
+
+    const qsa_kv kv = {
+        (const char *) k->data, (const char *) v->data,
+        (int64_t) k->nb[1], (int64_t) k->nb[2], (int64_t) k->nb[3],
+        (int64_t) v->nb[1], (int64_t) v->nb[2], (int64_t) v->nb[3],
+    };
+
+    const float * q_d   = (const float *)   q->data;
+    const int32_t * i_d = (const int32_t *) ids->data;
+    float * dst_d       = (float *)         dst->data;
+
+    const int64_t s_qh = q->nb[1]/sizeof(float);
+    const int64_t s_qt = q->nb[2]/sizeof(float);
+    const int64_t s_dh = dst->nb[1]/sizeof(float);
+    const int64_t s_dt = dst->nb[2]/sizeof(float);
+
+    cudaStream_t stream = ctx.stream();
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    // capability branch, not a fallback: the prompt kernel is written for Volta's mma.m8n8k4, other GPUs run the
+    // chunked kernel for every batch size
+    const bool prompt = n_tokens > QSA_ATTN_CHUNK_MAX_TOKENS && GGML_CUDA_CC_IS_NVIDIA(cc) &&
+        ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_VOLTA;
+
+    if (prompt) {
+        const int smem = (int) sizeof(qsa_prompt_smem);
+        static bool attr_set[GGML_CUDA_MAX_DEVICES] = { false };
+        const int device = ggml_cuda_get_device();
+        if (!attr_set[device]) {
+            CUDA_CHECK(cudaFuncSetAttribute(qsa_attn_prompt_kernel<TK, TV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+            attr_set[device] = true;
+        }
+        const float scale_log2 = 1.4426950408889634f*scale;
+        GGML_ASSERT(n_tokens <= 65535);
+        qsa_attn_prompt_kernel<TK, TV><<<dim3((unsigned) n_tokens, (unsigned) n_head_kv), QSA_PROMPT_THREADS, smem, stream>>>(
+            q_d, s_qh, s_qt, kv, i_d, n_sel, n_tps, scale_log2, dst_d, s_dh, s_dt);
+    } else {
+        const int n_chunks = (n_sel + QSA_CHUNK - 1)/QSA_CHUNK;
+        // per token: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head]
+        const int64_t stride = (int64_t) n_chunks*n_head*(QSA_HD + 2);
+        ggml_cuda_pool_alloc<float> scratch(ctx.pool(), stride*n_tokens);
+        float * part_acc = scratch.get();
+        float * part_m   = part_acc + (int64_t) n_chunks*n_head*QSA_HD;
+        float * part_l   = part_m   + (int64_t) n_chunks*n_head;
+
+        GGML_ASSERT(n_tokens <= 65535);
+        qsa_attn_chunk_kernel<TK, TV><<<dim3((unsigned) n_chunks, (unsigned) n_head_kv, (unsigned) n_tokens), QSA_CHUNK_THREADS, 0, stream>>>(
+            q_d, s_qh, s_qt, kv, i_d, n_sel, n_tps, scale, part_acc, part_m, part_l, n_chunks, stride);
+        qsa_attn_merge_kernel<<<dim3((unsigned) n_head, (unsigned) n_tokens), QSA_HD, 0, stream>>>(
+            part_acc, part_m, part_l, n_chunks, stride, dst_d, s_dh, s_dt);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_op_qsa_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+
+    if (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0) {
+        qsa_attn_launch<GGML_TYPE_Q8_0, GGML_TYPE_Q8_0>(ctx, dst);
+    } else if (k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16) {
+        qsa_attn_launch<GGML_TYPE_F16, GGML_TYPE_F16>(ctx, dst);
+    } else if (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_F16) {
+        qsa_attn_launch<GGML_TYPE_Q8_0, GGML_TYPE_F16>(ctx, dst);
+    } else if (k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_Q8_0) {
+        qsa_attn_launch<GGML_TYPE_F16, GGML_TYPE_Q8_0>(ctx, dst);
+    } else {
+        GGML_ABORT("fatal error");
+    }
+}
+
+bool ggml_cuda_qsa_attn_supported(int device, const ggml_tensor * dst) {
+    GGML_UNUSED(device);
+    const ggml_tensor * q   = dst->src[0];
+    const ggml_tensor * k   = dst->src[1];
+    const ggml_tensor * v   = dst->src[2];
+    const ggml_tensor * ids = dst->src[3];
+
+    // the kernels are written for 256-wide heads and 12 query heads per KV head
+    if (k->ne[0] != QSA_HD || v->ne[0] != QSA_HD || q->ne[1] != QSA_G*k->ne[1]) {
+        return false;
+    }
+    for (const ggml_tensor * t : { k, v }) {
+        if (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_Q8_0) {
+            return false;
+        }
+        if (t->nb[0] != ggml_type_size(t->type) || t->nb[1] % 16 != 0 || t->nb[2] % 2 != 0) {
+            return false;
+        }
+    }
+    if (q->nb[0] != sizeof(float) || q->nb[1] % 16 != 0 || q->nb[2] % 16 != 0) {
+        return false;
+    }
+    return ids->nb[0] == sizeof(int32_t) && ggml_is_contiguous(ids) && dst->nb[0] == sizeof(float) && q->ne[2] <= 65535;
+}

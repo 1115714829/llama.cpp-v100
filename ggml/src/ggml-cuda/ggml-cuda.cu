@@ -77,6 +77,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/qsa.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -4184,6 +4185,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
+            break;
+        case GGML_OP_QSA_SELECT:
+            ggml_cuda_op_qsa_select(ctx, dst);
+            break;
+        case GGML_OP_QSA_ATTN:
+            ggml_cuda_op_qsa_attn(ctx, dst);
             break;
         default:
             return false;
@@ -8750,6 +8757,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_QSA_SELECT:
+            return ggml_cuda_qsa_select_supported(dev_ctx->device, op);
+        case GGML_OP_QSA_ATTN:
+            return ggml_cuda_qsa_attn_supported(dev_ctx->device, op);
 
         default:
             return false;

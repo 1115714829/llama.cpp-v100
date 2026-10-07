@@ -10548,6 +10548,162 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// GGML_OP_QSA_SELECT
+// integer-valued q and keys keep every score exact on every backend (the CUDA scorer stages the keys in half), so the
+// selection, equal scores included, must match the CPU id for id
+struct test_qsa_select : public test_case {
+    const int64_t n_pool;  // pools, the last n_pad of them padded
+    const int64_t n_pad;
+    const int64_t nb;      // tokens
+    const int64_t kpool;
+    const int64_t n_top;
+    const ggml_type type_K;
+
+    std::string vars() override {
+        return VARS_TO_STR6(n_pool, n_pad, nb, kpool, n_top, type_K);
+    }
+
+    test_qsa_select(int64_t n_pool = 512, int64_t n_pad = 8, int64_t nb = 16, int64_t kpool = 4, int64_t n_top = 64,
+            ggml_type type_K = GGML_TYPE_F16)
+        : n_pool(n_pool), n_pad(n_pad), nb(nb), kpool(kpool), n_top(n_top), type_K(type_K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 4, nb);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, type_K, 128, 1, n_pool);
+        ggml_set_name(k, "k");
+        ggml_tensor * pidx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool, n_pool);
+        ggml_set_name(pidx, "pidx");
+        ggml_tensor * tidx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool - 1, nb);
+        ggml_set_name(tidx, "tidx");
+        ggml_tensor * prng = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, nb);
+        ggml_set_name(prng, "prng");
+
+        ggml_tensor * out = ggml_qsa_select(ctx, q, k, pidx, tidx, prng, 0.25f, (int32_t) n_top, -1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x51ec7);
+        const int64_t n_real = n_pool - n_pad;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "q") == 0 || strcmp(t->name, "k") == 0) {
+                // small integers: exact in half, and many equal scores to exercise the tie order
+                std::uniform_int_distribution<int> dist(-2, 2);
+                std::vector<float> v(ggml_nelements(t));
+                for (float & x : v) {
+                    x = (float) dist(gen);
+                }
+                if (t->type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+                } else {
+                    std::vector<ggml_fp16_t> h(v.size());
+                    ggml_fp32_to_fp16_row(v.data(), h.data(), (int64_t) v.size());
+                    ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+                }
+            } else if (strcmp(t->name, "pidx") == 0) {
+                // the real pools address distinct cells in a shuffled order, the padded ones are -1
+                std::vector<int32_t> cells(n_real*kpool);
+                for (size_t i = 0; i < cells.size(); ++i) {
+                    cells[i] = (int32_t) i;
+                }
+                std::shuffle(cells.begin(), cells.end(), gen);
+                std::vector<int32_t> v(n_pool*kpool, -1);
+                std::copy(cells.begin(), cells.end(), v.begin());
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "tidx") == 0) {
+                std::uniform_int_distribution<int> dist(-1, 1000);
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (int32_t & x : v) {
+                    const int c = dist(gen);
+                    x = c < 100 ? -1 : (int32_t) (n_real*kpool + c);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "prng") == 0) {
+                // visible ranges inside the real pools: empty, shorter and longer than n_top
+                std::uniform_int_distribution<int64_t> dist(0, n_real);
+                std::vector<int32_t> v(2*nb);
+                for (int64_t i = 0; i < nb; ++i) {
+                    int64_t a = dist(gen);
+                    int64_t b = dist(gen);
+                    if (i % 4 == 0) {
+                        a = 0;
+                        b = n_real;
+                    } else if (i % 4 == 1) {
+                        b = a;
+                    }
+                    v[2*i + 0] = (int32_t) std::min(a, b);
+                    v[2*i + 1] = (int32_t) std::max(a, b);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_QSA_ATTN
+struct test_qsa_attn : public test_case {
+    const int64_t n_head_kv;
+    const int64_t n_kv;
+    const int64_t nb;      // tokens over all streams
+    const int64_t ns;      // streams
+    const int64_t n_sel;
+    const int64_t n_valid; // valid ids per token, a prefix of the row
+    const ggml_type type_KV;
+
+    std::string vars() override {
+        return VARS_TO_STR7(n_head_kv, n_kv, nb, ns, n_sel, n_valid, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_qsa_attn(int64_t n_head_kv = 2, int64_t n_kv = 4096, int64_t nb = 4, int64_t ns = 1, int64_t n_sel = 2051,
+            int64_t n_valid = 2051, ggml_type type_KV = GGML_TYPE_Q8_0)
+        : n_head_kv(n_head_kv), n_kv(n_kv), nb(nb), ns(ns), n_sel(n_sel), n_valid(n_valid), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 12*n_head_kv, nb);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, 256, n_head_kv, n_kv, ns);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, 256, n_head_kv, n_kv, ns);
+        ggml_set_name(v, "v");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_sel, nb);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * out = ggml_qsa_attn(ctx, q, k, v, ids, 1.0f/16.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x9a77);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "ids") == 0) {
+                // distinct cells per token, the first n_valid of a row, then -1; a few tokens see fewer
+                std::vector<int32_t> cells(n_kv);
+                for (int64_t i = 0; i < n_kv; ++i) {
+                    cells[i] = (int32_t) i;
+                }
+                std::vector<int32_t> v(n_sel*nb, -1);
+                for (int64_t i = 0; i < nb; ++i) {
+                    std::shuffle(cells.begin(), cells.end(), gen);
+                    const int64_t n = i % 3 == 2 ? std::min<int64_t>(n_valid, 37 + i) : n_valid;
+                    std::copy(cells.begin(), cells.begin() + n, v.begin() + i*n_sel);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -14100,6 +14256,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
+    }
+
+    // qsa_select: the tile scorer (>= 8 tokens) and the vector scorer, ranges shorter and longer than n_top,
+    // more tokens than one scoring pass (64)
+    for (ggml_type type_K : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (int64_t nb : { 1, 3, 8, 16, 70, 130 }) {
+            test_cases.emplace_back(new test_qsa_select(512, 8, nb, 4, 64, type_K));
+        }
+        test_cases.emplace_back(new test_qsa_select(4096, 3, 20, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(100, 0, 9, 4, 100, type_K));
+    }
+
+    // qsa_attn: the chunked kernel (<= 16 tokens) and the prompt kernel, partial chunks, streams, both cache types
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int64_t nb : { 1, 4, 8, 16, 17, 64 }) {
+            test_cases.emplace_back(new test_qsa_attn(2, 4096, nb, 1, 2051, 2051, type_KV));
+        }
+        test_cases.emplace_back(new test_qsa_attn(2, 4096, 24, 1, 2051, 1000, type_KV));
+        test_cases.emplace_back(new test_qsa_attn(1, 4096, 8, 2, 2051, 2051, type_KV));
+        test_cases.emplace_back(new test_qsa_attn(1, 4096, 40, 2, 2051, 2051, type_KV));
+        test_cases.emplace_back(new test_qsa_attn(2, 300, 5, 1, 67, 67, type_KV));
+        test_cases.emplace_back(new test_qsa_attn(2, 300, 33, 1, 67, 50, type_KV));
     }
 
     return test_cases;

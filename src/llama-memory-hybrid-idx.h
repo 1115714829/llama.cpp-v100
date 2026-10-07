@@ -197,9 +197,11 @@ public:
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
     ggml_tensor * gather_mla_rows(ggml_context * ctx, ggml_tensor * idxs, int64_t n_rows, int64_t n_embd, int32_t il) const;
     // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
+    // pool_rng (I32 [2, n_tokens]): the pools [lo, hi) each token sees, for ggml_qsa_select; with it pool_mask may be
+    // null and the padded member and tail cells are -1 instead of the n_kv sentinel
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
-                         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
+                         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr, ggml_tensor * pool_rng = nullptr) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;

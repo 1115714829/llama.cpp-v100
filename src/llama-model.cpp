@@ -2536,8 +2536,9 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 bool llama_model::kq_range_mask_supported() const {
-    // these architectures feed the attention mask to ggml_flash_attn_ext only
-    return arch == LLM_ARCH_QWEN35;
+    // these architectures feed the attention mask to ggml_flash_attn_ext only (qwen4exp: its QSA layers attend
+    // through ggml_qsa_select ids, the mask serves the dense blocks)
+    return arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN4EXP;
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {

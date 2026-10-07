@@ -243,7 +243,7 @@ static __global__ void lightning_indexer_kernel_wmma(
 // thanks to that one warp operating on float4 processes whole indexer K/Q vectors
 // 32 * 4 = 128 (N_EMBD)
 
-template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
+template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K, bool HAS_MASK = true>
 static __global__ void lightning_indexer_kernel_vec(
         const float * Q, const char * K, const float * W, const half * M, float * dst,
         int64_t n_stream, int64_t n_batch, int64_t n_kv,
@@ -378,9 +378,13 @@ static __global__ void lightning_indexer_kernel_vec(
     if (tid < K_VECS_PER_BLOCK) {
         int i_kv = start_kv_block + tid;
         if (i_kv < n_kv) {
-            const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
             float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
-            dst_base[i_kv] = dst_shared[tid] + __half2float(m_base[i_kv]);
+            float m_val = 0.0f;
+            if constexpr (HAS_MASK) {
+                const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
+                m_val = __half2float(m_base[i_kv]);
+            }
+            dst_base[i_kv] = dst_shared[tid] + m_val;
         }
     }
 }
@@ -389,7 +393,7 @@ static __global__ void lightning_indexer_kernel_vec(
 // staged in half precision and the queries of every head in float, each thread owns KEYS_PER_THREAD
 // keys for one token, a warp shares its token so the query reads are broadcasts, and every key
 // element is widened once for all heads, so no dot product needs a cross thread reduction
-template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
+template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K, bool HAS_MASK = true>
 static __global__ void lightning_indexer_kernel_tile(
         const float * Q, const char * K, const float * W, const half * M, float * dst,
         int64_t n_stream, int64_t n_batch, int64_t n_kv,
@@ -519,14 +523,18 @@ static __global__ void lightning_indexer_kernel_tile(
         return;
     }
 
-    const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
     float * dst_base = (float *) ((char *) dst + i_batch*nb1 + i_stream*nb3);
 
 #pragma unroll
     for (int j = 0; j < KEYS_PER_THREAD; ++j) {
         const int i_kv = start_kv + kl + j*KEY_LANES;
         if (i_kv < n_kv) {
-            dst_base[i_kv] = score[j] + __half2float(m_base[i_kv]);
+            float m_val = 0.0f;
+            if constexpr (HAS_MASK) {
+                const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (i_stream%nem3)*nbm3);
+                m_val = __half2float(m_base[i_kv]);
+            }
+            dst_base[i_kv] = score[j] + m_val;
         }
     }
 }
@@ -719,6 +727,73 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 4, k, GGML_TYPE_F32)
         GGML_ABORT("fatal error");
     } else {
+        GGML_ABORT("fatal error");
+    }
+}
+
+// The unmasked scores of n_batch query tokens against every key of k, for QSA_SELECT: q points at
+// the first token of the tile, w at one row of N_HEAD head weights shared by all tokens (nbw1 = 0).
+#define LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel, type_K)                       \
+    if (k->type == (type_K)) {                                                                \
+        lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, 128, 4, type_K, false>    \
+            <<<grid, block, 0, stream>>>(                                                     \
+            q_d, k_d, w_d, nullptr, dst_d,                                                    \
+            1, n_batch, n_kv,                                                                 \
+            nb1, nb1*n_batch, nb1*n_batch,                                                    \
+            nbq1, nbq2, nbq2*n_batch,                                                         \
+            k->nb[1], k->nb[2], k->nb[3],                                                     \
+            0, 0, 0,                                                                          \
+            0, 0, 0,                                                                          \
+            1                                                                                 \
+        );                                                                                    \
+    } else
+
+void ggml_cuda_lightning_indexer_scores(
+        const float * q_d, size_t nbq1, size_t nbq2, int64_t n_batch,
+        const ggml_tensor * k, const float * w_d, float * dst_d, size_t nb1, cudaStream_t stream) {
+    GGML_ASSERT(k->ne[0] == 128 && k->ne[1] == 1);
+    GGML_ASSERT(k->nb[0] == ggml_type_size(k->type));
+
+    const char * k_d  = (const char *) k->data;
+    const int    n_kv = k->ne[2];
+
+#ifndef GGML_USE_MUSA
+    if (n_batch >= LIGHTNING_INDEXER_TILE_TOKENS) {
+        constexpr int WARPS_PER_BLOCK = 8;
+        constexpr int K_VECS_PER_BLOCK = 64;
+
+        dim3 block(32, WARPS_PER_BLOCK);
+        dim3 grid((n_kv + K_VECS_PER_BLOCK - 1)/K_VECS_PER_BLOCK,
+                  (n_batch + LIGHTNING_INDEXER_TILE_TOKENS - 1)/LIGHTNING_INDEXER_TILE_TOKENS, 1);
+
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_tile, GGML_TYPE_F16)
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_tile, GGML_TYPE_Q4_0)
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_tile, GGML_TYPE_Q4_1)
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_tile, GGML_TYPE_Q5_0)
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_tile, GGML_TYPE_Q5_1)
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_tile, GGML_TYPE_Q8_0)
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_tile, GGML_TYPE_BF16)
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_tile, GGML_TYPE_F32)
+        GGML_ABORT("fatal error");
+        return;
+    }
+#endif // GGML_USE_MUSA
+    {
+        constexpr int K_VECS_PER_WARP = 8;
+        constexpr int WARPS_PER_BLOCK = 8;
+        constexpr int K_VECS_PER_BLOCK = K_VECS_PER_WARP * WARPS_PER_BLOCK;
+
+        dim3 block(32, WARPS_PER_BLOCK);
+        dim3 grid((n_kv + K_VECS_PER_BLOCK - 1)/K_VECS_PER_BLOCK, n_batch, 1);
+
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_vec, GGML_TYPE_F16)
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_vec, GGML_TYPE_Q4_0)
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_vec, GGML_TYPE_Q4_1)
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_vec, GGML_TYPE_Q5_0)
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_vec, GGML_TYPE_Q5_1)
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_vec, GGML_TYPE_Q8_0)
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_vec, GGML_TYPE_BF16)
+        LIGHTNING_INDEXER_SCORES_CASE(lightning_indexer_kernel_vec, GGML_TYPE_F32)
         GGML_ABORT("fatal error");
     }
 }

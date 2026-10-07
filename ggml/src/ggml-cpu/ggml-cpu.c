@@ -2108,6 +2108,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
             } break;
+        case GGML_OP_QSA_SELECT:
+            {
+                ggml_compute_forward_qsa_select(params, tensor);
+            } break;
+        case GGML_OP_QSA_ATTN:
+            {
+                ggml_compute_forward_qsa_attn(params, tensor);
+            } break;
         case GGML_OP_DSV4_HC_COMB:
             {
                 ggml_compute_forward_dsv4_hc_comb(params, tensor);
@@ -2445,6 +2453,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
+        case GGML_OP_QSA_SELECT:
+        case GGML_OP_QSA_ATTN:
             {
                 n_tasks = n_threads;
             } break;
@@ -3053,6 +3063,20 @@ struct ggml_cplan ggml_graph_plan(
                         // temp buffer for dequantizing lightning indexer keys
                         const int64_t ne10 = node->src[1]->ne[0];
                         cur += sizeof(float)*ne10*n_tasks;
+                    } break;
+                case GGML_OP_QSA_SELECT:
+                    {
+                        // one widened key, the scores of the visible pools and their order, see ops.cpp
+                        const int64_t n_embd = node->src[1]->ne[0];
+                        const int64_t n_pool = node->src[1]->ne[2];
+                        cur += ((n_embd + 2*n_pool)*sizeof(float) + CACHE_LINE_SIZE)*n_tasks;
+                    } break;
+                case GGML_OP_QSA_ATTN:
+                    {
+                        // one widened K row, one widened V row and the accumulator, see ops.cpp
+                        const int64_t DK = node->src[1]->ne[0];
+                        const int64_t DV = node->src[2]->ne[0];
+                        cur += sizeof(float)*(DK + 2*DV + CACHE_LINE_SIZE_F32)*n_tasks;
                     } break;
                 default:
                     break;

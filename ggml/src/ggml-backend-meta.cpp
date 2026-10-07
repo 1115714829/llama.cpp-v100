@@ -1212,6 +1212,31 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1, {0}, false};
     };
 
+    // the selection reads every pool of every token: all mirrored
+    auto handle_qsa_select = [&](
+            const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        for (size_t i = 0; i < 5; i++) {
+            GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        }
+        return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1, {0}, false};
+    };
+
+    // q [D, n_head, T] and the caches [D, n_head_kv, n_kv, n_stream] split by head (axis 1) together, the ids
+    // mirrored: the output [D, n_head, T] follows the heads; or everything mirrored
+    auto handle_qsa_attn = [&](
+            const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+        if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1, {0}, false};
+        }
+        GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1 && !src_ss[0].has_off);
+        GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1, {0}, false};
+    };
+
     auto handle_ssm_conv = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
         if (src_ss[0].axis == src_ss[1].axis) {
             if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_0) {
@@ -1471,6 +1496,12 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             } break;
             case GGML_OP_LIGHTNING_INDEXER: {
                 split_state = handle_lightning_indexer(src_ss);
+            } break;
+            case GGML_OP_QSA_SELECT: {
+                split_state = handle_qsa_select(src_ss);
+            } break;
+            case GGML_OP_QSA_ATTN: {
+                split_state = handle_qsa_attn(src_ss);
             } break;
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_PRE:

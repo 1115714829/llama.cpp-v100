@@ -1100,6 +1100,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
+    "QSA_SELECT",
+    "QSA_ATTN",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
@@ -1120,7 +1122,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1215,6 +1217,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
+    "qsa_select(q, k, pool_idxs, tail_idxs, pool_rng)",
+    "qsa_attn(q, k, v, ids)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
@@ -1235,7 +1239,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6542,6 +6546,83 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_qsa_select
+
+struct ggml_tensor * ggml_qsa_select(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * pool_idxs,
+        struct ggml_tensor  * tail_idxs,
+        struct ggml_tensor  * pool_rng,
+        float                 head_scale,
+        int32_t               n_top_pool,
+        int32_t               sentinel) {
+
+    GGML_ASSERT(        q->type == GGML_TYPE_F32);
+    GGML_ASSERT(pool_idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT(tail_idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT( pool_rng->type == GGML_TYPE_I32);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[1] == 1);
+    GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1);
+    GGML_ASSERT(pool_idxs->ne[1] == k->ne[2]);
+    GGML_ASSERT(tail_idxs->ne[0] == pool_idxs->ne[0] - 1);
+    GGML_ASSERT(tail_idxs->ne[1] == q->ne[2]);
+    GGML_ASSERT( pool_rng->ne[0] == 2 && pool_rng->ne[1] == q->ne[2]);
+    GGML_ASSERT(n_top_pool > 0 && n_top_pool <= k->ne[2]);
+
+    const int64_t kpool = pool_idxs->ne[0];
+    GGML_ASSERT(kpool >= 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool*n_top_pool + kpool - 1, q->ne[2]);
+
+    ggml_set_op_params_f32(result, 0, head_scale);
+    ggml_set_op_params_i32(result, 1, n_top_pool);
+    ggml_set_op_params_i32(result, 2, sentinel);
+
+    result->op     = GGML_OP_QSA_SELECT;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = pool_idxs;
+    result->src[3] = tail_idxs;
+    result->src[4] = pool_rng;
+
+    return result;
+}
+
+// ggml_qsa_attn
+
+struct ggml_tensor * ggml_qsa_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * ids,
+        float                 scale) {
+
+    GGML_ASSERT(  q->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2] && k->ne[3] == v->ne[3]);
+    GGML_ASSERT(q->ne[1] % k->ne[1] == 0);
+    GGML_ASSERT(q->ne[3] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ids->ne[1] == q->ne[2]);
+    GGML_ASSERT(q->ne[2] % k->ne[3] == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, v->ne[0], q->ne[1], q->ne[2]);
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_QSA_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = ids;
 
     return result;
 }

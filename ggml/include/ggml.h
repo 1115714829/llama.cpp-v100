@@ -585,6 +585,8 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_QSA_SELECT,
+        GGML_OP_QSA_ATTN,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
@@ -2717,6 +2719,47 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // QSA selection: score the pooled keys like the lightning indexer with every head weight set to
+    // head_scale, keep the n_top_pool best pools a token can see and expand them into cell ids.
+    //
+    // q         [n_embd_idx, n_head_idx, n_tokens]  F32, normed and rotated
+    // k         [n_embd_idx, 1,          n_pool  ]  pooled keys, one per block
+    // pool_idxs [kpool,      n_pool]                I32 member cells of each block
+    // tail_idxs [kpool - 1,  n_tokens]              I32 incomplete tail cells of each token
+    // pool_rng  [2,          n_tokens]              I32 the pools [lo, hi) a token can see
+    // res       [kpool*n_top_pool + kpool - 1, n_tokens] I32
+    //
+    // The kept pools are the n_top_pool highest scores of [lo, hi), equal scores by ascending pool
+    // index. A row holds the cells of the kept pools in ascending pool index, then the tail cells
+    // that are not sentinel, then -1 up to the end: the valid ids are a prefix of the row.
+    GGML_API struct ggml_tensor * ggml_qsa_select(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * pool_idxs,
+        struct ggml_tensor  * tail_idxs,
+        struct ggml_tensor  * pool_rng,
+        float                 head_scale,
+        int32_t               n_top_pool,
+        int32_t               sentinel);
+
+    // QSA attention: each token attends to the cells that ids lists for it.
+    //
+    // q   [n_embd_k, n_head,    n_tokens]          F32
+    // k   [n_embd_k, n_head_kv, n_kv, n_stream]    K cache (F16 or Q8_0)
+    // v   [n_embd_v, n_head_kv, n_kv, n_stream]    V cache, not transposed
+    // ids [n_sel,    n_tokens]                     I32 cell ids into the token's stream, -1 to skip
+    // res [n_embd_v, n_head,    n_tokens]          F32
+    //
+    // The tokens are split evenly over the streams. Query head h reads KV head h/(n_head/n_head_kv).
+    GGML_API struct ggml_tensor * ggml_qsa_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * ids,
+        float                 scale);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
