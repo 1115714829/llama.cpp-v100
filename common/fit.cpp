@@ -613,11 +613,12 @@ static void common_params_fit_impl(
                 measured = common_get_device_memory_data_impl(
                     extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
             } catch (const std::runtime_error & e) {
-                // the extra model is optional, fit the main model alone rather than giving up
-                LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
-                dmds_extra = dmds_t(devs.size() + 1);
-                n_ctx_extra = cparams->n_ctx;
-                return;
+                // the user asked to fit this model alongside the main one: leaving it out
+                // would over-commit the devices and the real load would fail later, so this
+                // is an error, not an optional extra. The detailed loader error of the
+                // measurement is logged above by the model load.
+                throw std::runtime_error(std::string("failed to measure the memory of the extra model '")
+                    + extra->path_model + "': " + e.what());
             }
 
             dmds_extra = dmds_t(devs.size() + 1);
@@ -637,6 +638,21 @@ static void common_params_fit_impl(
                     dmd.mb.model = 0;
                 }
             }
+
+            // one INFO line per startup: what the extra model adds on every device and on
+            // the host. This is the budget the expert slots and the layer split compete with.
+            std::string per_dev;
+            for (size_t id = 0; id < devs.size(); id++) {
+                const llama_memory_breakdown_data & mb = dmds_extra[id].mb;
+                if (mb.total() == 0) {
+                    continue;
+                }
+                per_dev += " " + ggml_backend_dev_name(devs[id]) + " "
+                    + std::to_string(mb.total()/MiB) + " MiB (model " + std::to_string(mb.model/MiB)
+                    + ", context " + std::to_string(mb.context/MiB) + ", compute " + std::to_string(mb.compute/MiB) + "),";
+            }
+            LOG_INF("%s: extra model '%s' memory: host %.0f MiB,%s\n",
+                __func__, extra->path_model, (double) dmds_extra.back().mb.total()/MiB, per_dev.c_str());
 
             n_ctx_extra = cparams->n_ctx;
         }
