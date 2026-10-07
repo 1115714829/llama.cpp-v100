@@ -1210,7 +1210,7 @@ struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL 
                 /*.no_alloc   =*/ true,
             };
 
-            ggml_context_ptr ctx(ggml_init(&ctx_params));
+            ggml_context_ptr ctx(ggml_init(ctx_params));
             if (!ctx) {
                 throw std::runtime_error(format("%s: failed to create the measurement context for '%s'", __func__, name.c_str()));
             }
