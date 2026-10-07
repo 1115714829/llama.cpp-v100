@@ -121,6 +121,11 @@ struct llama_model_loader {
     // from unsloth PR #142
     const struct llama_model * model_shared = nullptr;
 
+    // true when the file's metadata says it left the shared tensors to the target
+    // (nextn_shared_target_tensors). a draft that ships its own tokens or does not set the
+    // key keeps its own tensors, see borrow_shared_tensor()
+    bool nextn_shared_target_tensors = false;
+
     llama_files files;
     llama_ftype ftype;
     llama_fver  fver;

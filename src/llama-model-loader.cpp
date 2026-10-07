@@ -714,6 +714,8 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    get_key(llm_kv(LLM_KV_NEXTN_SHARED_TARGET_TENSORS), nextn_shared_target_tensors, false);
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
@@ -1153,6 +1155,14 @@ struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL 
     // a file that ships the tensor keeps its own copy
     const std::string name = tn.str();
     if (get_weight(name.c_str()) != nullptr) {
+        return nullptr;
+    }
+
+    // a file that left the shared tensors to the target says so in its metadata; without that
+    // key a missing token_embd means the arch takes it from ctx_other at graph time (dflash,
+    // eagle3), so borrowing here would take that branch away and point the draft at a tensor
+    // on the wrong device
+    if (!nextn_shared_target_tensors) {
         return nullptr;
     }
 

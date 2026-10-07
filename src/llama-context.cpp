@@ -1553,6 +1553,10 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // enabling the nextn output adds t_h_nextn to the graph; without the reserve the scheduler
+    // keeps the shape it was built with before the flag was set (same class as set_embeddings_layer_inp)
+    sched_need_reserve = true;
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
