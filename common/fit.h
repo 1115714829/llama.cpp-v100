@@ -43,6 +43,21 @@ void common_fit_print(
                  llama_model_params * mparams,
                llama_context_params * cparams);
 
+// record the free VRAM of every device of a loaded model at one startup stage. Prints one
+// line per device at info level, plus the growth since the previous call at debug level.
+// Used to measure what the CUDA runtime adds after the fit measurement (module code,
+// cuBLAS workspaces, CUDA graphs, ...), which the expert slot budget must leave room for.
+// Pass nullptr to reset the recorded reference between runs.
+void common_fit_log_memory_stage(
+        const struct llama_model * model,
+                                  const char * stage);
+
+// same sampling on a raw device list; used when no model is available yet (the fit itself)
+void common_fit_log_memory_stage_devs(
+        struct ggml_backend_device ** devs,
+                                       int   nd,
+                                const char * stage);
+
 void common_memory_breakdown_print(const llama_context * ctx);
 
 struct common_device_memory_data {

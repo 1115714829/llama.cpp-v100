@@ -1271,6 +1271,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    common_fit_log_memory_stage(model, "model_loaded");
+
     pimpl->model.reset(model);
 
     if (model_only) {
@@ -1363,6 +1365,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
     }
+
+    common_fit_log_memory_stage(model, "sched_reserve");
 
     pimpl->context.reset(lctx);
 
@@ -1511,6 +1515,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();
     }
+
+    common_fit_log_memory_stage(model, "warmup");
 
     return res;
 }

@@ -462,6 +462,66 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
+// free VRAM of every device of a loaded model, sampled at the startup stages. The CUDA
+// runtime adds device memory lazily (module code and constants, cuBLAS workspaces, CUDA
+// graphs, communication buffers), so the free memory of a device shrinks after the fit
+// measured it. The expert slot budget must leave room for that growth; these samples are
+// what it is measured from. One line per device shows the stage free memory; the growth per
+// stage and the total are printed alongside, all at trace level.
+void common_fit_log_memory_stage(const struct llama_model * model, const char * stage) {
+    if (model == nullptr || stage == nullptr) {
+        common_fit_log_memory_stage_devs(nullptr, 0, nullptr);
+        return;
+    }
+
+    const int nd = llama_model_n_devices(model);
+    if (nd <= 0) {
+        return;
+    }
+
+    std::vector<ggml_backend_dev_t> devs((size_t) nd);
+    for (int i = 0; i < nd; i++) {
+        devs[(size_t) i] = llama_model_get_device(model, i);
+    }
+    common_fit_log_memory_stage_devs(devs.data(), nd, stage);
+}
+
+void common_fit_log_memory_stage_devs(struct ggml_backend_device ** devs, int nd, const char * stage) {
+    static std::vector<size_t> prev_free;
+    static int64_t             sum_growth = 0;
+
+    if (devs == nullptr || stage == nullptr) {
+        prev_free.clear();
+        sum_growth = 0;
+        return;
+    }
+    if (nd <= 0) {
+        return;
+    }
+
+    std::vector<size_t> cur_free((size_t) nd, 0);
+    for (int i = 0; i < nd; i++) {
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(devs[i], &free, &total);
+        cur_free[(size_t) i] = free;
+    }
+
+    int64_t stage_growth = 0;
+    for (int i = 0; i < nd; i++) {
+        const int64_t growth = prev_free.size() == (size_t) nd ? (int64_t) prev_free[(size_t) i] - (int64_t) cur_free[(size_t) i] : 0;
+        stage_growth += growth;
+        LOG_TRC("%s: stage '%s' device %d (%s): free %.0f MiB, %+.0f MiB since the previous stage\n",
+            __func__, stage, i, ggml_backend_dev_name(devs[i]),
+            (double) cur_free[(size_t) i] / 1024.0 / 1024.0, (double) growth / 1024.0 / 1024.0);
+    }
+    sum_growth += stage_growth;
+    LOG_TRC("%s: stage '%s': device free memory changed by %+.0f MiB (%.0f MiB since the reference sample)\n",
+        __func__, stage, (double) stage_growth / 1024.0 / 1024.0, (double) sum_growth / 1024.0 / 1024.0);
+
+    prev_free = std::move(cur_free);
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
@@ -567,6 +627,11 @@ static void common_params_fit_impl(
     add_extra_memory(dmds_full);
 
     const size_t nd = devs.size(); // number of devices
+
+    // baseline of the startup memory sampling series: the free memory the fit measures with.
+    // model_loaded / sched_reserve / warmup / first_prefill / first_decode follow in the same
+    // process and are logged relative to it, so the runtime growth is visible per stage.
+    common_fit_log_memory_stage_devs(devs.data(), (int) nd, "fit");
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
@@ -1361,6 +1426,18 @@ static void common_params_fit_impl(
                 (double) mb.model/MiB, (double) mb.context/MiB, (double) mb.compute/MiB,
                 slot_budget/1024.0/1024.0, slot_used/1024.0/1024.0, stage_bytes/1024.0/1024.0,
                 host_bytes/1024.0/1024.0, hit);
+            // runtime growth reserve of this device and its basis: the surplus is real free
+            // device memory at the fit measurement (the CUDA runtime has already loaded the
+            // kernel modules and their constants, see ggml_cuda_init), minus the dense
+            // weights, the KV cache and the compute buffers, minus the user margin. What the
+            // slots and the staging area do not consume is left for what the runtime adds
+            // afterwards. This is a measurement, not a guess.
+            const size_t slot_slack    = slot_budget > slot_used  ? slot_budget - slot_used  : 0;
+            const size_t staging_slack = stage_bytes > stage_peak ? stage_bytes - stage_peak : 0;
+            LOG_TRC("%s: device %zu runtime growth reserve: margin %.0f MiB (user target), slot slack %.0f MiB (whole-expert rounding), staging slack %.0f MiB; basis surplus %.0f MiB = free %.0f - accounted %.0f - margin %.0f\n",
+                __func__, id,
+                margins[id]/1024.0/1024.0, slot_slack/1024.0/1024.0, staging_slack/1024.0/1024.0,
+                surplus/1024.0/1024.0, dmds_full[id].free/1024.0/1024.0, mem_final[id]/1024.0/1024.0, margins[id]/1024.0/1024.0);
             slot_budgets[id] = slot_budget;
             has_experts = true;
             host_complement += (int64_t) host_bytes;
@@ -1918,6 +1995,11 @@ enum common_params_fit_status common_fit_params(
         const common_fit_extra_model * extra,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
+
+    // start a fresh startup memory sampling series: the model/context stages below are
+    // logged relative to this fit measurement
+    common_fit_log_memory_stage(nullptr, nullptr);
+
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
         common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
