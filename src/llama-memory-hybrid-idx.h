@@ -59,6 +59,9 @@ public:
 
     void clear(bool data) override;
 
+    // the indexer cache tracks the attention cache cell for cell, so it takes the same n_kv rule
+    void set_kq_range_allowed(bool allowed) override;
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;

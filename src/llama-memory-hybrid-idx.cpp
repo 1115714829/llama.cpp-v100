@@ -146,6 +146,13 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_update(llama_context * lc
     return std::make_unique<llama_memory_hybrid_idx_context>(this, lctx, optimize);
 }
 
+void llama_memory_hybrid_idx::set_kq_range_allowed(bool allowed) {
+    llama_memory_hybrid::set_kq_range_allowed(allowed);
+    if (mem_idx) {
+        mem_idx->set_kq_range_allowed(allowed);
+    }
+}
+
 void llama_memory_hybrid_idx::clear(bool data) {
     llama_memory_hybrid::clear(data);
 
