@@ -370,6 +370,17 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
+    // Pipeline parallelism primitives for multi-ubatch prefill.
+    // n_stages is the pipeline depth: the number of ubatches that may be in flight at once.
+    // n_stages == 1 means no overlap, equivalent to ggml_backend_sched_graph_compute_async.
+    GGML_API void                 ggml_backend_sched_set_n_stages(ggml_backend_sched_t sched, int n_stages);
+    // Submit one ubatch graph without waiting for it to finish. ubatch_id must increase across calls.
+    GGML_API enum ggml_status     ggml_backend_sched_pipeline_submit(ggml_backend_sched_t sched, struct ggml_cgraph * graph, int64_t ubatch_id);
+    // Wait for the ubatch with this ubatch_id to complete on all backends.
+    GGML_API void                 ggml_backend_sched_pipeline_wait(ggml_backend_sched_t sched, int64_t ubatch_id);
+    // Wait for all in-flight ubatches and reset the pipeline ring.
+    GGML_API void                 ggml_backend_sched_pipeline_advance(ggml_backend_sched_t sched);
+
     // copy user input tensors to the split backends asynchronously (default: false)
     // the caller synchronizes the scheduler before it writes the input tensors again, so user inputs
     // can be copied asynchronously (see ggml_backend_sched_compute_splits)

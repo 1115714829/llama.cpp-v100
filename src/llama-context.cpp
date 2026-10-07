@@ -514,10 +514,10 @@ llama_context::llama_context(
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
         // TODO: move these checks to ggml_backend_sched
-        // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // pipeline parallelism makes the scheduler keep n_copies input copies and events, which is
+        // required for multi-batch prefill overlap. it does not require the whole model to be offloaded.
         bool pipeline_parallel =
             model.n_devices() > 1 &&
-            model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
@@ -750,6 +750,9 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_async_inputs(sched.get(), true);
+    // prefill pipeline depth; 1 keeps the submit/wait/advance primitives equivalent to the
+    // existing single-batch compute path. the multi-ubatch overlap depth is set in a later step.
+    ggml_backend_sched_set_n_stages(sched.get(), 1);
 
     // the injection graph of a DFlash draft gets its own scheduler, see gf_res_slot
     if (dflash_draft) {
