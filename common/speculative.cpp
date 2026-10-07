@@ -1861,6 +1861,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
+        // the backend chain only holds top-k, while spec_retune puts the target temperature on the CPU
+        // chain; a probabilistic draft must sample and report q from one chain, so keep it on the CPU
+        if (this->params.probabilistic) {
+            this->params.backend_sampling = false;
+        }
+
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
@@ -2179,6 +2185,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 if (dp.result_q) {
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                }
+
+                // the sparse rejection verifier reads the proposal as a common_sampler_draft_q; on the
+                // CPU chain dist filled .p with the top-k normalized proposal the draft sampled from
+                if (dp.use_rejection && params.probabilistic) {
+                    GGML_ASSERT(dp.result_q_dflash);
+
+                    common_sampler_draft_q q;
+                    q.ids.reserve(cur_p->size);
+                    q.q.reserve(cur_p->size);
+                    for (size_t k = 0; k < cur_p->size; ++k) {
+                        q.ids.push_back(cur_p->data[k].id);
+                        q.q.push_back(cur_p->data[k].p);
+                    }
+                    dp.result_q_dflash->push_back(std::move(q));
                 }
 
                 if (params.n_max <= (int) result.size()) {

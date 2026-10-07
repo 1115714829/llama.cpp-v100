@@ -2166,12 +2166,17 @@ private:
                 slot.spec_synth_rng.seed(seed);
             }
 
-            // the rejection mode is fixed for the whole request
-            const bool spec_dflash2 = std::find(
+            // the rejection mode is fixed for the whole request; draft-dflash and draft-mtp both
+            // produce a proposal distribution per token, so both can verify on the sparse top-k rows
+            const bool spec_sparse_draft = std::find(
                     params_base.speculative.types.begin(),
                     params_base.speculative.types.end(),
-                    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
-            slot.spec_use_rejection = spec && spec_dflash2 && common_sampler_can_sparse_reject(slot.smpl.get());
+                    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end() ||
+                std::find(
+                    params_base.speculative.types.begin(),
+                    params_base.speculative.types.end(),
+                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+            slot.spec_use_rejection = spec && spec_sparse_draft && common_sampler_can_sparse_reject(slot.smpl.get());
 
             // the rejection reads only the top-k logits of the verified rows, so they do not have to leave
             // the device; the context setting is shared by the slots, hence a single slot only
@@ -3512,6 +3517,7 @@ private:
 
                     // stale candidates: a replay never reads them, a new draft refills them
                     slot.spec_draft_q.clear();
+                    slot.spec_draft_q_dflash.clear();
 
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
