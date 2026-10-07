@@ -264,7 +264,7 @@ static __global__ void expert_stage_plan_kernel(
         const uint32_t * __restrict__ bitmap, const int expert_lo, const int expert_hi,
         const int32_t * __restrict__ residency,
         const char * const * __restrict__ table_main, const char ** __restrict__ table_stage,
-        char * __restrict__ stage_dev, const size_t blob_aligned, const size_t blob_bytes,
+        char * __restrict__ stage_dev, const size_t blob_stride, const size_t blob_bytes,
         int32_t * __restrict__ hit_list, int * __restrict__ n_hit,
         int * __restrict__ slot_counter, unsigned long long * __restrict__ counters) {
     const int stride = gridDim.x * blockDim.x;
@@ -274,7 +274,7 @@ static __global__ void expert_stage_plan_kernel(
             atomicAdd(n_hit, 1);
             const int slot = atomicAdd(slot_counter, 1);
             hit_list[slot] = x;
-            table_stage[x] = stage_dev + (size_t) slot * blob_aligned;
+            table_stage[x] = stage_dev + (size_t) slot * blob_stride;
             atomicAdd(&counters[3], (unsigned long long) blob_bytes);
         } else {
             table_stage[x] = table_main[x];
@@ -282,12 +282,13 @@ static __global__ void expert_stage_plan_kernel(
     }
 }
 
-// Copies the routed host experts from the mapped host arena into their staging slots.
-// One block per hit entry, grid covers n_local (blocks beyond n_hit return at once).
+// Copies the routed host experts from the mapped host arena into their staging slots and
+// clears the row padding after each copy. One block per hit entry, grid covers n_local
+// (blocks beyond n_hit return at once).
 static __global__ void expert_stage_copy_kernel(
         const int32_t * __restrict__ hit_list, const int * __restrict__ n_hit,
         const char * __restrict__ host_dev, const int64_t * __restrict__ host_offset,
-        char * __restrict__ stage_dev, const size_t blob_aligned, const size_t blob_bytes) {
+        char * __restrict__ stage_dev, const size_t blob_stride, const size_t blob_bytes) {
     const int slot = blockIdx.x;
     if (slot >= *n_hit) {
         return;
@@ -295,7 +296,7 @@ static __global__ void expert_stage_copy_kernel(
     const int64_t expert = hit_list[slot];
     // the arena offsets and the slot pitch are 256-byte aligned
     const uint64_t * src64 = (const uint64_t *) (host_dev + host_offset[expert]);
-    uint64_t * dst64 = (uint64_t *) (stage_dev + (size_t) slot * blob_aligned);
+    uint64_t * dst64 = (uint64_t *) (stage_dev + (size_t) slot * blob_stride);
 
     const size_t n64 = blob_bytes / 8;
     for (size_t i = threadIdx.x; i < n64; i += blockDim.x) {
@@ -306,6 +307,12 @@ static __global__ void expert_stage_copy_kernel(
     for (size_t i = n64 * 8 + threadIdx.x; i < blob_bytes; i += blockDim.x) {
         dst[i] = src[i];
     }
+    // The staging area is shared by tensors with different strides, so the bytes past the
+    // data can still hold the weights of an earlier launch. Clear them: the MMQ loaders
+    // read that far and must see zeros, not a previous tensor's bytes.
+    for (size_t i = blob_bytes + threadIdx.x; i < blob_stride; i += blockDim.x) {
+        dst[i] = 0;
+    }
 }
 
 // per-tensor runtime state
@@ -314,8 +321,8 @@ struct ggml_cuda_expert_tensor_state {
     const ggml_tensor * tensor = nullptr;
 
     int64_t n_expert = 0;
-    size_t  blob_bytes = 0;
-    size_t  blob_aligned = 0; // staging slot pitch
+    size_t  blob_bytes = 0;  // data bytes of one expert
+    size_t  blob_stride = 0; // data + row padding + alignment: the staging slot pitch
     bool    has_host = false;
 
     const char ** table_main_dev = nullptr;
@@ -519,6 +526,9 @@ ggml_cuda_expert_stream_state & ggml_backend_cuda_expert_buffer_context::get_str
     ggml_cuda_expert_stream_state ss;
     if (stage_budget > 0) {
         CUDA_CHECK(cudaMalloc((void **) &ss.stage_dev, stage_budget));
+        // the copy kernel writes only the data bytes of a staged expert; the row padding
+        // after them is never touched again, so clearing the area once keeps it at zero
+        CUDA_CHECK(cudaMemset(ss.stage_dev, 0, stage_budget));
         ss.stage_bytes = stage_budget;
     }
 
@@ -723,7 +733,7 @@ const char * const * ggml_cuda_expert_stage_prepare(
 
     ggml_cuda_expert_stream_state & ss = ctx->get_stream(stream);
     GGML_ASSERT(ss.hit_list != nullptr && ss.hit_cap >= (size_t) s.n_expert && ss.stage_dev != nullptr);
-    GGML_ASSERT(ss.stage_bytes >= s.blob_aligned && ss.stage_bytes >= (size_t) st->host_used);
+    GGML_ASSERT(ss.stage_bytes >= s.blob_stride && ss.stage_bytes >= (size_t) st->host_used);
 
     const char ** table_stage = ss.tables[(size_t) ex_table.tensor_id];
     if (table_stage == nullptr) {
@@ -757,13 +767,13 @@ const char * const * ggml_cuda_expert_stage_prepare(
     const int plan_blocks = std::max(1, std::min((expert_hi - expert_lo + nthreads - 1) / nthreads, 1024));
     expert_stage_plan_kernel<<<plan_blocks, nthreads, 0, stream>>>(
         s.bitmap_dev, expert_lo, expert_hi, s.residency_dev,
-        s.table_main_dev, table_stage, block_dev, s.blob_aligned, s.blob_bytes,
+        s.table_main_dev, table_stage, block_dev, s.blob_stride, s.blob_bytes,
         ss.hit_list, ss.plan_state, ss.plan_state + 1, ctx->usage_dev);
     CUDA_CHECK(cudaGetLastError());
 
     expert_stage_copy_kernel<<<expert_hi - expert_lo, nthreads, 0, stream>>>(
         ss.hit_list, ss.plan_state, st->host_dev, s.host_offset_dev,
-        block_dev, s.blob_aligned, s.blob_bytes);
+        block_dev, s.blob_stride, s.blob_bytes);
     CUDA_CHECK(cudaGetLastError());
 
     // read the bitmap and the copy plan back without waiting: the log shows how many experts
@@ -881,7 +891,10 @@ static size_t ggml_backend_cuda_expert_buft_get_alignment(ggml_backend_buffer_ty
 
 static size_t ggml_backend_cuda_expert_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     if (ggml_cuda_expert_tensor_is_expert(tensor)) {
-        return ggml_nbytes(tensor);
+        // the store keeps its experts at the padded stride (data + row padding, aligned), so
+        // the size reported here matches what alloc_buffer_n actually reserves per expert
+        const size_t blob_pad = ggml_cuda_expert_blob_pad(tensor->type, tensor->ne[0]);
+        return (size_t) tensor->ne[2] * ggml_expert_store_stride((size_t) tensor->nb[2], blob_pad);
     }
     // plain tensor: the size the regular CUDA buffer type would allocate
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
@@ -972,7 +985,10 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
             continue;
         }
         if (ggml_cuda_expert_tensor_is_expert(t)) {
-            expert_bytes += ggml_nbytes(t);
+            // data bytes plus the per-expert row padding: the same span get_alloc_size and
+            // the store use, so the reported buffer size matches the real allocation
+            const size_t blob_pad = ggml_cuda_expert_blob_pad(t->type, t->ne[0]);
+            expert_bytes += (size_t) t->ne[2] * ggml_expert_store_stride((size_t) t->nb[2], blob_pad);
             expert_tensors.push_back(t);
         } else {
             plain_offset[i] = plain_size;
@@ -1006,7 +1022,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
     std::vector<ggml_expert_store_plan_tensor> plan_in;
     plan_in.reserve(expert_tensors.size());
     for (const ggml_tensor * t : expert_tensors) {
-        plan_in.push_back({ ggml_cuda_expert_tensor_layer(t), t->ne[2], (size_t) t->nb[2] });
+        plan_in.push_back({ ggml_cuda_expert_tensor_layer(t), t->ne[2], (size_t) t->nb[2],
+            ggml_cuda_expert_blob_pad(t->type, t->ne[0]) });
     }
     ggml_expert_store_placement plan;
     ggml_expert_store_plan(plan_in.data(), plan_in.size(), (int64_t) slot_budget, ctx->store->profile_path.c_str(), &plan);
@@ -1032,10 +1049,11 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
         ggml_tensor * t = expert_tensors[k];
         const int64_t n_expert = t->ne[2];
         const size_t blob_bytes = t->nb[2];
+        const size_t blob_pad   = ggml_cuda_expert_blob_pad(t->type, t->ne[0]);
 
         const int tensor_id = ggml_expert_store_add_tensor(ctx->store,
             ggml_cuda_expert_tensor_layer(t), ggml_cuda_expert_tensor_kind(t),
-            n_expert, blob_bytes,
+            n_expert, blob_bytes, blob_pad,
             plan.slot_experts[k].data(), plan.n_slot[k],
             -1); // the complement must always fit in host memory
         if (tensor_id < 0) {
@@ -1047,10 +1065,11 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
         const ggml_expert_store_tensor * st = ggml_expert_store_tensor_at(ctx->store, tensor_id);
 
         // poison the freshly allocated tiers with zeros so reading an unfilled slot or host
-        // entry is a deterministic error instead of stale bytes (Strata A1)
+        // entry is a deterministic error instead of stale bytes (Strata A1). This also clears
+        // the row padding of every expert: only the data bytes are copied in later, so the
+        // kernels read zeros past the last row instead of a neighbour or uninitialized bytes.
         if (st->slots_dev != nullptr) {
-            const size_t blob_aligned = (blob_bytes + 255) & ~(size_t) 255;
-            CUDA_CHECK(cudaMemset(st->slots_dev, 0, (size_t) st->n_slot * blob_aligned));
+            CUDA_CHECK(cudaMemset(st->slots_dev, 0, (size_t) st->n_slot * st->stride));
         }
         if (st->host_host != nullptr) {
             memset(st->host_host, 0, (size_t) st->host_used);
@@ -1061,7 +1080,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
         s.tensor       = t;
         s.n_expert     = n_expert;
         s.blob_bytes   = blob_bytes;
-        s.blob_aligned = (blob_bytes + 255) & ~(size_t) 255;
+        s.blob_stride  = st->stride;
         s.has_host     = st->n_host > 0;
 
         CUDA_CHECK(cudaMalloc((void **) &s.table_main_dev, (size_t) n_expert * sizeof(char *)));
@@ -1208,7 +1227,8 @@ void ggml_backend_cuda_expert_verify_all(void) {
 // code checks their NUMA placement against the nodes).
 void ggml_cuda_expert_plan(
         ggml_backend_buffer_type_t buft,
-        const int * layer, const int64_t * n_expert, const size_t * blob_bytes, size_t n_tensors,
+        const int * layer, const int64_t * n_expert, const size_t * blob_bytes,
+        const int * type, const int64_t * ne0, size_t n_tensors,
         size_t slot_budget,
         size_t * slot_bytes, size_t * host_bytes, size_t * host_peak, size_t * host_bytes_each) {
     if (buft == nullptr || !ggml_cuda_expert_buft_is_expert(buft)) {
@@ -1218,7 +1238,10 @@ void ggml_cuda_expert_plan(
     std::vector<ggml_expert_store_plan_tensor> tensors;
     tensors.reserve(n_tensors);
     for (size_t i = 0; i < n_tensors; ++i) {
-        tensors.push_back({ layer[i], n_expert[i], blob_bytes[i] });
+        // the fit plan must use the same per-expert stride the real allocation uses, so the
+        // row padding is derived here from the tensor type exactly like alloc_buffer_n does
+        const size_t blob_pad = ggml_cuda_expert_blob_pad((ggml_type) type[i], ne0[i]);
+        tensors.push_back({ layer[i], n_expert[i], blob_bytes[i], blob_pad });
     }
 
     ggml_expert_store_placement plan;
@@ -1373,13 +1396,16 @@ void ggml_cuda_expert_stats_tick(const ggml_tensor * src0, cudaStream_t stream) 
 
 void ggml_cuda_expert_plan(
         ggml_backend_buffer_type_t buft,
-        const int * layer, const int64_t * n_expert, const size_t * blob_bytes, size_t n_tensors,
+        const int * layer, const int64_t * n_expert, const size_t * blob_bytes,
+        const int * type, const int64_t * ne0, size_t n_tensors,
         size_t slot_budget,
         size_t * slot_bytes, size_t * host_bytes, size_t * host_peak, size_t * host_bytes_each) {
     GGML_UNUSED(buft);
     GGML_UNUSED(layer);
     GGML_UNUSED(n_expert);
     GGML_UNUSED(blob_bytes);
+    GGML_UNUSED(type);
+    GGML_UNUSED(ne0);
     GGML_UNUSED(n_tensors);
     GGML_UNUSED(slot_budget);
     GGML_UNUSED(slot_bytes);

@@ -17,6 +17,17 @@
 
 #include "../ggml-expert-store.h"
 
+// trailing row padding one expert of the given type needs past its data. The quantized MMQ
+// and MMVQ loaders read the last row up to MATRIX_ROW_PADDING elements; the regular CUDA
+// buffer covers that with get_alloc_size(). The expert store keeps the same bytes after
+// every expert, so no kernel reads a neighbour's bytes or uninitialized host memory.
+static inline size_t ggml_cuda_expert_blob_pad(ggml_type type, int64_t ne0) {
+    if (!ggml_is_quantized(type) || ne0 % MATRIX_ROW_PADDING == 0) {
+        return 0;
+    }
+    return ggml_row_size(type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
+}
+
 // lookup of one expert tensor by the mul_mat_id dispatch
 struct ggml_cuda_expert_table {
     const char * const * main  = nullptr;   // device table, one entry per local expert
@@ -104,7 +115,8 @@ void ggml_cuda_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_by
 // checks their NUMA placement against the nodes).
 void ggml_cuda_expert_plan(
         ggml_backend_buffer_type_t buft,
-        const int * layer, const int64_t * n_expert, const size_t * blob_bytes, size_t n_tensors,
+        const int * layer, const int64_t * n_expert, const size_t * blob_bytes,
+        const int * type, const int64_t * ne0, size_t n_tensors,
         size_t slot_budget,
         size_t * slot_bytes, size_t * host_bytes, size_t * host_peak, size_t * host_bytes_each);
 

@@ -6152,6 +6152,16 @@ static void mark_expert_tensor(ggml_backend_reg_t reg, ggml_backend_buffer_type_
     }
 }
 
+// per-expert span the expert store uses: the data bytes, the trailing row padding the MMQ
+// loaders read past the last row (the same rule as the CUDA buffer get_alloc_size) and the
+// 256-byte alignment of the next expert. The budgets below use it as the expert pitch.
+static size_t expert_store_stride(ggml_type type, int64_t k, int64_t m) {
+    const size_t blob = (size_t) ggml_row_size(type, k) * (size_t) m;
+    const size_t pad  = ggml_is_quantized(type) && k % 512 != 0
+        ? ggml_row_size(type, 512 - k % 512) : 0;
+    return (blob + pad + 255) & ~(size_t) 255;
+}
+
 // the expert store must place part of the experts in VRAM slots and the rest in the host
 // arena, and it must have room to stage the routed host experts during prefill. With
 // all_slot every expert is in a VRAM slot: no host arena, no staging area.
@@ -6218,10 +6228,10 @@ struct test_mul_mat_id_expert : public test_mul_mat_id {
             if (name.size() >= 8 && name.compare(name.size() - 8, 8, "_Experts") == 0) {
                 // keep two experts in the VRAM slots so both tiers are exercised. The staging
                 // area covers the whole host complement of the tensor, like fit sizes it; a
-                // smaller one is refused by the store. The budgets use the 256-byte expert
-                // pitch of the store. The all-slot mode gives the slot budget room for every
-                // expert and no staging.
-                const size_t blob_bytes   = GGML_PAD(ggml_row_size(type_a, k) * (size_t) m, 256);
+                // smaller one is refused by the store. The budgets use the expert pitch of
+                // the store (data + row padding, 256-aligned). The all-slot mode gives the
+                // slot budget room for every expert and no staging.
+                const size_t blob_bytes   = expert_store_stride(type_a, k, m);
                 const size_t expert_bytes = blob_bytes * (size_t) n_mats;
                 const size_t slot_bytes   = all_slot ? expert_bytes : 2*blob_bytes;
                 const size_t stage_bytes  = all_slot ? 0 : blob_bytes * (size_t) n_mats;
@@ -6262,6 +6272,35 @@ struct test_mul_mat_id_expert : public test_mul_mat_id {
         ggml_set_name(out, "out");
 
         return out;
+    }
+};
+
+// Expert store with K not a multiple of MATRIX_ROW_PADDING: every expert needs trailing row
+// padding. The all-slot store puts the LAST expert right at the end of the slot allocation,
+// so a read past data + padding leaves the allocation (compute-sanitizer reports it). The
+// allocation check here is deterministic: the reported slot bytes must cover data + padding
+// for every expert, the span the MMQ loaders may read.
+struct test_mul_mat_id_expert_pad : public test_mul_mat_id_expert {
+    test_mul_mat_id_expert_pad(ggml_type type_a, int n_mats, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, n_mats, 4, m, n, k, /*all_slot=*/true) {
+        GGML_ASSERT(ggml_is_quantized(type_a));
+        GGML_ASSERT(k % 512 != 0);
+    }
+
+    void check_weight_alloc(ggml_backend_t backend) override {
+        test_mul_mat_id_expert::check_weight_alloc(backend);
+
+        const size_t stride = expert_store_stride(type_a, k, m);
+        GGML_ASSERT(stride > (size_t) ggml_row_size(type_a, k) * (size_t) m);
+
+        auto get_alloc = (bool (*)(ggml_backend_buffer_type_t, size_t *, size_t *, size_t *))
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)),
+                "ggml_backend_cuda_expert_get_allocation");
+        size_t slot = 0;
+        size_t host = 0;
+        size_t stage = 0;
+        GGML_ASSERT(get_alloc != nullptr && get_alloc(expert_buft, &slot, &host, &stage));
+        GGML_ASSERT(slot >= (size_t) n_mats * stride);
     }
 };
 
@@ -6447,7 +6486,7 @@ struct test_mul_mat_id_expert_ep : public test_mul_mat_id_ep {
                 // the staging area covers the host complement of the largest shard, the
                 // budgets use the 256-byte expert pitch of the store
                 const int64_t shard_max  = (n_mats + n_shards - 1) / n_shards;
-                const size_t  blob_bytes = GGML_PAD(ggml_row_size(type_a, k) * (size_t) m, 256);
+                const size_t  blob_bytes = expert_store_stride(type_a, k, m);
                 auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
                 if (set_budget != nullptr) {
@@ -6568,10 +6607,10 @@ struct test_mul_mat_id_expert_ffn : public test_case {
             const std::string name = ggml_backend_buft_name(*extra);
             if (name.size() >= 8 && name.compare(name.size() - 8, 8, "_Experts") == 0) {
                 // three experts of every tensor in the VRAM slots, the complements in the host
-                // arena; the staging area covers the host complement of the largest tensor. The
-                // budgets use the 256-byte expert pitch of the store.
-                const size_t blob_gate = GGML_PAD(ggml_row_size(type_a, k) * (size_t) m, 256);
-                const size_t blob_down = GGML_PAD(ggml_row_size(type_down, m) * (size_t) k, 256);
+                // arena; the staging area covers the host complement of the largest tensor.
+                // The budgets use the expert pitch of the store (data + row padding, aligned).
+                const size_t blob_gate = expert_store_stride(type_a, k, m);
+                const size_t blob_down = expert_store_stride(type_down, m, k);
                 const size_t slot_bytes  = 3 * (2 * blob_gate + blob_down);
                 const size_t stage_bytes = std::max(blob_gate, blob_down) * (size_t) n_mats;
                 auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
@@ -12453,6 +12492,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 512, 10, 640, n, 2560, /*all_slot=*/false));
         }
     }
+
+    // K not a multiple of MATRIX_ROW_PADDING (512): the MMQ loaders read the last row up to a
+    // 512-element boundary, so every expert needs trailing bytes past its data. With all_slot
+    // every expert is in the slots with the 256-byte pitch of the store and the LAST expert
+    // ends at the end of the slot allocation: a kernel that reads past data + row padding
+    // runs off the allocation (compute-sanitizer reports it). n=2048 takes the batched MMQ
+    // path. k=640 is the Flash-Next down projection (Q5_1/Q8_0; the K-quants need a multiple
+    // of 256, so Q4_K uses k=768).
+    for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id_expert_pad(type_a, 32, 2560, 2048, 640));
+    }
+    test_cases.emplace_back(new test_mul_mat_id_expert_pad(GGML_TYPE_Q4_K, 32, 640, 2048, 768));
 
     // MoE FFN of the expert store: gate/up/down as separate store tensors, one shared ids, the
     // GLU between them. The MMQ prefill (n = 2048) stages the host experts of all three tensors

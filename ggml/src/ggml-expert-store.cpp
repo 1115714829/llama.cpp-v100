@@ -9,12 +9,6 @@
 #include <mutex>
 #include <tuple>
 
-#define GGML_EXPERT_STORE_ALIGN 256
-
-static size_t ggml_expert_store_align_up(size_t v) {
-    return (v + GGML_EXPERT_STORE_ALIGN - 1) & ~(size_t) (GGML_EXPERT_STORE_ALIGN - 1);
-}
-
 static bool ggml_expert_store_read_profile(const char * path, ggml_expert_store_profile & profile) {
     FILE * f = fopen(path, "r");
     if (f == nullptr) {
@@ -199,7 +193,7 @@ void ggml_expert_store_plan(
 
     size_t expert_bytes = 0;
     for (size_t i = 0; i < n_tensors; ++i) {
-        expert_bytes += (size_t) tensors[i].n_expert * tensors[i].blob_bytes;
+        expert_bytes += (size_t) tensors[i].n_expert * ggml_expert_store_stride(tensors[i].blob_bytes, tensors[i].blob_pad);
     }
     if (expert_bytes == 0) {
         return;
@@ -222,13 +216,14 @@ void ggml_expert_store_plan(
 
         // per-layer quota: this tensor is one layer, so its slot budget is its byte share of
         // the device budget; slot_budget < 0 means "all experts get a slot"
-        const size_t tensor_bytes = (size_t) in.n_expert * in.blob_bytes;
+        const size_t stride = ggml_expert_store_stride(in.blob_bytes, in.blob_pad);
+        const size_t tensor_bytes = (size_t) in.n_expert * stride;
         int64_t quota = (int64_t) tensor_bytes;
         if (slot_budget >= 0) {
             quota = (int64_t) ((double) slot_budget * (double) tensor_bytes / (double) expert_bytes);
         }
-        const int64_t n_slot = std::min<int64_t>(in.n_expert, quota / (int64_t) in.blob_bytes);
-        const int64_t aligned = (int64_t) ggml_expert_store_align_up(in.blob_bytes);
+        const int64_t n_slot = std::min<int64_t>(in.n_expert, quota / (int64_t) stride);
+        const int64_t aligned = (int64_t) stride;
 
         std::vector<int64_t> order((size_t) in.n_expert);
         for (int64_t e = 0; e < in.n_expert; ++e) {
@@ -258,7 +253,7 @@ void ggml_expert_store_plan(
 int ggml_expert_store_add_tensor(
         ggml_expert_store * store,
         int layer, int kind,
-        int64_t n_expert, size_t blob_bytes,
+        int64_t n_expert, size_t blob_bytes, size_t blob_pad,
         const int64_t * slot_experts, int64_t n_slot,
         int64_t host_budget) {
     GGML_ASSERT(store != nullptr);
@@ -272,13 +267,14 @@ int ggml_expert_store_add_tensor(
         return -1;
     }
 
+    const size_t stride = ggml_expert_store_stride(blob_bytes, blob_pad);
     const int64_t n_host = n_expert - n_slot;
 
     // the host tier stores the complement of the slot set; it must fit into the budget,
     // otherwise the placement is impossible and the caller has to make room.
-    if (host_budget >= 0 && n_host > 0 && host_budget < n_host * (int64_t) blob_bytes) {
+    if (host_budget >= 0 && n_host > 0 && host_budget < n_host * (int64_t) stride) {
         GGML_LOG_ERROR("%s: layer %d kind %d: %" PRId64 " host experts need %.2f MiB, budget is %.2f MiB\n",
-            __func__, layer, kind, n_host, n_host * blob_bytes / 1024.0 / 1024.0, host_budget / 1024.0 / 1024.0);
+            __func__, layer, kind, n_host, n_host * stride / 1024.0 / 1024.0, host_budget / 1024.0 / 1024.0);
         return -1;
     }
 
@@ -287,6 +283,8 @@ int ggml_expert_store_add_tensor(
     t.kind       = kind;
     t.n_expert   = n_expert;
     t.blob_bytes = blob_bytes;
+    t.blob_pad   = blob_pad;
+    t.stride     = stride;
     t.n_slot     = n_slot;
     t.n_host     = n_host;
     t.residency.assign((size_t) n_expert, GGML_EXPERT_STORE_INVALID);
@@ -303,17 +301,17 @@ int ggml_expert_store_add_tensor(
     for (int64_t e = 0; e < n_expert; ++e) {
         if (t.residency[(size_t) e] < 0) {
             t.host_offset[(size_t) e] = host_next;
-            host_next += (int64_t) ggml_expert_store_align_up(blob_bytes);
+            host_next += (int64_t) stride;
         }
     }
     t.host_used = host_next;
 
-    GGML_LOG_INFO("%s: layer %d kind %d: %" PRId64 " experts, %.2f MiB each, slots %" PRId64 ", host %" PRId64 "\n",
-        __func__, layer, kind, n_expert, blob_bytes / 1024.0 / 1024.0, n_slot, n_host);
+    GGML_LOG_INFO("%s: layer %d kind %d: %" PRId64 " experts, %.2f MiB data + %.2f MiB pad each, slots %" PRId64 ", host %" PRId64 "\n",
+        __func__, layer, kind, n_expert, blob_bytes / 1024.0 / 1024.0, blob_pad / 1024.0 / 1024.0, n_slot, n_host);
 
     // allocate the slot array and the host arena slice
     if (n_slot > 0) {
-        const size_t slot_bytes = (size_t) n_slot * ggml_expert_store_align_up(blob_bytes);
+        const size_t slot_bytes = (size_t) n_slot * stride;
         t.slots_dev = (char *) store->backend->alloc_device(store->backend->user, slot_bytes);
         if (t.slots_dev == nullptr) {
             GGML_LOG_ERROR("%s: layer %d kind %d: cannot allocate %.2f MiB of slots\n",
@@ -339,7 +337,7 @@ int ggml_expert_store_add_tensor(
     t.table_host = new char *[(size_t) n_expert];
     for (int64_t e = 0; e < n_expert; ++e) {
         if (t.residency[(size_t) e] >= 0) {
-            t.table_host[(size_t) e] = t.slots_dev + (size_t) t.residency[(size_t) e] * ggml_expert_store_align_up(blob_bytes);
+            t.table_host[(size_t) e] = t.slots_dev + (size_t) t.residency[(size_t) e] * stride;
         } else {
             t.table_host[(size_t) e] = t.host_dev + t.host_offset[(size_t) e];
         }
@@ -362,7 +360,7 @@ int ggml_expert_store_add_tensor(
 
     GGML_LOG_INFO("%s: layer %d kind %d: slots %" PRId64 " (%.2f MiB), host %" PRId64 " (%.2f MiB)\n",
         __func__, layer, kind,
-        n_slot, n_slot * (double) ggml_expert_store_align_up(blob_bytes) / 1024.0 / 1024.0,
+        n_slot, n_slot * (double) stride / 1024.0 / 1024.0,
         n_host, host_next / 1024.0 / 1024.0);
 
     store->tensors.push_back(std::move(t));
@@ -390,7 +388,9 @@ void ggml_expert_store_write(
         const size_t n = std::min(size - written, t.blob_bytes - in_expert);
 
         if (t.residency[(size_t) expert] >= 0) {
-            char * dst = t.slots_dev + (size_t) t.residency[(size_t) expert] * ggml_expert_store_align_up(t.blob_bytes) + in_expert;
+            // only the data bytes are copied; the padding after them stays zero from the
+            // allocation-time clear (see ggml_expert_store_add_tensor)
+            char * dst = t.slots_dev + (size_t) t.residency[(size_t) expert] * t.stride + in_expert;
             store->backend->copy_h2d(store->backend->user, dst, src + written, n);
         } else {
             char * dst = t.host_host + t.host_offset[(size_t) expert] + in_expert;
@@ -429,7 +429,7 @@ void ggml_expert_store_read(
         const size_t n = std::min(size - read, t.blob_bytes - in_expert);
 
         if (t.residency[(size_t) expert] >= 0) {
-            const char * src = t.slots_dev + (size_t) t.residency[(size_t) expert] * ggml_expert_store_align_up(t.blob_bytes) + in_expert;
+            const char * src = t.slots_dev + (size_t) t.residency[(size_t) expert] * t.stride + in_expert;
             store->backend->copy_d2h(store->backend->user, dst + read, src, n);
         } else {
             memcpy(dst + read, t.host_host + t.host_offset[(size_t) expert] + in_expert, n);
@@ -483,7 +483,7 @@ bool ggml_expert_store_verify(
         }
 
         if (t.residency[(size_t) expert] >= 0) {
-            const char * dev = t.slots_dev + (size_t) t.residency[(size_t) expert] * ggml_expert_store_align_up(t.blob_bytes);
+            const char * dev = t.slots_dev + (size_t) t.residency[(size_t) expert] * t.stride;
             store->backend->copy_d2h(store->backend->user, buf.data(), dev, t.blob_bytes);
         } else {
             memcpy(buf.data(), t.host_host + t.host_offset[(size_t) expert], t.blob_bytes);

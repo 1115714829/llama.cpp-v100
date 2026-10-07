@@ -142,9 +142,11 @@ static bool common_expert_get_allocation(ggml_backend_buffer_type_t buft, size_t
 // one MoE expert tensor as seen by the fit code: collected from the tensor metadata of the
 // loaded model, then handed to the pure plan function of the device that computes the layer
 struct common_expert_tensor {
-    int     layer      = -1; // block index from the tensor name
-    int64_t n_expert   = 0;
-    size_t  blob_bytes = 0;  // bytes of one expert
+    int        layer      = -1; // block index from the tensor name
+    int64_t    n_expert   = 0;
+    size_t     blob_bytes = 0;  // data bytes of one expert
+    ggml_type  type       = GGML_TYPE_COUNT; // for the per-expert row padding of the backend
+    int64_t    ne0        = 0;  // contraction size, same padding rule as the backend
 };
 
 // layer index of a tensor name "blk.<n>...", -1 for anything else. Used on tensors that
@@ -184,7 +186,8 @@ static bool common_expert_plan(ggml_backend_buffer_type_t buft,
         return false;
     }
     typedef void (*ggml_backend_expert_plan_t)(ggml_backend_buffer_type_t,
-        const int *, const int64_t *, const size_t *, size_t, size_t, size_t *, size_t *, size_t *, size_t *);
+        const int *, const int64_t *, const size_t *, const int *, const int64_t *, size_t,
+        size_t, size_t *, size_t *, size_t *, size_t *);
     auto plan = (ggml_backend_expert_plan_t)
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_plan");
     if (plan == nullptr) {
@@ -194,19 +197,25 @@ static bool common_expert_plan(ggml_backend_buffer_type_t buft,
     std::vector<int>     layers;
     std::vector<int64_t> n_experts;
     std::vector<size_t>  blobs;
+    std::vector<int>     types;
+    std::vector<int64_t> ne0s;
     layers.reserve(tensors.size());
     n_experts.reserve(tensors.size());
     blobs.reserve(tensors.size());
+    types.reserve(tensors.size());
+    ne0s.reserve(tensors.size());
     for (const common_expert_tensor & t : tensors) {
         layers.push_back(t.layer);
         n_experts.push_back(t.n_expert);
         blobs.push_back(t.blob_bytes);
+        types.push_back((int) t.type);
+        ne0s.push_back(t.ne0);
     }
 
     if (host_each != nullptr) {
         host_each->assign(tensors.size(), 0);
     }
-    plan(buft, layers.data(), n_experts.data(), blobs.data(), tensors.size(),
+    plan(buft, layers.data(), n_experts.data(), blobs.data(), types.data(), ne0s.data(), tensors.size(),
         slot_budget, slot_bytes, host_bytes, host_peak, host_each != nullptr ? host_each->data() : nullptr);
     return true;
 }
@@ -419,7 +428,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             if (layer < 0) {
                 continue;
             }
-            expert_tensors->push_back({ layer, t->ne[2], (size_t) t->nb[2] });
+            expert_tensors->push_back({ layer, t->ne[2], (size_t) t->nb[2], t->type, t->ne[0] });
         }
     }
 

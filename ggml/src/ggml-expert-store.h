@@ -34,6 +34,22 @@
 // upper bound of expert tensors per store (48 layers x gate/up/down with margin)
 #define GGML_EXPERT_STORE_MAX_TENSORS 512
 
+// byte alignment of one expert inside the tiers. The kernels address an expert through a
+// pointer table and copy whole experts with 64-bit loads, so every expert starts aligned.
+#define GGML_EXPERT_STORE_ALIGN 256
+
+static inline size_t ggml_expert_store_align_up(size_t v) {
+    return (v + GGML_EXPERT_STORE_ALIGN - 1) & ~(size_t) (GGML_EXPERT_STORE_ALIGN - 1);
+}
+
+// bytes one expert occupies in a slot / in the host arena: the data bytes, the row padding
+// the backend needs past the last row (see ggml_expert_store_plan_tensor::blob_pad) and the
+// alignment of the next expert. The store, the plan and the backend all use this one rule,
+// so the fit estimate and the real allocation match byte for byte.
+static inline size_t ggml_expert_store_stride(size_t blob_bytes, size_t blob_pad) {
+    return ggml_expert_store_align_up(blob_bytes + blob_pad);
+}
+
 // where an expert is served from
 enum ggml_expert_tier {
     GGML_EXPERT_TIER_VRAM = 0, // VRAM slot
@@ -67,7 +83,9 @@ struct ggml_expert_store_tensor {
     int      layer      = -1;
     int      kind       = -1; // llm tensor id of one of the ffn_*_exps tensors
     int64_t  n_expert   = 0;
-    size_t   blob_bytes = 0;  // bytes of one expert inside this tensor
+    size_t   blob_bytes = 0;  // data bytes of one expert inside this tensor
+    size_t   blob_pad   = 0;  // row padding after the data of one expert
+    size_t   stride     = 0;  // bytes from one expert to the next in a slot / in the host arena
 
     // placement
     std::vector<int32_t> residency;  // slot index (>= 0), or GGML_EXPERT_STORE_INVALID for host tier
@@ -153,7 +171,12 @@ GGML_API void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_de
 struct ggml_expert_store_plan_tensor {
     int     layer      = -1; // profile row of the tensor
     int64_t n_expert   = 0;
-    size_t  blob_bytes = 0;  // bytes of one expert
+    size_t  blob_bytes = 0;  // data bytes of one expert
+    // trailing bytes one expert needs past its data for the row padding of the kernels.
+    // The quantized MMQ/MMVQ loaders read the last row up to MATRIX_ROW_PADDING, which the
+    // regular CUDA buffer covers with get_alloc_size(); the store keeps the same padding
+    // after every expert so the kernels never read a neighbour's bytes.
+    size_t  blob_pad   = 0;
 };
 
 // result of ggml_expert_store_plan; sizes are bytes
@@ -184,7 +207,7 @@ GGML_API void ggml_expert_store_plan(
 GGML_API int ggml_expert_store_add_tensor(
         ggml_expert_store * store,
         int layer, int kind,
-        int64_t n_expert, size_t blob_bytes,
+        int64_t n_expert, size_t blob_bytes, size_t blob_pad,
         const int64_t * slot_experts, int64_t n_slot,
         int64_t host_budget);
 
