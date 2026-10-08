@@ -5035,11 +5035,22 @@ int32_t llama_set_adapter_cvec(
 // memory
 //
 
-// drain the prefill pipeline of the owning context before the memory is mutated, so no in-flight
-// ubatch is still writing the cache. the memory API has no context argument, hence the owner
+// drain the prefill pipeline of the owning context before the memory touches device data, so no
+// in-flight ubatch is still reading or writing it. the memory API has no context argument, hence
+// the owner
 static void llama_memory_drain(llama_memory_t mem) {
     if (llama_context * ctx = mem->get_owner()) {
         ctx->pipeline_drain();
+    }
+}
+
+// the sequence operations of most memory modules only edit the cell metadata on the host: the
+// in-flight ubatches keep writing the cells they were given, later ubatches are ordered after them
+// on the device streams, and position shifts are applied by memory_update on the stream. only a
+// module whose sequence operations write device data synchronously needs the pipeline drained
+static void llama_memory_drain_seq_op(llama_memory_t mem) {
+    if (mem->seq_ops_write_device()) {
+        llama_memory_drain(mem);
     }
 }
 
@@ -5062,7 +5073,7 @@ bool llama_memory_seq_rm(
         return true;
     }
 
-    llama_memory_drain(mem);
+    llama_memory_drain_seq_op(mem);
 
     return mem->seq_rm(seq_id, p0, p1);
 }
@@ -5077,7 +5088,7 @@ void llama_memory_seq_cp(
         return;
     }
 
-    llama_memory_drain(mem);
+    llama_memory_drain_seq_op(mem);
 
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
@@ -5089,7 +5100,7 @@ void llama_memory_seq_keep(
         return;
     }
 
-    llama_memory_drain(mem);
+    llama_memory_drain_seq_op(mem);
 
     mem->seq_keep(seq_id);
 }
@@ -5104,7 +5115,7 @@ void llama_memory_seq_add(
         return;
     }
 
-    llama_memory_drain(mem);
+    llama_memory_drain_seq_op(mem);
 
     mem->seq_add(seq_id, p0, p1, delta);
 }
@@ -5119,7 +5130,7 @@ void llama_memory_seq_div(
         return;
     }
 
-    llama_memory_drain(mem);
+    llama_memory_drain_seq_op(mem);
 
     mem->seq_div(seq_id, p0, p1, d);
 }

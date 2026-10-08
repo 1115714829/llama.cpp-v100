@@ -132,6 +132,10 @@ struct llama_memory_i {
     // state write/read
     //
 
+    // true when seq_rm / seq_cp / seq_keep / seq_add / seq_div write device data synchronously
+    // (most modules only edit the host-side cell metadata); the prefill pipeline is drained first
+    virtual bool seq_ops_write_device() const { return false; }
+
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
 
