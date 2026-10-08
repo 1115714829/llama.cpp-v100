@@ -812,7 +812,13 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = { nullptr, nullptr, nullptr };
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    // the MTP draft context is fed one ubatch after another during prompt processing (one catch-up
+    // pass per prefill chunk) but runs on a single device, so it has no pipeline stages. it still
+    // gets the two input copies of the prefill pipeline: its submissions then overlap without a
+    // whole-backend synchronization between the chunks (see process_ubatch)
+    const bool double_buffer_inputs = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel || double_buffer_inputs, cparams.op_offload));
     ggml_backend_sched_set_async_inputs(sched.get(), true);
     // prefill pipeline depth: one stage per compute segment (device) the layers of this context
     // span. input copies stay at two (double buffering), independent of the depth
@@ -2390,9 +2396,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (!pipeline) {
-        // user inputs are copied to the backends asynchronously, so the previous compute may still be
-        // reading them. synchronize before overwriting the input tensors (see ggml_backend_sched_set_async_inputs)
-        ggml_backend_sched_synchronize(sched_cur);
+        // with a single input copy the user inputs are copied to the backends asynchronously, so the
+        // previous compute may still be reading them. synchronize before overwriting the input
+        // tensors (see ggml_backend_sched_set_async_inputs). double buffered schedulers instead wait
+        // for the previous user of the input slot and copy synchronously (see
+        // ggml_backend_sched_compute_splits), so the backend must not be synchronized here
+        if (ggml_backend_sched_get_n_copies(sched_cur) == 1) {
+            ggml_backend_sched_synchronize(sched_cur);
+        }
     }
 
     // set the input data for the input tensors

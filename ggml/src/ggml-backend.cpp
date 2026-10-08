@@ -1794,10 +1794,10 @@ static enum ggml_status ggml_backend_sched_compute_split_sync(
         struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
         if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-            // pipeline stages share the host input tensors, so their copies must be complete before
-            // the caller overwrites them for the next ubatch. copy synchronously instead of queueing
-            // the copy on the compute stream, otherwise the host waits on the whole pipeline depth
-            if (sched->async_inputs && sched->n_stages == 1 && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer)) {
+            // double buffered inputs: wait for the previous user of this slot, then copy
+            // synchronously, so the caller can overwrite the host input for the next ubatch as soon
+            // as this submission returns (see ggml_backend_sched_compute_splits_pipeline)
+            if (sched->async_inputs && sched->n_stages == 1 && sched->n_copies == 1 && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer)) {
                 // the caller synchronizes the scheduler before writing the input data again,
                 // so the copy can be queued on the split backend without waiting for it to finish
                 ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
@@ -2391,10 +2391,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->graph_inputs_capacity = GGML_SCHED_MAX_SPLIT_INPUTS;
     sched->graph_inputs = (struct ggml_tensor **) calloc(sched->graph_inputs_capacity, sizeof(struct ggml_tensor *));
 
-    if (sched->n_copies > 1) {
-        // pipeline mode: one submission thread per non-CPU backend, indexed by backend id
-        sched->workers = new std::vector<std::unique_ptr<struct ggml_backend_sched_worker>>(n_backends);
-    }
+    // the submission workers are started by ggml_backend_sched_set_n_stages, when the scheduler is
+    // actually used for pipeline overlap. double buffered inputs alone do not submit tasks, see
+    // ggml_backend_sched_compute_splits
 
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
@@ -2404,13 +2403,6 @@ ggml_backend_sched_t ggml_backend_sched_new(
         if (sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
-            }
-            // the CPU backend keeps its splits on the main thread, no worker needed
-            if (ggml_backend_dev_type(ggml_backend_get_device(backends[b])) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                auto worker = std::make_unique<struct ggml_backend_sched_worker>();
-                struct ggml_backend_sched_worker * w = worker.get();
-                sched->workers->at(b) = std::move(worker);
-                w->thread = std::thread(ggml_backend_sched_worker_loop, w);
             }
         }
     }
@@ -2475,7 +2467,29 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched);
 }
 
-// per-backend submission workers; pipeline mode (n_copies > 1) only
+// per-backend submission workers; started when pipeline overlap is enabled (n_stages > 1)
+
+// start one submission thread per non-CPU backend, indexed by backend id
+void ggml_backend_sched_workers_start(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(sched->n_copies > 1); // the workers submit on the input slots
+
+    if (sched->workers != NULL) {
+        return;
+    }
+
+    sched->workers = new std::vector<std::unique_ptr<struct ggml_backend_sched_worker>>(sched->n_backends);
+    for (int b = 0; b < sched->n_backends; b++) {
+        // the CPU backend keeps its splits on the main thread, no worker needed
+        if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[b])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        auto worker = std::make_unique<struct ggml_backend_sched_worker>();
+        struct ggml_backend_sched_worker * w = worker.get();
+        sched->workers->at(b) = std::move(worker);
+        w->thread = std::thread(ggml_backend_sched_worker_loop, w);
+    }
+}
 
 // post a task to the worker of backend_id; returns the task sequence number
 uint64_t ggml_backend_sched_worker_post(ggml_backend_sched_t sched, int backend_id, std::function<void()> fn) {
