@@ -385,6 +385,10 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_pipeline_wait(ggml_backend_sched_t sched, int64_t ubatch_id);
     // Wait for all in-flight ubatches and reset the pipeline ring.
     GGML_API void                 ggml_backend_sched_pipeline_advance(ggml_backend_sched_t sched);
+    // Block until every task already posted to the submission thread of backend is enqueued on its
+    // stream (not until the device finished). Returns immediately if the scheduler has no
+    // submission threads, or if backend is not one of its backends.
+    GGML_API void                 ggml_backend_sched_wait_submitted(ggml_backend_sched_t sched, ggml_backend_t backend);
 
     // copy user input tensors to the split backends asynchronously (default: false)
     // the caller synchronizes the scheduler before it writes the input tensors again, so user inputs

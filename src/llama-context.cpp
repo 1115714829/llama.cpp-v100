@@ -1988,8 +1988,10 @@ bool llama_context::link_h_nextn(llama_context * ctx_dft) {
     embd_link          = link;
     ctx_dft->embd_link = link;
 
+    // the draft keeps its own backend_h_sink (set by enable_h_nextn_sink above): the sink events
+    // are cross-stream, one context writes and the other reads, so each side must queue its event
+    // wait/record on its own stream. the sink tensor itself is shared (t_h_sink below)
     ctx_dft->t_h_sink       = t_h_sink;
-    ctx_dft->backend_h_sink = backend_h_sink;
     ctx_dft->h_sink_extra   = h_sink_extra;
 
     // the draft graphs switch to the device gather path
@@ -2065,6 +2067,10 @@ bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols
         return false;
     }
 
+    // let the submission thread enqueue the split that wrote the source columns first: the
+    // capture copies below are then queued after the write on the same stream
+    wait_submitted(backend_h_sink);
+
     // the draft may still be reading the rows from the previous capture
     if (embd_link && embd_link->t_h_sink_tgt != nullptr) {
         ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_read_done);
@@ -2093,8 +2099,12 @@ bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols
         ggml_tensor * dst = ggml_view_2d(ctx_view.get(), t_h_sink, t_h_sink->ne[0], 1,
                 t_h_sink->nb[1], (size_t) (n_batch + i) * t_h_sink->nb[1]);
 
-        // same buffer and stream as the target graph, so the copy is ordered after the write
-        ggml_backend_tensor_copy(src, dst);
+        GGML_ASSERT(ggml_backend_view_init(src) == GGML_STATUS_SUCCESS);
+        GGML_ASSERT(ggml_backend_view_init(dst) == GGML_STATUS_SUCCESS);
+
+        // on CUDA the copy is queued async on the sink backend's own stream, after the graph that
+        // wrote these columns; a backend without async copy is synchronized by the API instead
+        ggml_backend_tensor_copy_async(backend_h_sink, backend_h_sink, src, dst);
     }
 
     // the next draft read must not start before the pending rows are in place
@@ -2406,11 +2416,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const bool reads_h_sink  = embd_link && embd_link->t_h_sink_tgt != nullptr && h_src_enable && !h_sink_is_target;
 
     if (writes_sink) {
+        // the splits posted so far (including the previous write) reach the target stream before
+        // this wait: it must not land in the middle of them
+        wait_submitted(backends[0].get());
         // the draft may still be copying the previous write
         ggml_backend_event_wait(backends[0].get(), embd_link->ev_copy_done);
     }
 
     if (writes_h_sink) {
+        // same on the output device stream: the previously posted splits reach the stream before
+        // this wait is queued
+        wait_submitted(backend_h_sink);
         // the draft may still be reading the previous target write
         ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_read_done);
     }
@@ -2442,12 +2458,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (writes_sink) {
-        // the draft can copy the sink once this graph completed on the target stream
+        // the submission thread has enqueued the write of this ubatch on the target stream, so the
+        // event is recorded after it; the draft can copy the sink once this graph completed
+        wait_submitted(backends[0].get());
         ggml_backend_event_record(embd_link->ev_tgt_done, backends[0].get());
     }
 
     if (writes_h_sink) {
-        // the draft can read the sink once this graph completed on the output device stream
+        // same as above on the output device stream: the sink write of this ubatch is enqueued
+        // before the event is recorded, so the draft reads the completed rows
+        wait_submitted(backend_h_sink);
         ggml_backend_event_record(embd_link->ev_h_tgt_done, backend_h_sink);
     }
 
@@ -2556,6 +2576,12 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     }
 
     auto * sched_res = sched_for_slot(gf_res_slot(ubatch));
+
+    // the async host reads below are ordered on the device streams after the compute of this
+    // ubatch: wait until the submission threads have enqueued it first
+    for (const auto & backend : backends) {
+        wait_submitted(backend.get());
+    }
 
     auto * t_logits  = res->get_logits();
     auto * t_embd    = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
@@ -2907,6 +2933,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     auto extract_outputs = [&](const llm_graph_result * res, ggml_backend_sched_t sched_res,
             const llama_ubatch & ubatch, int32_t n_outputs, int64_t n_outputs_prev, int64_t n_tokens_prev) {
+        // the async host reads below are enqueued on the streams of this ubatch's scheduler: wait
+        // until the submission threads have enqueued its compute first, so the copies are ordered
+        // after it. no-op for schedulers without submission threads
+        for (const auto & backend : backends) {
+            wait_submitted(backend.get());
+        }
+
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -3857,6 +3890,18 @@ ggml_status llama_context::graph_compute_impl(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+void llama_context::wait_submitted(ggml_backend_t backend) {
+    if (sched) {
+        ggml_backend_sched_wait_submitted(sched.get(), backend);
+    }
+    if (sched_slot0) {
+        ggml_backend_sched_wait_submitted(sched_slot0.get(), backend);
+    }
+    if (sched_dec) {
+        ggml_backend_sched_wait_submitted(sched_dec.get(), backend);
+    }
 }
 
 ggml_status llama_context::graph_compute(

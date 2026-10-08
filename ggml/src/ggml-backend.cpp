@@ -2563,6 +2563,27 @@ bool ggml_backend_sched_has_workers(ggml_backend_sched_t sched) {
     return false;
 }
 
+// wait until the submission thread of backend has enqueued every task posted to it so far
+void ggml_backend_sched_wait_submitted(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    if (sched == NULL || sched->workers == NULL) {
+        return;
+    }
+
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->backends[b] != backend) {
+            continue;
+        }
+        struct ggml_backend_sched_worker * w = sched->workers->at(b).get();
+        if (w == NULL) {
+            return;
+        }
+
+        std::unique_lock<std::mutex> lock(w->mtx);
+        w->cv_done.wait(lock, [w]() { return w->n_done >= w->n_posted; });
+        return;
+    }
+}
+
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     // reset state for the next run
