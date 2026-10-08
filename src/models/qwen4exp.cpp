@@ -585,12 +585,6 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // the draft memory has no recurrent layer, but its input still has to be allocated
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
-    // MTP catch-up cuts the attention, so the KQ mask has no consumer in this graph. It is still
-    // an input and set_input writes it, so it has to be allocated like the s_copy above
-    if (mtp_kv_only) {
-        ggml_build_forward_expand(gf, inp_hyb->get_attn()->self_kq_mask);
-    }
-
     llm_graph_input_kpool * inp_kpool = nullptr;
     // ratio 0: dense MTP block, there is no QSA k-pool to build
     if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0 && hparams.dsv4_compress_ratios[il] > 0) { // from unsloth PR #240
@@ -619,7 +613,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
 
     // MTP catch-up (n_outputs == 0): build_layer_attn has written the K/V cache and returned
-    // nullptr. Nothing downstream consumes this layer's output, so stop here
+    // nullptr. Nothing downstream consumes this layer's output, so stop here. The KQ mask of the
+    // cut attention stays unallocated: llm_graph_input_mem_hybrid::set_input skips filling it when
+    // its buffer is null, same as the qwen4exp QSA layers
     if (mtp_kv_only) {
         res->t_h_nextn = nullptr;
         res->t_embd    = nullptr;
