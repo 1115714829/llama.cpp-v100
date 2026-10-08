@@ -3528,10 +3528,10 @@ static int64_t ggml_cuda_mul_mat_id_ncols_typ(const ggml_tensor * src0, const gg
     return (src1->ne[2]*n_expert_used + src0->ne[2] - 1) / src0->ne[2];
 }
 
-// Prefill batches that reach the batched MMQ path stage the routed host experts into VRAM
-// (the staging area only serves that path: the grouped kernel reads every weight once, the
-// decode paths read the host arena in place). Uses the same conditions as the dispatch so
-// that needs_sync and the dispatch never disagree.
+// Prefill batches (above the MMVQ batch) stage the routed host experts into VRAM
+// (the grouped kernel and MMQ both read the staged copies; decode, up to the MMVQ batch, reads
+// the host arena in place). Uses the same conditions as the dispatch so that needs_sync and
+// the dispatch never disagree.
 static bool ggml_cuda_expert_stage_used(const ggml_tensor * dst, const ggml_cuda_expert_table & ex_table, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -3540,8 +3540,10 @@ static bool ggml_cuda_expert_stage_used(const ggml_tensor * dst, const ggml_cuda
     if (!ex_table.has_stage || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
         return false;
     }
+    // prefill reads every routed expert row at least once per column group: copy the routed host
+    // experts into VRAM once instead of reading them over the host link in place
     if (ggml_cuda_moe_grouped_mul_mat_id_supported(dst, cc)) {
-        return false;
+        return true;
     }
     return ggml_cuda_should_use_mmq(src0->type, cc, ggml_cuda_mul_mat_id_ncols_typ(src0, src1, ids->ne[0], cc), src0->ne[2]);
 }
@@ -3630,7 +3632,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         if (ggml_is_quantized(src0->type)) {
-            // Decode and verify windows (T <= 8) take the grouped kernel: it stages every
+            // Decode and verify windows (T <= 8) take the grouped kernel first: it stages every
             // entry routed to one expert and reads the weight row once, while the MMVQ MoE
             // kernel gives one warp per token and re-reads the weight for each routed token.
             // The gate/up fusion of separate gate/up weights stays on MMVQ (the target model
@@ -3650,18 +3652,25 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
 
-        if (ggml_cuda_moe_grouped_mul_mat_id(ctx, dst, is_expert_store ? ex_table.main : nullptr)) {
+        // Prefill (T > 8) takes the grouped kernel as well: it stages the entries of one expert
+        // and reads the weight row once per staged group, instead of the MMQ MUL_MAT_ID path
+        // which buckets by (token, slot) and re-reads the weight of a hot expert once per tile.
+        // This is a capability branch: the grouped kernel only covers the types and layouts it
+        // implements (see ggml_cuda_moe_grouped_mul_mat_id_supported), the other types keep
+        // their MMQ path below.
+        // prefill re-reads the routed expert rows (per column group or per tile): copy the routed
+        // host experts into the staging area once and read them from VRAM (Strata prefill ring)
+        const char * const * expert_ptrs = is_expert_store ? ex_table.main : nullptr;
+        if (is_expert_store && ggml_cuda_expert_stage_used(dst, ex_table, cc)) {
+            expert_ptrs = ggml_cuda_expert_stage_prepare(src0, ids, ggml_mul_mat_id_get_expert_offset(dst), ctx.stream());
+        }
+
+        if (ggml_cuda_moe_grouped_mul_mat_id(ctx, dst, expert_ptrs)) {
             return;
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ggml_cuda_mul_mat_id_ncols_typ(src0, src1, ids->ne[0], cc), /*n_experts=*/ne02)) {
-            // prefill re-reads the same expert rows for every tile: copy the routed host
-            // experts into the staging area once and read them from VRAM (Strata prefill ring)
-            const char * const * mmq_ptrs = is_expert_store ? ex_table.main : nullptr;
-            if (is_expert_store && ggml_cuda_expert_stage_used(dst, ex_table, cc)) {
-                mmq_ptrs = ggml_cuda_expert_stage_prepare(src0, ids, ggml_mul_mat_id_get_expert_offset(dst), ctx.stream());
-            }
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst, mmq_ptrs);
+            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst, expert_ptrs);
             return;
         }
 

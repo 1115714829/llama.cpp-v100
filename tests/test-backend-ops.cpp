@@ -42,6 +42,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 
@@ -6104,6 +6105,40 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax =
     init_mul_mat_id_ids(ctx, n_mats);
 }
 
+// Skewed routing: a few hot experts take most of the slots, so one expert receives far more
+// columns than the average (512 experts, top-10, n=2048 gives 40 on average but the hot ones
+// take hundreds). The grouped kernel must stay correct when an expert's column count exceeds
+// its staged-entry capacity. A token picks distinct experts like real top-k routing: every
+// expert draws a score, hot experts draw in a smaller range and so are picked first. The
+// routing tensor is the full (n_mats, n_rows) ids, the caller views its first n_used columns.
+static void init_mul_mat_id_ids_skew(ggml_context * ctx, int n_mats, int n_used, int n_hot) {
+    std::random_device rd;
+    std::default_random_engine rng(rd());
+    std::uniform_real_distribution<float> score(0.0f, 1.0f);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+            continue;
+        }
+        for (int64_t r = 0; r < ggml_nrows(t); r++) {
+            std::vector<std::pair<float, int32_t>> ranked(n_mats);
+            for (int32_t e = 0; e < n_mats; e++) {
+                // hot experts draw in [0, 1), the others in [0, 8): a hot one wins most slots
+                ranked[e] = { score(rng) * (e < n_hot ? 1.0f : 8.0f), e };
+            }
+            std::partial_sort(ranked.begin(), ranked.begin() + n_used, ranked.end());
+            std::vector<int32_t> data(t->ne[0]);
+            for (int i = 0; i < n_used; i++) {
+                data[i] = ranked[i].second;
+            }
+            for (int64_t i = n_used; i < t->ne[0]; i++) {
+                data[i] = (int32_t) i;
+            }
+            std::shuffle(data.begin(), data.begin() + n_used, rng);
+            ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+        }
+    }
+}
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -6185,6 +6220,30 @@ struct test_mul_mat_id : public test_case {
 
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// Skewed routing: a few hot experts take most of the slots. At n=2048 the average expert
+// receives 40 columns, but a hot expert receives hundreds, far more than the grouped kernel's
+// staged-entry capacity, so this exercises the per-expert column loop.
+struct test_mul_mat_id_skew : public test_mul_mat_id {
+    const int n_hot;
+
+    test_mul_mat_id_skew(ggml_type type_a = GGML_TYPE_Q4_K, int n_mats = 512, int n_used = 10,
+            int64_t m = 640, int64_t n = 2048, int64_t k = 2560, int n_hot = 8)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, n, k), n_hot(n_hot) {}
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + "," + std::to_string(n_hot);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+        init_mul_mat_id_ids_skew(ctx, n_mats, n_used, n_hot);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids_skew(ctx, n_mats, n_used, n_hot);
     }
 };
 
@@ -13040,6 +13099,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560));
     }
 
+    // Prefill (n = 2048) takes the grouped kernel too: the real UD-Q4_K_XL shapes, 512 experts
+    // top-10. The average expert receives 40 columns; a skewed routing with hot experts takes
+    // far more, which exercises the per-expert column loop.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, 2048, 2560)); // gate/up
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, 2048, 2560)); // merged gate_up
+    for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, 2048, 640)); // down
+    }
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        test_cases.emplace_back(new test_mul_mat_id_skew(type_a, 512, 10, 640, 2048, 2560, 8)); // skewed gate/up
+    }
+    test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q4_K, 512, 10, 1280, 2048, 2560, 8)); // skewed merged gate_up
+    for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id_skew(type_a, 512, 10, 2560, 2048, 640, 8)); // skewed down
+    }
+
     // multiple blocks per row: exercises the block-stride loop and the
     // per-expert base offset, which k == 256 alone leaves untested
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
@@ -14878,6 +14955,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t n : {1, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560));
     }
+
+    // the merged gate_up tensor at the prefill width (n = 2048), and a skewed routing where a
+    // few hot experts take most of the slots (the average expert column count is 40, a hot one
+    // is far past the grouped kernel's staged-entry capacity)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, 2048, 2560));
+    test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q4_K, 512, 10, 640, 2048, 2560, 8));
+    test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q4_K, 512, 10, 1280, 2048, 2560, 8));
 
     return test_cases;
 }
