@@ -392,11 +392,12 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_reg_kernel(
                 o[wpos*kpool + c] = pidx[b*kpool + c];
             }
             wpos++;
-        } else if (key[j] == thr) {
-            for (int c = 0; c < kpool && eq_left > 0; ++c, --eq_left) {
+        } else if (key[j] == thr && eq_left > 0) {
+            for (int c = 0; c < kpool; ++c) {
                 o[wpos*kpool + c] = pidx[b*kpool + c];
             }
             wpos++;
+            eq_left--;
         }
     }
     qsa_topk_epilogue(tidx, s_tidx, kpool, sentinel, tot, qi, o, n_sel, &s_digit);
