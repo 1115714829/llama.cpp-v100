@@ -20,7 +20,8 @@ struct common_fit_extra_model {
     llama_context_params * cparams;
     bool shares_model;
 
-    // device feature sinks that are not part of the memory breakdown of any context: the fit
+    // device feature sinks are raw backend buffers outside any memory breakdown (see
+    // llama_context::enable_layer_inp_sink/link_embd and enable_h_nextn_sink): the fit
     // reserves their bytes on the devices that will hold them
     bool     dflash_sink = false; // DFlash2: reserve the layer-input sink (target + draft staging)
     uint32_t h_sink_rows = 0;     // r-mtpdev: MTP nextn sink extra columns on top of n_batch (0 = off)

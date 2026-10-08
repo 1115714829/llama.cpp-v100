@@ -246,7 +246,7 @@ llama_context::llama_context(
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         if (params.ctx_other == nullptr) {
             // TODO: change from runtime_error to llama_exception to avoid printing error message
-            throw std::runtime_error("Gemma4Assistant requires ctx_other to be set (this warning is normal during memory fitting)");
+            throw std::runtime_error("Gemma4Assistant requires ctx_other to be set");
         }
 
         cparams.ctx_other = params.ctx_other;
@@ -255,7 +255,7 @@ llama_context::llama_context(
     if (model.arch == LLM_ARCH_EAGLE3 || model.arch == LLM_ARCH_DFLASH) {
         if (model.tok_embd == nullptr || model.output == nullptr) {
             if (params.ctx_other == nullptr) {
-                throw std::runtime_error(model.arch_name() + " requires ctx_other to be set (this warning is normal during memory fitting)");
+                throw std::runtime_error(model.arch_name() + " requires ctx_other to be set");
             }
             cparams.ctx_other = params.ctx_other;
         }
@@ -268,7 +268,7 @@ llama_context::llama_context(
         const llama_model * tgt = params.ctx_other ? llama_get_model(params.ctx_other) : nullptr;
         if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || !tgt || !tgt->tok_embd || !tgt->output ||
             tgt->hparams.n_embd != model.hparams.n_embd || tgt->vocab.n_tokens() != model.vocab.n_tokens()) {
-            throw std::runtime_error(model.arch_name() + " head without token_embd/output only works as an MTP draft (--spec-type draft-mtp) of a matching target (this warning is normal during memory fitting)");
+            throw std::runtime_error(model.arch_name() + " head without token_embd/output only works as an MTP draft (--spec-type draft-mtp) of a matching target");
         }
         cparams.model_tgt = tgt;
     }

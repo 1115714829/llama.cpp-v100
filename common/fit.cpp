@@ -491,9 +491,10 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     // its shared tensors from the target (borrow_shared_tensor), so the measurement graph
     // matches the real load - real tensor types, real devices, and the borrowed tensors
     // add no bytes to the model breakdown of the extra model (they are counted in the
-    // target measurement above).
-    // the MTP draft links itself to the target h sink during construction, so the measured
-    // target context has to outlive the extra measurement as well - it is freed below
+    // target measurement above). The draft context also links itself to the target while
+    // it is constructed (shared embeddings/output, device sinks, the MTP h sink), so the
+    // measured target context is handed to the draft as ctx_other below - same as the real
+    // load in common_speculative_init_result - and outlives the extra measurement.
     if (extra != nullptr && extra_mem != nullptr) {
         llama_model_params mparams_extra = *extra->mparams;
         mparams_extra.no_alloc      = true;
@@ -507,11 +508,15 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             throw std::runtime_error(std::string("failed to load the extra model '") + extra->path_model + "'");
         }
 
-        // the MTP draft links itself to the target h sink during construction: hand the measured
-        // target context over. The fit already accounts for the sink bytes (see below), so the
-        // linked sink only has to exist while the measurement graph is built
+        // the draft context is created against the measured target context, exactly like the
+        // real draft context: every draft links itself to the target during construction
+        // (shared embeddings/output, device sinks), so ctx_other is handed over here
+        extra->cparams->ctx_other = ctx;
+
+        // the MTP draft additionally checks the h sink layout at construction; the sink bytes
+        // are counted in below, so the linked sink only has to exist while the measurement
+        // graph is built
         if (extra->h_sink_rows > 0) {
-            extra->cparams->ctx_other     = ctx;
             extra->cparams->n_h_sink_rows = extra->h_sink_rows;
         }
 
@@ -528,31 +533,31 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
         collect_device_memory_breakdown(model_extra, ctx_extra, ret_extra);
 
-        // device feature sinks are raw backend buffers, so they are not part of the context
-        // memory breakdown. Reserve their bytes on the devices that hold them
+        // the device feature sinks are raw backend buffers, so no memory breakdown covers
+        // them. Reserve their bytes on the devices the real load allocates them on
         {
             const size_t sink_row = (size_t) llama_model_n_embd(model) * sizeof(float);
-            const uint32_t n_lids  = llama_model_target_layer_ids_n(model_extra);
 
-            if (extra->dflash_sink && n_lids > 0) {
-                // DFlash2 layer-input sink: mirrored, one copy per target device
-                const size_t bytes = sink_row * n_lids * cparams->n_batch;
-                for (size_t i = 0; i < nd; i++) {
-                    ret[i].mb.context += bytes;
+            if (extra->dflash_sink) {
+                const uint32_t n_lids = llama_model_target_layer_ids_n(model_extra);
+                if (n_lids > 0) {
+                    // DFlash2 layer-input sink [n_embd * n_lids, n_batch] on the first target
+                    // device and the draft staging sink [n_embd_inp_enc, n_ubatch] on the first
+                    // draft device: both are allocated from the main device buffer type of
+                    // backends[0] (llama_context::enable_layer_inp_sink / link_embd)
+                    ret      [0].mb.context += sink_row * n_lids * cparams->n_batch; // the host entry when there is no device
+                    ret_extra[0].mb.context += sink_row * n_lids * extra->cparams->n_ubatch;
                 }
-                // DFlash2 draft staging sink, [n_embd_inp_enc, n_ubatch] on the draft device
-                ret_extra[nd_extra > 0 ? nd_extra - 1 : 0].mb.context +=
-                    sink_row * n_lids * extra->cparams->n_ubatch;
             }
 
             if (extra->h_sink_rows > 0) {
-                // MTP nextn sink: the target copy on the target output device, the draft copy on
-                // the draft device. In the MTP layer-split layout both are the last device
+                // MTP nextn sink [n_embd_out, n_batch + extra rows]: allocated once by the
+                // target on its output device (llama_context::enable_h_nextn_sink); the draft
+                // shares those rows via link_h_nextn and allocates nothing. With a layer split
+                // the output device is the last target device
                 const size_t row = (size_t) llama_model_n_embd_out(model) * sizeof(float);
-                ret      [nd       > 0 ? nd       - 1 : 0].mb.context +=
-                    row * ((size_t) cparams->n_batch       + extra->h_sink_rows);
-                ret_extra[nd_extra > 0 ? nd_extra - 1 : 0].mb.context +=
-                    row * ((size_t) extra->cparams->n_batch + extra->h_sink_rows);
+                ret[nd > 0 ? nd - 1 : 0].mb.context +=
+                    row * ((size_t) cparams->n_batch + extra->h_sink_rows);
             }
         }
 
@@ -568,6 +573,10 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         *extra_mem = std::move(ret_extra);
     }
 
+    if (extra != nullptr) {
+        // the measured target context dies here, do not leave a dangling ctx_other behind
+        extra->cparams->ctx_other = nullptr;
+    }
     llama_free(ctx);
     llama_model_free(model);
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
