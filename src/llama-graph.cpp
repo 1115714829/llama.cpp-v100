@@ -1551,6 +1551,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     h_sink_is_target (params.h_sink_is_target),
     h_sink_write     (params.h_sink_write),
     fa_assist        (params.fa_assist),
+    mtp_kv_only      (params.mtp_kv_only),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -3040,6 +3041,14 @@ ggml_tensor * llm_graph_context::build_attn(
 
             ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
             ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        }
+
+        // MTP catch-up: the K/V cache write is the only consumer of this layer. Stop here so the
+        // attention, the v_rot undo and wo stay out of the graph. The K/V nodes and their expand
+        // order are unchanged, so the cached K/V is bit-identical to the full-layer graph. This is
+        // true only for the MTP context; every other context leaves mtp_kv_only false
+        if (mtp_kv_only) {
+            return nullptr;
         }
 
         k = mctx_cur->get_k(ctx0, il);
