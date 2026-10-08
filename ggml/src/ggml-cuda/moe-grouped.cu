@@ -13,7 +13,11 @@
 // the activation rows of the (token, expert) entries routed to one expert are staged into
 // shared memory, then a warp computes one output row against all staged entries. No column
 // is padded to a fixed tile, unlike the MMQ MUL_MAT_ID path which pads every expert to a J
-// wide tile. The weight row is read once per entry group and reused across the group.
+// wide tile. The weight row is read once per staged group and reused across the group.
+//
+// Both decode (T <= 8) and prefill use this kernel. The staged group width is picked at
+// launch time (MOE_GROUPED_CT_DECODE / MOE_GROUPED_CT_PREFILL); the column loop keeps a hot
+// expert correct when it receives more columns than the group width.
 
 template <ggml_type type>
 struct moe_grouped_traits;
@@ -151,7 +155,13 @@ bool ggml_cuda_moe_grouped_mul_mat_id_supported(const ggml_tensor * dst, const i
         default:
             return false;
     }
-    if (dst->ne[2] < 9 || dst->ne[2] > 64) {
+    // prefill only: the entries of one expert are staged into shared memory in groups and the
+    // weight row is read once per group; the group width follows the average columns per expert.
+    // There is no upper token bound: the kernel loops over the columns of one expert, a hot
+    // expert with more columns than the group width stays correct. Decode and verify windows
+    // (T <= MOE_GROUPED_MAX_TOKENS) stay on MMVQ: a few tokens rarely share an expert, so
+    // grouping saves no weight reads and only adds empty blocks (t54)
+    if (dst->ne[2] <= MOE_GROUPED_MAX_TOKENS) {
         return false;
     }
     if (src1->ne[3] != 1 || src0->ne[3] != 1) {
@@ -177,23 +187,20 @@ bool ggml_cuda_moe_grouped_mul_mat_id_supported(const ggml_tensor * dst, const i
     if (src0->ne[2] <= 0 || src0->ne[2] > 65535) {
         return false;
     }
-    // Shared memory for CT = 8 staged activation rows must fit in one block.
+    // Shared memory for the decode group width must fit; the prefill width is checked at launch.
     const int64_t nblocks_row_q8 = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING) / QK8_1;
-    if (8 * nblocks_row_q8 * (int64_t) sizeof(block_q8_1) > (int64_t) ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) {
+    if (MOE_GROUPED_CT_DECODE * nblocks_row_q8 * (int64_t) sizeof(block_q8_1) > (int64_t) ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) {
         return false;
     }
     return true;
 }
 
-template <ggml_type type, bool expert_store>
-static void moe_grouped_launch(
+template <ggml_type type, int ROWS, int CT, bool expert_store>
+static void moe_grouped_launch_ct(
         const char * vx, const int32_t * expert_bounds, const int32_t * ids_dst, const int32_t * ids_src1,
         const block_q8_1 * xq, float * dst, const int64_t nrows_x, const int64_t nblocks_weight, const int64_t nblocks_row_q8,
         const int64_t nb01, const int64_t nb02, const int64_t dst_stride_col, const int n_experts, cudaStream_t stream,
         const char * const * expert_ptrs) {
-    constexpr int ROWS = 32;
-    constexpr int CT   = 8;
-
     const size_t nbytes_shared = (size_t) CT * nblocks_row_q8 * sizeof(block_q8_1);
 
     const dim3 grid((nrows_x + ROWS - 1) / ROWS, n_experts);
@@ -210,6 +217,31 @@ static void moe_grouped_launch(
         (int) nrows_x, (int) nblocks_weight, (int) nblocks_row_q8, nb01, nb02, dst_stride_col, expert_ptrs);
 }
 
+template <ggml_type type, bool expert_store>
+static void moe_grouped_launch(
+        const char * vx, const int32_t * expert_bounds, const int32_t * ids_dst, const int32_t * ids_src1,
+        const block_q8_1 * xq, float * dst, const int64_t nrows_x, const int64_t nblocks_weight, const int64_t nblocks_row_q8,
+        const int64_t nb01, const int64_t nb02, const int64_t dst_stride_col, const int n_experts, cudaStream_t stream,
+        const char * const * expert_ptrs, const int64_t ncols_avg) {
+    // Decode and verify stage one group of MOE_GROUPED_CT_DECODE entries, which covers the whole
+    // routing of a small batch. Prefill stages a wider group and more output rows per block, so
+    // the weight row of an expert is read once for more of its columns and the staged activation
+    // is reused over more rows. The wider group needs more shared memory, so it is used only when
+    // it fits. A hot expert with more columns than the capacity keeps looping, so both widths
+    // stay correct. The width choice is a shared-memory capability limit, not a fallback.
+    const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
+    const bool prefill = ncols_avg > MOE_GROUPED_CT_DECODE &&
+        (size_t) MOE_GROUPED_CT_PREFILL * nblocks_row_q8 * sizeof(block_q8_1) <= smpbo;
+
+    if (prefill) {
+        moe_grouped_launch_ct<type, 64, MOE_GROUPED_CT_PREFILL, expert_store>(vx, expert_bounds, ids_dst, ids_src1, xq, dst,
+            nrows_x, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, n_experts, stream, expert_ptrs);
+    } else {
+        moe_grouped_launch_ct<type, 32, MOE_GROUPED_CT_DECODE, expert_store>(vx, expert_bounds, ids_dst, ids_src1, xq, dst,
+            nrows_x, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, n_experts, stream, expert_ptrs);
+    }
+}
+
 // Dispatch to the pointer-table kernel for expert store weights, to the src0 kernel otherwise.
 // The choice is made here so the kernel does not test expert_ptrs at run time.
 template <ggml_type type>
@@ -217,13 +249,13 @@ static void moe_grouped_launch_dispatch(
         const char * vx, const int32_t * expert_bounds, const int32_t * ids_dst, const int32_t * ids_src1,
         const block_q8_1 * xq, float * dst, const int64_t nrows_x, const int64_t nblocks_weight, const int64_t nblocks_row_q8,
         const int64_t nb01, const int64_t nb02, const int64_t dst_stride_col, const int n_experts, cudaStream_t stream,
-        const char * const * expert_ptrs) {
+        const char * const * expert_ptrs, const int64_t ncols_avg) {
     if (expert_ptrs != nullptr) {
         moe_grouped_launch<type, true>(vx, expert_bounds, ids_dst, ids_src1, xq, dst, nrows_x, nblocks_weight,
-            nblocks_row_q8, nb01, nb02, dst_stride_col, n_experts, stream, expert_ptrs);
+            nblocks_row_q8, nb01, nb02, dst_stride_col, n_experts, stream, expert_ptrs, ncols_avg);
     } else {
         moe_grouped_launch<type, false>(vx, expert_bounds, ids_dst, ids_src1, xq, dst, nrows_x, nblocks_weight,
-            nblocks_row_q8, nb01, nb02, dst_stride_col, n_experts, stream, expert_ptrs);
+            nblocks_row_q8, nb01, nb02, dst_stride_col, n_experts, stream, expert_ptrs, ncols_avg);
     }
 }
 
@@ -246,12 +278,17 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
 
     cudaStream_t stream = ctx.stream();
 
-    // Shared memory budget for the staged activation group (CT = 8 entries).
+    // Shared memory budget for the staged activation group (the decode width, the narrowest
+    // group). The prefill width is picked at launch time only when it fits.
     const int64_t nblocks_row_q8 = GGML_PAD(ne10, MATRIX_ROW_PADDING) / QK8_1;
-    const int64_t nbytes_shared  = 8 * nblocks_row_q8 * (int64_t) sizeof(block_q8_1);
+    const int64_t nbytes_shared  = MOE_GROUPED_CT_DECODE * nblocks_row_q8 * (int64_t) sizeof(block_q8_1);
     if (nbytes_shared > (int64_t) ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) {
         return false;
     }
+
+    // Average columns one expert receives. The grouped kernel picks its staged-entry width from
+    // it: a small batch stays on the decode width, prefill uses the wider group.
+    const int64_t ncols_avg = (ne12 * n_expert_used + ne02 - 1) / ne02;
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
@@ -302,23 +339,23 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
     switch (src0->type) {
         case GGML_TYPE_Q4_K:
             moe_grouped_launch_dispatch<GGML_TYPE_Q4_K>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
-                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
+                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs, ncols_avg);
             break;
         case GGML_TYPE_Q5_K:
             moe_grouped_launch_dispatch<GGML_TYPE_Q5_K>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
-                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
+                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs, ncols_avg);
             break;
         case GGML_TYPE_Q6_K:
             moe_grouped_launch_dispatch<GGML_TYPE_Q6_K>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
-                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
+                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs, ncols_avg);
             break;
         case GGML_TYPE_Q5_1:
             moe_grouped_launch_dispatch<GGML_TYPE_Q5_1>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
-                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
+                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs, ncols_avg);
             break;
         case GGML_TYPE_Q8_0:
             moe_grouped_launch_dispatch<GGML_TYPE_Q8_0>((const char *) src0->data, expert_bounds.get(), ids_dst.get(), ids_src1.get(),
-                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs);
+                xq, (float *) dst->data, ne01, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, ne02, stream, expert_ptrs, ncols_avg);
             break;
         default:
             GGML_ABORT("fatal error");
