@@ -483,6 +483,9 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+        if (memory) {
+            memory->set_owner(this);
+        }
     }
 
     // init backends
@@ -514,13 +517,31 @@ llama_context::llama_context(
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
         // TODO: move these checks to ggml_backend_sched
-        // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // pipeline parallelism makes the scheduler keep n_copies input copies and events, which is
+        // required for multi-batch prefill overlap. it does not require the whole model to be offloaded.
+        // it only applies when the layers this context computes span more than one device: the MTP
+        // context computes the nextn layer on a single device, and its single-token draft steps would
+        // only pay for the input copy rotation and the synchronous pipeline input copies
+        bool layers_span_devices = false;
+        if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            ggml_backend_dev_t dev0 = nullptr;
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                ggml_backend_dev_t dev = model.dev_layer(il);
+                if (dev0 == nullptr) {
+                    dev0 = dev;
+                } else if (dev != dev0) {
+                    layers_span_devices = true;
+                    break;
+                }
+            }
+        }
+
         bool pipeline_parallel =
+            layers_span_devices &&
             model.n_devices() > 1 &&
-            model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides();
+            !model.has_host_tensor_overrides();
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -750,18 +771,28 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_async_inputs(sched.get(), true);
+    // prefill pipeline depth: one stage per compute segment (device), capped by the number of input
+    // copies so each in-flight ubatch has its own copy. n_stages == 1 keeps submit/wait/advance
+    // equivalent to the single-batch path
+    if (cparams.pipeline_parallel) {
+        const int n_stages = std::min(ggml_backend_sched_get_n_backends(sched.get()),
+                                      ggml_backend_sched_get_n_copies(sched.get()));
+        ggml_backend_sched_set_n_stages(sched.get(), n_stages);
+    }
 
     // the injection graph of a DFlash draft gets its own scheduler, see gf_res_slot
     if (dflash_draft) {
-        sched_slot0.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        sched_slot0.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
         ggml_backend_sched_set_async_inputs(sched_slot0.get(), true);
     } else {
         sched_slot0.reset();
     }
 
     // decode batches (verification/single-token) get their own scheduler on regular contexts
+    // single copy: decode is a single ubatch, so input copies only rotate the CUDA graph and
+    // lower graph cache reuse. pipeline overlap is a prefill-only concern
     if (!dflash_draft) {
-        sched_dec.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        sched_dec.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
         ggml_backend_sched_set_async_inputs(sched_dec.get(), true);
     } else {
         sched_dec.reset();
@@ -804,27 +835,12 @@ void llama_context::sched_reserve() {
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
+        // the fit has already accounted for the pipeline compute buffers; an allocation failure here
+        // is a real out-of-memory, not a reason to silently drop the pipeline
         auto * gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
-            if (cparams.pipeline_parallel) {
-                LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
-                cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                ggml_backend_sched_set_async_inputs(sched.get(), true);
-                if (sched_slot0) {
-                    sched_slot0.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                    ggml_backend_sched_set_async_inputs(sched_slot0.get(), true);
-                }
-                if (sched_dec) {
-                    sched_dec.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                    ggml_backend_sched_set_async_inputs(sched_dec.get(), true);
-                }
-                gf = graph_reserve(n_tokens_pp, n_seqs, n_outputs_pp, mctx.get());
-            }
-            if (!gf) {
-                throw std::runtime_error("failed to allocate compute pp buffers");
-            }
+            throw std::runtime_error("failed to allocate compute pp buffers");
         }
 
         n_splits_pp        = ggml_backend_sched_get_n_splits(sched.get());
@@ -953,10 +969,22 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
+void llama_context::pipeline_drain() {
+    if (!sched) {
+        return;
+    }
+
+    ggml_backend_sched_pipeline_advance(sched.get());
+}
+
 void llama_context::synchronize() {
     if (!sched) {
         return;
     }
+
+    // drain any in-flight prefill pipeline: callers synchronize to read outputs or to touch shared
+    // state, so the pipeline must not keep writing while they do
+    pipeline_drain();
 
     // the schedulers are built on the same set of backends, synchronizing one of them is enough;
     // the extra schedulers are only synchronized to reset their copy index for pipeline parallelism
@@ -1049,7 +1077,9 @@ bool llama_context::memory_update(bool optimize) {
         switch (mctx->get_status()) {
             case LLAMA_MEMORY_STATUS_SUCCESS:
                 {
-                    // noop
+                    // an update will be applied: drain the prefill pipeline so no in-flight ubatch
+                    // is still writing the cache while the module shifts or copies cells
+                    ggml_backend_sched_pipeline_advance(sched.get());
                 } break;
             case LLAMA_MEMORY_STATUS_NO_UPDATE:
                 {
@@ -1898,7 +1928,8 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, size_t token_offset) {
+llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret, size_t token_offset,
+        bool pipeline, int64_t ubatch_id) {
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1907,6 +1938,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const int slot = gf_res_slot(ubatch);
 
+    // the ubatch reuses the graph result; in pipeline mode the graph is rebuilt and re-split for
+    // every ubatch on its own input copy, and the caller extracts the outputs before the next
+    // ubatch is submitted (the async copies are ordered on the device streams)
     auto * res = get_gf_res_prev(slot);
     auto * gf  = res->get_gf();
 
@@ -1916,7 +1950,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(sched_cur, res, ubatch, mctx, gtype, token_offset);
 
-    if (!graph_reuse_disable && gf_res_prev_active[slot] == res && res->can_reuse(gparams)) {
+    if (!pipeline && !graph_reuse_disable && gf_res_prev_active[slot] == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         n_reused++;
@@ -1958,18 +1992,31 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched_cur, gf)) {
+        if (pipeline) {
+            // split and allocate this ubatch on the next pipeline stage, without waiting for the
+            // in-flight ubatches. the graph result must not be reused while a ubatch is in flight,
+            // so the caller rebuilds the graph for every pipeline ubatch
+            if (!ggml_backend_sched_pipeline_begin(sched_cur, gf)) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+        } else if (!ggml_backend_sched_alloc_graph(sched_cur, gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
 
-        gf_res_prev_active[slot] = res;
+        if (!pipeline) {
+            gf_res_prev_active[slot] = res;
+        }
     }
 
-    // user inputs are copied to the backends asynchronously, so the previous compute may still be
-    // reading them. synchronize before overwriting the input tensors (see ggml_backend_sched_set_async_inputs)
-    ggml_backend_sched_synchronize(sched_cur);
+    if (!pipeline) {
+        // user inputs are copied to the backends asynchronously, so the previous compute may still be
+        // reading them. synchronize before overwriting the input tensors (see ggml_backend_sched_set_async_inputs)
+        ggml_backend_sched_synchronize(sched_cur);
+    }
 
     // set the input data for the input tensors
     {
@@ -2000,7 +2047,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_event_record(embd_link->ev_copy_done, backends[0].get());
     }
 
-    const auto status = graph_compute_impl(sched_cur, res->get_gf(), ubatch.n_tokens > 1);
+    ggml_status status;
+    if (pipeline) {
+        // enqueue all splits of this ubatch without waiting. the caller extracts the outputs right
+        // after (ordered on the device streams) and the pipeline stays in flight across decode()
+        // calls until a caller drains it. threadpools are set here since graph_compute_impl is
+        // bypassed on this path
+        graph_set_threads(ubatch.n_tokens > 1);
+        status = ggml_backend_sched_pipeline_submit(sched_cur, ubatch_id);
+    } else {
+        status = graph_compute_impl(sched_cur, res->get_gf(), ubatch.n_tokens > 1);
+    }
 
     if (writes_sink) {
         // the draft can copy the sink once this graph completed on the target stream
@@ -2025,6 +2082,9 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     }
 
     const auto & hparams = model.hparams;
+
+    // drain any in-flight prefill pipeline before the encoder graph touches the shared backends
+    ggml_backend_sched_pipeline_advance(sched.get());
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != hparams.n_embd_inp_enc()) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the encoder input %u\n",
@@ -2435,78 +2495,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
-    do {
-        const auto & ubatch = mctx->get_ubatch();
+    // prefill pipeline: when the prefill scheduler has more than one stage, the ubatches of one
+    // prompt are submitted without synchronizing between them. each ubatch has its own graph result
+    // and input copy, and its outputs are copied to distinct host regions right after submission, so
+    // the async reads are ordered on the device stream before the next ubatch's compute. the
+    // extraction is shared with the non-pipeline path via this lambda
+    const bool use_pipeline = ggml_backend_sched_get_n_stages(sched.get()) > 1;
 
-        // count the outputs in this ubatch
-        {
-            int32_t n_outputs_new = 0;
-
-            if (n_outputs_all == n_tokens_all) {
-                n_outputs_new = ubatch.n_tokens;
-            } else {
-                for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
-                    n_outputs_new += (int32_t) (ubatch.output[i] != 0);
-                }
-            }
-
-            // needs to happen before the graph is built
-            n_outputs = n_outputs_new;
-        }
-
-        ggml_status status;
-
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status, (size_t) n_tokens_prev);
-
-        if (!res) {
-            // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
-            llama_pos pos_min[LLAMA_MAX_SEQ];
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                pos_min[s] = std::numeric_limits<llama_pos>::max();
-            }
-
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                const auto & seq_id = ubatch.seq_id[i][0];
-
-                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
-            }
-
-            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
-                if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
-                    continue;
-                }
-
-                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
-
-                memory->seq_rm(s, pos_min[s], -1);
-            }
-
-            switch (status) {
-                case GGML_STATUS_ABORTED:      return  2;
-                case GGML_STATUS_ALLOC_FAILED: return -2;
-                case GGML_STATUS_FAILED:       return -3;
-                case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
-            }
-        }
-
-        // DFlash2: remember which (seq_id, pos) produced each sink column of this ubatch. The sink
-        // is written in ubatch order, and sink_cols.size() is the column of the next token, which
-        // matches the token_offset passed to process_ubatch
-        if (t_layer_inp_sink != nullptr && cparams.n_seq_max > 1) {
-            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                const llama_seq_id seq_id = ubatch.seq_id[i][0];
-                sink_cols.emplace_back(seq_id, ubatch.pos[i]);
-                sink_cols_by_seq[seq_id].emplace_back(ubatch.pos[i], (int32_t) sink_cols.size() - 1);
-            }
-        }
-
-        // plot the computation graph in dot format (for debugging purposes)
-        //if (n_past%100 == 0) {
-        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
-        //}
-
-        auto * sched_res = sched_for_slot(gf_res_slot(ubatch));
-
+    auto extract_outputs = [&](const llm_graph_result * res, ggml_backend_sched_t sched_res,
+            const llama_ubatch & ubatch, int32_t n_outputs, int64_t n_outputs_prev, int64_t n_tokens_prev) {
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -2656,10 +2653,110 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched_res, &sampling.probs_count);
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched_res, &sampling.candidates_count);
         }
+    };
+
+    do {
+        const auto & ubatch = mctx->get_ubatch();
+
+        // count the outputs in this ubatch
+        {
+            int32_t n_outputs_new = 0;
+
+            if (n_outputs_all == n_tokens_all) {
+                n_outputs_new = ubatch.n_tokens;
+            } else {
+                for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+                    n_outputs_new += (int32_t) (ubatch.output[i] != 0);
+                }
+            }
+
+            // needs to happen before the graph is built
+            n_outputs = n_outputs_new;
+        }
+
+        ggml_status status;
+
+        // only prefill-scale ubatches go through the pipeline: decode-sized ubatches keep the
+        // original graph-reuse path, which is faster for them (no per-ubatch graph rebuild)
+        const bool ubatch_pipeline = use_pipeline &&
+            ubatch.n_tokens > n_dec_max &&
+            sched_for_slot(gf_res_slot(ubatch)) == sched.get();
+
+        // a ubatch on another scheduler (e.g. the decode scheduler) must not read memory that an
+        // in-flight prefill ubatch may still be writing: drain the prefill pipeline first
+        if (use_pipeline && !ubatch_pipeline) {
+            ggml_backend_sched_pipeline_advance(sched.get());
+        }
+
+        const int64_t ubatch_id = pipeline_ubatch_id++;
+        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status, (size_t) n_tokens_prev,
+                ubatch_pipeline, ubatch_id);
+
+        if (!res) {
+            // drain any in-flight prefill ubatches before touching the memory module
+            if (use_pipeline) {
+                ggml_backend_sched_pipeline_advance(sched.get());
+            }
+
+            // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
+            llama_pos pos_min[LLAMA_MAX_SEQ];
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                pos_min[s] = std::numeric_limits<llama_pos>::max();
+            }
+
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                const auto & seq_id = ubatch.seq_id[i][0];
+
+                pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
+            }
+
+            for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
+                if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
+                    continue;
+                }
+
+                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
+
+                memory->seq_rm(s, pos_min[s], -1);
+            }
+
+            switch (status) {
+                case GGML_STATUS_ABORTED:      return  2;
+                case GGML_STATUS_ALLOC_FAILED: return -2;
+                case GGML_STATUS_FAILED:       return -3;
+                case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
+            }
+        }
+
+        // DFlash2: remember which (seq_id, pos) produced each sink column of this ubatch. The sink
+        // is written in ubatch order, and sink_cols.size() is the column of the next token, which
+        // matches the token_offset passed to process_ubatch
+        if (t_layer_inp_sink != nullptr && cparams.n_seq_max > 1) {
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                const llama_seq_id seq_id = ubatch.seq_id[i][0];
+                sink_cols.emplace_back(seq_id, ubatch.pos[i]);
+                sink_cols_by_seq[seq_id].emplace_back(ubatch.pos[i], (int32_t) sink_cols.size() - 1);
+            }
+        }
+
+        // plot the computation graph in dot format (for debugging purposes)
+        //if (n_past%100 == 0) {
+        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
+        //}
+
+        auto * sched_res = sched_for_slot(gf_res_slot(ubatch));
+
+        // the async copies into the host output buffers are ordered on the device streams after this
+        // ubatch's compute, so they can be enqueued immediately while later ubatches keep running
+        extract_outputs(res, sched_res, ubatch, n_outputs, n_outputs_prev, n_tokens_prev);
 
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    // the prefill pipeline is intentionally left in flight: the server chunks one prompt across
+    // multiple decode() calls and the next call keeps overlapping. it is drained only when a
+    // caller needs the results or mutates shared state (synchronize, memory ops, state, encode)
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -3305,10 +3402,7 @@ llm_graph_params llama_context::graph_params(
     };
 }
 
-ggml_status llama_context::graph_compute_impl(
-     ggml_backend_sched_t sched,
-            ggml_cgraph * gf,
-                   bool   batched) {
+void llama_context::graph_set_threads(bool batched) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3324,6 +3418,13 @@ ggml_status llama_context::graph_compute_impl(
     for (const auto & set_n_threads_fn : set_n_threads_fns) {
         set_n_threads_fn.second(set_n_threads_fn.first, n_threads);
     }
+}
+
+ggml_status llama_context::graph_compute_impl(
+     ggml_backend_sched_t sched,
+            ggml_cgraph * gf,
+                   bool   batched) {
+    graph_set_threads(batched);
 
     auto status = ggml_backend_sched_graph_compute_async(sched, gf);
     if (status != GGML_STATUS_SUCCESS) {
@@ -4106,6 +4207,9 @@ size_t llama_context::state_seq_save_file(llama_seq_id seq_id, const char * file
 size_t llama_context::state_write_data(llama_io_write_i & io) {
     LLAMA_LOG_DEBUG("%s: writing state\n", __func__);
 
+    // drain the prefill pipeline before reading the memory state off the devices
+    ggml_backend_sched_pipeline_advance(sched.get());
+
     // write model info
     {
         LLAMA_LOG_DEBUG("%s: - writing model info\n", __func__);
@@ -4125,6 +4229,9 @@ size_t llama_context::state_write_data(llama_io_write_i & io) {
 
 size_t llama_context::state_read_data(llama_io_read_i & io) {
     LLAMA_LOG_DEBUG("%s: reading state\n", __func__);
+
+    // drain the prefill pipeline before overwriting the memory state on the devices
+    ggml_backend_sched_pipeline_advance(sched.get());
 
     // read model info
     {
@@ -4150,6 +4257,10 @@ size_t llama_context::state_read_data(llama_io_read_i & io) {
 }
 
 size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // drain the prefill pipeline before reading the sequence state off the devices. this covers the
+    // mid-prefill GDN checkpoints of the server, which call llama_state_seq_get_data_ext
+    ggml_backend_sched_pipeline_advance(sched.get());
+
     if (memory) {
         memory->state_write(io, seq_id, flags);
     }
@@ -4158,6 +4269,9 @@ size_t llama_context::state_seq_write_data(llama_io_write_i & io, llama_seq_id s
 }
 
 size_t llama_context::state_seq_read_data(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // drain the prefill pipeline before overwriting the sequence state on the devices
+    ggml_backend_sched_pipeline_advance(sched.get());
+
     if (memory) {
         memory->state_read(io, seq_id, flags);
     }
@@ -4921,10 +5035,31 @@ int32_t llama_set_adapter_cvec(
 // memory
 //
 
+// drain the prefill pipeline of the owning context before the memory touches device data, so no
+// in-flight ubatch is still reading or writing it. the memory API has no context argument, hence
+// the owner
+static void llama_memory_drain(llama_memory_t mem) {
+    if (llama_context * ctx = mem->get_owner()) {
+        ctx->pipeline_drain();
+    }
+}
+
+// the sequence operations of most memory modules only edit the cell metadata on the host: the
+// in-flight ubatches keep writing the cells they were given, later ubatches are ordered after them
+// on the device streams, and position shifts are applied by memory_update on the stream. only a
+// module whose sequence operations write device data synchronously needs the pipeline drained
+static void llama_memory_drain_seq_op(llama_memory_t mem) {
+    if (mem->seq_ops_write_device()) {
+        llama_memory_drain(mem);
+    }
+}
+
 void llama_memory_clear(llama_memory_t mem, bool data) {
     if (!mem) {
         return;
     }
+
+    llama_memory_drain(mem);
 
     mem->clear(data);
 }
@@ -4937,6 +5072,8 @@ bool llama_memory_seq_rm(
     if (!mem) {
         return true;
     }
+
+    llama_memory_drain_seq_op(mem);
 
     return mem->seq_rm(seq_id, p0, p1);
 }
@@ -4951,6 +5088,8 @@ void llama_memory_seq_cp(
         return;
     }
 
+    llama_memory_drain_seq_op(mem);
+
     mem->seq_cp(seq_id_src, seq_id_dst, p0, p1);
 }
 
@@ -4960,6 +5099,8 @@ void llama_memory_seq_keep(
     if (!mem) {
         return;
     }
+
+    llama_memory_drain_seq_op(mem);
 
     mem->seq_keep(seq_id);
 }
@@ -4974,6 +5115,8 @@ void llama_memory_seq_add(
         return;
     }
 
+    llama_memory_drain_seq_op(mem);
+
     mem->seq_add(seq_id, p0, p1, delta);
 }
 
@@ -4986,6 +5129,8 @@ void llama_memory_seq_div(
     if (!mem) {
         return;
     }
+
+    llama_memory_drain_seq_op(mem);
 
     mem->seq_div(seq_id, p0, p1, d);
 }

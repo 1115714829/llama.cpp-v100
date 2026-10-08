@@ -785,6 +785,9 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // true if any tensor override sends a weight to a non-GPU (host) buffer
+    bool has_host_tensor_overrides() const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;

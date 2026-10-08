@@ -87,6 +87,9 @@ private:
 
 class llama_kv_cache_dsv4 : public llama_memory_i {
 public:
+    // seq_rm / seq_cp clear the compressed state streams on the device synchronously
+    bool seq_ops_write_device() const override { return true; }
+
     llama_kv_cache_dsv4(
             const llama_model & model,
                     ggml_type   type_k,

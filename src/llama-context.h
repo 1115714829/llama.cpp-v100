@@ -74,6 +74,10 @@ struct llama_context {
 
     void synchronize();
 
+    // wait for all in-flight prefill pipeline ubatches without touching the scheduler copy index
+    // or the perf counters. callers use it before mutating state the pipeline may still be writing
+    void pipeline_drain();
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -169,12 +173,16 @@ struct llama_context {
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
     // returns nullptr only if ret != GGML_STATUS_SUCCESS
+    // pipeline: submit the ubatch to the prefill pipeline instead of computing it synchronously.
+    // ubatch_id orders the submission and is used later to wait for this ubatch's outputs
     llm_graph_result * process_ubatch(
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
                        ggml_status & ret,
-                         size_t     token_offset = 0);
+                         size_t     token_offset = 0,
+                           bool     pipeline = false,
+                        int64_t     ubatch_id = 0);
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
@@ -316,6 +324,9 @@ private:
 
     ggml_status graph_compute_impl(ggml_backend_sched_t sched, ggml_cgraph * gf, bool batched);
 
+    // set the threadpool and thread counts for the given batch type
+    void graph_set_threads(bool batched);
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -440,6 +451,10 @@ private:
 
     // max tokens of a batch that sched_dec accepts and is reserved for, set once in the constructor
     uint32_t n_dec_max = 0;
+
+    // monotonic id of the prefill ubatches submitted to the pipeline. it spans decode() calls so
+    // the pipeline can stay in flight across the n_batch-sized chunks of one prompt
+    int64_t pipeline_ubatch_id = 0;
 
     bool sched_need_reserve = true;
 

@@ -1380,6 +1380,7 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+    bool has_host_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
 };
@@ -1434,6 +1435,73 @@ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model)
     }
 }
 
+// buffer types whose weights sit in device-readable host memory (the CUDA mapped type and the
+// CUDA expert type), looked up through the backend reg like the fit code does. the mapped type
+// belongs to a GPU device but keeps the weights on the host, so a device-type check alone
+// cannot tell it apart.
+static bool buft_is_device_mapped(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return false;
+    }
+    typedef bool (*ggml_backend_buft_is_mapped_t)(ggml_backend_buffer_type_t);
+    auto is_mapped = (ggml_backend_buft_is_mapped_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_mapped");
+    return is_mapped != nullptr && is_mapped(buft);
+}
+
+static bool buft_is_device_expert(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return false;
+    }
+    typedef bool (*ggml_backend_buft_is_expert_t)(ggml_backend_buffer_type_t);
+    auto is_expert = (ggml_backend_buft_is_expert_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_expert");
+    return is_expert != nullptr && is_expert(buft);
+}
+
+// true if an override keeps the weight on the GPU for the pipeline: a GPU buffer type that is
+// neither a host buffer nor device-readable host memory. the expert store buffer type is
+// allowed - it belongs to the GPU of its layer, and its host complement lives inside the
+// expert buffer, not in a separate override. a null buft is not a host placement: the loader
+// ignores it and selects the default buffer. a buffer type with no device is a host buffer
+// type (ggml_backend_cpu_buffer_type has device == NULL), so it counts as non-GPU.
+static bool tensor_override_is_on_gpu(const llama_model_tensor_buft_override & over) {
+    if (over.buft == nullptr) {
+        return false;
+    }
+    if (ggml_backend_buft_is_host(over.buft)) {
+        return false;
+    }
+    if (buft_is_device_expert(over.buft)) {
+        return true;
+    }
+    if (buft_is_device_mapped(over.buft)) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(over.buft);
+    if (dev == nullptr) {
+        return false;
+    }
+    switch (ggml_backend_dev_type(dev)) {
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:
+        case GGML_BACKEND_DEVICE_TYPE_META:
+            return true;
+        default:
+            return false;
+    }
+}
+
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
@@ -1442,6 +1510,18 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         this->params.tensor_split = pimpl->tensor_split_owned.data();
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+    pimpl->has_host_tensor_overrides = false;
+    if (params.tensor_buft_overrides != nullptr) {
+        for (const auto * over = params.tensor_buft_overrides; over->pattern != nullptr; ++over) {
+            if (over->buft == nullptr) {
+                continue;
+            }
+            if (!tensor_override_is_on_gpu(*over)) {
+                pimpl->has_host_tensor_overrides = true;
+                break;
+            }
+        }
+    }
 }
 
 llama_model::~llama_model() {
@@ -2498,6 +2578,10 @@ ggml_backend_buffer_type_t llama_model::select_buft(int il) const {
 
 bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
+}
+
+bool llama_model::has_host_tensor_overrides() const {
+    return pimpl->has_host_tensor_overrides;
 }
 
 const ggml_tensor * llama_model::get_tensor(const char * name) const {

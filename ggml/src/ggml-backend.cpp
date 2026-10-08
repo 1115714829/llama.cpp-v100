@@ -10,6 +10,7 @@
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
+#include "ggml-backend-sched.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
@@ -935,95 +936,8 @@ static bool ggml_is_view_op(enum ggml_op op) {
 }
 
 // scheduler
-
-#ifndef GGML_SCHED_MAX_BACKENDS
-#define GGML_SCHED_MAX_BACKENDS 16
-#endif
-
-#ifndef GGML_SCHED_MAX_SPLIT_INPUTS
-#define GGML_SCHED_MAX_SPLIT_INPUTS 30
-#endif
-
-#ifndef GGML_SCHED_MAX_COPIES
-#define GGML_SCHED_MAX_COPIES 4
-#endif
-
-struct ggml_backend_sched_split {
-    int backend_id;
-    int i_start;
-    int i_end;
-    struct ggml_tensor ** inputs;
-    int n_inputs;
-    int inputs_capacity;
-    // graph view of this split
-    struct ggml_cgraph graph;
-};
-
-struct ggml_backend_sched {
-    bool is_reset; // true if the scheduler has been reset since the last graph split
-    bool is_alloc;
-
-    int n_backends;
-
-    ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
-    ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
-    ggml_gallocr_t galloc;
-
-    // hash map of the nodes in the graph
-    struct ggml_hash_set  hash_set;
-    int                 * hv_tensor_backend_ids; // [hash_set.size]
-    struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
-
-    int * node_backend_ids; // [graph_size]
-    int * leaf_backend_ids; // [graph_size]
-
-    int * prev_node_backend_ids; // [graph_size]
-    int * prev_leaf_backend_ids; // [graph_size]
-
-    // copy of the graph with modified inputs
-    struct ggml_cgraph graph;
-
-    // graph splits
-    struct ggml_backend_sched_split * splits;
-    int n_splits;
-    int splits_capacity;
-
-    // pipeline parallelism support
-    int n_copies;
-    int cur_copy;
-    int next_copy;
-    ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
-    struct ggml_tensor ** graph_inputs;
-    int n_graph_inputs;
-    int graph_inputs_capacity;
-
-    struct ggml_context * ctx;
-
-    ggml_backend_sched_eval_callback callback_eval;
-    void * callback_eval_user_data;
-
-    char * context_buffer;
-    size_t context_buffer_size;
-
-    bool op_offload;
-
-    // if true, user inputs are copied to the split backends asynchronously
-    // in that case, the caller must synchronize the scheduler before overwriting the inputs
-    bool async_inputs;
-
-    int debug;
-
-    // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
-    // ref: https://github.com/ggml-org/llama.cpp/pull/17617
-    int debug_realloc;
-    int debug_graph_size;
-    int debug_prev_graph_size;
-};
-
-#define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
-#define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
-#define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
-#define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+// (struct ggml_backend_sched and its split/stage types live in ggml-backend-sched.h,
+//  shared with ggml-backend-pipeline.cpp)
 
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
     int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
@@ -1839,7 +1753,7 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
-static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
+enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
@@ -1871,7 +1785,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
-                if (sched->async_inputs && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer)) {
+                // pipeline stages share the host input tensors, so their copies must be complete before
+                // the caller overwrites them for the next ubatch. copy synchronously instead of queueing
+                // the copy on the compute stream, otherwise the host waits on the whole pipeline depth
+                if (sched->async_inputs && sched->n_stages == 1 && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer)) {
                     // the caller synchronizes the scheduler before writing the input data again,
                     // so the copy can be queued on the split backend without waiting for it to finish
                     ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
@@ -2073,6 +1990,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
+    // no pipeline overlap by default; multi-stage prefill opts in via ggml_backend_sched_set_n_stages
+    sched->n_stages = 1;
+    sched->next_stage = 0;
+    sched->oldest_stage = 0;
+    sched->pipeline_stage = -1;
+    sched->pipeline_last_ubatch_id = -1;
+
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
     sched->hash_set    = ggml_hash_set_new(graph_size);
@@ -2263,6 +2187,11 @@ int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_copies;
+}
+
+int ggml_backend_sched_get_n_stages(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->n_stages;
 }
 
 int ggml_backend_sched_get_n_backends(ggml_backend_sched_t sched) {

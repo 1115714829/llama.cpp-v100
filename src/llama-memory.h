@@ -82,6 +82,12 @@ struct llama_memory_i {
 
     virtual ~llama_memory_i() = default;
 
+    // the context that owns this memory module. the public memory API (llama_memory_seq_rm etc.)
+    // does not have the context at hand, so it uses this to drain the prefill pipeline before the
+    // memory is mutated
+    void set_owner(llama_context * lctx) { owner = lctx; }
+    llama_context * get_owner() const { return owner; }
+
     // split the input batch into a set of ubatches and verify that they can fit into the cache
     // return a context object containing the ubatches and memory state required to process them
     // check the llama_memory_context_i::get_status() for the result
@@ -126,8 +132,15 @@ struct llama_memory_i {
     // state write/read
     //
 
+    // true when seq_rm / seq_cp / seq_keep / seq_add / seq_div write device data synchronously
+    // (most modules only edit the host-side cell metadata); the prefill pipeline is drained first
+    virtual bool seq_ops_write_device() const { return false; }
+
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+private:
+    llama_context * owner = nullptr;
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
