@@ -61,6 +61,11 @@ struct llama_mmap {
     // drop the page cache of [first, last) of the file (Linux only, no-op elsewhere)
     void drop_page_cache(size_t first, size_t last);
 
+    // write back the dirty pages of [first, last) of the file, aligned outward to pages.
+    // a range that is pinned in place (cudaHostRegister) must not have pages still waiting
+    // for writeback, or the file system can wedge; throws when the sync fails
+    void flush_range(size_t first, size_t last);
+
     static const bool SUPPORTED;
 
 private:

@@ -615,6 +615,20 @@ struct llama_mmap::impl {
 #endif
     }
 
+    // write back the dirty pages of [first, last); the mapping is read-only, but a range
+    // written through another mapping of the same file is flushed as well
+    void flush_range(size_t first, size_t last) {
+        const size_t page_size = sysconf(_SC_PAGESIZE);
+        first = first & ~(page_size - 1);
+        last  = std::min((last + page_size - 1) & ~(page_size - 1), size);
+        if (first >= last) {
+            return;
+        }
+        if (msync((char *) addr + first, last - first, MS_SYNC) != 0) {
+            throw std::runtime_error(format("msync failed: %s", strerror(errno)));
+        }
+    }
+
     ~impl() {
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
@@ -689,6 +703,16 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    void flush_range(size_t first, size_t last) {
+        if (first >= last) {
+            return;
+        }
+        if (!FlushViewOfFile((char *) addr + first, last - first)) {
+            throw std::runtime_error(format("FlushViewOfFile failed: %s",
+                    llama_format_win_err(GetLastError()).c_str()));
+        }
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -724,6 +748,11 @@ struct llama_mmap::impl {
         GGML_UNUSED(first);
         GGML_UNUSED(last);
     }
+
+    void flush_range(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+    }
 #endif
 
     void * addr;
@@ -738,6 +767,8 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::drop_page_cache(size_t first, size_t last) { pimpl->drop_page_cache(first, last); }
+
+void llama_mmap::flush_range(size_t first, size_t last) { pimpl->flush_range(first, last); }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 

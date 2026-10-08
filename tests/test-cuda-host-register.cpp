@@ -106,6 +106,13 @@ int main() {
     for (size_t i = 0; i < nbytes; ++i) {
         file[i] = (uint8_t) ((i * 7 + 3) & 0xff);
     }
+    // the loading path flushes the mapped range before pinning it (llama_mmap::flush_range):
+    // pinning a page that still has to be written back can wedge the file system writeback,
+    // so the test must not register dirty pages either
+    if (msync(file, nbytes, MS_SYNC) != 0) {
+        fprintf(stderr, "FAIL: msync before registering failed\n");
+        return 1;
+    }
     if (mprotect(file, nbytes, PROT_READ) != 0) {
         fprintf(stderr, "FAIL: mprotect failed\n");
         return 1;
