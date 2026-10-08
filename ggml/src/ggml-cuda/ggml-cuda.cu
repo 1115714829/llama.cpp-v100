@@ -208,54 +208,248 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
 // start inside a range and need splitting. If a writable registration is ever added,
 // the D2H direction must be re-evaluated.
 //
+// cudaHostRegister works on whole pages and refuses a range that is already registered
+// (cudaErrorHostMemoryAlreadyRegistered). The page-aligned ranges of two nearby weights
+// of the same file can share an edge page, so overlapping or adjacent ranges are kept as
+// one segment, registered once. Every registered mapped buffer holds a reference to its
+// segment and the segment is unregistered when the last reference is released.
+//
 // A cudaMemcpy with a host pointer is classified by its starting address: when the range
 // starts inside a registered allocation but ends outside it, the runtime fails the copy
 // with "invalid argument". A registered mapped buffer covers whole pages, so its last
 // page can hold the start of the next tensor in the mmap-ed file; loading that tensor
 // starts inside the registered range and ends outside it. H2D copies that touch a host
 // range are therefore split at the end of every registered range they enter.
-struct ggml_cuda_registered_host_range {
-    uintptr_t begin;
-    uintptr_t end;
-};
 
-static std::mutex ggml_cuda_registered_host_ranges_mutex;
-static std::vector<ggml_cuda_registered_host_range> ggml_cuda_registered_host_ranges; // protected by the mutex
+struct ggml_backend_cuda_mapped_buffer_context;
 
-static void ggml_cuda_registered_host_range_add(void * ptr, size_t size) {
-    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_ranges_mutex);
-    ggml_cuda_registered_host_ranges.push_back({(uintptr_t) ptr, (uintptr_t) ptr + size});
+// page size of the host, for aligning a cudaHostRegister range
+static size_t ggml_cuda_host_page_size() {
+#if defined(__linux__)
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page > 0) {
+        return (size_t) page;
+    }
+#endif
+    return 4096;
 }
 
-static void ggml_cuda_registered_host_range_remove(void * ptr) {
-    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_ranges_mutex);
-    for (auto it = ggml_cuda_registered_host_ranges.begin(); it != ggml_cuda_registered_host_ranges.end(); ++it) {
-        if (it->begin == (uintptr_t) ptr) {
-            ggml_cuda_registered_host_ranges.erase(it);
+struct ggml_cuda_registered_host_segment {
+    uintptr_t begin;
+    uintptr_t end;
+    void * dev_base = nullptr; // device alias of begin
+    size_t refs = 0;
+    // registered mapped buffers referencing this segment; their device addresses are
+    // recomputed from dev_base, which a merged re-registration can move
+    std::vector<ggml_backend_cuda_mapped_buffer_context *> buffers;
+};
+
+static std::mutex ggml_cuda_registered_host_segments_mutex;
+static std::vector<std::unique_ptr<ggml_cuda_registered_host_segment>> ggml_cuda_registered_host_segments; // protected by the mutex
+// set when a device pointer derived from a segment is handed out; from then on the
+// segments must not be re-registered anymore
+static std::atomic<bool> ggml_cuda_registered_host_device_ptrs_in_use{false};
+
+// update the segment of a buffer context; defined below, where the context is complete
+static void ggml_cuda_registered_host_set_buffer_segment(ggml_backend_cuda_mapped_buffer_context * ctx, ggml_cuda_registered_host_segment * segment);
+
+// register [begin, end) (page-aligned) and return the segment covering it, holding one
+// reference on success. a range that overlaps or touches existing segments is merged with
+// them: the union is registered once, replacing the old segments
+static ggml_cuda_registered_host_segment * ggml_cuda_registered_host_segment_acquire(int device, uintptr_t begin, uintptr_t end) {
+    // On every platform this backend runs on a registered host pointer can be used as a
+    // device pointer (UVA): device aliases then do not depend on the registration and a
+    // merged re-registration never invalidates a device address. Capability check, not a
+    // fallback: a platform without it would need the loader to plan all registrations up
+    // front instead.
+    int can_use_host_ptr = 0;
+    cudaError_t err = cudaDeviceGetAttribute(&can_use_host_ptr, cudaDevAttrCanUseHostPointerForRegisteredMem, device);
+    if (err != cudaSuccess || can_use_host_ptr == 0) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: device %d cannot use host pointers for registered memory\n", __func__, device);
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_segments_mutex);
+
+    for (const auto & segment : ggml_cuda_registered_host_segments) {
+        if (segment->begin <= begin && end <= segment->end) {
+            segment->refs++;
+            return segment.get();
+        }
+    }
+
+    uintptr_t u_begin = begin;
+    uintptr_t u_end   = end;
+    size_t refs = 1;
+    // keep scanning until no further segment overlaps or touches the growing union: a
+    // segment skipped early can touch the union after another one extended it
+    std::vector<bool> merged(ggml_cuda_registered_host_segments.size(), false);
+    bool grew = true;
+    while (grew) {
+        grew = false;
+        for (size_t i = 0; i < ggml_cuda_registered_host_segments.size(); ++i) {
+            if (merged[i]) {
+                continue;
+            }
+            const ggml_cuda_registered_host_segment * segment = ggml_cuda_registered_host_segments[i].get();
+            if (u_end < segment->begin || segment->end < u_begin) {
+                continue;
+            }
+            // a segment that is already referenced may only be re-registered while no
+            // device pointer derived from a segment has been used, that is during loading
+            if (segment->refs > 0) {
+                GGML_ASSERT(!ggml_cuda_registered_host_device_ptrs_in_use);
+            }
+            u_begin = std::min(u_begin, segment->begin);
+            u_end   = std::max(u_end,   segment->end);
+            refs   += segment->refs;
+            merged[i] = true;
+            grew = true;
+        }
+    }
+    std::vector<size_t> merged_idx;
+    for (size_t i = 0; i < merged.size(); ++i) {
+        if (merged[i]) {
+            merged_idx.push_back(i);
+        }
+    }
+
+    // restore the merged segments when the union cannot be registered
+    auto restore_merged = [&]() {
+        for (size_t i : merged_idx) {
+            const ggml_cuda_registered_host_segment * segment = ggml_cuda_registered_host_segments[i].get();
+            cudaError_t rerr = cudaHostRegister((void *) segment->begin, segment->end - segment->begin,
+                                                cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+            if (rerr != cudaSuccess) {
+                (void) cudaGetLastError();
+                GGML_LOG_ERROR("%s: restoring a host range after a failed merge failed: %s\n",
+                               __func__, cudaGetErrorString(rerr));
+            }
+        }
+    };
+
+    // the runtime refuses a range that is already registered, so unregister the merged
+    // segments before registering the union
+    for (size_t i : merged_idx) {
+        err = cudaHostUnregister((void *) ggml_cuda_registered_host_segments[i]->begin);
+        if (err != cudaSuccess) {
+            (void) cudaGetLastError();
+            GGML_LOG_ERROR("%s: unregistering a host range merged into [%p, %p) failed: %s\n",
+                           __func__, (void *) u_begin, (void *) u_end, cudaGetErrorString(err));
+            restore_merged();
+            return nullptr;
+        }
+    }
+
+    err = cudaHostRegister((void *) u_begin, u_end - u_begin, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: registering %.2f MiB of host memory for device %d failed: %s\n",
+                       __func__, (u_end - u_begin) / 1024.0 / 1024.0, device, cudaGetErrorString(err));
+        restore_merged();
+        return nullptr;
+    }
+
+    void * dev_base = nullptr;
+    err = cudaHostGetDevicePointer(&dev_base, (void *) u_begin, 0);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        cudaHostUnregister((void *) u_begin);
+        GGML_LOG_ERROR("%s: device pointer for registered host memory on device %d: %s\n",
+                       __func__, device, cudaGetErrorString(err));
+        restore_merged();
+        return nullptr;
+    }
+    GGML_ASSERT(dev_base == (void *) u_begin);
+
+    ggml_cuda_registered_host_segment * segment = new ggml_cuda_registered_host_segment{ u_begin, u_end, dev_base, refs, {} };
+    for (size_t i : merged_idx) {
+        for (ggml_backend_cuda_mapped_buffer_context * ctx : ggml_cuda_registered_host_segments[i]->buffers) {
+            ggml_cuda_registered_host_set_buffer_segment(ctx, segment);
+            segment->buffers.push_back(ctx);
+        }
+    }
+    ggml_cuda_registered_host_segments.emplace_back(segment);
+    // erase the merged segments, from the back so the indexes stay valid
+    for (size_t i = merged_idx.size(); i-- > 0; ) {
+        ggml_cuda_registered_host_segments.erase(ggml_cuda_registered_host_segments.begin() + merged_idx[i]);
+    }
+    return segment;
+}
+
+// release one reference; the last reference unregisters the segment
+static void ggml_cuda_registered_host_segment_release(ggml_cuda_registered_host_segment * segment, ggml_backend_cuda_mapped_buffer_context * ctx) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_segments_mutex);
+
+    if (ctx != nullptr) {
+        for (auto it = segment->buffers.begin(); it != segment->buffers.end(); ++it) {
+            if (*it == ctx) {
+                segment->buffers.erase(it);
+                break;
+            }
+        }
+        GGML_ASSERT(segment->buffers.size() < segment->refs);
+    }
+    GGML_ASSERT(segment->refs > 0);
+    if (--segment->refs > 0) {
+        return;
+    }
+    GGML_ASSERT(segment->buffers.empty());
+
+    cudaError_t err = cudaHostUnregister((void *) segment->begin);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_WARN("%s: unregistering host range [%p, %p) failed: %s\n",
+                      __func__, (void *) segment->begin, (void *) segment->end, cudaGetErrorString(err));
+    }
+    for (auto it = ggml_cuda_registered_host_segments.begin(); it != ggml_cuda_registered_host_segments.end(); ++it) {
+        if (it->get() == segment) {
+            ggml_cuda_registered_host_segments.erase(it);
             return;
         }
     }
+    GGML_ABORT("%s: releasing an unknown host segment\n", __func__);
 }
 
-// end of the registered range that contains ptr, or 0 when ptr is in no range
-static uintptr_t ggml_cuda_registered_host_range_end(const void * ptr) {
-    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_ranges_mutex);
+// the segment a registered host range lives in, or nullptr; used by the plain
+// register/unregister pair, which has no buffer context to keep the reference
+static ggml_cuda_registered_host_segment * ggml_cuda_registered_host_segment_find(const void * ptr) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_segments_mutex);
     const uintptr_t addr = (uintptr_t) ptr;
-    for (const ggml_cuda_registered_host_range & range : ggml_cuda_registered_host_ranges) {
-        if (addr >= range.begin && addr < range.end) {
-            return range.end;
+    for (auto & segment : ggml_cuda_registered_host_segments) {
+        if (segment->begin <= addr && addr < segment->end) {
+            return segment.get();
+        }
+    }
+    return nullptr;
+}
+
+// number of registered segments; diagnostics for the unit test
+static size_t ggml_cuda_registered_host_segment_count() {
+    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_segments_mutex);
+    return ggml_cuda_registered_host_segments.size();
+}
+
+// end of the registered segment that contains ptr, or 0 when ptr is in no segment
+static uintptr_t ggml_cuda_registered_host_segment_end(const void * ptr) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_segments_mutex);
+    const uintptr_t addr = (uintptr_t) ptr;
+    for (const auto & segment : ggml_cuda_registered_host_segments) {
+        if (addr >= segment->begin && addr < segment->end) {
+            return segment->end;
         }
     }
     return 0;
 }
 
-// true when [ptr, ptr+size) overlaps any registered range
-static bool ggml_cuda_registered_host_range_intersects(const void * ptr, size_t size) {
-    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_ranges_mutex);
+// true when [ptr, ptr+size) overlaps any registered segment
+static bool ggml_cuda_registered_host_segment_intersects(const void * ptr, size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_segments_mutex);
     const uintptr_t begin = (uintptr_t) ptr;
     const uintptr_t end   = begin + size;
-    for (const ggml_cuda_registered_host_range & range : ggml_cuda_registered_host_ranges) {
-        if (begin < range.end && range.begin < end) {
+    for (const auto & segment : ggml_cuda_registered_host_segments) {
+        if (begin < segment->end && segment->begin < end) {
             return true;
         }
     }
@@ -270,7 +464,7 @@ void ggml_cuda_memcpy_h2d_async(void * dst, const void * src, size_t size, cudaS
     char * dst_bytes = (char *) dst;
 
     while (size > 0) {
-        const uintptr_t range_end = ggml_cuda_registered_host_range_end(src_bytes);
+        const uintptr_t range_end = ggml_cuda_registered_host_segment_end(src_bytes);
         size_t chunk = size;
         if (range_end != 0 && (uintptr_t) src_bytes + size > range_end) {
             chunk = (size_t) (range_end - (uintptr_t) src_bytes);
@@ -288,7 +482,7 @@ static void ggml_cuda_memcpy_2d_h2d_async(char * dst, size_t dpitch, const char 
     if (height == 0 || width == 0) {
         return;
     }
-    if (!ggml_cuda_registered_host_range_intersects(src, (height - 1)*spitch + width)) {
+    if (!ggml_cuda_registered_host_segment_intersects(src, (height - 1)*spitch + width)) {
         CUDA_CHECK(cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyHostToDevice, stream));
         return;
     }
@@ -2656,9 +2850,8 @@ struct ggml_backend_cuda_mapped_buffer_context {
     void * host_ptr = nullptr; // host address of the first byte of the buffer
     void * dev_ptr  = nullptr; // device address of the first byte of the buffer
     // set when host_ptr is external memory registered in place (an mmap of a model file);
-    // then the context owns no allocation and only unregisters it on free
-    void * reg_base = nullptr; // page-aligned address passed to cudaHostRegister
-    size_t reg_size = 0;
+    // then the context owns no allocation and only releases its segment reference on free
+    ggml_cuda_registered_host_segment * segment = nullptr;
     std::string name;
 
     ggml_backend_cuda_mapped_buffer_context(int device, int numa_node, void * host_ptr, void * dev_ptr) :
@@ -2666,40 +2859,49 @@ struct ggml_backend_cuda_mapped_buffer_context {
         name(GGML_CUDA_NAME + std::to_string(device) + "_Mapped") {
     }
 
-    ggml_backend_cuda_mapped_buffer_context(int device, void * host_ptr, void * dev_ptr, void * reg_base, size_t reg_size) :
-        device(device), host_ptr(host_ptr), dev_ptr(dev_ptr), reg_base(reg_base), reg_size(reg_size),
+    ggml_backend_cuda_mapped_buffer_context(int device, void * host_ptr, ggml_cuda_registered_host_segment * segment) :
+        device(device), host_ptr(host_ptr), segment(segment),
         name(GGML_CUDA_NAME + std::to_string(device) + "_Mapped_Registered") {
     }
 
     bool registered() const {
-        return reg_base != nullptr;
+        return segment != nullptr;
     }
 
     ~ggml_backend_cuda_mapped_buffer_context() {
         if (registered()) {
-            cudaHostUnregister(reg_base);
-            ggml_cuda_registered_host_range_remove(reg_base);
+            ggml_cuda_registered_host_segment_release(segment, this);
         } else if (host_ptr != nullptr) {
             CUDA_CHECK(cudaFreeHost(host_ptr));
         }
     }
 };
 
+static void ggml_cuda_registered_host_set_buffer_segment(ggml_backend_cuda_mapped_buffer_context * ctx, ggml_cuda_registered_host_segment * segment) {
+    ctx->segment = segment;
+}
+
+// note that a registered mapped buffer references the segment; called right after acquire
+static void ggml_cuda_registered_host_segment_attach(ggml_cuda_registered_host_segment * segment, ggml_backend_cuda_mapped_buffer_context * ctx) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_segments_mutex);
+    ggml_cuda_registered_host_set_buffer_segment(ctx, segment);
+    segment->buffers.push_back(ctx);
+}
+
+// device address of the first byte of a mapped buffer; for a registered buffer it is
+// recomputed from the segment base, which a merged re-registration can move (this only
+// happens while loading, before any device pointer derived from a segment is used)
+static void * ggml_backend_cuda_mapped_buffer_dev_ptr(ggml_backend_cuda_mapped_buffer_context * ctx) {
+    if (ctx->segment != nullptr) {
+        return (char *) ctx->segment->dev_base + ((char *) ctx->host_ptr - (char *) ctx->segment->begin);
+    }
+    return ctx->dev_ptr;
+}
+
 static const char * ggml_backend_cuda_mapped_buffer_type_name(ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_buffer_type_context * ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
     return ctx->name.c_str();
-}
-
-// page size of the host, for aligning a cudaHostRegister range
-static size_t ggml_cuda_host_page_size() {
-#if defined(__linux__)
-    const long page = sysconf(_SC_PAGESIZE);
-    if (page > 0) {
-        return (size_t) page;
-    }
-#endif
-    return 4096;
 }
 
 static void ggml_backend_cuda_mapped_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -2714,12 +2916,18 @@ static void ggml_backend_cuda_mapped_buffer_free_buffer(ggml_backend_buffer_t bu
 
 static void * ggml_backend_cuda_mapped_buffer_get_base(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *)buffer->context;
-    return ctx->dev_ptr;
+    if (ctx->registered()) {
+        ggml_cuda_registered_host_device_ptrs_in_use = true;
+    }
+    return ggml_backend_cuda_mapped_buffer_dev_ptr(ctx);
 }
 
-// host pointer of a tensor in a mapped buffer; the device and host pointers refer to the
-// same allocation with the same offset, so the offset is recovered from the device pointer
+// host pointer of a tensor in a mapped buffer; the offset inside the buffer is recovered
+// from the device pointer, and for a registered buffer from the segment device base
 static char * ggml_backend_cuda_mapped_buffer_host_ptr(ggml_backend_cuda_mapped_buffer_context * ctx, const ggml_tensor * tensor) {
+    if (ctx->registered()) {
+        return (char *) ctx->segment->begin + ((const char *) tensor->data - (const char *) ctx->segment->dev_base);
+    }
     return (char *) ctx->host_ptr + ((const char *) tensor->data - (const char *) ctx->dev_ptr);
 }
 
@@ -2965,7 +3173,7 @@ ggml_backend_buffer_type_t ggml_backend_cuda_mapped_registered_buffer_type(int d
 }
 
 // pin an existing host range in place and expose it as a device-readable mapped buffer.
-// the caller keeps ownership of the memory; the buffer only unregisters it on free.
+// the caller keeps ownership of the memory; the buffer only releases its reference on free.
 ggml_backend_buffer_t ggml_backend_cuda_mapped_buffer_from_host_ptr(int device, void * ptr, size_t size) {
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
@@ -2980,36 +3188,22 @@ ggml_backend_buffer_t ggml_backend_cuda_mapped_buffer_from_host_ptr(int device, 
 
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
     // cudaHostRegister works on whole pages, so the registered range covers the pages that
-    // contain [ptr, ptr + size)
+    // contain [ptr, ptr + size); a range that overlaps or touches an existing segment is
+    // merged into it, so that a page shared by two weights is registered only once
     const size_t page = ggml_cuda_host_page_size();
     void * reg_base = (void *) ((uintptr_t) ptr & ~(uintptr_t) (page - 1));
     const size_t reg_offset = (size_t) ((char *) ptr - (char *) reg_base);
     const size_t reg_size   = ((reg_offset + size + page - 1) & ~(page - 1));
 
-    cudaError_t err = cudaHostRegister(reg_base, reg_size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
-    if (err != cudaSuccess) {
-        (void) cudaGetLastError();
-        GGML_LOG_ERROR("%s: registering %.2f MiB of host memory for device %d failed: %s\n",
-                       __func__, size / 1024.0 / 1024.0, device, cudaGetErrorString(err));
-        return nullptr;
+    ggml_cuda_registered_host_segment * segment =
+        ggml_cuda_registered_host_segment_acquire(device, (uintptr_t) reg_base, (uintptr_t) reg_base + reg_size);
+    if (segment == nullptr) {
+        return nullptr; // acquire() already logged the reason
     }
-    ggml_cuda_registered_host_range_add(reg_base, reg_size);
-
-    void * dev_base = nullptr;
-    err = cudaHostGetDevicePointer(&dev_base, reg_base, 0);
-    if (err != cudaSuccess) {
-        (void) cudaGetLastError();
-        cudaHostUnregister(reg_base);
-        ggml_cuda_registered_host_range_remove(reg_base);
-        GGML_LOG_ERROR("%s: device pointer for registered host memory on device %d: %s\n",
-                       __func__, device, cudaGetErrorString(err));
-        return nullptr;
-    }
-
-    void * dev_ptr = (char *) dev_base + reg_offset;
 
     ggml_backend_buffer_type_t buft = ggml_backend_cuda_mapped_registered_buffer_type(device);
-    ggml_backend_cuda_mapped_buffer_context * ctx = new ggml_backend_cuda_mapped_buffer_context(device, ptr, dev_ptr, reg_base, reg_size);
+    ggml_backend_cuda_mapped_buffer_context * ctx = new ggml_backend_cuda_mapped_buffer_context(device, ptr, segment);
+    ggml_cuda_registered_host_segment_attach(segment, ctx);
 
     GGML_LOG_INFO("%s: device %d: registered %.2f MiB of host memory in place at %p\n",
                   __func__, device, size / 1024.0 / 1024.0, ptr);
@@ -3037,7 +3231,8 @@ static void * ggml_backend_cuda_mapped_buffer_host_to_device(ggml_backend_buffer
     if (h < (const char *) ctx->host_ptr || h >= (const char *) ctx->host_ptr + buffer->size) {
         return nullptr;
     }
-    return (char *) ctx->dev_ptr + (h - (const char *) ctx->host_ptr);
+    ggml_cuda_registered_host_device_ptrs_in_use = true;
+    return (char *) ctx->segment->dev_base + (h - (const char *) ctx->segment->begin);
 }
 
 // true for the registered mapped buffer type
@@ -3068,6 +3263,14 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_dev_mapped_registered_buft(g
 }
 
 #else // defined(GGML_USE_MUSA)
+
+// MUSA has no registered mapped buffer type, so no buffer ever joins a segment and this
+// setter is never called; it exists because the segment merge path references it
+static void ggml_cuda_registered_host_set_buffer_segment(ggml_backend_cuda_mapped_buffer_context * ctx, ggml_cuda_registered_host_segment * segment) {
+    GGML_UNUSED(ctx);
+    GGML_UNUSED(segment);
+    GGML_ABORT("%s: registered host segments are not supported on MUSA\n", __func__);
+}
 
 ggml_backend_buffer_type_t ggml_backend_cuda_mapped_buffer_type(int device) {
     GGML_UNUSED(device);
@@ -8430,16 +8633,23 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
     }
 
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
-    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    // the range is registered page-aligned and merged with existing segments, exactly like
+    // a registered mapped buffer is; the caller has no buffer context, so the reference is
+    // released by the matching unregister call
+    int device = 0;
+    cudaError_t err = cudaGetDevice(&device);
     if (err != cudaSuccess) {
-        // clear the error
-        (void)cudaGetLastError();
-
-        GGML_LOG_DEBUG("%s: failed to register %.2f MiB of pinned memory: %s\n", __func__,
-                           size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        (void) cudaGetLastError();
         return false;
     }
-    ggml_cuda_registered_host_range_add(buffer, size);
+    const size_t page = ggml_cuda_host_page_size();
+    const uintptr_t begin = (uintptr_t) buffer & ~(uintptr_t) (page - 1);
+    const size_t offset = (size_t) ((char *) buffer - (char *) begin);
+    const uintptr_t end = begin + ((offset + size + page - 1) & ~(page - 1));
+
+    if (ggml_cuda_registered_host_segment_acquire(device, begin, end) == nullptr) {
+        return false; // acquire() already logged the reason
+    }
     return true;
 #else
     GGML_UNUSED(buffer);
@@ -8453,12 +8663,14 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
         return;
     }
 
-    cudaError_t err = cudaHostUnregister(buffer);
-    if (err != cudaSuccess) {
-        // clear the error
-        (void)cudaGetLastError();
+    // the range may have been merged into a segment shared with registered mapped buffers,
+    // so releasing the reference cannot unregister blindly
+    ggml_cuda_registered_host_segment * segment = ggml_cuda_registered_host_segment_find(buffer);
+    if (segment == nullptr) {
+        GGML_LOG_DEBUG("%s: host range at %p is not registered\n", __func__, buffer);
+        return;
     }
-    ggml_cuda_registered_host_range_remove(buffer);
+    ggml_cuda_registered_host_segment_release(segment, nullptr);
 }
 
 
@@ -9382,6 +9594,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_mapped_buffer_host_to_device") == 0) {
         return (void *)ggml_backend_cuda_mapped_buffer_host_to_device;
+    }
+    if (strcmp(name, "ggml_backend_cuda_registered_host_segment_count") == 0) {
+        return (void *)ggml_cuda_registered_host_segment_count;
     }
     if (strcmp(name, "ggml_backend_cuda_expert_set_slot_limit") == 0) {
         return (void *)ggml_cuda_expert_set_slot_limit;
