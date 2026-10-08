@@ -8,6 +8,7 @@
 //   - qsa_attn_prompt_kernel: src/kernels/cuda/qsa_prompt_attn.cu, prompt_attn_v70_kernel (mma.m8n8k4)
 // Adapted to ggml: K/V rows are read from the ggml cache (F16 or Q8_0, row strides per KV head, cell and
 // stream) instead of Strata's paged pools, the selection comes from QSA_SELECT, a cell id of -1 is skipped.
+// The prompt kernel keeps the v70 numerics: hi/lo mma chains and Q8_0 scales applied in FP32.
 
 #include "qsa.cuh"
 #include "lightning-indexer.cuh"
@@ -316,24 +317,39 @@ static __device__ __forceinline__ float qsa_load1(const char * row, const int d)
     }
 }
 
-// a row widened to half precision, [0, QSA_HD), by the threads of a block
+// smem element of a KV row: half values for F16, the raw int8 codes for Q8_0 (the scales stay FP32)
+template <ggml_type T> struct qsa_row_elem { using type = half; };
+template <> struct qsa_row_elem<GGML_TYPE_Q8_0> { using type = int8_t; };
+
+// a KV row [0, QSA_HD) copied into smem by the threads of a block: F16 verbatim, Q8_0 as int8 codes with the per-32
+// scale written to dsc[]. part in [0, n_part) is the thread's piece of the row.
 template <ggml_type T>
-static __device__ __forceinline__ void qsa_row_to_half(const char * row, half * dst, const int lane, const int n_lanes) {
+static __device__ __forceinline__ void qsa_row_to_smem(
+        const char * row, typename qsa_row_elem<T>::type * dst, float * dsc, const int part, const int n_part) {
     if constexpr (T == GGML_TYPE_F16) {
-        for (int i = lane; i < QSA_HD*(int) sizeof(half)/16; i += n_lanes) {
+        for (int i = part; i < QSA_HD*(int) sizeof(half)/16; i += n_part) {
             ((uint4 *) dst)[i] = ((const uint4 *) row)[i];
         }
+        dsc[part] = 1.0f;
     } else {
         static_assert(T == GGML_TYPE_Q8_0, "unsupported type");
-        for (int b = lane; b < QSA_HD/QK8_0; b += n_lanes) {
-            const block_q8_0 * blk = (const block_q8_0 *) row + b;
-            const float d = __half2float(blk->d);
+        const block_q8_0 * blk = (const block_q8_0 *) row + part;
+        // both sides are only 2-byte aligned (the row carries 2-byte scales between the code blocks)
 #pragma unroll
-            for (int j = 0; j < QK8_0; ++j) {
-                dst[b*QK8_0 + j] = __float2half_rn((float) blk->qs[j] * d);
-            }
+        for (int j = 0; j < QK8_0/2; ++j) {
+            ((uint16_t *) dst)[part*QK8_0/2 + j] = ((const uint16_t *) blk->qs)[j];
         }
+        dsc[part] = __half2float(blk->d);
     }
+}
+
+// two int8 codes (low byte first) as an exact half2: 1024 + (c + 128) built in the mantissa, minus 1152
+static __device__ __forceinline__ uint32_t qsa_i8x2_to_h2(const uint32_t x) {
+    uint32_t y = ((x & 0xffu) | ((x & 0xff00u) << 8)) ^ 0x00800080u;
+    y |= 0x64006400u;
+    half2 h = *reinterpret_cast<half2 *>(&y);
+    h = __hsub2(h, __halves2half2(__float2half(1152.f), __float2half(1152.f)));
+    return *reinterpret_cast<uint32_t *>(&h);
 }
 
 static __device__ __forceinline__ float qsa_warp_sum(float v) {
@@ -616,10 +632,11 @@ static __global__ void __launch_bounds__(QSA_HD) qsa_attn_merge_kernel(
 // two registers) and column j of B; C register i is row (lane & 1) + 4*(lane >> 4) + 2*((i >> 1) & 1), column
 // (lane & 2) + 4*(i >> 2) + (i & 1) of its QP's 8x8 tile.
 //   q.k: warp w owns dims [64w, 64w+64); QP q takes cells 8q..8q+7 of the 32-cell chunk; 16 k-steps of 4 dims, two
-//        8-row blocks (12 heads + 4 zero rows), q as hi + lo halves.
+//        8-row blocks (12 heads + 4 zero rows), q as hi + lo halves in separate chains.
 //   p.v: warp w owns dims [64w, 64w+64); QP q its 16 dims 64w+16q.. (two n-tiles of 8); k = the 32 cells in steps of
 //        4; p split into hi + lo halves.
-// The cache rows are widened to half when they are gathered.
+// F16 cache rows are gathered as half. Q8_0 rows keep their int8 codes (exact in FP16) and their per-32 scales,
+// which are applied on the FP32 partials.
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA && __CUDA_ARCH__ < GGML_CUDA_CC_TURING
 #define QSA_VOLTA_MMA 1
@@ -644,14 +661,23 @@ static __device__ __forceinline__ uint32_t qsa_pack_h2(const float lo_k, const f
     return *reinterpret_cast<uint32_t *>(&h);
 }
 
-#define QSA_QS (QSA_HD + 8)    // q row stride in halves, bank-conflict-free fragment loads
-#define QSA_KVROW (QSA_HD + 8) // K/V row stride in halves
+#define QSA_QS (QSA_HD + 8) // q row stride in halves, bank-conflict-free fragment loads
 
+// K/V smem rows: half values or int8 codes, 16-byte pieces and bank spread
+template <ggml_type T> struct qsa_kv_smem {
+    using elem = typename qsa_row_elem<T>::type;
+    static constexpr int ROW    = T == GGML_TYPE_F16 ? QSA_HD + 8 : QSA_HD + 16;
+    static constexpr int PIECES = QSA_HD*(int) sizeof(elem)/16; // 16-byte pieces of the values
+};
+
+template <ggml_type TK, ggml_type TV>
 struct qsa_prompt_smem {
     half  qh[16][QSA_QS];
     half  ql[16][QSA_QS];
-    half  k[QSA_PROMPT_CH][QSA_KVROW];
-    half  v[QSA_PROMPT_CH][QSA_KVROW];
+    typename qsa_kv_smem<TK>::elem k[QSA_PROMPT_CH][qsa_kv_smem<TK>::ROW];
+    typename qsa_kv_smem<TV>::elem v[QSA_PROMPT_CH][qsa_kv_smem<TV>::ROW];
+    float ks[QSA_PROMPT_CH][QSA_HD/32];   // K scale per 32 values (1 for F16)
+    float vs[QSA_PROMPT_CH][QSA_HD/32];   // V scale per 32 values (1 for F16)
     float part[4][16][QSA_PROMPT_CH + 4]; // q.k per dim group
     float s[16][QSA_PROMPT_CH + 4];       // the chunk's probabilities
     float qmax[QSA_PROMPT_THREADS/32];
@@ -670,7 +696,7 @@ static __global__ void __launch_bounds__(QSA_PROMPT_THREADS) qsa_attn_prompt_ker
     constexpr int CH = QSA_PROMPT_CH;
 
     extern __shared__ __align__(16) unsigned char qsa_smem_raw[];
-    qsa_prompt_smem & S = *reinterpret_cast<qsa_prompt_smem *>(qsa_smem_raw);
+    qsa_prompt_smem<TK, TV> & S = *reinterpret_cast<qsa_prompt_smem<TK, TV> *>(qsa_smem_raw);
 
     const int qi  = blockIdx.x;
     const int kvh = blockIdx.y;
@@ -733,10 +759,6 @@ static __global__ void __launch_bounds__(QSA_PROMPT_THREADS) qsa_attn_prompt_ker
         }
     }
 
-    // the V rows are half, their scale is 1: p carries 2^14, the accumulator 2^-14
-    constexpr float vup   = 16384.0f;
-    constexpr float vdown = 1.0f/16384.0f;
-
     for (int c0 = 0; c0 < n_sel; c0 += CH) {
         // the valid ids are a prefix: stop at the first chunk that starts with -1
         if (__ldg(ids + c0) < 0) {
@@ -748,44 +770,65 @@ static __global__ void __launch_bounds__(QSA_PROMPT_THREADS) qsa_attn_prompt_ker
         }
         __syncthreads(); // cells ready; the previous chunk's p.v is done with k, v, s
 
-        // gather the chunk's K and V rows, widened to half; a missing cell is zero and masked below
+        // gather the chunk's K and V rows, with their per-32 scales; a missing cell is zero and masked below
         for (int i = t; i < CH*8; i += QSA_PROMPT_THREADS) {
             const int c    = i / 8;
             const int part = i % 8;
             const int cell = S.cell[c];
             if (cell >= 0) {
-                qsa_row_to_half<TK>(k_base + cell*kv.nbk2, S.k[c], part, 8);
-                qsa_row_to_half<TV>(v_base + cell*kv.nbv2, S.v[c], part, 8);
+                qsa_row_to_smem<TK>(k_base + cell*kv.nbk2, S.k[c], S.ks[c], part, 8);
+                qsa_row_to_smem<TV>(v_base + cell*kv.nbv2, S.v[c], S.vs[c], part, 8);
             } else {
-                for (int d = part; d < QSA_HD/8; d += 8) {
+                for (int d = part; d < qsa_kv_smem<TK>::PIECES; d += 8) {
                     ((uint4 *) S.k[c])[d] = make_uint4(0, 0, 0, 0);
+                }
+                for (int d = part; d < qsa_kv_smem<TV>::PIECES; d += 8) {
                     ((uint4 *) S.v[c])[d] = make_uint4(0, 0, 0, 0);
                 }
+                S.ks[c][part] = 0.0f;
+                S.vs[c][part] = 0.0f;
             }
         }
         __syncthreads();
 
-        // scores: warp w = dim group w (64 dims), QP q = cells 8q..8q+7
+        // scores: warp w = dim group w (64 dims), QP q = cells 8q..8q+7. The q hi and lo halves accumulate in their
+        // own m8n8k4 chains (tg, tgl), added in FP32 below: in one chain Volta's truncating accumulation dropped
+        // most of the lo half correction. Q8_0 K codes enter the mma exactly, the per-32 scale stays in FP32.
         {
-            float tg[2][8];
+            constexpr int NG = TK == GGML_TYPE_F16 ? 1 : 2; // scale groups per 64-dim warp row
+            float tg[NG][2][8], tgl[NG][2][8];
 #pragma unroll
-            for (int rb = 0; rb < 2; ++rb) {
+            for (int g = 0; g < NG; ++g) {
 #pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    tg[rb][i] = 0.0f;
+                for (int rb = 0; rb < 2; ++rb) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) {
+                        tg[g][rb][i] = 0.0f;
+                        tgl[g][rb][i] = 0.0f;
+                    }
                 }
             }
             const int cell_b = qp*8 + jj;
 #pragma unroll
             for (int ks = 0; ks < 16; ++ks) {
                 const int d0 = warp*64 + ks*4;
-                const uint2 raw = *reinterpret_cast<const uint2 *>(&S.k[cell_b][d0]);
+                const int g  = NG == 1 ? 0 : ks >> 3;
+                uint32_t b0, b1;
+                if constexpr (TK == GGML_TYPE_F16) {
+                    const uint2 raw = *reinterpret_cast<const uint2 *>(&S.k[cell_b][d0]);
+                    b0 = raw.x;
+                    b1 = raw.y;
+                } else {
+                    const uint32_t raw = *reinterpret_cast<const uint32_t *>(&S.k[cell_b][d0]);
+                    b0 = qsa_i8x2_to_h2(raw & 0xffffu);
+                    b1 = qsa_i8x2_to_h2(raw >> 16);
+                }
 #pragma unroll
                 for (int rb = 0; rb < 2; ++rb) {
                     const uint2 ah = *reinterpret_cast<const uint2 *>(&S.qh[rb*8 + jj][d0]);
                     const uint2 al = *reinterpret_cast<const uint2 *>(&S.ql[rb*8 + jj][d0]);
-                    qsa_mma884(tg[rb], ah.x, ah.y, raw.x, raw.y);
-                    qsa_mma884(tg[rb], al.x, al.y, raw.x, raw.y);
+                    qsa_mma884(tg[g][rb], ah.x, ah.y, b0, b1);
+                    qsa_mma884(tgl[g][rb], al.x, al.y, b0, b1);
                 }
             }
 #pragma unroll
@@ -794,7 +837,12 @@ static __global__ void __launch_bounds__(QSA_PROMPT_THREADS) qsa_attn_prompt_ker
                 for (int i = 0; i < 8; ++i) {
                     const int row  = rb*8 + crow + 2*((i >> 1) & 1);
                     const int cell = qp*8 + ccol + 4*(i >> 2) + (i & 1);
-                    S.part[warp][row][cell] = tg[rb][i];
+                    if constexpr (NG == 1) {
+                        S.part[warp][row][cell] = tg[0][rb][i] + tgl[0][rb][i];
+                    } else {
+                        S.part[warp][row][cell] = (tg[0][rb][i] + tgl[0][rb][i])*S.ks[cell][2*warp + 0] +
+                                                  (tg[1][rb][i] + tgl[1][rb][i])*S.ks[cell][2*warp + 1];
+                    }
                 }
             }
         }
@@ -841,31 +889,50 @@ static __global__ void __launch_bounds__(QSA_PROMPT_THREADS) qsa_attn_prompt_ker
         }
         __syncthreads();
 
-        // p.v: warp w owns dims [64w, 64w+64), QP q its 16 dims 64w+16q..
+        // p.v: warp w owns dims [64w, 64w+64), QP q its 16 dims 64w+16q.. The V scale is folded into p in FP32
+        // relative to this warp's largest (times 2^14, the accumulator scales back). The p hi and lo halves
+        // accumulate in their own chains (tmp, tmpl); Q8_0 V codes enter the mma exactly.
         {
-            float tmp[2][2][8];
+            const int vg = 2*warp + (qp >> 1); // the 32-value scale group of this thread's dims
+            float vmax = 1.0f;
+            if constexpr (TV == GGML_TYPE_Q8_0) {
+                vmax = 0.0f;
+                for (int c = 0; c < CH; ++c) {
+                    vmax = fmaxf(vmax, S.vs[c][vg]);
+                }
+            }
+            const float vup   = vmax > 0.0f ? 16384.0f/vmax : 0.0f;
+            const float vdown = vmax*(1.0f/16384.0f);
+
+            float tmp[2][2][8], tmpl[2][2][8];
 #pragma unroll
             for (int rb = 0; rb < 2; ++rb) {
 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) {
 #pragma unroll
                     for (int i = 0; i < 8; ++i) {
-                        tmp[rb][nt][i] = 0.0f;
+                        tmp[rb][nt][i]  = 0.0f;
+                        tmpl[rb][nt][i] = 0.0f;
                     }
                 }
             }
 #pragma unroll
             for (int ks = 0; ks < CH/4; ++ks) {
                 const int cs = ks*4;
+                float w[4];
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    w[e] = S.vs[cs + e][vg]*vup;
+                }
                 uint2 ah[2];
                 uint2 al[2];
 #pragma unroll
                 for (int rb = 0; rb < 2; ++rb) {
                     const float4 pv = *reinterpret_cast<const float4 *>(&S.s[rb*8 + jj][cs]);
-                    const float p0 = pv.x*vup;
-                    const float p1 = pv.y*vup;
-                    const float p2 = pv.z*vup;
-                    const float p3 = pv.w*vup;
+                    const float p0 = pv.x*w[0];
+                    const float p1 = pv.y*w[1];
+                    const float p2 = pv.z*w[2];
+                    const float p3 = pv.w*w[3];
                     ah[rb].x = qsa_pack_h2(p0, p1);
                     ah[rb].y = qsa_pack_h2(p2, p3);
                     const float2 f01 = __half22float2(*reinterpret_cast<const half2 *>(&ah[rb].x));
@@ -876,14 +943,22 @@ static __global__ void __launch_bounds__(QSA_PROMPT_THREADS) qsa_attn_prompt_ker
 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) {
                     const int d = warp*64 + qp*16 + nt*8 + jj;
-                    const half2 h0 = __halves2half2(S.v[cs + 0][d], S.v[cs + 1][d]);
-                    const half2 h1 = __halves2half2(S.v[cs + 2][d], S.v[cs + 3][d]);
-                    const uint32_t b0 = *reinterpret_cast<const uint32_t *>(&h0);
-                    const uint32_t b1 = *reinterpret_cast<const uint32_t *>(&h1);
+                    uint32_t b0, b1;
+                    if constexpr (TV == GGML_TYPE_F16) {
+                        const half2 h0 = __halves2half2(S.v[cs + 0][d], S.v[cs + 1][d]);
+                        const half2 h1 = __halves2half2(S.v[cs + 2][d], S.v[cs + 3][d]);
+                        b0 = *reinterpret_cast<const uint32_t *>(&h0);
+                        b1 = *reinterpret_cast<const uint32_t *>(&h1);
+                    } else {
+                        const uint32_t x0 = (uint8_t) S.v[cs + 0][d] | ((uint32_t) (uint8_t) S.v[cs + 1][d] << 8);
+                        const uint32_t x1 = (uint8_t) S.v[cs + 2][d] | ((uint32_t) (uint8_t) S.v[cs + 3][d] << 8);
+                        b0 = qsa_i8x2_to_h2(x0);
+                        b1 = qsa_i8x2_to_h2(x1);
+                    }
 #pragma unroll
                     for (int rb = 0; rb < 2; ++rb) {
                         qsa_mma884(tmp[rb][nt], ah[rb].x, ah[rb].y, b0, b1);
-                        qsa_mma884(tmp[rb][nt], al[rb].x, al[rb].y, b0, b1);
+                        qsa_mma884(tmpl[rb][nt], al[rb].x, al[rb].y, b0, b1);
                     }
                 }
             }
@@ -895,7 +970,8 @@ static __global__ void __launch_bounds__(QSA_PROMPT_THREADS) qsa_attn_prompt_ker
                 for (int nt = 0; nt < 2; ++nt) {
 #pragma unroll
                     for (int i = 0; i < 8; ++i) {
-                        acc[rb][nt][i] = fmaf(acc[rb][nt][i], ((i >> 1) & 1) ? a1 : a0, tmp[rb][nt][i]*vdown);
+                        acc[rb][nt][i] = fmaf(acc[rb][nt][i], ((i >> 1) & 1) ? a1 : a0,
+                                              (tmp[rb][nt][i] + tmpl[rb][nt][i])*vdown);
                     }
                 }
             }
@@ -972,7 +1048,7 @@ static void qsa_attn_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         ggml_cuda_highest_compiled_arch(cc) == GGML_CUDA_CC_VOLTA;
 
     if (prompt) {
-        const int smem = (int) sizeof(qsa_prompt_smem);
+        const int smem = (int) sizeof(qsa_prompt_smem<TK, TV>);
         static bool attr_set[GGML_CUDA_MAX_DEVICES] = { false };
         const int device = ggml_cuda_get_device();
         if (!attr_set[device]) {
