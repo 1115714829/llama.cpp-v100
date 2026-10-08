@@ -203,6 +203,13 @@ LLAMA_API void llama_set_h_sink_offset(struct llama_context * ctx, int32_t offse
 // output rows for the next step to read
 LLAMA_API void llama_set_h_sink_write(struct llama_context * ctx, bool write);
 
+// r-mtpskip: target-side prefill skip. The target skips its sink write and the cross-context
+// ordering for a ubatch whose positions all lie below the first position of their sequence. The
+// MTP draft can never read those rows (the draft KV ring keeps only the last window + n_ubatch
+// positions), so the write is wasted work. A first position of 0 disables the skip for that
+// sequence (all positions are written). Set per sequence and cleared when the prompt is done.
+LLAMA_API void llama_set_h_sink_first_pos(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos_first);
+
 // r-mtpdev draft: copy the sink rows src_cols into the reserved pending columns
 // [2*n_batch, 2*n_batch + n_cols), so that the next batch may overwrite the source columns. The
 // copies run on the draft's output-device stream, ordered after the target write and after the
