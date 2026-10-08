@@ -1548,6 +1548,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     h_src_cols       (params.h_src_cols),
     h_token_offset   (params.h_token_offset),
     h_sink_is_target (params.h_sink_is_target),
+    h_sink_write     (params.h_sink_write),
     fa_assist        (params.fa_assist),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -3850,7 +3851,7 @@ void llm_graph_context::build_layer_inp_sink() const {
 }
 
 void llm_graph_context::build_h_nextn_sink() const {
-    if (t_h_sink == nullptr) {
+    if (t_h_sink == nullptr || !h_sink_write) {
         return;
     }
 
@@ -3859,13 +3860,15 @@ void llm_graph_context::build_h_nextn_sink() const {
         return;
     }
 
+    const size_t col0 = token_offset + (size_t) h_token_offset;
+
     GGML_ASSERT(cur->type == GGML_TYPE_F32);
     GGML_ASSERT(cur->ne[0] == t_h_sink->ne[0]);
-    GGML_ASSERT(token_offset + (size_t) cur->ne[1] <= (size_t) t_h_sink->ne[1]);
+    GGML_ASSERT(col0 + (size_t) cur->ne[1] <= (size_t) t_h_sink->ne[1]);
 
     // the column offset is part of the graph parameters, so a reused graph writes the same columns
     ggml_tensor * dst = ggml_view_2d(ctx0, t_h_sink, cur->ne[0], cur->ne[1],
-            t_h_sink->nb[1], token_offset * t_h_sink->nb[1]);
+            t_h_sink->nb[1], col0 * t_h_sink->nb[1]);
     ggml_tensor * cpy = ggml_cpy(ctx0, cur, dst);
     ggml_set_name(cpy, "h_nextn_sink_cpy");
     ggml_build_forward_expand(gf, cpy);

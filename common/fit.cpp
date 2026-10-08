@@ -518,6 +518,34 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
         collect_device_memory_breakdown(model_extra, ctx_extra, ret_extra);
 
+        // device feature sinks are raw backend buffers, so they are not part of the context
+        // memory breakdown. Reserve their bytes on the devices that hold them
+        {
+            const size_t sink_row = (size_t) llama_model_n_embd(model) * sizeof(float);
+            const uint32_t n_lids  = llama_model_target_layer_ids_n(model_extra);
+
+            if (extra->dflash_sink && n_lids > 0) {
+                // DFlash2 layer-input sink: mirrored, one copy per target device
+                const size_t bytes = sink_row * n_lids * cparams->n_batch;
+                for (size_t i = 0; i < nd; i++) {
+                    ret[i].mb.context += bytes;
+                }
+                // DFlash2 draft staging sink, [n_embd_inp_enc, n_ubatch] on the draft device
+                ret_extra[nd_extra > 0 ? nd_extra - 1 : 0].mb.context +=
+                    sink_row * n_lids * extra->cparams->n_ubatch;
+            }
+
+            if (extra->h_sink_rows > 0) {
+                // MTP nextn sink: the target copy on the target output device, the draft copy on
+                // the draft device. In the MTP layer-split layout both are the last device
+                const size_t row = (size_t) llama_model_n_embd_out(model) * sizeof(float);
+                ret      [nd       > 0 ? nd       - 1 : 0].mb.context +=
+                    row * ((size_t) cparams->n_batch       + extra->h_sink_rows);
+                ret_extra[nd_extra > 0 ? nd_extra - 1 : 0].mb.context +=
+                    row * ((size_t) extra->cparams->n_batch + extra->h_sink_rows);
+            }
+        }
+
         llama_free(ctx_extra);
         if (extra_devs != nullptr) {
             extra_devs->clear();

@@ -1237,9 +1237,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
         // the draft context is created from the same base params and follows the main context, fit both together
-        const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        const bool has_draft  = params.speculative.has_dft();
+        const bool spec_mtp   = std::find(params.speculative.types.begin(), params.speculative.types.end(),
             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        const bool spec_dflash = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
 
         common_params params_dft = common_base_params_to_speculative(params);
 
@@ -1250,11 +1252,18 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
         cparams_dft.n_rs_seq = 0;
 
+        // the MTP nextn sink reserves n_seq pending columns and (n_max + 1) draft-step columns
+        // per sequence on top of n_batch; the fit needs the same columns to reserve the bytes
+        const uint32_t h_sink_rows = spec_mtp
+            ? (uint32_t) (params.n_parallel * (params.speculative.draft.n_max + 2)) : 0;
+
         const common_fit_extra_model extra = {
             /*.path_model   =*/ params_dft.model.path.c_str(),
             /*.mparams      =*/ &mparams_dft,
             /*.cparams      =*/ &cparams_dft,
             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+            /*.dflash_sink  =*/ spec_dflash,
+            /*.h_sink_rows  =*/ h_sink_rows,
         };
 
         if (common_fit_params(params.model.path.c_str(), &mparams, &cparams,

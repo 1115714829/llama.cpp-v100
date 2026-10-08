@@ -167,14 +167,27 @@ struct llama_context {
 
     // r-mtpdev: keep the nextn hidden state in a device sink. The target writes its t_h_nextn rows
     // there; the draft reads them as its graph input. is_target selects the role of the context.
-    bool enable_h_nextn_sink(bool is_target);
-    // r-mtpdev: link a draft context to this target context, so that the draft reads the target
-    // h sink in place and the two sides are ordered by a pair of CUDA events
+    // n_h_rows is the number of extra sink columns that the MTP draft needs on top of n_batch
+    // (the pending rows and the draft-step rows); the target allocates them, the draft only
+    // reserves the role and is bound to the target sink by link_h_nextn
+    bool enable_h_nextn_sink(bool is_target, uint32_t n_h_rows);
+    // r-mtpdev: link a draft context to this target context, so that the draft reads and writes
+    // the target h sink in place and the two sides are ordered by a pair of CUDA events
     bool link_h_nextn(llama_context * ctx_dft);
     // r-mtpdev: select the h source of the next draft batch: true gathers the h in the graph from
-    // the target-sink columns [cols, cols + n_cols), false uses the host input
+    // the sink columns [cols, cols + n_cols), false disables the device gather
     void set_h_source(bool enable, const int32_t * cols, size_t n_cols);
-    // r-mtpdev host fallback: copy the sink rows [token_offset, token_offset + n_tokens) into dst
+    // r-mtpdev draft: column offset of the next sink write (the chained-head draft step index
+    // times n_seq_max). target writes keep offset 0
+    void set_h_sink_offset(int32_t offset);
+    // r-mtpdev draft: enable/disable the sink write of the next draft graph (catch-up decodes
+    // keep it off so that they do not overwrite the target batch columns)
+    void set_h_sink_write(bool write);
+    // r-mtpdev target: copy the sink rows src_cols into the reserved pending columns
+    // [n_batch, n_batch + n_cols). Runs on the sink device, ordered after the target write and
+    // before the next draft read
+    bool h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols);
+    // r-mtpdev: read back the sink rows [token_offset, token_offset + n_tokens) into dst
     bool h_nextn_sink_get(size_t token_offset, size_t n_tokens, float * dst);
     // r-mtpdev: the h-sink column of token (seq_id, pos) of the last decoded batch, -1 if absent
     int32_t h_nextn_sink_col(llama_seq_id seq_id, llama_pos pos) const;
@@ -411,23 +424,30 @@ private:
     ggml_backend_buffer_ptr buf_embd_src;
     ggml_tensor *           t_embd_src_sink = nullptr;
 
-    // r-mtpdev: device-side sink for the local nextn hidden state, [n_embd_out, n_batch]. The
-    // target writes its t_h_nextn rows there, the draft writes the h of its own steps
+    // r-mtpdev: device-side sink for the nextn hidden state, [n_embd_out, n_batch + n_h_rows].
+    // The target writes its t_h_nextn rows and the MTP bookkeeping rows; a linked draft context
+    // shares this tensor (t_h_sink points at the target sink) and reads/writes its columns
     ggml_context_ptr        ctx_h_sink; // declared before buf_h_sink so that the buffer is freed first
     ggml_backend_buffer_ptr buf_h_sink;
     ggml_tensor *           t_h_sink = nullptr;
     bool                    h_sink_is_target = false; // true: this sink holds the target h rows
     ggml_backend_t          backend_h_sink = nullptr; // non-owning: the backend that holds the sink
+    uint32_t                h_sink_extra = 0;         // target: extra columns after n_batch
 
     // r-mtpdev: the (seq_id, pos) of each h-sink column written by the last batch, in column order
     std::vector<std::pair<llama_seq_id, llama_pos>> h_sink_cols;
     // r-mtpdev: per-sequence (pos, column) index into h_sink_cols; positions grow within a batch
     std::unordered_map<llama_seq_id, std::vector<std::pair<llama_pos, int32_t>>> h_sink_cols_by_seq;
 
-    // r-mtpdev draft: the next draft graph gathers its h from the target sink at these columns.
+    // r-mtpdev draft: the next draft graph gathers its h from the sink at these columns.
     // The vector only grows, so the graph input pointer stays valid across batches
     bool                 h_src_enable = false;
     std::vector<int32_t> h_src_cols;
+
+    // r-mtpdev draft: sink column offset of the next write (see set_h_sink_offset)
+    int32_t h_sink_offset = 0;
+    // r-mtpdev: write the nextn rows of the next graph into the sink (draft catch-up turns it off)
+    bool    h_sink_write = true;
 
     // r-mtpdev: the id of the most recent ubatch submitted through the prefill pipeline, -1 if none
     int64_t pipeline_ubatch_last = -1;

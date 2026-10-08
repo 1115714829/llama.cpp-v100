@@ -643,6 +643,11 @@ struct llama_model {
 
     std::string name = "n/a";
 
+    // r-mtpdev: the arch graph_mtp reads the nextn h rows from the device sink (t_embd_h_src
+    // branch in the MTP graph). Set by the model loader of architectures that implement it;
+    // the h sink is not usable without it
+    bool h_nextn_sink_ok = false;
+
     llama_hparams hparams = {};
     llama_vocab   vocab;
 

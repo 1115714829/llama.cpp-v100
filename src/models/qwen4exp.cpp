@@ -24,6 +24,9 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
 }
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
+    // r-mtpdev: graph_mtp reads the nextn h from the device sink
+    h_nextn_sink_ok = true;
+
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
@@ -551,30 +554,20 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
 
-    inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
-    ggml_set_input(inp->embd);
+    // r-mtpdev device path: the h rows are gathered in place from the sink. The separate host
+    // input branch is gone with the MTP host h path, so the linked sink is required
+    GGML_ASSERT(t_embd_h_src != nullptr);
+    GGML_ASSERT(t_embd_h_src->type == GGML_TYPE_F32);
+    GGML_ASSERT(t_embd_h_src->ne[0] == (int64_t) hparams.n_embd_out());
+    GGML_ASSERT(h_src_cols != nullptr);
 
-    ggml_tensor * h = nullptr;
-    if (t_embd_h_src != nullptr) {
-        // r-mtpdev device path: gather the h rows in place from the target sink, no host input.
-        // the graph input h is not created, so llm_graph_input_embd_h::set_input only copies the
-        // columns of the rows
-        GGML_ASSERT(t_embd_h_src->type == GGML_TYPE_F32);
-        GGML_ASSERT(t_embd_h_src->ne[0] == (int64_t) hparams.n_embd_out());
-        GGML_ASSERT(h_src_cols != nullptr);
+    inp->h_cols     = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    // a larger batch is split into ubatches: each graph copies the columns of its own slice
+    inp->h_cols_src = h_src_cols + token_offset;
+    ggml_set_input(inp->h_cols);
 
-        inp->h_cols     = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-        inp->h_cols_src = h_src_cols;
-        ggml_set_input(inp->h_cols);
-
-        h = ggml_get_rows(ctx0, t_embd_h_src, inp->h_cols);
-        ggml_set_name(h, "mtp_h_input");
-    } else {
-        inp->h = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_out(), n_tokens);
-        ggml_set_input(inp->h);
-        ggml_set_name(inp->h, "mtp_h_input");
-        h = inp->h;
-    }
+    ggml_tensor * h = ggml_get_rows(ctx0, t_embd_h_src, inp->h_cols);
+    ggml_set_name(h, "mtp_h_input");
 
     // a shared MTP head has neither embeddings nor lm head; take them from the target
     // from unsloth PR #240

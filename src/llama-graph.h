@@ -844,10 +844,11 @@ struct llm_graph_params {
 
     // r-mtpdev device sink for the nextn hidden state
     ggml_tensor * t_h_sink      = nullptr;       // both: the local sink, written by this graph
-    ggml_tensor * t_embd_h_src  = nullptr;       // draft: target sink read in place by the mtp graph
-    const int32_t * h_src_cols  = nullptr;       // draft: target-sink column of each h row, host side
-    size_t h_token_offset = 0;                   // draft: first sink column read by this ubatch
+    ggml_tensor * t_embd_h_src  = nullptr;       // draft: sink read in place by the mtp graph
+    const int32_t * h_src_cols  = nullptr;       // draft: sink column of each h row, host side
+    size_t h_token_offset = 0;                   // draft: first sink column written by this ubatch
     bool h_sink_is_target = false;               // true: the local sink is the target h sink
+    bool h_sink_write = true;                    // false: this graph does not write the sink
 
     // 6-card FA assist: whether this ubatch marks the FA nodes as shareable (see qwen35). The
     // marked/unmarked nodes are different graphs, so reuse must not cross this flag
@@ -932,6 +933,7 @@ struct llm_graph_params {
             t_embd_h_src          == other.t_embd_h_src          &&
             h_token_offset        == other.h_token_offset        &&
             h_sink_is_target      == other.h_sink_is_target      &&
+            h_sink_write          == other.h_sink_write          &&
             fa_assist             == other.fa_assist             &&
             layer_inp_sink_layers == other.layer_inp_sink_layers;
     }
@@ -1099,10 +1101,11 @@ struct llm_graph_context {
     const std::vector<uint32_t> layer_inp_sink_layers;
     const size_t token_offset;               // target: first sink column written by this ubatch
     ggml_tensor * const t_h_sink;            // r-mtpdev: the local nextn sink written by this graph
-    ggml_tensor * const t_embd_h_src;        // r-mtpdev draft: target nextn sink read in place
-    const int32_t * const h_src_cols;        // r-mtpdev draft: target-sink column of each h row
-    const size_t h_token_offset;             // r-mtpdev draft: first sink column read by this ubatch
+    ggml_tensor * const t_embd_h_src;        // r-mtpdev draft: nextn sink read in place
+    const int32_t * const h_src_cols;        // r-mtpdev draft: sink column of each h row
+    const size_t h_token_offset;             // r-mtpdev draft: first sink column written by this ubatch
     const bool h_sink_is_target;             // r-mtpdev: true when the local sink is the target h sink
+    const bool h_sink_write;                 // r-mtpdev: false when this graph skips the sink write
     const bool fa_assist;                    // mark the FA nodes for the 6-card assist path
 
     ggml_context * ctx0 = nullptr;
