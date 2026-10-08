@@ -247,16 +247,19 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
-    // the KQ mask of this ubatch is exactly one [lo, hi) range of visible cells per token:
+    // the KQ mask of this ubatch is exactly two [lo, hi) ranges of visible cells per token:
     // a non-SWA cache, one sequence per stream, and cells [0, n_used) all holding that sequence
     // in strict causal order (O(n_used) check per stream)
+    // a standard SWA ring whose write order is the position order with no holes and no shared
+    // positions: the window maps to one or two linear cell ranges (see set_input_kq_range)
     bool get_kq_range_ok(const slot_info & sinfo, const llama_ubatch & ubatch) const;
 
     // true if every ubatch of a single sequence can take a range mask, so the worst-case graphs take one too
     bool get_kq_range_reserve() const;
 
-    // fills an I32 [2, n_tokens/n_stream, 1, n_stream] range mask: [0, cell + 1) for every token,
-    // where cell is the index of the cell that the token was stored in (see get_kq_range_ok)
+    // fills an I32 [4, n_tokens/n_stream, 1, n_stream] range mask: two [lo, hi) pairs of visible
+    // cells per token. the non-SWA case writes [0, cell + 1) and an empty second pair; the SWA case
+    // writes the window [p1 - n_swa + 1, p1] split at the ring boundary (see get_kq_range_ok)
     void set_input_kq_range(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore

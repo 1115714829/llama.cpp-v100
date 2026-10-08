@@ -37,8 +37,9 @@ static ggml_tensor * build_attn_inp_kq_mask(
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
     if (allow_range && mctx->get_kq_range()) {
-        // a range mask: one I32 [lo, hi) pair of visible KV columns per token
-        ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, n_tokens/n_stream, 1, n_stream);
+        // a range mask: two I32 [lo, hi) pairs of visible KV columns per token. the second pair is
+        // empty (hi1 <= lo1) unless the visible columns wrap around the end of a ring cache
+        ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 4, n_tokens/n_stream, 1, n_stream);
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_kq_mask");
 
@@ -76,7 +77,7 @@ static bool can_reuse_kq_mask(
 
     if (range) {
         // the range mask shape does not carry n_kv: compare the K/V view width the graph was built with
-        res &= (kq_mask->ne[0] == 2);
+        res &= (kq_mask->ne[0] == 4);
         res &= (n_kv_graph == n_kv);
     } else {
         res &= (kq_mask->ne[0] == n_kv);

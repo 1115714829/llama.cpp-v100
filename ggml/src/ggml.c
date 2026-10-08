@@ -5571,8 +5571,8 @@ struct ggml_tensor * ggml_flash_attn_ext(
         GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_is_contiguous(mask));
         if (mask->type == GGML_TYPE_I32) {
-            // range mask: one [lo, hi) pair of visible KV columns per query row
-            GGML_ASSERT(mask->ne[0] == 2);
+            // range mask: two [lo, hi) pairs of visible KV columns per query row
+            GGML_ASSERT(mask->ne[0] == 4);
             GGML_ASSERT(mask->ne[1] >= q->ne[1]);
             GGML_ASSERT(max_bias == 0.0f);
         }

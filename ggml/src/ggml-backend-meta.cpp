@@ -3204,9 +3204,9 @@ static bool ggml_backend_meta_assist_build(
 
                 const ggml_tensor * mask = plan.nodes[j][layer.i_node]->src[3];
                 d.mask = mask->data;
-                // int2 units, as the CUDA range bounds kernel indexes the mask
-                d.mask_row_stride   = (int64_t) mask->nb[1] / sizeof(int64_t);
-                d.mask_batch_stride = mask->ne[3] == 1 ? 0 : (int64_t) mask->nb[3] / sizeof(int64_t);
+                // int4 units, as the CUDA range bounds kernel indexes the two-interval mask
+                d.mask_row_stride   = (int64_t) mask->nb[1] / (4*sizeof(int32_t));
+                d.mask_batch_stride = mask->ne[3] == 1 ? 0 : (int64_t) mask->nb[3] / (4*sizeof(int32_t));
 
                 d.work       = bufs[j].base + bufs[j].work_off;
                 d.work_bytes = bufs[j].work_bytes;

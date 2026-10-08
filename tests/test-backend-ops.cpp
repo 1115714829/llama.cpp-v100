@@ -217,21 +217,22 @@ static void init_tensor_kq_mask_causal(ggml_tensor * tensor) {
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
-// generate an I32 range mask: the row for query i1 holds [lo, hi), the visible KV columns
-// mode: 1 = causal, 2 = random, 3 = causal over the first half of the KV positions (a range
-// that ends well before the KV view the kernel is given), 4 = deterministic split coverage:
+// generate an I32 range mask: the row for query i1 holds two [lo, hi) pairs, the visible KV
+// columns. mode: 1 = causal, 2 = random, 3 = causal over the first half of the KV positions (a
+// range that ends well before the KV view the kernel is given), 4 = deterministic split coverage:
 // every third row sees only the first eighth of the KV view, the next one only the last
 // eighth, and the last one is fully masked (all -inf), 5 = whole q blocks whose range lies
-// inside the first two KV blocks, so a KV split segment comes back empty
+// inside the first two KV blocks, so a KV split segment comes back empty, 6 = ring wrap: the
+// first pair covers [a, n_kv), the second [0, b), so the visible set wraps the array end
 static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, int mode) {
     GGML_ASSERT(tensor->type == GGML_TYPE_I32);
-    GGML_ASSERT(tensor->ne[0] == 2);
+    GGML_ASSERT(tensor->ne[0] == 4);
 
     const int64_t ne1 = tensor->ne[1];
     const int64_t ne2 = tensor->ne[2];
     const int64_t ne3 = tensor->ne[3];
 
-    std::vector<int32_t> data(2*ne1*ne2*ne3);
+    std::vector<int32_t> data(4*ne1*ne2*ne3);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -239,29 +240,31 @@ static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, int mode) {
     for (int64_t i3 = 0; i3 < ne3; i3++) {
         for (int64_t i2 = 0; i2 < ne2; i2++) {
             for (int64_t i1 = 0; i1 < ne1; i1++) {
-                int64_t lo;
-                int64_t hi;
+                int64_t lo0;
+                int64_t hi0;
+                int64_t lo1 = 0;
+                int64_t hi1 = 0;
                 if (mode == 1) {
-                    lo = 0;
-                    hi = n_kv - ne1 + i1 + 1;
-                    hi = std::max<int64_t>(1, std::min<int64_t>(hi, n_kv));
+                    lo0 = 0;
+                    hi0 = n_kv - ne1 + i1 + 1;
+                    hi0 = std::max<int64_t>(1, std::min<int64_t>(hi0, n_kv));
                 } else if (mode == 3) {
-                    lo = 0;
-                    hi = n_kv/2 - ne1 + i1 + 1;
-                    hi = std::max<int64_t>(1, std::min<int64_t>(hi, n_kv/2));
+                    lo0 = 0;
+                    hi0 = n_kv/2 - ne1 + i1 + 1;
+                    hi0 = std::max<int64_t>(1, std::min<int64_t>(hi0, n_kv/2));
                 } else if (mode == 4) {
                     switch (i1 % 3) {
                         case 0:
-                            lo = 0;
-                            hi = std::max<int64_t>(1, n_kv/8);
+                            lo0 = 0;
+                            hi0 = std::max<int64_t>(1, n_kv/8);
                             break;
                         case 1:
-                            lo = n_kv - n_kv/8;
-                            hi = n_kv;
+                            lo0 = n_kv - n_kv/8;
+                            hi0 = n_kv;
                             break;
                         default:
-                            lo = n_kv/2;
-                            hi = n_kv/2;
+                            lo0 = n_kv/2;
+                            hi0 = n_kv/2;
                             break;
                     }
                 } else if (mode == 5) {
@@ -272,32 +275,44 @@ static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, int mode) {
                     // masked (both KV splits are empty)
                     switch ((i1 / 64) % 3) {
                         case 0:
-                            lo = 0;
-                            hi = std::min<int64_t>(32, n_kv);
+                            lo0 = 0;
+                            hi0 = std::min<int64_t>(32, n_kv);
                             break;
                         case 1:
-                            lo = std::min<int64_t>(32, n_kv);
-                            hi = std::min<int64_t>(64, n_kv);
+                            lo0 = std::min<int64_t>(32, n_kv);
+                            hi0 = std::min<int64_t>(64, n_kv);
                             break;
                         default:
-                            lo = 0;
-                            hi = 0;
+                            // both windows are empty but their hi is not 0, so the bounds
+                            // kernel must still mark the whole q block as not visible
+                            lo0 = hi0 = std::min<int64_t>(48, n_kv);
+                            lo1 = hi1 = std::min<int64_t>(16, n_kv);
                             break;
                     }
+                } else if (mode == 6) {
+                    // a ring window that wraps the array end: [a, n_kv) plus [0, b), disjoint and
+                    // both non-empty. a and b advance per row so every wrap offset is covered
+                    const int64_t step = std::max<int64_t>(1, n_kv/4);
+                    lo0 = n_kv/2 + (i1 % step);
+                    hi0 = n_kv;
+                    lo1 = 0;
+                    hi1 = std::min<int64_t>(n_kv/4 + (i1 % step), n_kv/2);
                 } else {
-                    lo = std::uniform_int_distribution<int64_t>(0, n_kv - 1)(gen);
-                    hi = std::uniform_int_distribution<int64_t>(lo + 1, n_kv)(gen);
+                    lo0 = std::uniform_int_distribution<int64_t>(0, n_kv - 1)(gen);
+                    hi0 = std::uniform_int_distribution<int64_t>(lo0 + 1, n_kv)(gen);
                     if ((rd() & 3) == 0) {
-                        lo = 0;
+                        lo0 = 0;
                     }
                     if ((rd() & 3) == 0) {
-                        hi = n_kv;
+                        hi0 = n_kv;
                     }
                 }
 
-                const int64_t off = ((i3*ne2 + i2)*ne1 + i1)*2;
-                data[off + 0] = (int32_t) lo;
-                data[off + 1] = (int32_t) hi;
+                const int64_t off = ((i3*ne2 + i2)*ne1 + i1)*4;
+                data[off + 0] = (int32_t) lo0;
+                data[off + 1] = (int32_t) hi0;
+                data[off + 2] = (int32_t) lo1;
+                data[off + 3] = (int32_t) hi1;
             }
         }
     }
@@ -9903,7 +9918,7 @@ struct test_flash_attn_ext : public test_case {
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
     const bool causal; // use a causal mask instead of a random mask
-    const int range; // 0: dense f16 mask, 1: causal range mask (I32), 2: random range mask (I32), 3-5: deterministic range masks
+    const int range; // 0: dense f16 mask, 1: causal range mask (I32), 2: random range mask (I32), 3-5: deterministic range masks, 6: ring-wrap two-interval mask
 
     std::string vars() override {
         return VARS_TO_STR19(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, causal, range);
@@ -9973,7 +9988,7 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = range != 0 ? ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, nb, 1, nr23[1])
+            m = range != 0 ? ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 4, nb, 1, nr23[1])
                            : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
             ggml_set_name(m, "m");
         }
@@ -10073,7 +10088,7 @@ struct test_flash_attn_ext_window : public test_case {
         v = ggml_permute(ctx, v, 0, 2, 1, 3);
         ggml_set_name(v, "v");
 
-        ggml_tensor * m = range_mask ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_q)
+        ggml_tensor * m = range_mask ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, n_q)
                                      : ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_q);
         ggml_set_name(m, "m");
 
@@ -13929,6 +13944,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 4096, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, 0, false, 3));
+
+    // ring wrap (mode 6): the visible columns are [a, n_kv) plus [0, b), so the two-interval
+    // mask covers a window that crosses the array end. Split-D prefill, grouped verify and the
+    // dense expansion must all union the two intervals
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 4096, 2048, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 0, false, 6));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 32768, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, 6));
+    // the sliding-window ring of the online MTP draft: same shape, ring size and batch
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 34816, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 6));
+    // q = 8 with GQA 6 reaches the grouped sm_70 verify kernel
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 1025, 8, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, false, 6));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 1024, 7, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, 6));
 
     // grouped decode / verify shapes with range masks
     for (int nh : { 1, 4 }) {

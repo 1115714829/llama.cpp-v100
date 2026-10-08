@@ -526,7 +526,7 @@ extern "C" {
 
         // Mask: the same mirrored copy exists on every device, the descriptor holds this device's.
         const void * mask;
-        int64_t mask_row_stride;   // range mask: int2 units, f16 mask: halfs
+        int64_t mask_row_stride;   // range mask: int4 units, f16 mask: halfs
         int64_t mask_batch_stride; // same units, 0 when the mask has a single batch
         bool    mask_is_range;
 
