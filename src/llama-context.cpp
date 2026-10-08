@@ -2067,6 +2067,10 @@ bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols
         return false;
     }
 
+    // let the submission thread enqueue the split that wrote the source columns first: the
+    // capture copies below are then queued after the write on the same stream
+    wait_submitted(backend_h_sink);
+
     // the draft may still be reading the rows from the previous capture
     if (embd_link && embd_link->t_h_sink_tgt != nullptr) {
         ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_read_done);
@@ -2412,11 +2416,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const bool reads_h_sink  = embd_link && embd_link->t_h_sink_tgt != nullptr && h_src_enable && !h_sink_is_target;
 
     if (writes_sink) {
+        // the splits posted so far (including the previous write) reach the target stream before
+        // this wait: it must not land in the middle of them
+        wait_submitted(backends[0].get());
         // the draft may still be copying the previous write
         ggml_backend_event_wait(backends[0].get(), embd_link->ev_copy_done);
     }
 
     if (writes_h_sink) {
+        // same on the output device stream: the previously posted splits reach the stream before
+        // this wait is queued
+        wait_submitted(backend_h_sink);
         // the draft may still be reading the previous target write
         ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_read_done);
     }
@@ -2448,12 +2458,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (writes_sink) {
-        // the draft can copy the sink once this graph completed on the target stream
+        // the submission thread has enqueued the write of this ubatch on the target stream, so the
+        // event is recorded after it; the draft can copy the sink once this graph completed
+        wait_submitted(backends[0].get());
         ggml_backend_event_record(embd_link->ev_tgt_done, backends[0].get());
     }
 
     if (writes_h_sink) {
-        // the draft can read the sink once this graph completed on the output device stream
+        // same as above on the output device stream: the sink write of this ubatch is enqueued
+        // before the event is recorded, so the draft reads the completed rows
+        wait_submitted(backend_h_sink);
         ggml_backend_event_record(embd_link->ev_h_tgt_done, backend_h_sink);
     }
 
@@ -2562,6 +2576,12 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     }
 
     auto * sched_res = sched_for_slot(gf_res_slot(ubatch));
+
+    // the async host reads below are ordered on the device streams after the compute of this
+    // ubatch: wait until the submission threads have enqueued it first
+    for (const auto & backend : backends) {
+        wait_submitted(backend.get());
+    }
 
     auto * t_logits  = res->get_logits();
     auto * t_embd    = res->get_embd_pooled() ? res->get_embd_pooled() : res->get_embd();
@@ -2913,6 +2933,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     auto extract_outputs = [&](const llm_graph_result * res, ggml_backend_sched_t sched_res,
             const llama_ubatch & ubatch, int32_t n_outputs, int64_t n_outputs_prev, int64_t n_tokens_prev) {
+        // the async host reads below are enqueued on the streams of this ubatch's scheduler: wait
+        // until the submission threads have enqueued its compute first, so the copies are ordered
+        // after it. no-op for schedulers without submission threads
+        for (const auto & backend : backends) {
+            wait_submitted(backend.get());
+        }
+
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -3863,6 +3890,18 @@ ggml_status llama_context::graph_compute_impl(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+void llama_context::wait_submitted(ggml_backend_t backend) {
+    if (sched) {
+        ggml_backend_sched_wait_submitted(sched.get(), backend);
+    }
+    if (sched_slot0) {
+        ggml_backend_sched_wait_submitted(sched_slot0.get(), backend);
+    }
+    if (sched_dec) {
+        ggml_backend_sched_wait_submitted(sched_dec.get(), backend);
+    }
 }
 
 ggml_status llama_context::graph_compute(

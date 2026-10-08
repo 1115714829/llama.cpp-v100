@@ -362,6 +362,11 @@ private:
 
     ggml_status graph_compute_impl(ggml_backend_sched_t sched, ggml_cgraph * gf, bool batched);
 
+    // wait until the submission threads of the schedulers of this context have enqueued the work
+    // already posted for the given backend on its stream. no-op for schedulers without submission
+    // threads, or when the backend is not part of them
+    void wait_submitted(ggml_backend_t backend);
+
     // set the threadpool and thread counts for the given batch type
     void graph_set_threads(bool batched);
 
