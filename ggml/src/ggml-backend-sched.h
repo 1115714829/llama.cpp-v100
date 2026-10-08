@@ -8,6 +8,31 @@
 #include "ggml-impl.h"
 
 #ifdef  __cplusplus
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
+#endif
+
+#ifdef  __cplusplus
+// one submission thread per non-CPU backend; created only in pipeline mode (n_copies > 1).
+// the thread only runs tasks posted with ggml_backend_sched_worker_post()
+struct ggml_backend_sched_worker {
+    std::thread             thread;
+    std::mutex              mtx;
+    std::condition_variable cv;       // wakes the worker
+    std::condition_variable cv_done;  // signals progress of n_done
+    std::deque<std::function<void()>> tasks;
+    uint64_t                n_posted = 0; // tasks posted so far
+    uint64_t                n_done   = 0; // tasks executed (enqueued on the device stream) so far
+    bool                    stop     = false;
+};
+#endif
+
+#ifdef  __cplusplus
 extern "C" {
 #endif
 
@@ -102,6 +127,12 @@ struct ggml_backend_sched {
     int pipeline_stage;              // stage prepared by ggml_backend_sched_pipeline_begin, or -1
     int64_t pipeline_last_ubatch_id; // last submitted ubatch id, for ordering checks
 
+#ifdef __cplusplus
+    // per-backend submission threads, pipeline mode only (n_copies > 1), indexed by backend id;
+    // NULL for the CPU backend. pointer because the scheduler is calloc'ed
+    std::vector<std::unique_ptr<struct ggml_backend_sched_worker>> * workers;
+#endif
+
     struct ggml_context * ctx;
 
     ggml_backend_sched_eval_callback callback_eval;
@@ -132,4 +163,10 @@ struct ggml_backend_sched {
 
 #ifdef  __cplusplus
 }
+
+// per-backend submission workers, implemented in ggml-backend.cpp; pipeline mode only
+uint64_t ggml_backend_sched_worker_post(ggml_backend_sched_t sched, int backend_id, std::function<void()> fn);
+void ggml_backend_sched_worker_wait_done(ggml_backend_sched_t sched, int backend_id, uint64_t seq);
+void ggml_backend_sched_workers_drain(ggml_backend_sched_t sched);
+bool ggml_backend_sched_has_workers(ggml_backend_sched_t sched);
 #endif

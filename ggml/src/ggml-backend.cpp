@@ -21,6 +21,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -1964,6 +1970,35 @@ enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     return GGML_STATUS_SUCCESS;
 }
 
+// worker thread of the pipeline submission queue: runs tasks posted with
+// ggml_backend_sched_worker_post() in order, then signals the waiters
+//
+// CUDA note: the current device is per host thread, so this thread cannot rely on the main
+// thread's setting. ggml_backend_cuda_graph_compute() sets it (ggml-cuda.cu:7467), while
+// ggml_backend_cuda_event_record() (7602), ggml_backend_cuda_event_wait() (7608) and
+// ggml_backend_cuda_cpy_tensor_async() (4268, sets the src device only when it lazily creates
+// cuda_ctx_src->copy_event at 4312) do not. A task that calls those must set the device itself.
+static void ggml_backend_sched_worker_loop(struct ggml_backend_sched_worker * w) {
+    while (true) {
+        std::function<void()> fn;
+        {
+            std::unique_lock<std::mutex> lock(w->mtx);
+            w->cv.wait(lock, [w]() { return w->stop || !w->tasks.empty(); });
+            if (w->stop && w->tasks.empty()) {
+                return;
+            }
+            fn = std::move(w->tasks.front());
+            w->tasks.pop_front();
+        }
+        fn();
+        {
+            std::lock_guard<std::mutex> lock(w->mtx);
+            w->n_done++;
+        }
+        w->cv_done.notify_all();
+    }
+}
+
 ggml_backend_sched_t ggml_backend_sched_new(
         ggml_backend_t * backends,
         ggml_backend_buffer_type_t * bufts,
@@ -2023,6 +2058,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->graph_inputs_capacity = GGML_SCHED_MAX_SPLIT_INPUTS;
     sched->graph_inputs = (struct ggml_tensor **) calloc(sched->graph_inputs_capacity, sizeof(struct ggml_tensor *));
 
+    if (sched->n_copies > 1) {
+        // pipeline mode: one submission thread per non-CPU backend, indexed by backend id
+        sched->workers = new std::vector<std::unique_ptr<struct ggml_backend_sched_worker>>(n_backends);
+    }
+
     for (int b = 0; b < n_backends; b++) {
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
@@ -2031,6 +2071,13 @@ ggml_backend_sched_t ggml_backend_sched_new(
         if (sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {
                 sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
+            }
+            // the CPU backend keeps its splits on the main thread, no worker needed
+            if (ggml_backend_dev_type(ggml_backend_get_device(backends[b])) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                auto worker = std::make_unique<struct ggml_backend_sched_worker>();
+                struct ggml_backend_sched_worker * w = worker.get();
+                sched->workers->at(b) = std::move(worker);
+                w->thread = std::thread(ggml_backend_sched_worker_loop, w);
             }
         }
     }
@@ -2046,6 +2093,22 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->workers != NULL) {
+        // stop the submission threads before releasing anything they may touch
+        for (auto & w : *sched->workers) {
+            if (!w) {
+                continue;
+            }
+            {
+                std::lock_guard<std::mutex> lock(w->mtx);
+                w->stop = true;
+            }
+            w->cv.notify_all();
+            w->thread.join();
+        }
+        delete sched->workers;
+        sched->workers = NULL;
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
@@ -2070,6 +2133,59 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->graph.nodes);
     free(sched->graph.leafs);
     free(sched);
+}
+
+// per-backend submission workers; pipeline mode (n_copies > 1) only
+
+// post a task to the worker of backend_id; returns the task sequence number
+uint64_t ggml_backend_sched_worker_post(ggml_backend_sched_t sched, int backend_id, std::function<void()> fn) {
+    GGML_ASSERT(sched->workers != NULL);
+    GGML_ASSERT(backend_id >= 0 && backend_id < (int) sched->workers->size());
+    struct ggml_backend_sched_worker * w = sched->workers->at(backend_id).get();
+    GGML_ASSERT(w != NULL && "backend has no submission worker");
+
+    std::lock_guard<std::mutex> lock(w->mtx);
+    w->tasks.push_back(std::move(fn));
+    const uint64_t seq = ++w->n_posted;
+    w->cv.notify_one();
+    return seq;
+}
+
+// wait until the worker has executed (enqueued to the device stream) task number seq
+void ggml_backend_sched_worker_wait_done(ggml_backend_sched_t sched, int backend_id, uint64_t seq) {
+    GGML_ASSERT(sched->workers != NULL);
+    struct ggml_backend_sched_worker * w = sched->workers->at(backend_id).get();
+    GGML_ASSERT(w != NULL);
+
+    std::unique_lock<std::mutex> lock(w->mtx);
+    w->cv_done.wait(lock, [w, seq]() { return w->n_done >= seq; });
+}
+
+// wait until all workers have executed every task posted so far
+void ggml_backend_sched_workers_drain(ggml_backend_sched_t sched) {
+    if (sched->workers == NULL) {
+        return;
+    }
+    for (size_t b = 0; b < sched->workers->size(); b++) {
+        struct ggml_backend_sched_worker * w = sched->workers->at(b).get();
+        if (w == NULL) {
+            continue;
+        }
+        std::unique_lock<std::mutex> lock(w->mtx);
+        w->cv_done.wait(lock, [w]() { return w->n_done >= w->n_posted; });
+    }
+}
+
+bool ggml_backend_sched_has_workers(ggml_backend_sched_t sched) {
+    if (sched->workers == NULL) {
+        return false;
+    }
+    for (const auto & w : *sched->workers) {
+        if (w) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
