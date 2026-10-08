@@ -2164,6 +2164,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         if (is_registered_mapped) {
             GGML_ASSERT(!ml.no_alloc);
+            // cudaHostRegister pins the pages of the range in place; a pinned page that still
+            // has dirty data to write back can wedge the writeback of the whole file system
+            // (ext4 mpage_prepare_extent_to_map), so push every mapped range out to disk
+            // first. flush_range aligns outward to pages, the same range the backend registers.
+            const int64_t t_flush = ggml_time_us();
+            size_t flushed = 0;
+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                void * addr = nullptr;
+                size_t first, last; // NOLINT
+                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+                if (first >= last) {
+                    continue;
+                }
+                ml.mappings.at(idx)->flush_range(first, last);
+                flushed += last - first;
+            }
+            LLAMA_LOG_INFO("%s: flushed %.2f MiB of mmap weights to disk in %.2f s\n",
+                    __func__, flushed / 1024.0 / 1024.0, (ggml_time_us() - t_flush) / 1e6);
+
             const int64_t t_start = ggml_time_us();
             size_t total = 0;
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
