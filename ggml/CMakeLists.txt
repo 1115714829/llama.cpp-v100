@@ -185,7 +185,7 @@ set(GGML_CPU_ARM_ARCH        "" CACHE STRING "ggml: CPU architecture for ARM")
 set(GGML_CPU_POWERPC_CPUTYPE "" CACHE STRING "ggml: CPU type for PowerPC")
 
 # ggml core
-set(GGML_SCHED_MAX_COPIES  "8" CACHE STRING "ggml: max input copies for pipeline parallelism")
+set(GGML_SCHED_MAX_COPIES  "2" CACHE STRING "ggml: number of input copies for pipeline double buffering")
 option(GGML_CPU                             "ggml: enable CPU backend"                        ON)
 option(GGML_SCHED_NO_REALLOC                "ggml: disallow reallocations in ggml-alloc (for debugging)" OFF)
 

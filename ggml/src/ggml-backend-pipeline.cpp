@@ -8,10 +8,14 @@
 // builds a distinct graph per ubatch, so the scheduler can split and allocate a ubatch independently
 // while the previous ones keep running on the devices:
 //
-//   begin():  wait until the stage is reusable, split+allocate the graph on the stage's input copy
+//   begin():  wait until the stage is reusable, split+allocate the graph on the stage's input slot
 //   submit(): enqueue all splits of the stage without waiting
 //   wait():   wait for one ubatch (before reading its outputs)
 //   advance(): wait for all in-flight ubatches and reset the ring
+//
+// The input copies are double buffered independently of the depth: ubatch i uses slot i % n_copies
+// on every backend. A slot may be written again only after the previous user finished with it; this
+// is enforced by the per-(backend, slot) events, recorded after each split.
 //
 // Cross-device activation copies are chained by events inside the CUDA backend, and consecutive
 // ubatches on the same device are ordered by the device stream FIFO. The only scheduler-level waits
@@ -47,7 +51,7 @@ static void ggml_backend_sched_pipeline_wait_stage(ggml_backend_sched_t sched, i
     }
 
     for (int b = 0; b < sched->n_backends; b++) {
-        ggml_backend_event_t ev = sched->events[b][stage->copy_id];
+        ggml_backend_event_t ev = sched->events[b][stage->slot];
         if (ev != NULL) {
             ggml_backend_event_synchronize(ev);
         }
@@ -57,7 +61,7 @@ static void ggml_backend_sched_pipeline_wait_stage(ggml_backend_sched_t sched, i
 }
 
 // split and allocate the graph on the next pipeline stage, without computing it
-bool ggml_backend_sched_pipeline_begin(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+bool ggml_backend_sched_pipeline_begin(ggml_backend_sched_t sched, struct ggml_cgraph * graph, int64_t ubatch_id) {
     GGML_ASSERT(sched);
     GGML_ASSERT(graph);
     GGML_ASSERT(sched->n_stages > 1);
@@ -71,16 +75,19 @@ bool ggml_backend_sched_pipeline_begin(ggml_backend_sched_t sched, struct ggml_c
     }
     memset(stage->backend_seq, 0, sizeof(stage->backend_seq));
 
-    // each stage uses its own input copy, so in-flight ubatches never share device input buffers
-    const int copy_id = s % sched->n_copies;
+    // input copies are double buffered: ubatch i uses slot i % n_copies on every backend, so
+    // in-flight ubatches never overwrite each other's device inputs. the previous user of a slot is
+    // waited for by the writers (host input copies and pushed cross-device copies), see
+    // ggml_backend_sched_compute_splits_pipeline
+    const int slot = (int) (ubatch_id % sched->n_copies);
     ggml_backend_sched_reset(sched);
-    sched->next_copy = copy_id;
+    sched->next_copy = slot;
 
     if (!ggml_backend_sched_alloc_graph(sched, graph)) {
         return false;
     }
 
-    stage->copy_id = sched->cur_copy;
+    stage->slot = sched->cur_copy; // == slot
     sched->pipeline_stage = s;
 
     return true;
@@ -106,7 +113,8 @@ enum ggml_status ggml_backend_sched_pipeline_submit(ggml_backend_sched_t sched, 
         return status;
     }
 
-    // compute_splits records sched->events[b][cur_copy] at the end of each split; cur_copy == copy_id
+    // compute_splits records sched->events[b][cur_copy] at the end of each split; cur_copy is the
+    // input slot of this ubatch
     stage->ubatch_id = ubatch_id;
     stage->in_flight = true;
     sched->pipeline_stage = -1;

@@ -44,8 +44,10 @@ extern "C" {
 #define GGML_SCHED_MAX_SPLIT_INPUTS 30
 #endif
 
+// input copies of the pipeline. the copies are double buffered and independent of the pipeline
+// depth: ubatch i uses copy i % n_copies on every backend, so two copies suffice for any depth
 #ifndef GGML_SCHED_MAX_COPIES
-#define GGML_SCHED_MAX_COPIES 8
+#define GGML_SCHED_MAX_COPIES 2
 #endif
 
 // pipeline parallelism: max number of ubatches of one prefill in flight at once
@@ -66,11 +68,11 @@ struct ggml_backend_sched_split {
 
 // one in-flight ubatch of a pipeline-parallel prefill
 //
-// every ubatch has its own graph (the caller rebuilds it), so a later ubatch can be split and
-// allocated while the earlier ones are still running. each stage owns an input copy, so the host
-// inputs of a later ubatch never overwrite the device inputs of an in-flight one.
+// every ubatch has its own graph (the caller rebuilds it) and uses the input copy of its
+// submission index, so a later ubatch can be split and allocated while the earlier ones are still
+// running. the input copies are small: only the graph inputs and the split inputs are duplicated
 struct ggml_backend_sched_stage {
-    int copy_id;       // input copy used by this stage
+    int slot;          // input copy slot used by this stage (ubatch_id % n_copies)
     int64_t ubatch_id; // logical batch index, for ordering checks
     bool in_flight;
     // last submission-worker task posted for this stage, per backend (0 = none); the stage events

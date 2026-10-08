@@ -22,7 +22,8 @@
 #include <string.h>
 #include <algorithm>
 #include <atomic>
-#include <condition_variable>#include <deque>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -2353,7 +2354,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
-    sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    // pipeline mode double buffers the inputs: two copies are enough for any pipeline depth, the
+    // depth is set independently via ggml_backend_sched_set_n_stages
+    sched->n_copies = parallel ? 2 : 1;
 
     // no pipeline overlap by default; multi-stage prefill opts in via ggml_backend_sched_set_n_stages
     sched->n_stages = 1;
