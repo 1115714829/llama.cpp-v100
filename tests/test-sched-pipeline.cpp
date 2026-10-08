@@ -540,6 +540,191 @@ static int run_pipeline_gpu_deep(void) {
     return n_gpu;
 }
 
+// Deep pipeline variant with a changing graph topology: consecutive ubatches alternate between
+// two graphs that differ by one node (a scale by 1, so the value is unchanged). Alternating the
+// node count makes ggml_gallocr_needs_realloc() return true on every ubatch, so every
+// ggml_backend_sched_pipeline_begin below enters the reallocation branch of
+// ggml_backend_sched_alloc_splits and frees/re-reserves the graph buffers while earlier ubatches
+// are still in flight. With submission workers (GPU) the already posted but not yet enqueued tasks
+// reference the old allocations, so the branch must drain the workers before it re-reserves.
+static int run_pipeline_gpu_deep_realloc(void) {
+    std::vector<ggml_backend_dev_t> gpu_devs;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu_devs.push_back(dev);
+        }
+    }
+    if (gpu_devs.size() < 2) {
+        // capability branch: the deep pipeline needs at least two devices with workers
+        printf("pipeline gpu deep realloc: skipped (need >= 2 GPU)\n");
+        return 0;
+    }
+    if (gpu_devs.size() > 2) {
+        gpu_devs.resize(2);
+    }
+    const int n_gpu   = (int) gpu_devs.size();
+    const int stages  = n_gpu;
+    const int n_ub    = 4 * stages;
+
+    printf("pipeline gpu deep realloc: %d GPU, %d stages ... ", n_gpu, stages);
+    fflush(stdout);
+
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev == NULL) {
+        fprintf(stderr, "FAILED: no CPU backend\n");
+        exit(1);
+    }
+
+    std::vector<ggml_backend_t> backends;
+    std::vector<ggml_backend_buffer_type_t> bufts;
+    for (int g = 0; g < n_gpu; g++) {
+        ggml_backend_t backend = ggml_backend_dev_init(gpu_devs[g], NULL);
+        if (backend == NULL) {
+            fprintf(stderr, "FAILED: gpu backend init\n");
+            exit(1);
+        }
+        backends.push_back(backend);
+        bufts.push_back(ggml_backend_get_default_buffer_type(backend));
+    }
+    ggml_backend_t cpu_backend = ggml_backend_dev_init(cpu_dev, NULL);
+    backends.push_back(cpu_backend);
+    bufts.push_back(ggml_backend_get_default_buffer_type(cpu_backend));
+
+    const int n_backends = (int) backends.size();
+
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends.data(), bufts.data(), n_backends, 2048, true, false);
+    ggml_backend_sched_set_n_stages(sched, stages);
+
+    std::vector<struct ggml_context *>      w_ctxs;
+    std::vector<ggml_backend_buffer_t>      w_bufs;
+    std::vector<struct ggml_tensor *>       weights;
+    for (int g = 0; g < n_gpu; g++) {
+        struct ggml_init_params wparams = {
+            /* .mem_size   = */ 16 * 1024,
+            /* .mem_buffer = */ NULL,
+            /* .no_alloc   = */ true,
+        };
+        struct ggml_context * w_ctx = ggml_init(wparams);
+        struct ggml_tensor * w = ggml_new_tensor_1d(w_ctx, GGML_TYPE_F32, n_tokens);
+        ggml_backend_buffer_t w_buf = ggml_backend_alloc_ctx_tensors(w_ctx, backends[g]);
+        if (w_buf == NULL) {
+            fprintf(stderr, "FAILED: weight alloc\n");
+            exit(1);
+        }
+        std::vector<float> host(n_tokens);
+        for (int i = 0; i < n_tokens; i++) {
+            host[i] = (float) (100*g + i);
+        }
+        ggml_backend_tensor_set(w, host.data(), 0, ggml_nbytes(w));
+
+        w_ctxs.push_back(w_ctx);
+        w_bufs.push_back(w_buf);
+        weights.push_back(w);
+    }
+
+    std::vector<struct ggml_context *> ctxs(n_ub, nullptr);
+    std::vector<float>                 host_out(n_ub * n_tokens, -1.0f);
+
+    for (int ub = 0; ub < n_ub; ub++) {
+        struct ggml_init_params params = {
+            /* .mem_size   = */ (ggml_tensor_overhead() + ggml_graph_overhead()) * 16,
+            /* .mem_buffer = */ NULL,
+            /* .no_alloc   = */ true,
+        };
+        ctxs[ub] = ggml_init(params);
+        if (ctxs[ub] == NULL) {
+            fprintf(stderr, "FAILED: ggml_init\n");
+            exit(1);
+        }
+
+        struct ggml_tensor * a = nullptr;
+        struct ggml_tensor * b = nullptr;
+        struct ggml_tensor * x1 = nullptr;
+        struct ggml_cgraph * gf = build_graph_gpu(ctxs[ub], weights[0], n_gpu > 1 ? weights[1] : NULL,
+                n_tokens + 8, false, &a, &b, &x1);
+
+        // the odd ubatches get one extra node: a scale by 1 keeps the value but changes the node
+        // count, which forces the reallocation branch of the scheduler on the next begin
+        struct ggml_tensor * out = x1;
+        if (ub % 2 == 1) {
+            out = ggml_scale(ctxs[ub], x1, 1.0f);
+            ggml_build_forward_expand(gf, out);
+        }
+        ggml_set_output(out);
+
+        if (!ggml_backend_sched_pipeline_begin(sched, gf, ub)) {
+            fail("pipeline_begin gpu deep realloc", ub, -1);
+        }
+
+        for (int i = 0; i < n_tokens + 8; i++) {
+            ((float *) a->data)[i] = (float) (ub*1000 + i);
+        }
+        for (int i = 0; i < n_tokens; i++) {
+            ((float *) b->data)[i] = (float) (ub*7 + i);
+        }
+
+        if (ggml_backend_sched_pipeline_submit(sched, ub) != GGML_STATUS_SUCCESS) {
+            fail("pipeline_submit gpu deep realloc", ub, -1);
+        }
+
+        // rewrite the caller graph inputs immediately, then build the next ubatch
+        memset(a->data, 0, ggml_nbytes(a));
+        memset(b->data, 0, ggml_nbytes(b));
+
+        // copy this ubatch's output to its own host region, ordered after its compute
+        ggml_backend_t out_backend = ggml_backend_sched_get_tensor_backend(sched, out);
+        const int out_backend_id = ggml_backend_sched_get_tensor_backend_id(sched, out);
+        float * dst = host_out.data() + (size_t) ub * n_tokens;
+        ggml_backend_sched_post_task(sched, out_backend_id, [=]() {
+            ggml_backend_tensor_get_async(out_backend, out, dst, 0, n_tokens*sizeof(float));
+        });
+    }
+
+    const auto check = [&](int ub, const char * what) {
+        for (int i = 0; i < n_tokens; i++) {
+            const float av = (float) (ub*1000 + i + 8);
+            const float bv = (float) (ub*7 + i);
+            float expect = (float) i + av + bv;
+            if (n_gpu > 1) {
+                expect += (float) (100 + i);
+            }
+            if (memcmp(&host_out[(size_t) ub * n_tokens + i], &expect, sizeof(float)) != 0) {
+                fail(what, ub, i);
+            }
+        }
+    };
+
+    // only the last ubatch is waited for first: the earlier submissions must still be intact. the
+    // stage wait covers the output copies posted to the same workers
+    {
+        const int ub = n_ub - 1;
+        ggml_backend_sched_pipeline_wait(sched, ub);
+        check(ub, "wrong output gpu deep realloc (last)");
+    }
+
+    // then every ubatch, in submission order
+    ggml_backend_sched_pipeline_advance(sched);
+    for (int ub = 0; ub < n_ub; ub++) {
+        check(ub, "wrong output gpu deep realloc");
+    }
+
+    for (int ub = 0; ub < n_ub; ub++) {
+        ggml_free(ctxs[ub]);
+    }
+    ggml_backend_sched_free(sched);
+    for (size_t g = 0; g < w_bufs.size(); g++) {
+        ggml_backend_buffer_free(w_bufs[g]);
+        ggml_free(w_ctxs[g]);
+    }
+    for (int b = 0; b < n_backends; b++) {
+        ggml_backend_free(backends[b]);
+    }
+
+    printf("OK\n");
+    return n_gpu;
+}
+
 int main() {
     printf("pipeline: 1 backend ... ");
     fflush(stdout);
@@ -559,6 +744,7 @@ int main() {
     run_pipeline_gpu(true,  false, true);
     run_pipeline_gpu(true,  true,  true);
     run_pipeline_gpu_deep();
+    run_pipeline_gpu_deep_realloc();
 
     return 0;
 }

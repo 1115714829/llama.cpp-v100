@@ -2442,14 +2442,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     bool writes_h_sink = embd_link && embd_link->t_h_sink_tgt != nullptr && t_h_sink != nullptr && h_sink_is_target;
     const bool reads_h_sink  = embd_link && embd_link->t_h_sink_tgt != nullptr && h_src_enable && !h_sink_is_target;
 
-    // r-mtpskip: skip the sink write and the cross-context ordering of a target ubatch whose
-    // positions all lie below the prefill boundary of their sequence. The MTP draft skips the
-    // same positions, so it never reads those rows: the write has no consumer. Not a fallback.
-    // A ubatch is kept when any of its tokens is at or above its sequence boundary.
+    // r-mtpskip: a target ubatch whose positions all lie below the prefill boundary of their
+    // sequence is not read by the MTP draft (the draft skips the same positions). The graph still
+    // writes the sink rows: the topology must stay identical to the reserved worst case, otherwise
+    // the allocator re-reserves for the current batch size and every later batch re-reserves again.
+    // The extra copy has no reader and is cheap. Not a fallback: only the cross-context ordering is
+    // dropped, the write itself stays.
     const bool h_sink_skip = writes_h_sink && h_sink_ubatch_skip(ubatch);
-    if (h_sink_skip) {
-        writes_h_sink = false;
-    }
 
     int32_t sink_group = 0; // the group this ubatch writes, 0 when it writes none
 
@@ -2462,7 +2461,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(sched_cur, res, ubatch, mctx, gtype, token_offset, h_sink_skip);
+    const auto gparams = graph_params(sched_cur, res, ubatch, mctx, gtype, token_offset);
 
     if (!pipeline && !graph_reuse_disable && gf_res_prev_active[slot] == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -2568,7 +2567,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_event_wait(backends[0].get(), embd_link->ev_copy_done);
     }
 
-    if (writes_h_sink) {
+    if (writes_h_sink && !h_sink_skip) {
         // same on the output device stream: the previously posted splits reach the stream before
         // this wait is queued
         wait_submitted(backend_h_sink);
@@ -2614,7 +2613,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_event_record(embd_link->ev_tgt_done, backends[0].get());
     }
 
-    if (writes_h_sink) {
+    if (writes_h_sink && !h_sink_skip) {
         // same as above on the output device stream: the sink write of this ubatch is enqueued
         // before the event is recorded, so the draft reads the completed rows
         wait_submitted(backend_h_sink);
@@ -3996,8 +3995,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype,
-                             size_t        token_offset,
-                                bool        h_sink_skip) const {
+                             size_t        token_offset) const {
     // the 6-card FA assist shares the KV tail with the idle devices, but with a range mask the
     // marked FA view always spans the whole cache: gate on the KV length the batch really uses
     bool fa_assist = false;
@@ -4055,7 +4053,7 @@ llm_graph_params llama_context::graph_params(
         /*.h_src_cols            =*/ (!h_sink_is_target && h_src_enable && !h_src_cols.empty()) ? h_src_cols.data() : nullptr,
         /*.h_token_offset        =*/ (size_t) h_sink_offset,
         /*.h_sink_is_target      =*/ h_sink_is_target,
-        /*.h_sink_write          =*/ h_sink_write && !h_sink_skip,
+        /*.h_sink_write          =*/ h_sink_write,
         /*.fa_assist             =*/ fa_assist,
         /*.mtp_kv_only           =*/ mtp_kv_only,
     };

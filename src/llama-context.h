@@ -378,8 +378,7 @@ private:
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype,
-                             size_t        token_offset = 0,
-                                bool        h_sink_skip = false) const;
+                             size_t        token_offset = 0) const;
 
     llm_graph_cb graph_get_cb(ggml_backend_sched_t sched) const;
 

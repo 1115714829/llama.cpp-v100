@@ -1772,6 +1772,13 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
 
+        // a pipeline submission can have tasks posted to the workers but not yet enqueued to the
+        // device streams. those tasks still reference the allocations about to be freed or moved,
+        // and synchronizing the streams alone does not cover them. drain the workers first
+        if (sched->workers != NULL) {
+            ggml_backend_sched_workers_drain(sched);
+        }
+
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
         for (int i = 0; i < sched->n_backends; i++) {
