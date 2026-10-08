@@ -75,9 +75,23 @@ struct ggml_backend_sched_stage {
     int slot;          // input copy slot used by this stage (ubatch_id % n_copies)
     int64_t ubatch_id; // logical batch index, for ordering checks
     bool in_flight;
+    // completion of this ubatch, recorded by the submission tasks after their split. the slot
+    // events are shared by every n_copies submissions, so only these events can tell whether the
+    // ubatch on this stage is still running
+    ggml_backend_event_t done[GGML_SCHED_MAX_BACKENDS];
     // last submission-worker task posted for this stage, per backend (0 = none); the stage events
     // can only be synchronized once these tasks have been enqueued
     uint64_t backend_seq[GGML_SCHED_MAX_BACKENDS];
+};
+
+// pinned host staging of the pipeline user inputs. one ring per backend: the main thread copies the
+// inputs of a ubatch into the entry of its stage, the backend submission worker uploads the entry
+// before the graph computes, and the entry is reused once the upload of n_stages submissions ago
+// completed
+struct ggml_backend_sched_staging {
+    ggml_backend_buffer_t buf; // n_stages entries of `size` bytes
+    size_t size;               // bytes per entry
+    ggml_backend_event_t done[GGML_SCHED_MAX_STAGES]; // upload completion of each entry
 };
 
 // shared with ggml-backend-pipeline.cpp: enqueue the splits of the currently allocated graph
@@ -120,6 +134,9 @@ struct ggml_backend_sched {
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
+
+    // pinned host staging of the pipeline user inputs, indexed by backend
+    struct ggml_backend_sched_staging staging[GGML_SCHED_MAX_BACKENDS];
 
     // pipeline depth; 1 = no pipeline (single ubatch at a time)
     int n_stages;

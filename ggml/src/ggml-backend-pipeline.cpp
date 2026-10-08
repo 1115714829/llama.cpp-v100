@@ -19,11 +19,11 @@
 //
 // Cross-device activation copies are chained by events inside the CUDA backend, and consecutive
 // ubatches on the same device are ordered by the device stream FIFO. The only scheduler-level waits
-// are the stage reuse (ring wrap-around) and the output reads.
+// are the stage reuse (ring wrap-around, distance n_stages) and the output reads.
 //
-// The host inputs of a pipeline ubatch are copied synchronously in ggml_backend_sched_compute_splits,
-// so once submit() returns the caller can overwrite the host input tensors for the next ubatch
-// without waiting for the device.
+// The host inputs of a pipeline ubatch are copied by the main thread into a pinned staging ring and
+// uploaded by the submission workers before their graph computes, so once submit() returns the
+// caller can overwrite the host input tensors for the next ubatch without waiting for the device.
 
 void ggml_backend_sched_set_n_stages(ggml_backend_sched_t sched, int n_stages) {
     GGML_ASSERT(sched);
@@ -39,6 +39,18 @@ void ggml_backend_sched_set_n_stages(ggml_backend_sched_t sched, int n_stages) {
     // the submission workers only exist when the scheduler overlaps pipeline stages. a scheduler
     // with double buffered inputs but no overlap (n_stages == 1) submits synchronously
     if (n_stages > 1) {
+        // per-stage completion events and the staging events of the workers. devices without event
+        // support (CPU) yield NULL and never take the pipeline submission path
+        for (int s = 0; s < n_stages; s++) {
+            for (int b = 0; b < sched->n_backends; b++) {
+                if (sched->stages[s].done[b] == NULL) {
+                    sched->stages[s].done[b] = ggml_backend_event_new(sched->backends[b]->device);
+                }
+                if (sched->staging[b].done[s] == NULL) {
+                    sched->staging[b].done[s] = ggml_backend_event_new(sched->backends[b]->device);
+                }
+            }
+        }
         ggml_backend_sched_workers_start(sched);
     }
 }
@@ -46,20 +58,20 @@ void ggml_backend_sched_set_n_stages(ggml_backend_sched_t sched, int n_stages) {
 static void ggml_backend_sched_pipeline_wait_stage(ggml_backend_sched_t sched, int stage_id) {
     struct ggml_backend_sched_stage * stage = &sched->stages[stage_id];
 
-    // the stage events are recorded by the submitted tasks: wait until those tasks have been
-    // enqueued, otherwise the synchronize below could observe a stale recording
-    if (ggml_backend_sched_has_workers(sched)) {
-        for (int b = 0; b < sched->n_backends; b++) {
-            if (stage->backend_seq[b] > 0) {
-                ggml_backend_sched_worker_wait_done(sched, b, stage->backend_seq[b]);
-            }
-        }
-    }
-
+    // wait for the completion of this stage on every backend that ran a part of it. the distance to
+    // the previous user of the stage is n_stages, so the pipeline keeps n_stages ubatches in flight
     for (int b = 0; b < sched->n_backends; b++) {
-        ggml_backend_event_t ev = sched->events[b][stage->slot];
-        if (ev != NULL) {
-            ggml_backend_event_synchronize(ev);
+        if (stage->backend_seq[b] == 0) {
+            continue;
+        }
+
+        // the completion events are recorded by the submitted tasks: wait until those tasks have
+        // been enqueued, otherwise the synchronize below could observe a stale recording
+        if (ggml_backend_sched_has_workers(sched)) {
+            ggml_backend_sched_worker_wait_done(sched, b, stage->backend_seq[b]);
+        }
+        if (stage->done[b] != NULL) {
+            ggml_backend_event_synchronize(stage->done[b]);
         }
     }
 
@@ -83,8 +95,8 @@ bool ggml_backend_sched_pipeline_begin(ggml_backend_sched_t sched, struct ggml_c
 
     // input copies are double buffered: ubatch i uses slot i % n_copies on every backend, so
     // in-flight ubatches never overwrite each other's device inputs. the previous user of a slot is
-    // waited for by the writers (host input copies and pushed cross-device copies), see
-    // ggml_backend_sched_compute_splits_pipeline
+    // waited for by the pushed cross-device copies, and the host input uploads are ordered after it
+    // by the backend stream FIFO, see ggml_backend_sched_compute_splits_pipeline
     const int slot = (int) (ubatch_id % sched->n_copies);
     ggml_backend_sched_reset(sched);
     sched->next_copy = slot;
@@ -119,8 +131,8 @@ enum ggml_status ggml_backend_sched_pipeline_submit(ggml_backend_sched_t sched, 
         return status;
     }
 
-    // compute_splits records sched->events[b][cur_copy] at the end of each split; cur_copy is the
-    // input slot of this ubatch
+    // compute_splits records sched->events[b][cur_copy] and the stage completion events at the end
+    // of each split; cur_copy is the input slot of this ubatch
     stage->ubatch_id = ubatch_id;
     stage->in_flight = true;
     sched->pipeline_stage = -1;
