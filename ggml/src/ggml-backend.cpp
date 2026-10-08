@@ -1788,6 +1788,13 @@ struct ggml_backend_sched_ids_cache {
     std::vector<ggml_bitset_t> used_ids;
 };
 
+// a view of a user input shares its data: the user writes it through the input tensor, so it is
+// staged and copied like the input itself
+static bool ggml_backend_sched_is_user_input(const struct ggml_tensor * t) {
+    return (t->flags & GGML_TENSOR_FLAG_INPUT) ||
+           (t->view_src != NULL && (t->view_src->flags & GGML_TENSOR_FLAG_INPUT));
+}
+
 // process one split of the allocated graph synchronously on the calling thread
 // prev_backend_id is the backend of the previous split; it is updated here and left unchanged when
 // the split is skipped, matching the original loop
@@ -1814,7 +1821,7 @@ static enum ggml_status ggml_backend_sched_compute_split_sync(
         struct ggml_tensor * input = split->inputs[input_id];
         struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
-        if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+        if (ggml_backend_sched_is_user_input(input)) {
             // double buffered inputs: wait for the previous user of this slot, then copy
             // synchronously, so the caller can overwrite the host input for the next ubatch as soon
             // as this submission returns (see ggml_backend_sched_compute_splits_pipeline)
@@ -2077,7 +2084,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
     for (int s = 0; s < n_splits; s++) {
         for (int i = 0; i < splits[s].n_inputs; i++) {
             struct ggml_tensor * input = splits[s].inputs[i];
-            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            if (ggml_backend_sched_is_user_input(input)) {
                 continue;
             }
             producer_split[input] = -1;
@@ -2092,8 +2099,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
         }
     }
 
-    // pass 2: CPU backend splits and splits with host weight inputs (the MoE expert copy branch reads
-    // the ids on the host) keep their original synchronous semantics on the main thread
+    // pass 2: CPU backend splits and splits with host non-user-input tensors (host weights: the MoE
+    // expert copy branch reads the ids on the host) keep their original synchronous semantics on the
+    // main thread
     std::vector<char> on_main(n_splits, 0);
     for (int s = 0; s < n_splits; s++) {
         if (sched->workers->at(splits[s].backend_id) == NULL) {
@@ -2102,7 +2110,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
         }
         for (int i = 0; i < splits[s].n_inputs; i++) {
             struct ggml_tensor * input = splits[s].inputs[i];
-            if ((input->flags & GGML_TENSOR_FLAG_INPUT) == 0 && input->buffer != NULL &&
+            if (!ggml_backend_sched_is_user_input(input) && input->buffer != NULL &&
                     ggml_backend_buffer_is_host(input->buffer)) {
                 on_main[s] = 1;
                 break;
@@ -2121,7 +2129,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
         }
         for (int i = 0; i < splits[s].n_inputs; i++) {
             struct ggml_tensor * input = splits[s].inputs[i];
-            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            if (ggml_backend_sched_is_user_input(input)) {
                 continue;
             }
             struct ggml_tensor * input_cpy = tensor_copy(input, splits[s].backend_id, copy_id);
@@ -2179,7 +2187,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
         }
         for (int i = 0; i < splits[s].n_inputs; i++) {
             struct ggml_tensor * input = splits[s].inputs[i];
-            if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+            if (ggml_backend_sched_is_user_input(input)) {
                 staging_need[splits[s].backend_id] += ggml_nbytes(input);
             }
         }
@@ -2277,7 +2285,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
         std::vector<struct ggml_backend_sched_staging_copy> split_staging;
         for (int i = 0; i < split->n_inputs; i++) {
             struct ggml_tensor * input = split->inputs[i];
-            if ((input->flags & GGML_TENSOR_FLAG_INPUT) == 0) {
+            if (!ggml_backend_sched_is_user_input(input)) {
                 continue;
             }
             struct ggml_tensor * input_cpy = tensor_copy(input, backend_id, copy_id);
