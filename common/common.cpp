@@ -1252,10 +1252,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         }
         cparams_dft.n_rs_seq = 0;
 
-        // the MTP nextn sink reserves n_seq pending columns and (n_max + 1) draft-step columns
-        // per sequence on top of n_batch; the fit needs the same columns to reserve the bytes
+        // the MTP nextn sink reserves a second batch-column group (the prefill ring) plus n_seq
+        // pending columns and (n_max + 1) draft-step columns per sequence on top of n_batch; the
+        // fit needs the same columns to reserve the bytes
         const uint32_t h_sink_rows = spec_mtp
-            ? (uint32_t) (params.n_parallel * (params.speculative.draft.n_max + 2)) : 0;
+            ? (uint32_t) params.n_batch + (uint32_t) (params.n_parallel * (params.speculative.draft.n_max + 2)) : 0;
 
         const common_fit_extra_model extra = {
             /*.path_model   =*/ params_dft.model.path.c_str(),

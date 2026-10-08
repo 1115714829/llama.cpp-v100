@@ -169,19 +169,29 @@ LLAMA_API int32_t llama_layer_inp_sink_col(struct llama_context * ctx, llama_seq
 // r-mtpdev: keep the nextn hidden state in a device sink. The target writes its t_h_nextn rows
 // there; the draft reads and writes the same sink through the link. is_target selects the role
 // of the context; n_h_rows is the number of extra sink columns the MTP draft needs on top of
-// n_batch (pending rows and draft-step rows). Returns false if unsupported or the allocation
-// failed - the caller reports the failure instead of silently going back to the host path.
+// n_batch (the second batch-column group followed by the pending rows and the draft-step rows).
+// Returns false if unsupported or the allocation failed - the caller reports the failure instead
+// of silently going back to the host path.
 LLAMA_API bool llama_enable_h_nextn_sink(struct llama_context * ctx, bool is_target, uint32_t n_h_rows);
 
 // r-mtpdev: link a target and a draft context for the direct device access to the target h sink.
-// Creates the events that order the target writes, the captures and the draft reads/writes.
-// Returns false if the devices are not compatible or the events are not available.
+// Creates the per-group events that order the target writes, the captures and the draft
+// reads/writes. Returns false if the devices are not compatible or the events are not available.
 LLAMA_API bool llama_context_link_h_nextn(struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
 
 // r-mtpdev: select the h source of the next draft batch: true gathers the h rows in the graph
 // from the sink columns [cols, cols + n_cols), false disables the device gather. No-op when the
 // context is not linked.
 LLAMA_API void llama_set_h_source(struct llama_context * ctx, bool enable, const int32_t * cols, size_t n_cols);
+
+// r-mtpdev draft: the sink group (0 or 1) that the next draft graph reads, -1 when it reads no
+// group columns. The catch-up decode reads the group of the last target write; the draft steps
+// only touch the pending and step columns and must pass -1.
+LLAMA_API void llama_set_h_src_group(struct llama_context * ctx, int32_t group);
+
+// r-mtpdev: the sink group written by the most recent target graph (0 or 1). The driver maps its
+// columns through this group instead of counting target submissions on its own.
+LLAMA_API int32_t llama_h_nextn_sink_group(struct llama_context * ctx);
 
 // r-mtpdev draft: column offset of the next sink write. The chained-head draft uses it to keep
 // one row per draft step; the non-chained draft keeps the first draft-step column. No-op for a
@@ -194,14 +204,14 @@ LLAMA_API void llama_set_h_sink_offset(struct llama_context * ctx, int32_t offse
 LLAMA_API void llama_set_h_sink_write(struct llama_context * ctx, bool write);
 
 // r-mtpdev target: copy the sink rows src_cols into the reserved pending columns
-// [n_batch, n_batch + n_cols), so that the next batch may overwrite the source columns. The
+// [2*n_batch, 2*n_batch + n_cols), so that the next batch may overwrite the source columns. The
 // copy is ordered on the sink device after the target write and before the next draft read.
 // Returns false if the context has no target sink or n_cols exceeds the reserved space.
 LLAMA_API bool llama_h_nextn_sink_capture(struct llama_context * ctx, const int32_t * src_cols, size_t n_cols);
 
-// r-mtpdev: copy the target sink rows [token_offset, token_offset + n_tokens) into dst.
+// r-mtpdev: copy the target sink rows [group*n_batch + token_offset, ... + n_tokens) into dst.
 // Requires a target sink.
-LLAMA_API bool llama_h_nextn_sink_get(struct llama_context * ctx, size_t token_offset, size_t n_tokens, float * dst);
+LLAMA_API bool llama_h_nextn_sink_get(struct llama_context * ctx, int32_t group, size_t token_offset, size_t n_tokens, float * dst);
 
 // r-mtpdev: the h-sink column of token (seq_id, pos) of the last decoded batch, -1 if not in the sink
 LLAMA_API int32_t llama_h_nextn_sink_col(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);

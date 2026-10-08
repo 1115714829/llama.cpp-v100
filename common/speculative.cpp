@@ -1856,8 +1856,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<int32_t>> verify_h_cols;
     std::vector<int32_t> verify_h_rows;
 
-    // r-mtpdev: sink layout. Columns 0..n_batch-1 hold one batch in token order; the reserved
-    // pending columns and the draft-step columns follow (see enable/link and the capture calls)
+    // r-mtpdev: sink layout. The first 2*n_batch columns hold two batch-column groups (the
+    // pipelined prefill alternates between them); the reserved pending columns and the
+    // draft-step columns follow (see enable/link and the capture calls)
     int32_t h_sink_pending0 = 0; // first pending column, one per sequence
     int32_t h_sink_step0    = 0; // first draft-step column
     int32_t h_sink_extra    = 0; // total extra columns requested from the target
@@ -1934,15 +1935,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         // r-mtpdev: the MTP draft keeps every hidden state on the device. The target sink holds
-        // the batch rows in columns 0..n_batch-1, then n_seq pending columns and (n_max + 1)
-        // draft-step columns per sequence. The host h path is gone, so an unavailable sink or a
-        // model graph without the device branch is a hard error.
+        // two batch-column groups ([0, n_batch) and [n_batch, 2*n_batch), the pipelined prefill
+        // alternates between them), then n_seq pending columns and (n_max + 1) draft-step
+        // columns per sequence. The host h path is gone, so an unavailable sink or a model graph
+        // without the device branch is a hard error.
         // The sink was sized and linked by common_speculative_init_result before the context was
         // created; use the same unbounded n_max here so the layout matches (the chain clamp
         // below only lowers the number of columns that are used)
-        h_sink_pending0 = (int32_t) llama_n_batch(ctx_tgt);
+        const int32_t n_batch_tgt = (int32_t) llama_n_batch(ctx_tgt);
+        h_sink_pending0 = 2*n_batch_tgt;
         h_sink_step0    = h_sink_pending0 + (int32_t) n_seq;
-        h_sink_extra    = (int32_t) (n_seq * (this->params.n_max + 2));
+        h_sink_extra    = n_batch_tgt + (int32_t) (n_seq * (this->params.n_max + 2));
 
         // idempotent checks: the enable/link already ran during the context construction, these
         // calls must not allocate or build anything again
@@ -2042,6 +2045,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
 
+        // the target writes its batch columns into one of two groups; the columns of the batch
+        // just decoded live in the group of the most recent target write
+        const int32_t h_sink_group = llama_h_nextn_sink_group(ctx_tgt);
+        const int32_t h_group_base = h_sink_group * (int32_t) llama_n_batch(ctx_tgt);
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
             batch.clear();
@@ -2063,10 +2071,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 const int32_t idx = batch.add(batch_in.tokens[k].id, batch_in.tokens[k].pos[0], seq_id, false);
 
-                h_cols[k] = k == i_batch_beg[seq_id] ? pending_col[seq_id] : k - 1;
+                h_cols[k] = k == i_batch_beg[seq_id] ? pending_col[seq_id] : h_group_base + (k - 1);
                 (void) idx;
             }
 
+            // the catch-up is the only draft graph that reads group columns, so only it records
+            // the group as read (the draft steps below set -1)
+            llama_set_h_src_group(ctx_dft, h_sink_group);
             llama_set_h_source(ctx_dft, true, h_cols.data(), h_cols.size());
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -2113,9 +2124,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_cols[seq_id].resize((size_t) n_rows);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                // the sink column of batch row i_batch_beg + i is the row index itself: the
-                // target writes one sink column per batch token, in batch order
-                verify_h_cols[seq_id][i] = i_batch_beg[seq_id] + i;
+                // the sink column of batch row i_batch_beg + i is the row index itself, offset
+                // by the group base: the target writes one sink column per batch token, in
+                // batch order, into the group of its most recent write
+                verify_h_cols[seq_id][i] = h_group_base + i_batch_beg[seq_id] + i;
             }
 
             if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
@@ -2125,7 +2137,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             // carry the last row into the reserved pending column before the next target batch
             // overwrites the batch columns
-            pending_src[seq_id] = i_batch_end[seq_id];
+            pending_src[seq_id] = h_group_base + i_batch_end[seq_id];
         }
 
         if (!llama_h_nextn_sink_capture(ctx_tgt, pending_src.data(), pending_src.size())) {
@@ -2148,6 +2160,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // every draft step writes its output row into the sink for the next step to read
         llama_set_h_sink_write(ctx_dft, true);
         llama_set_h_sink_offset(ctx_dft, h_sink_step0);
+
+        // the draft steps read the pending and step columns only: they must not mark any batch
+        // group as read, or they would release a group the target may still be writing
+        llama_set_h_src_group(ctx_dft, -1);
 
         // the h column of every batch row of the next step, in batch order
         std::vector<int32_t> step_cols;
@@ -3195,10 +3211,12 @@ common_speculative_init_result::common_speculative_init_result(
         // the sink is sized here, before the draft context is created: the MTP draft links itself
         // to the target sink during construction (llama_init_from_model), so the layout must be
         // known up front. the chain clamp (n_mtp_layers) can only lower n_max later, which keeps
-        // this allocation a superset of the columns that end up used
-        const uint32_t n_seq = llama_n_seq_max(ctx_tgt);
-        const int32_t  n_max = std::max(0, params.speculative.draft.n_max);
-        cparams.n_h_sink_rows = n_seq * (uint32_t) (n_max + 2);
+        // this allocation a superset of the columns that end up used. the extra columns are one
+        // whole batch group for the prefill rotation plus the per-sequence bookkeeping columns
+        const uint32_t n_seq   = llama_n_seq_max(ctx_tgt);
+        const uint32_t n_batch = llama_n_batch(ctx_tgt);
+        const int32_t  n_max   = std::max(0, params.speculative.draft.n_max);
+        cparams.n_h_sink_rows = n_batch + n_seq * (uint32_t) (n_max + 2);
     }
 
     // the draft context holds as many tokens per sequence as the target context

@@ -1902,8 +1902,10 @@ bool llama_context::enable_h_nextn_sink(bool is_target, uint32_t n_h_rows) {
     };
     ctx_h_sink.reset(ggml_init(params));
 
-    // n_batch columns hold the rows of one batch (token order), the next n_h_rows hold the MTP
-    // bookkeeping rows (pending rows and draft-step rows), see the callers in common/speculative.cpp
+    // the first n_batch columns hold the rows of batch group 0, the next n_batch columns those of
+    // group 1 (the pipelined prefill alternates between the two groups), then n_h_rows extra
+    // columns follow: the MTP bookkeeping rows (pending rows and draft-step rows), see the
+    // callers in common/speculative.cpp
     ggml_tensor * sink = ggml_new_tensor_2d(ctx_h_sink.get(), GGML_TYPE_F32, n_embd_out, (int64_t) cparams.n_batch + n_h_rows);
     ggml_set_name(sink, "h_nextn_sink");
 
@@ -1975,11 +1977,27 @@ bool llama_context::link_h_nextn(llama_context * ctx_dft) {
         return false;
     }
 
-    ggml_backend_event_t ev_h_tgt_done  = ggml_backend_event_new(ggml_backend_get_device(backend_h_sink));
-    ggml_backend_event_t ev_h_read_done = ggml_backend_event_new(ggml_backend_get_device(ctx_dft->backend_h_sink));
-    if (ev_h_tgt_done == nullptr || ev_h_read_done == nullptr) {
-        ggml_backend_event_free(ev_h_tgt_done);
-        ggml_backend_event_free(ev_h_read_done);
+    // one target-done and one read-done event per batch group, plus one event that covers the
+    // pending columns (the draft steps do not read any group, so their completion needs its own
+    // signal for the capture that overwrites the pending columns)
+    ggml_backend_event_t ev_h_tgt_done[2]  = { nullptr, nullptr };
+    ggml_backend_event_t ev_h_read_done[2] = { nullptr, nullptr };
+    for (int i = 0; i < 2; ++i) {
+        ev_h_tgt_done[i]  = ggml_backend_event_new(ggml_backend_get_device(backend_h_sink));
+        ev_h_read_done[i] = ggml_backend_event_new(ggml_backend_get_device(ctx_dft->backend_h_sink));
+    }
+    ggml_backend_event_t ev_h_pending_done = ggml_backend_event_new(ggml_backend_get_device(ctx_dft->backend_h_sink));
+
+    bool events_ok = ev_h_pending_done != nullptr;
+    for (int i = 0; i < 2; ++i) {
+        events_ok = events_ok && ev_h_tgt_done[i] != nullptr && ev_h_read_done[i] != nullptr;
+    }
+    if (!events_ok) {
+        for (int i = 0; i < 2; ++i) {
+            ggml_backend_event_free(ev_h_tgt_done[i]);
+            ggml_backend_event_free(ev_h_read_done[i]);
+        }
+        ggml_backend_event_free(ev_h_pending_done);
         return false;
     }
 
@@ -1987,9 +2005,13 @@ bool llama_context::link_h_nextn(llama_context * ctx_dft) {
     if (!link) {
         link = std::make_shared<llama_embd_link>();
     }
-    link->ev_h_tgt_done  = ev_h_tgt_done;
-    link->ev_h_read_done = ev_h_read_done;
-    link->t_h_sink_tgt   = t_h_sink;
+    for (int i = 0; i < 2; ++i) {
+        link->ev_h_tgt_done[i]  = ev_h_tgt_done[i];
+        link->ev_h_read_done[i] = ev_h_read_done[i];
+    }
+    link->ev_h_pending_done = ev_h_pending_done;
+    link->t_h_sink_tgt      = t_h_sink;
+    link->h_sink_group_last = 0;
 
     embd_link          = link;
     ctx_dft->embd_link = link;
@@ -2062,14 +2084,30 @@ void llama_context::set_h_sink_write(bool write) {
     h_sink_write = write;
 }
 
+void llama_context::set_h_src_group(int32_t group) {
+    if (h_sink_is_target || t_h_sink == nullptr) {
+        return;
+    }
+
+    h_src_group = group;
+}
+
+int32_t llama_context::h_nextn_sink_group() const {
+    if (!embd_link || embd_link->t_h_sink_tgt == nullptr) {
+        return 0;
+    }
+
+    return embd_link->h_sink_group_last;
+}
+
 bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols) {
     if (t_h_sink == nullptr || !h_sink_is_target || src_cols == nullptr || n_cols == 0) {
         return false;
     }
 
-    // the reserved pending columns are the first n_h_rows columns after n_batch
+    // the reserved pending columns start at 2*n_batch, after the two batch-column groups
     const size_t n_batch = cparams.n_batch;
-    if (n_batch + n_cols > (size_t) t_h_sink->ne[1]) {
+    if (2*n_batch + n_cols > (size_t) t_h_sink->ne[1]) {
         return false;
     }
 
@@ -2077,9 +2115,10 @@ bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols
     // capture copies below are then queued after the write on the same stream
     wait_submitted(backend_h_sink);
 
-    // the draft may still be reading the rows from the previous capture
+    // the draft may still be reading the pending columns (the catch-up and the draft steps both
+    // read the carried row); this capture overwrites them
     if (embd_link && embd_link->t_h_sink_tgt != nullptr) {
-        ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_read_done);
+        ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_pending_done);
     }
 
     const ggml_init_params params = {
@@ -2095,15 +2134,15 @@ bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols
             // this sequence had no rows in the batch: keep its pending column as it is
             continue;
         }
-        if ((size_t) src_col >= n_batch) {
-            // a source outside the batch columns means the caller passed a stale column
+        if ((size_t) src_col >= 2*n_batch) {
+            // a source outside the two batch-column groups means the caller passed a stale column
             return false;
         }
 
         ggml_tensor * src = ggml_view_2d(ctx_view.get(), t_h_sink, t_h_sink->ne[0], 1,
                 t_h_sink->nb[1], (size_t) src_col * t_h_sink->nb[1]);
         ggml_tensor * dst = ggml_view_2d(ctx_view.get(), t_h_sink, t_h_sink->ne[0], 1,
-                t_h_sink->nb[1], (size_t) (n_batch + i) * t_h_sink->nb[1]);
+                t_h_sink->nb[1], (size_t) (2*n_batch + i) * t_h_sink->nb[1]);
 
         GGML_ASSERT(ggml_backend_view_init(src) == GGML_STATUS_SUCCESS);
         GGML_ASSERT(ggml_backend_view_init(dst) == GGML_STATUS_SUCCESS);
@@ -2113,29 +2152,37 @@ bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols
         ggml_backend_tensor_copy_async(backend_h_sink, backend_h_sink, src, dst);
     }
 
-    // the next draft read must not start before the pending rows are in place
+    // the next draft read must not start before the pending rows are in place. The source
+    // columns belong to the group of the most recent target write: the driver maps its columns
+    // through that group. The capture copies read the source group on this stream, ahead of any
+    // later write of the same group on this stream, so no read-side event is needed here
     if (embd_link && embd_link->t_h_sink_tgt != nullptr) {
-        ggml_backend_event_record(embd_link->ev_h_tgt_done, backend_h_sink);
+        ggml_backend_event_record(embd_link->ev_h_tgt_done[embd_link->h_sink_group_last], backend_h_sink);
     }
 
     return true;
 }
 
-bool llama_context::h_nextn_sink_get(size_t token_offset, size_t n_tokens, float * dst) {
+bool llama_context::h_nextn_sink_get(int32_t group, size_t token_offset, size_t n_tokens, float * dst) {
     if (t_h_sink == nullptr || !h_sink_is_target || dst == nullptr) {
+        return false;
+    }
+
+    if (group != 0 && group != 1) {
         return false;
     }
 
     const size_t row = (size_t) t_h_sink->ne[0];
     GGML_ASSERT(row == (size_t) model.hparams.n_embd_out());
 
-    if (token_offset + n_tokens > (size_t) t_h_sink->ne[1]) {
+    const size_t col0 = (size_t) group * cparams.n_batch + token_offset;
+    if (col0 + n_tokens > (size_t) t_h_sink->ne[1]) {
         return false;
     }
 
     // the sink may still be written by the target graph
     synchronize();
-    ggml_backend_tensor_get(t_h_sink, dst, token_offset*row*sizeof(float), n_tokens*row*sizeof(float));
+    ggml_backend_tensor_get(t_h_sink, dst, col0*row*sizeof(float), n_tokens*row*sizeof(float));
 
     return true;
 }
@@ -2329,6 +2376,24 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     auto * sched_cur = sched_for_slot(slot);
 
+    // r-mtpdev cross-context ordering for the nextn h sink: the target write waits for the draft
+    // to finish reading the previous write, the draft read waits for the target graph to finish.
+    // The batch columns hold two groups; only the pipelined prefill rotates between them. Every
+    // other target graph (the verify graph of a decode round, a single-token decode) writes
+    // group 0, or its column offset would flip between rounds and force a rebuild of the
+    // otherwise reusable decode graph
+    const bool writes_h_sink = embd_link && embd_link->t_h_sink_tgt != nullptr && t_h_sink != nullptr && h_sink_is_target;
+    const bool reads_h_sink  = embd_link && embd_link->t_h_sink_tgt != nullptr && h_src_enable && !h_sink_is_target;
+
+    int32_t sink_group = 0; // the group this ubatch writes, 0 when it writes none
+
+    if (writes_h_sink) {
+        sink_group = pipeline ? h_sink_group : 0;
+
+        // the group base is part of the graph parameters and enters the graph reuse check
+        h_sink_offset = sink_group * (int32_t) cparams.n_batch;
+    }
+
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(sched_cur, res, ubatch, mctx, gtype, token_offset);
@@ -2421,11 +2486,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const bool writes_sink = embd_link && t_layer_inp_sink != nullptr;
     const bool copies_src  = embd_link && embd_src_enable && t_embd_src_sink != nullptr && ubatch.embd != nullptr;
 
-    // r-mtpdev cross-context ordering for the nextn h sink: the target write waits for the draft
-    // to finish reading the previous write, the draft read waits for the target graph to finish
-    const bool writes_h_sink = embd_link && embd_link->t_h_sink_tgt != nullptr && t_h_sink != nullptr && h_sink_is_target;
-    const bool reads_h_sink  = embd_link && embd_link->t_h_sink_tgt != nullptr && h_src_enable && !h_sink_is_target;
-
     if (writes_sink) {
         // the splits posted so far (including the previous write) reach the target stream before
         // this wait: it must not land in the middle of them
@@ -2438,8 +2498,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // same on the output device stream: the previously posted splits reach the stream before
         // this wait is queued
         wait_submitted(backend_h_sink);
-        // the draft may still be reading the previous target write
-        ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_read_done);
+        // the draft may still be reading this group: it was written two target writes ago, so in
+        // steady state the wait is free (the group rotation buys the target one round of slack)
+        ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_read_done[sink_group]);
     }
 
     if (copies_src) {
@@ -2452,8 +2513,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (reads_h_sink) {
-        // the draft graph reads the target sink in place
-        ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_tgt_done);
+        // the draft graph reads the target sink in place, in the group of the most recent target
+        // write; the link is the authority on that group (the driver must not keep its own
+        // counter: not every target submission goes through the speculative driver)
+        ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_tgt_done[embd_link->h_sink_group_last]);
     }
 
     ggml_status status;
@@ -2479,12 +2542,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // same as above on the output device stream: the sink write of this ubatch is enqueued
         // before the event is recorded, so the draft reads the completed rows
         wait_submitted(backend_h_sink);
-        ggml_backend_event_record(embd_link->ev_h_tgt_done, backend_h_sink);
+        ggml_backend_event_record(embd_link->ev_h_tgt_done[sink_group], backend_h_sink);
+
+        // the driver maps its columns through the group of the most recent write. Only the
+        // pipelined prefill advances the rotation; non-pipelined graphs keep writing group 0
+        embd_link->h_sink_group_last = sink_group;
+        if (pipeline) {
+            h_sink_group ^= 1;
+        }
     }
 
     if (reads_h_sink) {
-        // the draft is done with the sink, the target may overwrite it
-        ggml_backend_event_record(embd_link->ev_h_read_done, backend_h_sink);
+        // the draft is done with the group columns, the target may overwrite the group. The
+        // draft steps read no group columns (h_src_group is -1 then), so only the catch-up
+        // records a group here. Every draft graph may write the pending columns, so their
+        // completion is recorded unconditionally for the capture that overwrites them
+        if (h_src_group >= 0) {
+            ggml_backend_event_record(embd_link->ev_h_read_done[h_src_group], backend_h_sink);
+        }
+        ggml_backend_event_record(embd_link->ev_h_pending_done, backend_h_sink);
     }
 
     if (status != GGML_STATUS_SUCCESS) {
@@ -3189,12 +3265,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
 
-        // r-mtpdev: same mapping for the target h sink (the draft reads it through this mapping)
-        if (t_h_sink != nullptr && h_sink_is_target && cparams.n_seq_max > 1) {
+        // r-mtpdev: same mapping for the target h sink (the draft reads it through this mapping).
+        // The columns of this ubatch start at its token offset within the group written by the
+        // target graph (h_sink_offset, set by process_ubatch; n_tokens_prev is the offset passed
+        // to it); storing the absolute column keeps the group rotation out of the lookups
+        if (embd_link && embd_link->t_h_sink_tgt != nullptr && h_sink_is_target && cparams.n_seq_max > 1) {
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 const llama_seq_id seq_id = ubatch.seq_id[i][0];
                 h_sink_cols.emplace_back(seq_id, ubatch.pos[i]);
-                h_sink_cols_by_seq[seq_id].emplace_back(ubatch.pos[i], (int32_t) h_sink_cols.size() - 1);
+                h_sink_cols_by_seq[seq_id].emplace_back(ubatch.pos[i], h_sink_offset + (int32_t) n_tokens_prev + (int32_t) i);
             }
         }
 
@@ -5410,6 +5489,14 @@ void llama_set_h_source(struct llama_context * ctx, bool enable, const int32_t *
     ctx->set_h_source(enable, cols, n_cols);
 }
 
+void llama_set_h_src_group(struct llama_context * ctx, int32_t group) {
+    ctx->set_h_src_group(group);
+}
+
+int32_t llama_h_nextn_sink_group(struct llama_context * ctx) {
+    return ctx->h_nextn_sink_group();
+}
+
 void llama_set_h_sink_offset(struct llama_context * ctx, int32_t offset) {
     ctx->set_h_sink_offset(offset);
 }
@@ -5422,8 +5509,8 @@ bool llama_h_nextn_sink_capture(struct llama_context * ctx, const int32_t * src_
     return ctx->h_nextn_sink_capture(src_cols, n_cols);
 }
 
-bool llama_h_nextn_sink_get(struct llama_context * ctx, size_t token_offset, size_t n_tokens, float * dst) {
-    return ctx->h_nextn_sink_get(token_offset, n_tokens, dst);
+bool llama_h_nextn_sink_get(struct llama_context * ctx, int32_t group, size_t token_offset, size_t n_tokens, float * dst) {
+    return ctx->h_nextn_sink_get(group, token_offset, n_tokens, dst);
 }
 
 int32_t llama_h_nextn_sink_col(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {

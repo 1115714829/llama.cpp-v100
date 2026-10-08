@@ -551,10 +551,12 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             }
 
             if (extra->h_sink_rows > 0) {
-                // MTP nextn sink [n_embd_out, n_batch + extra rows]: allocated once by the
-                // target on its output device (llama_context::enable_h_nextn_sink); the draft
-                // shares those rows via link_h_nextn and allocates nothing. With a layer split
-                // the output device is the last target device
+                // MTP nextn sink [n_embd_out, n_batch + extra rows] where the extra rows hold a
+                // second batch-column group (the prefill ring) and the per-sequence bookkeeping
+                // columns: allocated once by the target on its output device
+                // (llama_context::enable_h_nextn_sink); the draft shares those rows via
+                // link_h_nextn and allocates nothing. With a layer split the output device is
+                // the last target device
                 const size_t row = (size_t) llama_model_n_embd_out(model) * sizeof(float);
                 ret[nd > 0 ? nd - 1 : 0].mb.context +=
                     row * ((size_t) cparams->n_batch + extra->h_sink_rows);
