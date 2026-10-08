@@ -52,10 +52,10 @@ struct llama_embd_link {
 
     // r-mtpdev: device link for the nextn hidden state (see llama_context_link_h_nextn). The
     // batch columns of the h sink are split into two groups; every event that guards them exists
-    // once per group and is indexed by the group of the write or read it orders
+    // once per group and is indexed by the group of the write or read it orders. The pending
+    // columns need no event: only the draft stream reads and writes them
     ggml_backend_event_t ev_h_tgt_done[2]  = { nullptr, nullptr }; // target finished writing the group
     ggml_backend_event_t ev_h_read_done[2] = { nullptr, nullptr }; // draft finished reading the group
-    ggml_backend_event_t ev_h_pending_done = nullptr;              // draft finished reading the pending columns
     ggml_tensor * t_h_sink_tgt = nullptr;          // target h sink, read by the draft graph
     int32_t h_sink_group_last = 0;                 // group written by the most recent target graph
 
@@ -66,7 +66,6 @@ struct llama_embd_link {
             ggml_backend_event_free(ev_h_tgt_done[i]);
             ggml_backend_event_free(ev_h_read_done[i]);
         }
-        ggml_backend_event_free(ev_h_pending_done);
     }
 };
 
@@ -196,9 +195,9 @@ struct llama_context {
     // r-mtpdev draft: enable/disable the sink write of the next draft graph (catch-up decodes
     // keep it off so that they do not overwrite the target batch columns)
     void set_h_sink_write(bool write);
-    // r-mtpdev target: copy the sink rows src_cols into the reserved pending columns
-    // [2*n_batch, 2*n_batch + n_cols). Runs on the sink device, ordered after the target write
-    // and before the next draft read
+    // r-mtpdev draft: copy the sink rows src_cols into the reserved pending columns
+    // [2*n_batch, 2*n_batch + n_cols). Runs on the draft's output-device stream, ordered after
+    // the target write and after the draft graph, and before the next draft read
     bool h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols);
     // r-mtpdev: read back the sink rows [group*n_batch + token_offset, ... + n_tokens) into dst
     bool h_nextn_sink_get(int32_t group, size_t token_offset, size_t n_tokens, float * dst);

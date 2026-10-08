@@ -203,10 +203,11 @@ LLAMA_API void llama_set_h_sink_offset(struct llama_context * ctx, int32_t offse
 // output rows for the next step to read
 LLAMA_API void llama_set_h_sink_write(struct llama_context * ctx, bool write);
 
-// r-mtpdev target: copy the sink rows src_cols into the reserved pending columns
+// r-mtpdev draft: copy the sink rows src_cols into the reserved pending columns
 // [2*n_batch, 2*n_batch + n_cols), so that the next batch may overwrite the source columns. The
-// copy is ordered on the sink device after the target write and before the next draft read.
-// Returns false if the context has no target sink or n_cols exceeds the reserved space.
+// copies run on the draft's output-device stream, ordered after the target write and after the
+// draft graph, and before the next draft read. Returns false if the context is not a linked draft
+// or n_cols exceeds the reserved space.
 LLAMA_API bool llama_h_nextn_sink_capture(struct llama_context * ctx, const int32_t * src_cols, size_t n_cols);
 
 // r-mtpdev: copy the target sink rows [group*n_batch + token_offset, ... + n_tokens) into dst.

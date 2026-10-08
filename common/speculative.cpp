@@ -2140,7 +2140,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             pending_src[seq_id] = h_group_base + i_batch_end[seq_id];
         }
 
-        if (!llama_h_nextn_sink_capture(ctx_tgt, pending_src.data(), pending_src.size())) {
+        if (!llama_h_nextn_sink_capture(ctx_dft, pending_src.data(), pending_src.size())) {
             SPC_ERR("%s", "failed to capture the pending h rows\n");
             return false;
         }
@@ -2391,8 +2391,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // overwrites the batch columns
         pending_src[seq_id] = verify_h_cols[seq_id][i_h];
 
-        auto * ctx_tgt = this->params.ctx_tgt;
-        if (!llama_h_nextn_sink_capture(ctx_tgt, pending_src.data(), pending_src.size())) {
+        // the capture runs on the draft stream, behind the draft steps that read the pending
+        // columns, and stays off the target stream
+        auto * ctx_dft = this->params.ctx_dft;
+        if (!llama_h_nextn_sink_capture(ctx_dft, pending_src.data(), pending_src.size())) {
             SPC_ERR("accept: failed to capture the pending h rows of seq=%d\n", (int) seq_id);
             return;
         }

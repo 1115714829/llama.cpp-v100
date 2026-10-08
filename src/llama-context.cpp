@@ -1977,18 +1977,24 @@ bool llama_context::link_h_nextn(llama_context * ctx_dft) {
         return false;
     }
 
-    // one target-done and one read-done event per batch group, plus one event that covers the
-    // pending columns (the draft steps do not read any group, so their completion needs its own
-    // signal for the capture that overwrites the pending columns)
+    // the capture computes the sink column offsets with its own n_batch (it runs on the draft
+    // context), so both contexts must split the group columns the same way
+    if (ctx_dft->cparams.n_batch != cparams.n_batch) {
+        LLAMA_LOG_WARN("%s: draft and target batch sizes do not match\n", __func__);
+        return false;
+    }
+
+    // one target-done and one read-done event per batch group. The pending columns need no
+    // event: the capture runs on the draft stream, so the draft stream orders the pending reads
+    // and writes by itself (FIFO)
     ggml_backend_event_t ev_h_tgt_done[2]  = { nullptr, nullptr };
     ggml_backend_event_t ev_h_read_done[2] = { nullptr, nullptr };
     for (int i = 0; i < 2; ++i) {
         ev_h_tgt_done[i]  = ggml_backend_event_new(ggml_backend_get_device(backend_h_sink));
         ev_h_read_done[i] = ggml_backend_event_new(ggml_backend_get_device(ctx_dft->backend_h_sink));
     }
-    ggml_backend_event_t ev_h_pending_done = ggml_backend_event_new(ggml_backend_get_device(ctx_dft->backend_h_sink));
 
-    bool events_ok = ev_h_pending_done != nullptr;
+    bool events_ok = true;
     for (int i = 0; i < 2; ++i) {
         events_ok = events_ok && ev_h_tgt_done[i] != nullptr && ev_h_read_done[i] != nullptr;
     }
@@ -1997,7 +2003,6 @@ bool llama_context::link_h_nextn(llama_context * ctx_dft) {
             ggml_backend_event_free(ev_h_tgt_done[i]);
             ggml_backend_event_free(ev_h_read_done[i]);
         }
-        ggml_backend_event_free(ev_h_pending_done);
         return false;
     }
 
@@ -2009,16 +2014,17 @@ bool llama_context::link_h_nextn(llama_context * ctx_dft) {
         link->ev_h_tgt_done[i]  = ev_h_tgt_done[i];
         link->ev_h_read_done[i] = ev_h_read_done[i];
     }
-    link->ev_h_pending_done = ev_h_pending_done;
     link->t_h_sink_tgt      = t_h_sink;
     link->h_sink_group_last = 0;
 
     embd_link          = link;
     ctx_dft->embd_link = link;
 
-    // the draft keeps its own backend_h_sink (set by enable_h_nextn_sink above): the sink events
-    // are cross-stream, one context writes and the other reads, so each side must queue its event
-    // wait/record on its own stream. the sink tensor itself is shared (t_h_sink below)
+    // the draft keeps its own backend_h_sink (set by enable_h_nextn_sink above): the sink work
+    // and the sink events are cross-stream, so each side must queue its event wait/record on its
+    // own stream. The capture runs on the draft stream (llama_h_nextn_sink_capture is called on
+    // the draft context), which removes the target stream from the D->capture->T serial chain.
+    // The sink tensor itself is shared (t_h_sink below)
     ctx_dft->t_h_sink       = t_h_sink;
     ctx_dft->h_sink_extra   = h_sink_extra;
 
@@ -2101,7 +2107,12 @@ int32_t llama_context::h_nextn_sink_group() const {
 }
 
 bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols) {
-    if (t_h_sink == nullptr || !h_sink_is_target || src_cols == nullptr || n_cols == 0) {
+    // runs on the draft context: the copies queue on the draft's output-device stream, after the
+    // draft graph that reads the pending columns and before the next one. On the target stream
+    // the capture would sit between two target graphs, and the draft would still stall the
+    // output device. The sink tensor is shared (t_h_sink points at the target sink)
+    if (h_sink_is_target || t_h_sink == nullptr || embd_link == nullptr || embd_link->t_h_sink_tgt == nullptr ||
+            src_cols == nullptr || n_cols == 0) {
         return false;
     }
 
@@ -2111,15 +2122,16 @@ bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols
         return false;
     }
 
-    // let the submission thread enqueue the split that wrote the source columns first: the
-    // capture copies below are then queued after the write on the same stream
+    // let the submission thread enqueue the in-flight draft splits first: the copies below are
+    // then queued on the draft stream after the graph that read the pending columns. The pending
+    // columns need no event: this stream is their only reader and writer, the FIFO order is enough
     wait_submitted(backend_h_sink);
 
-    // the draft may still be reading the pending columns (the catch-up and the draft steps both
-    // read the carried row); this capture overwrites them
-    if (embd_link && embd_link->t_h_sink_tgt != nullptr) {
-        ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_pending_done);
-    }
+    // the source columns belong to the group of the most recent target write. Wait for that write
+    // on the draft stream: the draft steps read no group columns, so on their path this stream
+    // has not waited for the event yet, and the wait must not be skipped
+    const int32_t src_group = embd_link->h_sink_group_last;
+    ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_tgt_done[src_group]);
 
     const ggml_init_params params = {
         /*.mem_size   =*/ (2*n_cols + 1)*ggml_tensor_overhead(),
@@ -2147,18 +2159,16 @@ bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols
         GGML_ASSERT(ggml_backend_view_init(src) == GGML_STATUS_SUCCESS);
         GGML_ASSERT(ggml_backend_view_init(dst) == GGML_STATUS_SUCCESS);
 
-        // on CUDA the copy is queued async on the sink backend's own stream, after the graph that
-        // wrote these columns; a backend without async copy is synchronized by the API instead
+        // on CUDA the copy is queued async on the draft stream, after the graph that read the
+        // pending columns; a backend without async copy is synchronized by the API instead
         ggml_backend_tensor_copy_async(backend_h_sink, backend_h_sink, src, dst);
     }
 
-    // the next draft read must not start before the pending rows are in place. The source
-    // columns belong to the group of the most recent target write: the driver maps its columns
-    // through that group. The capture copies read the source group on this stream, ahead of any
-    // later write of the same group on this stream, so no read-side event is needed here
-    if (embd_link && embd_link->t_h_sink_tgt != nullptr) {
-        ggml_backend_event_record(embd_link->ev_h_tgt_done[embd_link->h_sink_group_last], backend_h_sink);
-    }
+    // the group columns are read on the draft stream up to here (the catch-up graph queued ahead,
+    // then these copies), so the target may write the group again. The target waits for this
+    // event before writing the same group, two target writes after the previous one (the two
+    // groups rotate): that keeps the two-write window that bounds how far the draft may lag
+    ggml_backend_event_record(embd_link->ev_h_read_done[src_group], backend_h_sink);
 
     return true;
 }
@@ -2498,8 +2508,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // same on the output device stream: the previously posted splits reach the stream before
         // this wait is queued
         wait_submitted(backend_h_sink);
-        // the draft may still be reading this group: it was written two target writes ago, so in
-        // steady state the wait is free (the group rotation buys the target one round of slack)
+        // the draft may still be reading this group (the catch-up graph and the capture that
+        // copies the group columns run on the draft stream): the group was written two target
+        // writes ago, so in steady state the wait is free (the group rotation buys the target
+        // one round of slack)
         ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_read_done[sink_group]);
     }
 
@@ -2553,14 +2565,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (reads_h_sink) {
-        // the draft is done with the group columns, the target may overwrite the group. The
-        // draft steps read no group columns (h_src_group is -1 then), so only the catch-up
-        // records a group here. Every draft graph may write the pending columns, so their
-        // completion is recorded unconditionally for the capture that overwrites them
+        // the draft catch-up is done with the group columns, the target may overwrite the group.
+        // The draft steps read no group columns (h_src_group is -1 then), so only the catch-up
+        // records a group here; the capture that copies the same group records it again after
+        // its own copies, which queue behind this graph on the same stream
         if (h_src_group >= 0) {
             ggml_backend_event_record(embd_link->ev_h_read_done[h_src_group], backend_h_sink);
         }
-        ggml_backend_event_record(embd_link->ev_h_pending_done, backend_h_sink);
     }
 
     if (status != GGML_STATUS_SUCCESS) {
