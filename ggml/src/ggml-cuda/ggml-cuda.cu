@@ -28,6 +28,7 @@
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/fattn-sm70-d256.cuh"
+#include "ggml-cuda/fused-expert.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/ggml-cuda-expert.cuh"
@@ -3542,6 +3543,9 @@ static bool ggml_cuda_expert_stage_used(const ggml_tensor * dst, const ggml_cuda
     }
     // prefill reads every routed expert row at least once per column group: copy the routed host
     // experts into VRAM once instead of reading them over the host link in place
+    if (ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc)) {
+        return true;
+    }
     if (ggml_cuda_moe_grouped_mul_mat_id_supported(dst, cc)) {
         return true;
     }
@@ -3574,8 +3578,12 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return true;
     }
 
-    // the grouped kernel is a plain launch that builds its tables on the device, so it can be
-    // recorded into a CUDA graph. Check it before MMVQ so the order matches the dispatch.
+    // the fused-expert and grouped kernels are plain launches that build their tables on the
+    // device, so they can be recorded into a CUDA graph. Check them before MMVQ so the order
+    // matches the dispatch.
+    if (ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc)) {
+        return false;
+    }
     if (ggml_cuda_moe_grouped_mul_mat_id_supported(dst, cc)) {
         return false;
     }
@@ -3632,15 +3640,6 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         if (ggml_is_quantized(src0->type)) {
-            // Decode and verify windows (T <= 8) take the grouped kernel first: it stages every
-            // entry routed to one expert and reads the weight row once, while the MMVQ MoE
-            // kernel gives one warp per token and re-reads the weight for each routed token.
-            // The gate/up fusion of separate gate/up weights stays on MMVQ (the target model
-            // merges them into one gate_up tensor, so its gate/up is a plain MUL_MAT_ID).
-            if (ne2 <= MOE_GROUPED_MAX_TOKENS &&
-                    ggml_cuda_moe_grouped_mul_mat_id(ctx, dst, is_expert_store ? ex_table.main : nullptr)) {
-                return;
-            }
             // The MMVQ mmid kernel is a separate kernel whose block width is the token count,
             // so on Volta it can go past MMVQ_MAX_BATCH_SIZE.
             if (ne2 <= get_mmvq_mmid_max_batch(src0->type, cc)) {
@@ -3652,12 +3651,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
 
-        // Prefill (T > 8) takes the grouped kernel as well: it stages the entries of one expert
-        // and reads the weight row once per staged group, instead of the MMQ MUL_MAT_ID path
-        // which buckets by (token, slot) and re-reads the weight of a hot expert once per tile.
-        // This is a capability branch: the grouped kernel only covers the types and layouts it
-        // implements (see ggml_cuda_moe_grouped_mul_mat_id_supported), the other types keep
-        // their MMQ path below.
+        // Prefill (T > 8) takes the W4A16 fused-expert kernel on Volta: it dequantizes the weight
+        // tile into shared memory and multiplies it on the FP16 tensor cores (mma.m8n8k4), which
+        // is the only tensor core path sm_70 has. Types and shapes it does not cover fall
+        // through to the grouped dp4a kernel and then to MMQ below. This is a capability branch,
+        // not a fallback.
         // prefill re-reads the routed expert rows (per column group or per tile): copy the routed
         // host experts into the staging area once and read them from VRAM (Strata prefill ring)
         const char * const * expert_ptrs = is_expert_store ? ex_table.main : nullptr;
@@ -3665,6 +3663,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             expert_ptrs = ggml_cuda_expert_stage_prepare(src0, ids, ggml_mul_mat_id_get_expert_offset(dst), ctx.stream());
         }
 
+        if (ggml_cuda_fused_expert_mul_mat_id(ctx, dst, expert_ptrs)) {
+            return;
+        }
+
+        // Prefill (T > 8) also takes the grouped kernel: it stages the entries of one expert
+        // and reads the weight row once per staged group, instead of the MMQ MUL_MAT_ID path
+        // which buckets by (token, slot) and re-reads the weight of a hot expert once per tile.
+        // This is a capability branch: the grouped kernel only covers the types and layouts it
+        // implements (see ggml_cuda_moe_grouped_mul_mat_id_supported), the other types keep
+        // their MMQ path below.
         if (ggml_cuda_moe_grouped_mul_mat_id(ctx, dst, expert_ptrs)) {
             return;
         }
