@@ -109,8 +109,14 @@ struct llama_model_loader {
             return it == ranges.end() ? none : it->second;
         }
 
-        // lazy tensors are gathered on the host, so no offload setting applies to them
-        static ggml_backend_buffer_type_t buft();
+        // device that consumes the lazy tensors, set by the model before the tensors are created.
+        // when it is a CUDA device the lazy table is pinned in place and read on the device
+        // (registered mapped buffer); otherwise it stays in a CPU mmap buffer
+        ggml_backend_dev_t dev = nullptr;
+
+        // buffer type of a lazy tensor: a device-readable registered mapped buffer when the
+        // consuming device offers one, otherwise the CPU buffer type
+        ggml_backend_buffer_type_t buft() const;
 
     private:
         std::map<uint32_t, llama_mmap::ranges> ranges;

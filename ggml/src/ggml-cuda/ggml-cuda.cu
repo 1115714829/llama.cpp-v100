@@ -2556,8 +2556,12 @@ static int ggml_backend_cuda_expert_check_host_nodes(
 struct ggml_backend_cuda_mapped_buffer_context {
     int device;
     int numa_node = GGML_CUDA_NUMA_NODE_ANY; // node the allocation was placed on
-    void * host_ptr = nullptr;
-    void * dev_ptr  = nullptr;
+    void * host_ptr = nullptr; // host address of the first byte of the buffer
+    void * dev_ptr  = nullptr; // device address of the first byte of the buffer
+    // set when host_ptr is external memory registered in place (an mmap of a model file);
+    // then the context owns no allocation and only unregisters it on free
+    void * reg_base = nullptr; // page-aligned address passed to cudaHostRegister
+    size_t reg_size = 0;
     std::string name;
 
     ggml_backend_cuda_mapped_buffer_context(int device, int numa_node, void * host_ptr, void * dev_ptr) :
@@ -2565,8 +2569,19 @@ struct ggml_backend_cuda_mapped_buffer_context {
         name(GGML_CUDA_NAME + std::to_string(device) + "_Mapped") {
     }
 
+    ggml_backend_cuda_mapped_buffer_context(int device, void * host_ptr, void * dev_ptr, void * reg_base, size_t reg_size) :
+        device(device), host_ptr(host_ptr), dev_ptr(dev_ptr), reg_base(reg_base), reg_size(reg_size),
+        name(GGML_CUDA_NAME + std::to_string(device) + "_Mapped_Registered") {
+    }
+
+    bool registered() const {
+        return reg_base != nullptr;
+    }
+
     ~ggml_backend_cuda_mapped_buffer_context() {
-        if (host_ptr != nullptr) {
+        if (registered()) {
+            cudaHostUnregister(reg_base);
+        } else if (host_ptr != nullptr) {
             CUDA_CHECK(cudaFreeHost(host_ptr));
         }
     }
@@ -2578,10 +2593,23 @@ static const char * ggml_backend_cuda_mapped_buffer_type_name(ggml_backend_buffe
     return ctx->name.c_str();
 }
 
+// page size of the host, for aligning a cudaHostRegister range
+static size_t ggml_cuda_host_page_size() {
+#if defined(__linux__)
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page > 0) {
+        return (size_t) page;
+    }
+#endif
+    return 4096;
+}
+
 static void ggml_backend_cuda_mapped_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *)buffer->context;
 #if defined(GGML_CUDA_MAPPED_NUMA)
-    ggml_cuda_mapped_numa_unplace(ctx->device, ctx->numa_node, buffer->size);
+    if (!ctx->registered()) {
+        ggml_cuda_mapped_numa_unplace(ctx->device, ctx->numa_node, buffer->size);
+    }
 #endif
     delete ctx;
 }
@@ -2620,11 +2648,21 @@ static enum ggml_status ggml_backend_cuda_mapped_buffer_init_tensor(ggml_backend
 static void ggml_backend_cuda_mapped_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
 
+    // a registered buffer wraps read-only file-backed memory that must never be written
+    if (ctx->registered()) {
+        GGML_ABORT("%s: refusing to write a registered mapped buffer\n", __func__);
+    }
+
     memset(ggml_backend_cuda_mapped_buffer_host_ptr(ctx, tensor) + offset, value, size);
 }
 
 static void ggml_backend_cuda_mapped_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
+
+    // a registered buffer wraps read-only file-backed memory that must never be written
+    if (ctx->registered()) {
+        GGML_ABORT("%s: refusing to write a registered mapped buffer\n", __func__);
+    }
 
     memcpy(ggml_backend_cuda_mapped_buffer_host_ptr(ctx, tensor) + offset, data, size);
 }
@@ -2638,6 +2676,11 @@ static void ggml_backend_cuda_mapped_buffer_get_tensor(ggml_backend_buffer_t buf
 static bool ggml_backend_cuda_mapped_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
 
+    // a registered buffer wraps read-only file-backed memory that must never be written
+    if (ctx->registered()) {
+        GGML_ABORT("%s: refusing to write a registered mapped buffer\n", __func__);
+    }
+
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_cuda_set_device(ctx->device);
         CUDA_CHECK(cudaMemcpyAsync(ggml_backend_cuda_mapped_buffer_host_ptr(ctx, dst), src->data, ggml_nbytes(src),
@@ -2650,6 +2693,11 @@ static bool ggml_backend_cuda_mapped_buffer_cpy_tensor(ggml_backend_buffer_t buf
 
 static void ggml_backend_cuda_mapped_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
+
+    // a registered buffer wraps read-only file-backed memory that must never be written
+    if (ctx->registered()) {
+        GGML_ABORT("%s: refusing to clear a registered mapped buffer\n", __func__);
+    }
 
     memset(ctx->host_ptr, value, buffer->size);
 }
@@ -2731,6 +2779,39 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_mapped_buffer_type_int
     /* .is_host             = */ NULL, // not a host buffer: the scheduler keeps ops using it on the CUDA backend
 };
 
+// registered mapped buffer: an existing host range (a read-only mmap of a model file) pinned
+// in place with cudaHostRegister. The file bytes are the weights, so there is no padding and
+// the buffer cannot be allocated from scratch; it is only built from a host pointer.
+static ggml_backend_buffer_t ggml_backend_cuda_mapped_registered_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    // the memory-fit pass allocates a zero-sized dummy buffer to learn the placement; real
+    // buffers of this type are only built in place from a host pointer
+    if (size == 0) {
+        ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+        ggml_backend_cuda_mapped_buffer_context * ctx = new ggml_backend_cuda_mapped_buffer_context(buft_ctx->device, GGML_CUDA_NUMA_NODE_ANY, nullptr, nullptr);
+        return ggml_backend_buffer_init(buft, ggml_backend_cuda_mapped_buffer_interface, ctx, 0);
+    }
+    GGML_LOG_ERROR("%s: a registered mapped buffer can only be built from a host pointer\n", __func__);
+    return nullptr;
+}
+
+// the file bytes are used as they are, so no row padding is added (the PLE GET_ROWS kernel
+// never reads past a row)
+static size_t ggml_backend_cuda_mapped_registered_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    GGML_UNUSED(buft);
+    return ggml_nbytes(tensor);
+}
+
+static const ggml_backend_buffer_type_i ggml_backend_cuda_mapped_registered_buffer_type_interface = {
+    /* .get_name            = */ ggml_backend_cuda_mapped_buffer_type_name, // recognized as a mapped buffer by the scheduler
+    /* .alloc_buffer        = */ ggml_backend_cuda_mapped_registered_buffer_type_alloc_buffer,
+    /* .alloc_buffer_n      = */ NULL,
+    /* .get_alignment       = */ ggml_backend_cuda_buffer_type_get_alignment,
+    /* .get_max_size        = */ NULL, // defaults to SIZE_MAX
+    /* .get_alloc_size      = */ ggml_backend_cuda_mapped_registered_buffer_type_get_alloc_size,
+    /* .get_alloc_size_n    = */ NULL,
+    /* .is_host             = */ NULL, // not a host buffer: the scheduler keeps ops using it on the CUDA backend
+};
+
 ggml_backend_buffer_type_t ggml_backend_cuda_mapped_buffer_type(int device) {
     static std::mutex mutex;
     std::lock_guard<std::mutex> lock(mutex);
@@ -2757,10 +2838,174 @@ ggml_backend_buffer_type_t ggml_backend_cuda_mapped_buffer_type(int device) {
     return &ggml_backend_cuda_mapped_buffer_types[device];
 }
 
+ggml_backend_buffer_type_t ggml_backend_cuda_mapped_registered_buffer_type(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type ggml_backend_cuda_mapped_registered_buffer_types[GGML_CUDA_MAX_DEVICES];
+
+    static bool initialized = false;
+
+    if (!initialized) {
+        for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+            ggml_backend_cuda_buffer_type_context * ctx = new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i) + "_Mapped_Registered"};
+            ctx->registered = true;
+            ggml_backend_cuda_mapped_registered_buffer_types[i] = {
+                /* .iface    = */ ggml_backend_cuda_mapped_registered_buffer_type_interface,
+                /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                /* .context  = */ ctx,
+            };
+        }
+        initialized = true;
+    }
+
+    return &ggml_backend_cuda_mapped_registered_buffer_types[device];
+}
+
+// pin an existing host range in place and expose it as a device-readable mapped buffer.
+// the caller keeps ownership of the memory; the buffer only unregisters it on free.
+ggml_backend_buffer_t ggml_backend_cuda_mapped_buffer_from_host_ptr(int device, void * ptr, size_t size) {
+    if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
+        GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
+        return nullptr;
+    }
+    if (ptr == nullptr || size == 0) {
+        GGML_LOG_ERROR("%s: empty host range for device %d\n", __func__, device);
+        return nullptr;
+    }
+
+    ggml_cuda_set_device(device);
+
+#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+    // cudaHostRegister works on whole pages, so the registered range covers the pages that
+    // contain [ptr, ptr + size)
+    const size_t page = ggml_cuda_host_page_size();
+    void * reg_base = (void *) ((uintptr_t) ptr & ~(uintptr_t) (page - 1));
+    const size_t reg_offset = (size_t) ((char *) ptr - (char *) reg_base);
+    const size_t reg_size   = ((reg_offset + size + page - 1) & ~(page - 1));
+
+    cudaError_t err = cudaHostRegister(reg_base, reg_size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: registering %.2f MiB of host memory for device %d failed: %s\n",
+                       __func__, size / 1024.0 / 1024.0, device, cudaGetErrorString(err));
+        return nullptr;
+    }
+
+    void * dev_base = nullptr;
+    err = cudaHostGetDevicePointer(&dev_base, reg_base, 0);
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        cudaHostUnregister(reg_base);
+        GGML_LOG_ERROR("%s: device pointer for registered host memory on device %d: %s\n",
+                       __func__, device, cudaGetErrorString(err));
+        return nullptr;
+    }
+
+    void * dev_ptr = (char *) dev_base + reg_offset;
+
+    ggml_backend_buffer_type_t buft = ggml_backend_cuda_mapped_registered_buffer_type(device);
+    ggml_backend_cuda_mapped_buffer_context * ctx = new ggml_backend_cuda_mapped_buffer_context(device, ptr, dev_ptr, reg_base, reg_size);
+
+    GGML_LOG_INFO("%s: device %d: registered %.2f MiB of host memory in place at %p\n",
+                  __func__, device, size / 1024.0 / 1024.0, ptr);
+
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_mapped_buffer_interface, ctx, size);
+#else
+    GGML_LOG_ERROR("%s: cudaHostRegisterReadOnly requires CUDA >= 11.1\n", __func__);
+    return nullptr;
+#endif
+}
+
+static bool ggml_backend_buft_is_cuda_mapped(ggml_backend_buffer_type_t buft);
+
+// device address of a host address inside a mapped buffer, or nullptr if the buffer does not
+// expose its host range (only the registered mapped buffer does)
+static void * ggml_backend_cuda_mapped_buffer_host_to_device(ggml_backend_buffer_t buffer, void * host_ptr) {
+    if (!ggml_backend_buft_is_cuda_mapped(buffer->buft)) {
+        return nullptr;
+    }
+    ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
+    if (!ctx->registered()) {
+        return nullptr;
+    }
+    const char * h = (const char *) host_ptr;
+    if (h < (const char *) ctx->host_ptr || h >= (const char *) ctx->host_ptr + buffer->size) {
+        return nullptr;
+    }
+    return (char *) ctx->dev_ptr + (h - (const char *) ctx->host_ptr);
+}
+
+// true for the registered mapped buffer type
+static bool ggml_backend_buft_is_cuda_mapped_registered(ggml_backend_buffer_type_t buft) {
+    return buft != nullptr && buft->iface.get_name == ggml_backend_cuda_mapped_buffer_type_name &&
+        ((ggml_backend_cuda_buffer_type_context *) buft->context)->registered;
+}
+
+// build a registered mapped buffer for the device of the given registered mapped buffer type
+static ggml_backend_buffer_t ggml_backend_cuda_mapped_buffer_from_host_ptr_buft(ggml_backend_buffer_type_t buft, void * ptr, size_t size) {
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+    return ggml_backend_cuda_mapped_buffer_from_host_ptr(buft_ctx->device, ptr, size);
+}
+
+// the registered mapped buffer type of a CUDA device, or nullptr when the device is not CUDA
+static ggml_backend_buffer_type_t ggml_backend_cuda_dev_mapped_registered_buft(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg != ggml_backend_cuda_reg()) {
+        return nullptr;
+    }
+    const size_t n_dev = ggml_backend_reg_dev_count(reg);
+    for (size_t i = 0; i < n_dev; ++i) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            return ggml_backend_cuda_mapped_registered_buffer_type((int) i);
+        }
+    }
+    return nullptr;
+}
+
 #else // defined(GGML_USE_MUSA)
 
 ggml_backend_buffer_type_t ggml_backend_cuda_mapped_buffer_type(int device) {
     GGML_UNUSED(device);
+    return nullptr;
+}
+
+ggml_backend_buffer_type_t ggml_backend_cuda_mapped_registered_buffer_type(int device) {
+    GGML_UNUSED(device);
+    return nullptr;
+}
+
+ggml_backend_buffer_t ggml_backend_cuda_mapped_buffer_from_host_ptr(int device, void * ptr, size_t size) {
+    GGML_UNUSED(device);
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    return nullptr;
+}
+
+static bool ggml_backend_buft_is_cuda_mapped_registered(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return false;
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_mapped_buffer_from_host_ptr_buft(ggml_backend_buffer_type_t buft, void * ptr, size_t size) {
+    GGML_UNUSED(buft);
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+    return nullptr;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_dev_mapped_registered_buft(ggml_backend_dev_t dev) {
+    GGML_UNUSED(dev);
+    return nullptr;
+}
+
+static void * ggml_backend_cuda_mapped_buffer_host_to_device(ggml_backend_buffer_t buffer, void * host_ptr) {
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(host_ptr);
     return nullptr;
 }
 
@@ -8439,6 +8684,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                         return true;
                     case GGML_TYPE_IQ4_NL:
+                        // IQ4_NL rows only need to be a multiple of the 32-value sub-block
+                        return op->src[0]->ne[0] % QK4_NL == 0;
                     case GGML_TYPE_MXFP4:
                         // 32-value sub-blocks, the row size does not guarantee
                         // the QK_K super-blocks the get_rows kernel iterates on
@@ -8977,6 +9224,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_buft_is_device_expert") == 0) {
         return (void *)ggml_backend_buft_is_cuda_expert;
+    }
+    if (strcmp(name, "ggml_backend_buft_is_device_mapped_registered") == 0) {
+        return (void *)ggml_backend_buft_is_cuda_mapped_registered;
+    }
+    if (strcmp(name, "ggml_backend_cuda_dev_mapped_registered_buft") == 0) {
+        return (void *)ggml_backend_cuda_dev_mapped_registered_buft;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mapped_buffer_from_host_ptr_buft") == 0) {
+        return (void *)ggml_backend_cuda_mapped_buffer_from_host_ptr_buft;
+    }
+    if (strcmp(name, "ggml_backend_cuda_mapped_buffer_host_to_device") == 0) {
+        return (void *)ggml_backend_cuda_mapped_buffer_host_to_device;
     }
     if (strcmp(name, "ggml_backend_cuda_expert_set_slot_limit") == 0) {
         return (void *)ggml_cuda_expert_set_slot_limit;

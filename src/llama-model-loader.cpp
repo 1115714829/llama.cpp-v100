@@ -1105,7 +1105,25 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
-ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
+// the registered mapped buffer type of a device, or nullptr when the device (or its backend)
+// does not offer one. this is a capability query, not a fallback: only CUDA exposes it
+static ggml_backend_buffer_type_t llama_buft_device_mapped_registered(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    typedef ggml_backend_buffer_type_t (*get_buft_t)(ggml_backend_dev_t);
+    auto get_buft = (get_buft_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_dev_mapped_registered_buft");
+    return get_buft != nullptr ? get_buft(dev) : nullptr;
+}
+
+ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() const {
+    if (ggml_backend_buffer_type_t mapped = llama_buft_device_mapped_registered(dev)) {
+        return mapped;
+    }
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
         throw std::runtime_error("no CPU backend found");
@@ -1350,7 +1368,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (is_lazy) {
-            return lazy_read::buft();
+            return lazy.buft();
         }
 
         // select the buffer type for this tensor
@@ -1782,6 +1800,23 @@ bool llama_model_loader::load_all_data(
         return is_mapped != nullptr && is_mapped(buft);
     };
 
+    // device address of a host address inside a registered mapped buffer, or nullptr when the
+    // buffer is not one (its tensors are then addressed by the host pointer itself)
+    auto mapped_buffer_host_to_device = [](ggml_backend_buffer_t buffer, void * host_ptr) -> void * {
+        if (buffer == nullptr) {
+            return nullptr;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
+        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+        if (reg == nullptr) {
+            return nullptr;
+        }
+        typedef void * (*host_to_device_t)(ggml_backend_buffer_t, void *);
+        auto host_to_device = (host_to_device_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_mapped_buffer_host_to_device");
+        return host_to_device != nullptr ? host_to_device(buffer, host_ptr) : nullptr;
+    };
+
     // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
     // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
     if (!use_mmap) {
@@ -1857,7 +1892,13 @@ bool llama_model_loader::load_all_data(
 
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
-                ggml_backend_tensor_alloc(buf_mmap, cur, data);
+                // a registered mapped buffer exposes its memory through a device pointer, so the
+                // tensor must be addressed by the device address of its range
+                if (void * dev_data = mapped_buffer_host_to_device(buf_mmap, data)) {
+                    ggml_backend_tensor_alloc(buf_mmap, cur, dev_data);
+                } else {
+                    ggml_backend_tensor_alloc(buf_mmap, cur, data);
+                }
 
                 // locking a lazy tensor would fault all of it in, which is what lazy avoids
                 if (lmlocks && !lazy.has(cur)) {
