@@ -10656,18 +10656,37 @@ struct test_qsa_select : public test_case {
         const int64_t n_real = n_pool - n_pad;
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "q") == 0 || strcmp(t->name, "k") == 0) {
-                // small integers: exact in half, and many equal scores to exercise the tie order
-                std::uniform_int_distribution<int> dist(-2, 2);
-                std::vector<float> v(ggml_nelements(t));
-                for (float & x : v) {
-                    x = (float) dist(gen);
-                }
-                if (t->type == GGML_TYPE_F32) {
-                    ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+                if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
+                    // small integers: exact in half, and many equal scores to exercise the tie order
+                    std::uniform_int_distribution<int> dist(-2, 2);
+                    std::vector<float> v(ggml_nelements(t));
+                    for (float & x : v) {
+                        x = (float) dist(gen);
+                    }
+                    if (t->type == GGML_TYPE_F32) {
+                        ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+                    } else {
+                        std::vector<ggml_fp16_t> h(v.size());
+                        ggml_fp32_to_fp16_row(v.data(), h.data(), (int64_t) v.size());
+                        ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+                    }
                 } else {
-                    std::vector<ggml_fp16_t> h(v.size());
-                    ggml_fp32_to_fp16_row(v.data(), h.data(), (int64_t) v.size());
-                    ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+                    // Q8_0 keys on the 1/128 grid with an exact amax of 127/128 in every block: the quantizer
+                    // picks d = 1/128, so the dequantized keys are exact in half and the CPU and the CUDA
+                    // scorer see the same values
+                    GGML_ASSERT(t->type == GGML_TYPE_Q8_0);
+                    std::uniform_int_distribution<int> dist(-127, 127);
+                    std::vector<float> v(ggml_nelements(t));
+                    for (float & x : v) {
+                        x = (float) dist(gen) / 128.0f;
+                    }
+                    const size_t blck = (size_t) ggml_blck_size(t->type);
+                    for (size_t i = 0; i < v.size(); i += blck) {
+                        v[i] = 127.0f / 128.0f;
+                    }
+                    std::vector<uint8_t> dataq(ggml_row_size(t->type, v.size()));
+                    ggml_quantize_chunk(t->type, v.data(), dataq.data(), 0, (int64_t) (v.size()/blck), (int64_t) blck, nullptr);
+                    ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
                 }
             } else if (strcmp(t->name, "pidx") == 0) {
                 // the real pools address distinct cells in a shuffled order, the padded ones are -1
@@ -14369,7 +14388,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // qsa_select: the tile scorer (>= 8 tokens) and the vector scorer, ranges shorter and longer than n_top,
     // more tokens than one scoring pass (64)
-    for (ggml_type type_K : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+    for (ggml_type type_K : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
         for (int64_t nb : { 1, 3, 8, 16, 70, 130 }) {
             test_cases.emplace_back(new test_qsa_select(512, 8, nb, 4, 64, type_K));
         }
@@ -14380,6 +14399,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_select(33792, 8, 4, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(40000, 8, 4, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(50000, 8, 4, 4, 512, type_K));
+        // a pool count of the 65536 order (not the full 200K context) that is not a multiple of the 256-key
+        // block of the Volta wmma scorer: the last block scores only its first keys
+        test_cases.emplace_back(new test_qsa_select(8192 + 7, 7, 70, 4, 512, type_K));
     }
 
     // qsa_attn: the chunked kernel (<= 16 tokens) and the prompt kernel, partial chunks, streams, both cache types
