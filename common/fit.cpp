@@ -487,13 +487,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
     }
 
-    llama_free(ctx);
-
     // measure the extra model while the target model is still alive: a draft head borrows
     // its shared tensors from the target (borrow_shared_tensor), so the measurement graph
     // matches the real load - real tensor types, real devices, and the borrowed tensors
     // add no bytes to the model breakdown of the extra model (they are counted in the
     // target measurement above).
+    // the MTP draft links itself to the target h sink during construction, so the measured
+    // target context has to outlive the extra measurement as well - it is freed below
     if (extra != nullptr && extra_mem != nullptr) {
         llama_model_params mparams_extra = *extra->mparams;
         mparams_extra.no_alloc      = true;
@@ -502,13 +502,23 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
         llama_model * model_extra = llama_model_load_from_file(extra->path_model, mparams_extra);
         if (model_extra == nullptr) {
+            llama_free(ctx);
             llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
             throw std::runtime_error(std::string("failed to load the extra model '") + extra->path_model + "'");
+        }
+
+        // the MTP draft links itself to the target h sink during construction: hand the measured
+        // target context over. The fit already accounts for the sink bytes (see below), so the
+        // linked sink only has to exist while the measurement graph is built
+        if (extra->h_sink_rows > 0) {
+            extra->cparams->ctx_other     = ctx;
+            extra->cparams->n_h_sink_rows = extra->h_sink_rows;
         }
 
         llama_context * ctx_extra = llama_init_from_model(model_extra, *extra->cparams);
         if (ctx_extra == nullptr) {
             llama_model_free(model_extra);
+            llama_free(ctx);
             llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
             throw std::runtime_error(std::string("failed to create llama_context from the extra model '") + extra->path_model + "'");
         }
@@ -558,6 +568,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         *extra_mem = std::move(ret_extra);
     }
 
+    llama_free(ctx);
     llama_model_free(model);
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 

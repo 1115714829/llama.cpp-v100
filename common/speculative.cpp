@@ -1933,25 +1933,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     (int) this->params.backend_sampling, (int) this->params.probabilistic);
         }
 
-        if (chain_heads) {
-            this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
-        }
-        this->n_max = this->params.n_max;
-
         // r-mtpdev: the MTP draft keeps every hidden state on the device. The target sink holds
         // the batch rows in columns 0..n_batch-1, then n_seq pending columns and (n_max + 1)
         // draft-step columns per sequence. The host h path is gone, so an unavailable sink or a
-        // model graph without the device branch is a hard error
+        // model graph without the device branch is a hard error.
+        // The sink was sized and linked by common_speculative_init_result before the context was
+        // created; use the same unbounded n_max here so the layout matches (the chain clamp
+        // below only lowers the number of columns that are used)
         h_sink_pending0 = (int32_t) llama_n_batch(ctx_tgt);
         h_sink_step0    = h_sink_pending0 + (int32_t) n_seq;
         h_sink_extra    = (int32_t) (n_seq * (this->params.n_max + 2));
 
+        // idempotent checks: the enable/link already ran during the context construction, these
+        // calls must not allocate or build anything again
         if (!llama_enable_h_nextn_sink(ctx_tgt, true, (uint32_t) h_sink_extra) ||
             !llama_enable_h_nextn_sink(ctx_dft, false, (uint32_t) h_sink_extra) ||
             !llama_context_link_h_nextn(ctx_tgt, ctx_dft)) {
             SPC_ERR("%s\n", "failed to enable the device nextn h sink; MTP has no host h path anymore");
             throw std::runtime_error("MTP requires the device nextn h sink");
         }
+
+        if (chain_heads) {
+            this->params.n_max = std::min(this->params.n_max, n_mtp_layers);
+        }
+        this->n_max = this->params.n_max;
 
         // catch-up decodes must not write the sink: their output rows have no consumer and
         // would overwrite the target batch columns
@@ -3186,6 +3191,14 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+
+        // the sink is sized here, before the draft context is created: the MTP draft links itself
+        // to the target sink during construction (llama_init_from_model), so the layout must be
+        // known up front. the chain clamp (n_mtp_layers) can only lower n_max later, which keeps
+        // this allocation a superset of the columns that end up used
+        const uint32_t n_seq = llama_n_seq_max(ctx_tgt);
+        const int32_t  n_max = std::max(0, params.speculative.draft.n_max);
+        cparams.n_h_sink_rows = n_seq * (uint32_t) (n_max + 2);
     }
 
     // the draft context holds as many tokens per sequence as the target context

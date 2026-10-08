@@ -580,6 +580,31 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // r-mtpdev: the MTP graph reads its h rows from the device sink and the host h input is
+        // gone, so the sink link has to exist before the reserve graphs below are built
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.h_nextn_sink_ok) {
+            if (params.ctx_other == nullptr || params.n_h_sink_rows == 0) {
+                throw std::runtime_error("MTP context requires the target context and the h sink layout (ctx_other, n_h_sink_rows)");
+            }
+
+            if (!params.ctx_other->enable_h_nextn_sink(true, params.n_h_sink_rows)) {
+                throw std::runtime_error("failed to enable the target nextn h sink");
+            }
+            if (!enable_h_nextn_sink(false, params.n_h_sink_rows) ||
+                !params.ctx_other->link_h_nextn(this)) {
+                throw std::runtime_error("failed to link the MTP h sink to the target context");
+            }
+
+            // the device gather is the only h input of an MTP draft, so it is enabled from the
+            // start. the initial column map just fills the buffer of the graph input; the
+            // speculative driver sets the real columns before every decode
+            std::vector<int32_t> h_cols(cparams.n_batch);
+            for (size_t i = 0; i < h_cols.size(); ++i) {
+                h_cols[i] = (int32_t) i;
+            }
+            set_h_source(true, h_cols.data(), h_cols.size());
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -5005,6 +5030,7 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.n_swa_mtp                   =*/ 0,
+        /*.n_h_sink_rows               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
