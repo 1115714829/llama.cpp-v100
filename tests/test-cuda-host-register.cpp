@@ -6,7 +6,8 @@
 // written through the ordinary backend API (set_tensor), and the data is copied in by the
 // model loader, which then drops the page cache of the source range in the order of the
 // weights. The test checks allocation, host writes, a GET_ROWS graph computed on the device
-// with the weights read over UVA, and release.
+// with the weights read over UVA, whose output is F32 and is compared as the exact F16 to
+// F32 conversion, and release.
 //
 // The test uses only the public backend API: the buffer type is reached through the proc
 // address of the CUDA backend. It skips (and passes) when no CUDA device is present or the
@@ -114,6 +115,10 @@ int main() {
     ggml_set_name(ids, "ids");
     ggml_tensor * out = ggml_get_rows(ctx_g, table, ids);
     ggml_set_name(out, "out");
+    if (out->type != GGML_TYPE_F32) {
+        fprintf(stderr, "FAIL: GET_ROWS output is not F32\n");
+        return 1;
+    }
     ggml_backend_buffer_t graph_buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx_g, ggml_backend_dev_buffer_type(dev));
     if (graph_buffer == nullptr) {
         fprintf(stderr, "FAIL: cannot allocate the device buffer\n");
@@ -130,12 +135,16 @@ int main() {
         return 1;
     }
 
-    std::vector<uint16_t> got((size_t) (n_embd * n_tokens), 0);
-    ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(uint16_t));
+    std::vector<float> got((size_t) (n_embd * n_tokens), 0.0f);
+    ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(float));
     for (int64_t t = 0; t < n_tokens; ++t) {
-        const uint16_t * want = rows.data() + (size_t) ids_data[t] * n_embd;
-        const uint16_t * have = got.data() + (size_t) t * n_embd;
-        if (!check_bytes("GET_ROWS over UVA", (const uint8_t *) have, (const uint8_t *) want, n_embd * sizeof(uint16_t))) {
+        const uint16_t * src = rows.data() + (size_t) ids_data[t] * n_embd;
+        std::vector<float> want((size_t) n_embd);
+        for (int64_t j = 0; j < n_embd; ++j) {
+            want[j] = ggml_fp16_to_fp32((ggml_fp16_t) src[j]);
+        }
+        const float * have = got.data() + (size_t) t * n_embd;
+        if (!check_bytes("GET_ROWS over UVA", (const uint8_t *) have, (const uint8_t *) want.data(), n_embd * sizeof(float))) {
             return 1;
         }
     }
