@@ -1,5 +1,7 @@
 #include "ggml-backend-sched.h"
 
+#include <string.h>
+
 // Pipeline parallelism primitives for multi-ubatch prefill.
 //
 // n_stages is the pipeline depth: the number of ubatches that may be in flight at once. The caller
@@ -34,6 +36,16 @@ void ggml_backend_sched_set_n_stages(ggml_backend_sched_t sched, int n_stages) {
 static void ggml_backend_sched_pipeline_wait_stage(ggml_backend_sched_t sched, int stage_id) {
     struct ggml_backend_sched_stage * stage = &sched->stages[stage_id];
 
+    // the stage events are recorded by the submitted tasks: wait until those tasks have been
+    // enqueued, otherwise the synchronize below could observe a stale recording
+    if (ggml_backend_sched_has_workers(sched)) {
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (stage->backend_seq[b] > 0) {
+                ggml_backend_sched_worker_wait_done(sched, b, stage->backend_seq[b]);
+            }
+        }
+    }
+
     for (int b = 0; b < sched->n_backends; b++) {
         ggml_backend_event_t ev = sched->events[b][stage->copy_id];
         if (ev != NULL) {
@@ -57,6 +69,7 @@ bool ggml_backend_sched_pipeline_begin(ggml_backend_sched_t sched, struct ggml_c
     if (stage->in_flight) {
         ggml_backend_sched_pipeline_wait_stage(sched, s);
     }
+    memset(stage->backend_seq, 0, sizeof(stage->backend_seq));
 
     // each stage uses its own input copy, so in-flight ubatches never share device input buffers
     const int copy_id = s % sched->n_copies;
@@ -133,6 +146,7 @@ void ggml_backend_sched_pipeline_advance(ggml_backend_sched_t sched) {
     // the per-stage events only cover the compute, not the asynchronous copies of the outputs to
     // the host. synchronize the backends so those reads complete before the host output buffers are
     // reused by the next batch. this runs once per prefill, not per ubatch
+    ggml_backend_sched_workers_drain(sched);
     for (int b = 0; b < sched->n_backends; b++) {
         ggml_backend_synchronize(sched->backends[b]);
     }

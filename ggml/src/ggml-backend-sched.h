@@ -73,6 +73,9 @@ struct ggml_backend_sched_stage {
     int copy_id;       // input copy used by this stage
     int64_t ubatch_id; // logical batch index, for ordering checks
     bool in_flight;
+    // last submission-worker task posted for this stage, per backend (0 = none); the stage events
+    // can only be synchronized once these tasks have been enqueued
+    uint64_t backend_seq[GGML_SCHED_MAX_BACKENDS];
 };
 
 // shared with ggml-backend-pipeline.cpp: enqueue the splits of the currently allocated graph
@@ -131,6 +134,10 @@ struct ggml_backend_sched {
     // per-backend submission threads, pipeline mode only (n_copies > 1), indexed by backend id;
     // NULL for the CPU backend. pointer because the scheduler is calloc'ed
     std::vector<std::unique_ptr<struct ggml_backend_sched_worker>> * workers;
+
+    // handoff events of the pipeline submission, one per split, recorded by the producer split after
+    // its output copies; created on first use and kept for the lifetime of the scheduler
+    std::vector<ggml_backend_event_t> * handoff_events;
 #endif
 
     struct ggml_context * ctx;
