@@ -50,9 +50,16 @@ struct llama_embd_link {
     ggml_tensor * t_layer_inp_sink = nullptr;    // target sink, [n_embd * n_layers, n_batch]
     ggml_tensor * t_embd_src_sink  = nullptr;    // draft staging sink, [n_embd_inp, n_ubatch]
 
+    // r-mtpdev: device link for the nextn hidden state (see llama_context_link_h_nextn)
+    ggml_backend_event_t ev_h_tgt_done  = nullptr; // target finished writing the h sink
+    ggml_backend_event_t ev_h_read_done = nullptr; // draft finished reading the h sink
+    ggml_tensor * t_h_sink_tgt = nullptr;          // target h sink, read by the draft graph
+
     ~llama_embd_link() {
         ggml_backend_event_free(ev_tgt_done);
         ggml_backend_event_free(ev_copy_done);
+        ggml_backend_event_free(ev_h_tgt_done);
+        ggml_backend_event_free(ev_h_read_done);
     }
 };
 
@@ -157,6 +164,24 @@ struct llama_context {
     // DFlash2: the sink column that holds the features of token (seq_id, pos) of the last decoded
     // batch, or -1 if the token is not in the sink
     int32_t layer_inp_sink_col(llama_seq_id seq_id, llama_pos pos) const;
+
+    // r-mtpdev: keep the nextn hidden state in a device sink. The target writes its t_h_nextn rows
+    // there; the draft reads them as its graph input. is_target selects the role of the context.
+    bool enable_h_nextn_sink(bool is_target);
+    // r-mtpdev: link a draft context to this target context, so that the draft reads the target
+    // h sink in place and the two sides are ordered by a pair of CUDA events
+    bool link_h_nextn(llama_context * ctx_dft);
+    // r-mtpdev: select the h source of the next draft batch: true gathers the h in the graph from
+    // the target-sink columns [cols, cols + n_cols), false uses the host input
+    void set_h_source(bool enable, const int32_t * cols, size_t n_cols);
+    // r-mtpdev host fallback: copy the sink rows [token_offset, token_offset + n_tokens) into dst
+    bool h_nextn_sink_get(size_t token_offset, size_t n_tokens, float * dst);
+    // r-mtpdev: the h-sink column of token (seq_id, pos) of the last decoded batch, -1 if absent
+    int32_t h_nextn_sink_col(llama_seq_id seq_id, llama_pos pos) const;
+    // r-mtpdev: wait for one in-flight prefill pipeline ubatch without draining the rest of the
+    // pipeline. A negative id waits for the most recent one. Returns false when no prefill
+    // pipeline ubatch has been submitted (decode-sized batches are not tracked there)
+    bool synchronize_ubatch(int64_t ubatch_id);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -385,6 +410,27 @@ private:
     ggml_context_ptr        ctx_embd_src;
     ggml_backend_buffer_ptr buf_embd_src;
     ggml_tensor *           t_embd_src_sink = nullptr;
+
+    // r-mtpdev: device-side sink for the local nextn hidden state, [n_embd_out, n_batch]. The
+    // target writes its t_h_nextn rows there, the draft writes the h of its own steps
+    ggml_context_ptr        ctx_h_sink; // declared before buf_h_sink so that the buffer is freed first
+    ggml_backend_buffer_ptr buf_h_sink;
+    ggml_tensor *           t_h_sink = nullptr;
+    bool                    h_sink_is_target = false; // true: this sink holds the target h rows
+    ggml_backend_t          backend_h_sink = nullptr; // non-owning: the backend that holds the sink
+
+    // r-mtpdev: the (seq_id, pos) of each h-sink column written by the last batch, in column order
+    std::vector<std::pair<llama_seq_id, llama_pos>> h_sink_cols;
+    // r-mtpdev: per-sequence (pos, column) index into h_sink_cols; positions grow within a batch
+    std::unordered_map<llama_seq_id, std::vector<std::pair<llama_pos, int32_t>>> h_sink_cols_by_seq;
+
+    // r-mtpdev draft: the next draft graph gathers its h from the target sink at these columns.
+    // The vector only grows, so the graph input pointer stays valid across batches
+    bool                 h_src_enable = false;
+    std::vector<int32_t> h_src_cols;
+
+    // r-mtpdev: the id of the most recent ubatch submitted through the prefill pipeline, -1 if none
+    int64_t pipeline_ubatch_last = -1;
 
     // producer/consumer link, shared with the linked context
     std::shared_ptr<llama_embd_link> embd_link;

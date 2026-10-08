@@ -163,6 +163,34 @@ LLAMA_API bool llama_layer_inp_sink_get(struct llama_context * ctx, size_t token
 // DFlash2: the target sink column of token (seq_id, pos) of the last decoded batch, -1 if not in the sink
 LLAMA_API int32_t llama_layer_inp_sink_col(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
 
+// r-mtpdev: keep the nextn hidden state in a device sink. The target writes its t_h_nextn rows
+// there; the draft reads them as its graph input. is_target selects the role of the context.
+// Returns false if unsupported or the allocation failed - the caller reports the failure instead
+// of silently going back to the host path.
+LLAMA_API bool llama_enable_h_nextn_sink(struct llama_context * ctx, bool is_target);
+
+// r-mtpdev: link a target and a draft context for the direct device read of the target h sink.
+// Creates the events that order the target writes and the draft reads. Returns false if the
+// devices are not compatible or the events are not available.
+LLAMA_API bool llama_context_link_h_nextn(struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
+
+// r-mtpdev: select the h source of the next draft batch: true gathers the h rows in the graph
+// from the target-sink columns [cols, cols + n_cols), false uses the host input. No-op when the
+// context is not linked.
+LLAMA_API void llama_set_h_source(struct llama_context * ctx, bool enable, const int32_t * cols, size_t n_cols);
+
+// r-mtpdev host fallback: copy the target sink rows [token_offset, token_offset + n_tokens) into
+// dst. Requires a target sink.
+LLAMA_API bool llama_h_nextn_sink_get(struct llama_context * ctx, size_t token_offset, size_t n_tokens, float * dst);
+
+// r-mtpdev: the h-sink column of token (seq_id, pos) of the last decoded batch, -1 if not in the sink
+LLAMA_API int32_t llama_h_nextn_sink_col(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
+
+// r-mtpdev: wait for one prefill pipeline ubatch without draining the pipeline. A negative id
+// waits for the most recent one. Returns false if the context has no scheduler or the ubatch is
+// not tracked by the pipeline (decode-sized batches).
+LLAMA_API bool llama_synchronize_ubatch(struct llama_context * ctx, int64_t ubatch_id);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //
