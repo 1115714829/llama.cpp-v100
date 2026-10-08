@@ -1131,6 +1131,13 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() const {
     return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
+// unlike a lazy table, the token embedding table is always read as a whole: when the device
+// does not offer a registered mapped buffer there is no buffer type for it here, and the table
+// keeps the buffer type of the input layer (a CPU buffer), see load_tensors()
+ggml_backend_buffer_type_t llama_model_loader::embd_read::buft() const {
+    return llama_buft_device_mapped_registered(dev);
+}
+
 bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
     if (mode == LLAMA_LAZY_MODE_OFF) {
         return false;
@@ -1369,6 +1376,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         if (is_lazy) {
             return lazy.buft();
+        }
+
+        // the token embedding table is pinned in place on the device that reads it. a converted
+        // BF16 table is rewritten while loading, so it cannot point into the read-only mapping.
+        // load_tensors() only sets embd.dev after checking that the device offers the buffer type
+        if (!bf16_as_f16 && tn.tensor == LLM_TENSOR_TOKEN_EMBD && !(flags & TENSOR_DUPLICATED) && embd.dev != nullptr) {
+            ggml_backend_buffer_type_t registered = embd.buft();
+            GGML_ASSERT(registered != nullptr);
+            return registered;
         }
 
         // select the buffer type for this tensor

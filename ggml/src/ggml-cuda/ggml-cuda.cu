@@ -8533,6 +8533,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         if (op->src[i] && op->src[i]->buffer &&
                 (ggml_backend_buft_is_cuda(op->src[i]->buffer->buft) || ggml_backend_buft_is_cuda_mapped(op->src[i]->buffer->buft) ||
                  ggml_backend_buft_is_cuda_expert(op->src[i]->buffer->buft))) {
+            // a registered mapped source is host memory pinned Portable: every device can read
+            // it over UVA, so it does not tie the op to the device it was registered for. this
+            // is a capability branch of the registered mapped buffer type, not a fallback
+            if (ggml_backend_buft_is_cuda_mapped_registered(op->src[i]->buffer->buft)) {
+                continue;
+            }
             ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)op->src[i]->buffer->buft->context;
             if (buft_ctx->device != dev_ctx->device) {
                 return false;
@@ -9017,8 +9023,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
+    // a registered mapped buffer holds host memory pinned Portable, which every device can read
+    // over UVA. this is a capability branch (the buffer type is only offered by CUDA), not a
+    // fallback: any device may run an op that reads it
+    const bool registered_mapped = ggml_backend_buft_is_cuda_mapped(buft) &&
+        ggml_backend_buft_is_cuda_mapped_registered(buft);
     return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) ||
-           (ggml_backend_buft_is_cuda_mapped(buft) && buft->device == dev) ||
+           (ggml_backend_buft_is_cuda_mapped(buft) && (buft->device == dev || registered_mapped)) ||
            (ggml_backend_buft_is_cuda_expert(buft) && buft->device == dev) ||
            (integrated && ggml_backend_buft_is_cuda_host(buft));
 }

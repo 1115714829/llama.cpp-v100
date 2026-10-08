@@ -1814,6 +1814,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // the token embedding table is read by the device that holds layer 0: pin it in place and
+    // run the input layer GET_ROWS there. this is a capability branch (only CUDA offers a
+    // registered mapped buffer, and only mmap gives a range to register); without it the table
+    // stays in a CPU mmap buffer and GET_ROWS runs on the CPU. with --no-mmap there is no
+    // mapping to register and the table follows the regular input layer path: a CPU buffer.
+    // the memory-fit pass keeps the regular accounting (no_alloc)
+    if (ml.use_mmap && !ml.no_alloc && n_layer_all > 0) {
+        ml.embd.dev = pimpl->dev_layer[0].dev;
+        if (ml.embd.buft() == nullptr) {
+            ml.embd.dev = nullptr;
+        } else {
+            LLAMA_LOG_INFO("%s: token embedding table assigned to device %s\n", __func__, ggml_backend_dev_name(ml.embd.dev));
+        }
+    }
+
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
     // create tensors for the weights
@@ -2061,10 +2076,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
 
-        // a lazy context on a CUDA device is pinned in place and read on the device: build the
-        // mapped buffer from the mmap range instead of allocating one. this is a capability
-        // branch (only CUDA offers a registered mapped buffer), not a fallback.
-        const bool is_registered_mapped = ctx_key.lazy && !ml.no_alloc && !ctx_has_bf16_as_f16 &&
+        // a context whose buffer type is a registered mapped buffer (a lazy table, or the token
+        // embedding table) points into the mmap range instead of allocating: build the mapped
+        // buffer in place. this is a capability branch (only CUDA offers the buffer type)
+        const bool is_registered_mapped = !ml.no_alloc && !ctx_has_bf16_as_f16 &&
             ggml_backend_buft_is_device_mapped_registered(buft);
 
         if (is_registered_mapped) {
@@ -2088,7 +2103,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 buf_map.emplace(idx, buf);
             }
             // cudaHostRegister faults the pages in, so this reports the full pin cost
-            LLAMA_LOG_INFO("%s: pinned %.2f MiB of lazy weights in %.2f s\n",
+            LLAMA_LOG_INFO("%s: pinned %.2f MiB of mmap weights in %.2f s\n",
                     __func__, total / 1024.0 / 1024.0, (ggml_time_us() - t_start) / 1e6);
         } else if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && !ctx_has_bf16_as_f16 && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);

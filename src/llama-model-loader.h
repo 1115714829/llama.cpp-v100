@@ -123,6 +123,18 @@ struct llama_model_loader {
         std::set<std::string>                  tensors;
     } lazy;
 
+    // handle the token embedding table of the input layer: the input layer stays on the CPU,
+    // but the table is pinned in place and read on the device that holds layer 0, so that
+    // GET_ROWS runs there instead of splitting the graph back to the CPU for it
+    struct embd_read {
+        // set by the model before the create_tensor() calls
+        ggml_backend_dev_t dev = nullptr;
+
+        // buffer type of the token embedding table: the device-readable registered mapped
+        // buffer of dev, or nullptr when the device does not offer one
+        ggml_backend_buffer_type_t buft() const;
+    } embd;
+
     // target model a draft head borrows the shared tensors from, see borrow_shared_tensor()
     // from unsloth PR #142
     const struct llama_model * model_shared = nullptr;
