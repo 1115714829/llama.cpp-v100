@@ -2107,6 +2107,38 @@ void llama_context::set_h_src_group(int32_t group) {
     h_src_group = group;
 }
 
+void llama_context::set_h_sink_first_pos(llama_seq_id seq_id, llama_pos pos_first) {
+    if (t_h_sink == nullptr || !h_sink_is_target || seq_id < 0) {
+        return;
+    }
+
+    if ((size_t) seq_id >= h_sink_first_pos.size()) {
+        h_sink_first_pos.resize((size_t) seq_id + 1, 0);
+    }
+
+    h_sink_first_pos[seq_id] = pos_first;
+}
+
+bool llama_context::h_sink_ubatch_skip(const llama_ubatch & ubatch) const {
+    if (h_sink_first_pos.empty() || ubatch.pos == nullptr || ubatch.seq_id == nullptr || ubatch.n_seq_id == nullptr) {
+        return false;
+    }
+
+    // the ubatch is skipped only when every token lies below the boundary of every sequence it
+    // belongs to. A token without a boundary (or a sequence beyond the vector) keeps the ubatch
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const llama_pos pos = ubatch.pos[i*ubatch.n_pos];
+        for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][s];
+            if (seq_id < 0 || (size_t) seq_id >= h_sink_first_pos.size() || pos >= h_sink_first_pos[seq_id]) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 int32_t llama_context::h_nextn_sink_group() const {
     if (!embd_link || embd_link->t_h_sink_tgt == nullptr) {
         return 0;
@@ -2407,8 +2439,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // other target graph (the verify graph of a decode round, a single-token decode) writes
     // group 0, or its column offset would flip between rounds and force a rebuild of the
     // otherwise reusable decode graph
-    const bool writes_h_sink = embd_link && embd_link->t_h_sink_tgt != nullptr && t_h_sink != nullptr && h_sink_is_target;
+    bool writes_h_sink = embd_link && embd_link->t_h_sink_tgt != nullptr && t_h_sink != nullptr && h_sink_is_target;
     const bool reads_h_sink  = embd_link && embd_link->t_h_sink_tgt != nullptr && h_src_enable && !h_sink_is_target;
+
+    // r-mtpskip: skip the sink write and the cross-context ordering of a target ubatch whose
+    // positions all lie below the prefill boundary of their sequence. The MTP draft skips the
+    // same positions, so it never reads those rows: the write has no consumer. Not a fallback.
+    // A ubatch is kept when any of its tokens is at or above its sequence boundary.
+    const bool h_sink_skip = writes_h_sink && h_sink_ubatch_skip(ubatch);
+    if (h_sink_skip) {
+        writes_h_sink = false;
+    }
 
     int32_t sink_group = 0; // the group this ubatch writes, 0 when it writes none
 
@@ -2421,7 +2462,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(sched_cur, res, ubatch, mctx, gtype, token_offset);
+    const auto gparams = graph_params(sched_cur, res, ubatch, mctx, gtype, token_offset, h_sink_skip);
 
     if (!pipeline && !graph_reuse_disable && gf_res_prev_active[slot] == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -3314,8 +3355,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // r-mtpdev: same mapping for the target h sink (the draft reads it through this mapping).
         // The columns of this ubatch start at its token offset within the group written by the
         // target graph (h_sink_offset, set by process_ubatch; n_tokens_prev is the offset passed
-        // to it); storing the absolute column keeps the group rotation out of the lookups
-        if (embd_link && embd_link->t_h_sink_tgt != nullptr && h_sink_is_target && cparams.n_seq_max > 1) {
+        // to it); storing the absolute column keeps the group rotation out of the lookups.
+        // r-mtpskip: a skipped ubatch writes no sink rows, so it records no mapping either
+        if (embd_link && embd_link->t_h_sink_tgt != nullptr && h_sink_is_target && cparams.n_seq_max > 1 &&
+                !h_sink_ubatch_skip(ubatch)) {
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 const llama_seq_id seq_id = ubatch.seq_id[i][0];
                 h_sink_cols.emplace_back(seq_id, ubatch.pos[i]);
@@ -3953,7 +3996,8 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype,
-                             size_t        token_offset) const {
+                             size_t        token_offset,
+                                bool        h_sink_skip) const {
     // the 6-card FA assist shares the KV tail with the idle devices, but with a range mask the
     // marked FA view always spans the whole cache: gate on the KV length the batch really uses
     bool fa_assist = false;
@@ -4003,7 +4047,7 @@ llm_graph_params llama_context::graph_params(
         /*.h_src_cols            =*/ (!h_sink_is_target && h_src_enable && !h_src_cols.empty()) ? h_src_cols.data() : nullptr,
         /*.h_token_offset        =*/ (size_t) h_sink_offset,
         /*.h_sink_is_target      =*/ h_sink_is_target,
-        /*.h_sink_write          =*/ h_sink_write,
+        /*.h_sink_write          =*/ h_sink_write && !h_sink_skip,
         /*.fa_assist             =*/ fa_assist,
     };
 }
@@ -5563,6 +5607,10 @@ void llama_set_h_sink_offset(struct llama_context * ctx, int32_t offset) {
 
 void llama_set_h_sink_write(struct llama_context * ctx, bool write) {
     ctx->set_h_sink_write(write);
+}
+
+void llama_set_h_sink_first_pos(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos_first) {
+    ctx->set_h_sink_first_pos(seq_id, pos_first);
 }
 
 bool llama_h_nextn_sink_capture(struct llama_context * ctx, const int32_t * src_cols, size_t n_cols) {

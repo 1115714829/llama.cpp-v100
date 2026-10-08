@@ -3973,6 +3973,19 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // r-mtpskip: tell the MTP driver where the prompt ends, so it can skip the
+                        // draft catch-up of the positions its attention window can never read.
+                        // The last prompt position is the next position of the cached prefix plus
+                        // the remaining task tokens, minus one. Multimodal positions do not map to
+                        // token indices, so the skip stays off there (capability branch, not a
+                        // fallback: the draft has no mtmd support).
+                        if (spec) {
+                            const llama_pos pos_end = slot.prompt.tokens.has_mtmd
+                                ? -1
+                                : slot.prompt.tokens.pos_next() + (llama_pos) (slot.task->n_tokens() - slot.prompt.n_tokens()) - 1;
+                            common_speculative_set_prompt_end(spec.get(), slot.id, pos_end);
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {

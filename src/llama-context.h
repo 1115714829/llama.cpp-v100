@@ -195,6 +195,13 @@ struct llama_context {
     // r-mtpdev draft: enable/disable the sink write of the next draft graph (catch-up decodes
     // keep it off so that they do not overwrite the target batch columns)
     void set_h_sink_write(bool write);
+    // r-mtpskip target: skip the sink write and the cross-context ordering of a ubatch whose
+    // positions all lie below pos_first (0 = write every position). Set per sequence before a
+    // prompt starts and cleared once the prompt is done
+    void set_h_sink_first_pos(llama_seq_id seq_id, llama_pos pos_first);
+    // r-mtpskip: true when every token of the ubatch lies below the sink boundary of all of its
+    // sequences, so the target writes no sink rows for it
+    bool h_sink_ubatch_skip(const llama_ubatch & ubatch) const;
     // r-mtpdev draft: copy the sink rows src_cols into the reserved pending columns
     // [2*n_batch, 2*n_batch + n_cols). Runs on the draft's output-device stream, ordered after
     // the target write and after the draft graph, and before the next draft read
@@ -371,7 +378,8 @@ private:
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype,
-                             size_t        token_offset = 0) const;
+                             size_t        token_offset = 0,
+                                bool        h_sink_skip = false) const;
 
     llm_graph_cb graph_get_cb(ggml_backend_sched_t sched) const;
 
@@ -478,6 +486,11 @@ private:
     // r-mtpdev draft: the group that the next draft graph reads, -1 when it reads no group
     // columns (draft steps only touch the pending and step columns)
     int32_t h_src_group = -1;
+
+    // r-mtpskip target: per-sequence first position of the MTP draft KV window. A prefill ubatch
+    // whose positions all lie below this value writes no sink rows and does no cross-context
+    // ordering; 0 means the sequence writes every position (no skip)
+    std::vector<llama_pos> h_sink_first_pos;
 
     // r-mtpdev: the id of the most recent ubatch submitted through the prefill pipeline, -1 if none
     int64_t pipeline_ubatch_last = -1;

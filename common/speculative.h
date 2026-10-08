@@ -94,6 +94,13 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
+// tell the speculative driver the absolute position of the last prompt token (inclusive), before
+// the first prompt batch is processed. The MTP draft uses it to skip the catch-up of prompt
+// positions that its attention window can never read again. A negative pos_end disables the skip
+// for that sequence. Only implementations with a windowed draft KV make use of it; the base
+// implementation ignores the call.
+void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_end);
+
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
