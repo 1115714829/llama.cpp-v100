@@ -1195,6 +1195,12 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
+// host copies that split at the end of every cudaHostRegister range the host side enters
+// (defined in ggml-cuda.cu): a copy that starts inside a registered range and ends outside
+// it fails with "invalid argument", so it is split at the range boundary
+void ggml_cuda_memcpy_h2d_async(void * dst, const void * src, size_t size, cudaStream_t stream);
+void ggml_cuda_memcpy_d2h_async(void * dst, const void * src, size_t size, cudaStream_t stream);
+
 // shared by the regular CUDA buffer type and the expert buffer type
 struct ggml_backend_cuda_buffer_type_context {
     int device;

@@ -177,13 +177,15 @@ static void ggml_cuda_expert_free_host(void * user, void * ptr) {
 static void ggml_cuda_expert_copy_h2d(void * user, void * dst_dev, const void * src_host, size_t size) {
     const int device = (int) (intptr_t) user;
     ggml_cuda_set_device(device);
-    CUDA_CHECK(cudaMemcpy(dst_dev, src_host, size, cudaMemcpyHostToDevice));
+    ggml_cuda_memcpy_h2d_async(dst_dev, src_host, size, cudaStreamPerThread);
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
 static void ggml_cuda_expert_copy_d2h(void * user, void * dst_host, const void * src_dev, size_t size) {
     const int device = (int) (intptr_t) user;
     ggml_cuda_set_device(device);
-    CUDA_CHECK(cudaMemcpy(dst_host, src_dev, size, cudaMemcpyDeviceToHost));
+    ggml_cuda_memcpy_d2h_async(dst_host, src_dev, size, cudaStreamPerThread);
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
 static void ggml_cuda_expert_table_upload(void * user, void * dst_dev, const char * const * src_host, size_t n) {
@@ -892,7 +894,7 @@ static void ggml_backend_cuda_expert_buffer_set_tensor(ggml_backend_buffer_t buf
     if (tensor_id < 0) {
         // plain tensor: same behavior as the regular CUDA buffer type
         ggml_cuda_set_device(ctx->device);
-        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+        ggml_cuda_memcpy_h2d_async((char *) tensor->data + offset, data, size, cudaStreamPerThread);
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         return;
     }
@@ -906,7 +908,7 @@ static void ggml_backend_cuda_expert_buffer_get_tensor(ggml_backend_buffer_t buf
     if (tensor_id < 0) {
         // plain tensor: same behavior as the regular CUDA buffer type
         ggml_cuda_set_device(ctx->device);
-        CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+        ggml_cuda_memcpy_d2h_async(data, (const char *) tensor->data + offset, size, cudaStreamPerThread);
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         return;
     }
