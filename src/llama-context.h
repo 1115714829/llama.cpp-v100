@@ -356,6 +356,9 @@ public:
 private:
     llm_graph_result * get_gf_res_prev(int slot);
 
+    // graph result of one pipeline stage, see gf_res_pipe
+    llm_graph_result * get_gf_res_pipe(int stage);
+
     // slot of the previous-graph cache for this ubatch
     int gf_res_slot(const llama_ubatch & ubatch) const;
 
@@ -575,6 +578,11 @@ private:
     // slot 2 for decode batches when sched_dec is enabled
     std::array<llm_graph_result_ptr, 3> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // one graph result per pipeline stage: a ubatch's graph result must stay alive while its
+    // submission workers still read its nodes, so it is reset only when the stage is reused.
+    // indexed by the stage returned by ggml_backend_sched_pipeline_next_stage
+    std::vector<llm_graph_result_ptr> gf_res_pipe;
 
     std::array<llm_graph_result *, 3> gf_res_prev_active = { nullptr, nullptr, nullptr };
 

@@ -34,11 +34,31 @@ void ggml_backend_sched_set_n_stages(ggml_backend_sched_t sched, int n_stages) {
     sched->next_stage = 0;
     sched->oldest_stage = 0;
     sched->pipeline_stage = -1;
+    sched->pipeline_post_stage = -1;
     sched->pipeline_last_ubatch_id = -1;
+    sched->pipeline_error = GGML_STATUS_SUCCESS;
 
     // the submission workers only exist when the scheduler overlaps pipeline stages. a scheduler
     // with double buffered inputs but no overlap (n_stages == 1) submits synchronously
     if (n_stages > 1) {
+        // every stage gets its own input copy context: the submission workers of a stage keep
+        // reading its copy tensor structs until the stage is reused, n_stages ubatches later. the
+        // default context built by ggml_backend_sched_new becomes stage 0's
+        for (int s = 0; s < n_stages; s++) {
+            if (s == 0) {
+                sched->stages[s].context_buffer      = sched->context_buffer;
+                sched->stages[s].context_buffer_size = sched->context_buffer_size;
+                sched->stages[s].ctx                 = sched->ctx;
+            } else {
+                sched->stages[s].context_buffer      = (char *) malloc(sched->context_buffer_size);
+                sched->stages[s].context_buffer_size = sched->context_buffer_size;
+                sched->stages[s].ctx                 = NULL;
+            }
+        }
+        sched->ctx                 = sched->stages[0].ctx;
+        sched->context_buffer      = sched->stages[0].context_buffer;
+        sched->context_buffer_size = sched->stages[0].context_buffer_size;
+
         // per-stage completion events and the staging events of the workers. devices without event
         // support (CPU) yield NULL and never take the pipeline submission path
         for (int s = 0; s < n_stages; s++) {
@@ -75,6 +95,16 @@ static void ggml_backend_sched_pipeline_wait_stage(ggml_backend_sched_t sched, i
         }
     }
 
+    // the tasks of the stage have run by now: their error flag is final. the first failure is
+    // sticky, the caller checks it through pipeline_advance before reading the stage outputs
+    if (stage->error != NULL) {
+        const int ec = stage->error->load();
+        if (ec != (int) GGML_STATUS_SUCCESS) {
+            sched->pipeline_error = (enum ggml_status) ec;
+        }
+        stage->error.reset();
+    }
+
     stage->in_flight = false;
 }
 
@@ -91,7 +121,21 @@ bool ggml_backend_sched_pipeline_begin(ggml_backend_sched_t sched, struct ggml_c
     if (stage->in_flight) {
         ggml_backend_sched_pipeline_wait_stage(sched, s);
     }
+    if (sched->pipeline_error != GGML_STATUS_SUCCESS) {
+        // a previous ubatch of this pipeline failed; abort the prefill. the flag is sticky until
+        // the caller drains the pipeline through pipeline_advance
+        return false;
+    }
+    // this stage is being prepared: no submission is outstanding for the post-task target anymore,
+    // so a task posted before the submit below must run inline instead of extending a stale stage
+    sched->pipeline_post_stage = -1;
     memset(stage->backend_seq, 0, sizeof(stage->backend_seq));
+
+    // switch the scheduler to this stage's input copy context. the context of the previous user of
+    // the stage was freed by the wait above (or has not been built yet), so it is safe to rebuild
+    sched->ctx                 = stage->ctx;
+    sched->context_buffer      = stage->context_buffer;
+    sched->context_buffer_size = stage->context_buffer_size;
 
     // input copies are double buffered: ubatch i uses slot i % n_copies on every backend, so
     // in-flight ubatches never overwrite each other's device inputs. the previous user of a slot is
@@ -135,11 +179,29 @@ enum ggml_status ggml_backend_sched_pipeline_submit(ggml_backend_sched_t sched, 
     // of each split; cur_copy is the input slot of this ubatch
     stage->ubatch_id = ubatch_id;
     stage->in_flight = true;
+    // worker tasks of this ubatch (including the output copies posted later) extend this stage, so
+    // the stage reuse wait must cover tasks posted after the submission returns
+    sched->pipeline_post_stage = s;
     sched->pipeline_stage = -1;
-
     sched->next_stage = (s + 1) % sched->n_stages;
 
     return GGML_STATUS_SUCCESS;
+}
+
+int ggml_backend_sched_pipeline_next_stage(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->next_stage;
+}
+
+void ggml_backend_sched_pipeline_wait_next_stage(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    const int s = sched->next_stage;
+
+    // the stage seqs cover the output copies posted after the compute (see
+    // ggml_backend_sched_post_task), so this also waits for them
+    if (sched->stages[s].in_flight) {
+        ggml_backend_sched_pipeline_wait_stage(sched, s);
+    }
 }
 
 void ggml_backend_sched_pipeline_wait(ggml_backend_sched_t sched, int64_t ubatch_id) {
@@ -165,24 +227,37 @@ void ggml_backend_sched_pipeline_advance(ggml_backend_sched_t sched) {
     for (int s = 0; s < sched->n_stages; s++) {
         in_flight = in_flight || sched->stages[s].in_flight;
     }
-    if (!in_flight) {
-        return;
+
+    if (in_flight) {
+        // the per-stage events only cover the compute, not the asynchronous copies of the outputs
+        // to the host (those are posted to the same workers, after the compute). drain the workers
+        // and synchronize the backends so those reads complete before the host output buffers are
+        // reused by the next batch. this runs once per prefill, not per ubatch
+        ggml_backend_sched_workers_drain(sched);
+        for (int b = 0; b < sched->n_backends; b++) {
+            ggml_backend_synchronize(sched->backends[b]);
+        }
     }
 
-    // the per-stage events only cover the compute, not the asynchronous copies of the outputs to
-    // the host. synchronize the backends so those reads complete before the host output buffers are
-    // reused by the next batch. this runs once per prefill, not per ubatch
-    ggml_backend_sched_workers_drain(sched);
-    for (int b = 0; b < sched->n_backends; b++) {
-        ggml_backend_synchronize(sched->backends[b]);
-    }
-
+    // the tasks of every stage have run: collect their errors before the stages are reused
     for (int s = 0; s < sched->n_stages; s++) {
+        if (sched->stages[s].error != NULL) {
+            const int ec = sched->stages[s].error->load();
+            if (ec != (int) GGML_STATUS_SUCCESS) {
+                sched->pipeline_error = (enum ggml_status) ec;
+            }
+            sched->stages[s].error.reset();
+        }
         sched->stages[s].in_flight = false;
     }
+
+    // the caller has observed any failure through pipeline_begin/pipeline_wait: the next prefill
+    // starts clean
+    sched->pipeline_error = GGML_STATUS_SUCCESS;
 
     sched->next_stage = 0;
     sched->oldest_stage = 0;
     sched->pipeline_stage = -1;
+    sched->pipeline_post_stage = -1;
     sched->pipeline_last_ubatch_id = -1;
 }

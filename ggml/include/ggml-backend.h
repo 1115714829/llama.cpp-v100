@@ -18,9 +18,12 @@
 #endif
 
 #ifdef  __cplusplus
-extern "C" {
+#include <functional>
 #endif
 
+#ifdef  __cplusplus
+extern "C" {
+#endif
     typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
     typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
     typedef struct ggml_backend_event * ggml_backend_event_t;
@@ -361,6 +364,9 @@ extern "C" {
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
+    // Backend id of the node, as returned by ggml_backend_sched_get_n_backends. -1 if unassigned.
+    // Resolve it before the next graph is allocated: the assignment map is reset then.
+    GGML_API int                  ggml_backend_sched_get_tensor_backend_id(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
@@ -378,6 +384,13 @@ extern "C" {
     // Split and allocate one ubatch graph on its input copy slot (ubatch_id % n_copies), without
     // computing it. ubatch_id must increase across calls.
     GGML_API bool                 ggml_backend_sched_pipeline_begin(ggml_backend_sched_t sched, struct ggml_cgraph * graph, int64_t ubatch_id);
+    // Stage index that the next ggml_backend_sched_pipeline_begin will use. The caller uses it to
+    // pick the per-stage graph result before it rebuilds the graph.
+    GGML_API int                  ggml_backend_sched_pipeline_next_stage(ggml_backend_sched_t sched);
+    // Wait until the stage that the next ggml_backend_sched_pipeline_begin will use is reusable.
+    // The caller must call this before it rebuilds the graph result of that stage, so no submission
+    // worker still reads the old nodes. ggml_backend_sched_pipeline_begin then does not wait again.
+    GGML_API void                 ggml_backend_sched_pipeline_wait_next_stage(ggml_backend_sched_t sched);
     // Enqueue all splits of the graph prepared by ggml_backend_sched_pipeline_begin, without waiting.
     // ubatch_id must increase across calls.
     GGML_API enum ggml_status     ggml_backend_sched_pipeline_submit(ggml_backend_sched_t sched, int64_t ubatch_id);
@@ -389,6 +402,14 @@ extern "C" {
     // stream (not until the device finished). Returns immediately if the scheduler has no
     // submission threads, or if backend is not one of its backends.
     GGML_API void                 ggml_backend_sched_wait_submitted(ggml_backend_sched_t sched, ggml_backend_t backend);
+
+#ifdef  __cplusplus
+    // Post a host task to the submission worker of backend_id. The task runs after every task
+    // already posted to that worker, so a copy enqueued here is ordered after this ubatch's compute
+    // on the backend stream, without waiting on the caller thread. Backends without a submission
+    // worker (CPU) run the task directly.
+    GGML_API void                 ggml_backend_sched_post_task(ggml_backend_sched_t sched, int backend_id, std::function<void()> fn);
+#endif
 
     // copy user input tensors to the split backends asynchronously (default: false)
     // the caller synchronizes the scheduler before it writes the input tensors again, so user inputs

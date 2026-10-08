@@ -809,6 +809,8 @@ void llama_context::sched_reserve() {
     for (auto & res : gf_res_prev) {
         res.reset();
     }
+    // the pipeline graph results are indexed by stage; size them once here, matching the scheduler
+    gf_res_pipe.clear();
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = { nullptr, nullptr, nullptr };
 
@@ -824,6 +826,7 @@ void llama_context::sched_reserve() {
     // span. input copies stay at two (double buffering), independent of the depth
     if (cparams.pipeline_parallel) {
         ggml_backend_sched_set_n_stages(sched.get(), count_layer_devices(model, cparams));
+        gf_res_pipe.resize(ggml_backend_sched_get_n_stages(sched.get()));
     }
 
     // the injection graph of a DFlash draft gets its own scheduler, see gf_res_slot
@@ -1162,6 +1165,12 @@ bool llama_context::memory_update(bool optimize) {
         // reset the previous graph results to make sure that they won't be reused
         // TODO: make mctx->apply() report if a graph reserve is needed, then reset graph results only if the memory module reset the scheduler
         for (auto & res : gf_res_prev) {
+            if (res) {
+                res->reset();
+            }
+        }
+        // the pipeline is drained above, so no stage result is being read
+        for (auto & res : gf_res_pipe) {
             if (res) {
                 res->reset();
             }
@@ -2378,13 +2387,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     const int slot = gf_res_slot(ubatch);
 
+    auto * sched_cur = sched_for_slot(slot);
+
     // the ubatch reuses the graph result; in pipeline mode the graph is rebuilt and re-split for
     // every ubatch on its own input copy, and the caller extracts the outputs before the next
     // ubatch is submitted (the async copies are ordered on the device streams)
-    auto * res = get_gf_res_prev(slot);
+    //
+    // pipeline mode keeps one graph result per stage: the submission workers of a stage still read
+    // its nodes until the stage is reused, so a ubatch must not reset the result of an earlier
+    // in-flight ubatch. the stage index comes from the scheduler, not from the ubatch id (the id
+    // does not wrap when the ring advances)
+    auto * res = pipeline ? get_gf_res_pipe(ggml_backend_sched_pipeline_next_stage(sched_cur))
+                          : get_gf_res_prev(slot);
     auto * gf  = res->get_gf();
-
-    auto * sched_cur = sched_for_slot(slot);
 
     // r-mtpdev cross-context ordering for the nextn h sink: the target write waits for the draft
     // to finish reading the previous write, the draft read waits for the target graph to finish.
@@ -2426,6 +2441,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 gf_res_prev_active[i] = nullptr;
             }
         }
+
+        // pipeline: the workers of the previous ubatch on this stage still read the nodes of its
+        // graph result. wait for the stage to be reusable before resetting the result. the begin
+        // call below then reuses this stage without waiting again
+        if (pipeline) {
+            ggml_backend_sched_pipeline_wait_next_stage(sched_cur);
+        }
+
         res->reset();
 
         ggml_backend_sched_reset(sched_cur);
@@ -2788,6 +2811,21 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     return 0;
 }
 
+// enqueue a device-to-host copy that must run after this ubatch's compute. in pipeline mode the
+// compute is still queued in the submission workers, so the copy is posted to the worker of the
+// tensor's backend: the worker runs its queue in order, which orders the copy after the compute on
+// the device stream without waiting on the caller thread. schedulers without workers (no pipeline,
+// CPU) run the copy inline, exactly like a direct ggml_backend_tensor_get_async
+static void post_tensor_get_async(
+        ggml_backend_sched_t sched, ggml_backend_t backend, ggml_tensor * tensor,
+        void * dst, size_t offset, size_t size) {
+    const int backend_id = ggml_backend_sched_get_tensor_backend_id(sched, tensor);
+    GGML_ASSERT(backend_id >= 0);
+    ggml_backend_sched_post_task(sched, backend_id, [=]() {
+        ggml_backend_tensor_get_async(backend, tensor, dst, offset, size);
+    });
+}
+
 template<typename T>
 static void copy_tensor_async_rows(
     const std::vector<ggml_tensor *> & tensors,
@@ -2814,7 +2852,7 @@ static void copy_tensor_async_rows(
 
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, tensor);
         T * row_ptr = dst.data + (size_t) row * stride;
-        ggml_backend_tensor_get_async(backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
+        post_tensor_get_async(sched, backend, tensor, row_ptr, 0, ggml_nbytes(tensor));
 
         if (counts) {
             GGML_ASSERT(row < counts->size());
@@ -3031,13 +3069,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     auto extract_outputs = [&](const llm_graph_result * res, ggml_backend_sched_t sched_res,
             const llama_ubatch & ubatch, int32_t n_outputs, int64_t n_outputs_prev, int64_t n_tokens_prev) {
-        // the async host reads below are enqueued on the streams of this ubatch's scheduler: wait
-        // until the submission threads have enqueued its compute first, so the copies are ordered
-        // after it. no-op for schedulers without submission threads
-        for (const auto & backend : backends) {
-            wait_submitted(backend.get());
-        }
-
+        // the async host reads below are ordered on the streams of this ubatch's scheduler after
+        // its compute. when the compute is still queued in the submission workers, post the reads
+        // to the workers instead of waiting: the worker FIFO orders them after the compute, so the
+        // caller thread does not stall on the submission (see post_tensor_get_async)
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -3057,7 +3092,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                post_tensor_get_async(sched_res, backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
             }
         }
 
@@ -3066,8 +3101,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const size_t n = (size_t) cparams.logits_topk*cparams.logits_topk_shards;
             GGML_ASSERT((n_outputs_prev + n_outputs)*n <= topk_logits.size);
             ggml_backend_t backend_topk = ggml_backend_sched_get_tensor_backend(sched_res, res->t_logits_topk);
-            ggml_backend_tensor_get_async(backend_topk, res->t_logits_topk,     topk_logits.data + n_outputs_prev*n, 0, n_outputs*n*sizeof(float));
-            ggml_backend_tensor_get_async(backend_topk, res->t_logits_topk_ids, topk_ids.data    + n_outputs_prev*n, 0, n_outputs*n*sizeof(int32_t));
+            post_tensor_get_async(sched_res, backend_topk, res->t_logits_topk,     topk_logits.data + n_outputs_prev*n, 0, n_outputs*n*sizeof(float));
+            post_tensor_get_async(sched_res, backend_topk, res->t_logits_topk_ids, topk_ids.data    + n_outputs_prev*n, 0, n_outputs*n*sizeof(int32_t));
         }
 
         // extract embeddings
@@ -3086,7 +3121,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         if (n_outputs) {
                             GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                             GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_out <= (int64_t) embd.size);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
+                            post_tensor_get_async(sched_res, backend_embd, t_embd, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_MEAN:
@@ -3105,7 +3140,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                             const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
                             embd_seq_out[seq_id].resize(n_embd_out);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd_out*seq_idx)*sizeof(float), n_embd_out*sizeof(float));
+                            post_tensor_get_async(sched_res, backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd_out*seq_idx)*sizeof(float), n_embd_out*sizeof(float));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_RANK:
@@ -3159,7 +3194,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                post_tensor_get_async(sched_res, backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
                 extract_all_idxs = extract_all_idxs || !masked;
 
                 if (cparams.embeddings_nextn) {
@@ -3580,7 +3615,7 @@ bool llama_context::extract_layer_inputs(ggml_backend_sched_t sched, const llm_g
         ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, t);
         GGML_ASSERT(backend != nullptr);
         // Tensor-split backends require a zero source offset.
-        ggml_backend_tensor_get_async(backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
+        post_tensor_get_async(sched, backend, t, embd_layer_inp[il].data + dst_offset, 0, nbytes);
         extracted = true;
     }
     return extracted;
@@ -3750,6 +3785,15 @@ llm_graph_result * llama_context::get_gf_res_prev(int slot) {
     return res.get();
 }
 
+llm_graph_result * llama_context::get_gf_res_pipe(int stage) {
+    GGML_ASSERT(stage >= 0 && stage < (int) gf_res_pipe.size());
+    auto & res = gf_res_pipe[stage];
+    if (!res) {
+        res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+    }
+    return res.get();
+}
+
 int llama_context::gf_res_slot(const llama_ubatch & ubatch) const {
     // verification/single-token decode batches of regular contexts get the dedicated decode scheduler.
     // embd batches stay off it because an embd injection pass (DFlash, EAGLE) builds a different graph;
@@ -3854,6 +3898,11 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // when the scheduler is reset, we cannot reuse old graphs, so we reset the previous graph results
     for (auto & res : gf_res_prev) {
+        if (res) {
+            res->reset();
+        }
+    }
+    for (auto & res : gf_res_pipe) {
         if (res) {
             res->reset();
         }

@@ -1204,6 +1204,16 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ABORT("%s: failed to initialize context\n", __func__);
     }
 
+    // the active context belongs to a pipeline stage: keep the stage's pointer in sync with the
+    // freshly initialized one, so a later pipeline_begin restores the right pointer
+    if (sched->n_stages > 1) {
+        for (int s = 0; s < sched->n_stages; s++) {
+            if (sched->stages[s].context_buffer == sched->context_buffer) {
+                sched->stages[s].ctx = sched->ctx;
+            }
+        }
+    }
+
     graph->uid = ggml_graph_next_uid();
 
     // pass 1: assign backends to ops with pre-allocated inputs
@@ -2211,16 +2221,28 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
         }
     }
 
-    // handoff events, one per split, recorded by the split that pushes the copies. the backend of a
-    // split may differ between graphs, in which case the event is recreated on the new device.
-    if (sched->handoff_events == NULL) {
-        sched->handoff_events = new std::vector<ggml_backend_event_t>();
+    // handoff events, one per split, recorded by the split that pushes the copies. a pipeline
+    // submission uses the events of its stage, so a later ubatch that reuses the stage records
+    // them only after this stage's previous ubatch completed (the stage reuse wait). a plain
+    // submission on a pipeline scheduler uses the scheduler-level set
+    std::vector<ggml_backend_event_t> * handoff = NULL;
+    if (sched->pipeline_stage >= 0) {
+        struct ggml_backend_sched_stage * hstage = &sched->stages[sched->pipeline_stage];
+        if (hstage->handoff_events == NULL) {
+            hstage->handoff_events = new std::vector<ggml_backend_event_t>();
+        }
+        handoff = hstage->handoff_events;
+    } else if (sched->n_stages > 1) {
+        if (sched->handoff_events == NULL) {
+            sched->handoff_events = new std::vector<ggml_backend_event_t>();
+        }
+        handoff = sched->handoff_events;
     }
-    while ((int) sched->handoff_events->size() < n_splits) {
-        sched->handoff_events->push_back(NULL);
+    while (handoff != NULL && (int) handoff->size() < n_splits) {
+        handoff->push_back(NULL);
     }
-    for (int s = 0; s < n_splits; s++) {
-        ggml_backend_event_t & ev = sched->handoff_events->at(s);
+    for (int s = 0; handoff != NULL && s < n_splits; s++) {
+        ggml_backend_event_t & ev = handoff->at(s);
         ggml_backend_dev_t dev = sched->backends[splits[s].backend_id]->device;
         if (ev != NULL && ev->device == dev) {
             continue;
@@ -2229,7 +2251,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
             continue; // capability branch: the device has no events (CPU)
         }
         if (ev != NULL) {
-            // waiting streams of the previous ubatch already completed (submit drained)
+            // the previous user of this stage completed before the stage was reused
             ggml_backend_event_synchronize(ev);
             ggml_backend_event_free(ev);
         }
@@ -2237,10 +2259,10 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
     }
     for (int p = 0; p < n_splits; p++) {
         for (auto & push : pushes[p]) {
-            push.handoff = sched->handoff_events->at(p);
+            push.handoff = handoff != NULL ? handoff->at(p) : NULL;
         }
         for (auto & dep : deps[p]) {
-            dep.handoff = sched->handoff_events->at(dep.producer_split_id);
+            dep.handoff = handoff != NULL ? handoff->at(dep.producer_split_id) : NULL;
         }
     }
 
@@ -2284,6 +2306,11 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
     }
 
     auto error = std::make_shared<std::atomic<int>>((int) GGML_STATUS_SUCCESS);
+    // a pipeline submission records its error on the stage: the caller checks it at the stage wait
+    // instead of at submit time, since the tasks are not done yet when this returns
+    if (sched->pipeline_stage >= 0) {
+        sched->stages[sched->pipeline_stage].error = error;
+    }
 
     std::vector<uint64_t> last_seq(sched->n_backends, 0); // last task posted in this submission
     std::vector<uint64_t> producer_seq(n_splits, 0);      // task of the producer split, 0 = main thread
@@ -2297,9 +2324,14 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
         ggml_backend_t backend = sched->backends[backend_id];
 
         if (on_main[split_id]) {
-            // the synchronous path touches the device streams and the host: let the posted tasks
-            // reach their streams first
-            ggml_backend_sched_workers_drain(sched);
+            // the synchronous path touches the device streams and the host: let the tasks already
+            // posted for this ubatch reach their streams first, without waiting for the whole queue
+            // (which would serialize the pipeline again)
+            for (int b = 0; b < sched->n_backends; b++) {
+                if (last_seq[b] > 0) {
+                    ggml_backend_sched_worker_wait_done(sched, b, last_seq[b]);
+                }
+            }
             enum ggml_status ec = ggml_backend_sched_compute_split_sync(sched, split_id, prev_backend_id, ids_cache);
             if (ec != GGML_STATUS_SUCCESS) {
                 // the posted tasks must consume the caller graph before it is rebuilt
@@ -2418,14 +2450,19 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
         prev_backend_id = backend_id;
     }
 
-    // the caller rebuilds the graph of the next ubatch as soon as this returns, so every task must
-    // have consumed the graph metadata by now. this waits for the submission only, the devices keep
-    // running while the caller prepares the next ubatch.
-    ggml_backend_sched_workers_drain(sched);
+    // a pipeline submission returns without draining: the next ubatch rebuilds the caller graph and
+    // the scheduler context on its own stage, and the stage reuse wait (pipeline_begin) guarantees
+    // the tasks have consumed this ubatch's metadata before it is overwritten. a synchronous
+    // submission on this scheduler has no stage of its own, so it must drain here
+    if (sched->pipeline_stage < 0) {
+        ggml_backend_sched_workers_drain(sched);
+        // this submission had no stage: later posted tasks must not extend the last pipeline stage
+        sched->pipeline_post_stage = -1;
 
-    const int ec = error->load();
-    if (ec != (int) GGML_STATUS_SUCCESS) {
-        return (enum ggml_status) ec;
+        const int ec = error->load();
+        if (ec != (int) GGML_STATUS_SUCCESS) {
+            return (enum ggml_status) ec;
+        }
     }
 
     // remember the last task per backend so the stage events can be synchronized once those tasks
@@ -2523,6 +2560,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->next_stage = 0;
     sched->oldest_stage = 0;
     sched->pipeline_stage = -1;
+    sched->pipeline_post_stage = -1;
     sched->pipeline_last_ubatch_id = -1;
 
     // initialize hash table
@@ -2595,6 +2633,13 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
         delete sched->workers;
         sched->workers = NULL;
     }
+    // the scheduler may have switched to the context of the last used stage; restore stage 0's
+    // (the default one) so the release below frees the shared context exactly once
+    if (sched->n_stages > 1) {
+        sched->ctx                 = sched->stages[0].ctx;
+        sched->context_buffer      = sched->stages[0].context_buffer;
+        sched->context_buffer_size = sched->stages[0].context_buffer_size;
+    }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
@@ -2607,6 +2652,21 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int s = 0; s < GGML_SCHED_MAX_STAGES; s++) {
         for (int b = 0; b < sched->n_backends; b++) {
             ggml_backend_event_free(sched->stages[s].done[b]);
+        }
+        // the stages live in a calloc'ed scheduler, so they have no destructor to release the
+        // shared_ptr control block of the error flag
+        sched->stages[s].error.reset();
+        // stage 0 shares the default context/buffer of the scheduler, released below
+        if (s > 0) {
+            ggml_free(sched->stages[s].ctx);
+            free(sched->stages[s].context_buffer);
+        }
+        if (sched->stages[s].handoff_events != NULL) {
+            for (ggml_backend_event_t ev : *sched->stages[s].handoff_events) {
+                ggml_backend_event_free(ev);
+            }
+            delete sched->stages[s].handoff_events;
+            sched->stages[s].handoff_events = NULL;
         }
     }
     if (sched->handoff_events != NULL) {
@@ -2672,6 +2732,41 @@ uint64_t ggml_backend_sched_worker_post(ggml_backend_sched_t sched, int backend_
     const uint64_t seq = ++w->n_posted;
     w->cv.notify_one();
     return seq;
+}
+
+// post a host task to the worker of backend_id, or run it directly when the backend has none
+void ggml_backend_sched_post_task(ggml_backend_sched_t sched, int backend_id, std::function<void()> fn) {
+    GGML_ASSERT(sched);
+    GGML_ASSERT(backend_id >= 0 && backend_id < sched->n_backends);
+
+    if (sched->workers == NULL || sched->pipeline_post_stage < 0) {
+        // capability branch: no submission thread (CPU), or no outstanding pipeline submission
+        // (the compute was already enqueued by the draining synchronous path), run the task inline
+        fn();
+        return;
+    }
+    struct ggml_backend_sched_worker * w = sched->workers->at(backend_id).get();
+    if (w == NULL) {
+        // capability branch: the CPU backend has no submission thread, run the task inline
+        fn();
+        return;
+    }
+    // the task extends the worker queue of the stage of the last submission (the output copies run
+    // after its compute). the stage index is reset by the next submission, so resolve the stage and
+    // its completion event here. re-record that event after the task: the compute recorded it first,
+    // so a stage wait (worker_wait_done + event synchronize) then also covers the copies posted here
+    const int post_stage = sched->pipeline_post_stage;
+    ggml_backend_event_t done = sched->stages[post_stage].done[backend_id];
+    ggml_backend_t backend = sched->backends[backend_id];
+    const uint64_t seq = ggml_backend_sched_worker_post(sched, backend_id, [fn = std::move(fn), done, backend]() {
+        fn();
+        if (done != NULL) {
+            ggml_backend_event_record(done, backend);
+        }
+    });
+
+    // record the task in the stage so the stage reuse wait covers it as well
+    sched->stages[post_stage].backend_seq[backend_id] = seq;
 }
 
 // number of tasks posted to the worker of backend_id so far (0 for the CPU backend)
@@ -2926,6 +3021,11 @@ ggml_backend_t ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched,
         return NULL;
     }
     return sched->backends[backend_index];
+}
+
+int ggml_backend_sched_get_tensor_backend_id(ggml_backend_sched_t sched, struct ggml_tensor * node) {
+    GGML_ASSERT(sched);
+    return tensor_backend_id(node);
 }
 
 // utils

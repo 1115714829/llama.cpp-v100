@@ -8,6 +8,7 @@
 #include "ggml-impl.h"
 
 #ifdef  __cplusplus
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -82,6 +83,18 @@ struct ggml_backend_sched_stage {
     // last submission-worker task posted for this stage, per backend (0 = none); the stage events
     // can only be synchronized once these tasks have been enqueued
     uint64_t backend_seq[GGML_SCHED_MAX_BACKENDS];
+    // this stage's input copy context. the next ubatch rebuilds the active sched->ctx, which would
+    // overwrite the copy tensor structs that the submission workers of this stage still read
+    char *                context_buffer;
+    size_t                context_buffer_size;
+    struct ggml_context * ctx;
+    // handoff events of this stage, one per split. the stage is only reused after its previous
+    // ubatch completed (n_stages away), so a re-record cannot race a consumer of the previous batch.
+    // pointer because the stage array lives in a calloc'ed scheduler
+    std::vector<ggml_backend_event_t> * handoff_events;
+    // error of this stage's submission, set by the first failing task. checked after the workers of
+    // the stage are known to have run (pipeline_wait_stage), not at submit time
+    std::shared_ptr<std::atomic<int>> error;
 };
 
 // pinned host staging of the pipeline user inputs. one ring per backend: the main thread copies the
@@ -150,15 +163,17 @@ struct ggml_backend_sched {
     // pipeline state; each in-flight ubatch has its own freshly built graph and input copy, so the
     // scheduler only tracks which stage is being prepared and the submission order
     int pipeline_stage;              // stage prepared by ggml_backend_sched_pipeline_begin, or -1
+    int pipeline_post_stage;         // stage of the last submission; its worker tasks extend this stage
     int64_t pipeline_last_ubatch_id; // last submitted ubatch id, for ordering checks
+    enum ggml_status pipeline_error; // first compute error observed at a stage wait, sticky until advance
 
 #ifdef __cplusplus
     // per-backend submission threads, pipeline mode only (n_copies > 1), indexed by backend id;
     // NULL for the CPU backend. pointer because the scheduler is calloc'ed
     std::vector<std::unique_ptr<struct ggml_backend_sched_worker>> * workers;
 
-    // handoff events of the pipeline submission, one per split, recorded by the producer split after
-    // its output copies; created on first use and kept for the lifetime of the scheduler
+    // handoff events of a plain asynchronous submission on a pipeline scheduler (no stage), one
+    // per split. the pipeline path keeps one set per stage instead, see ggml_backend_sched_stage
     std::vector<ggml_backend_event_t> * handoff_events;
 #endif
 
