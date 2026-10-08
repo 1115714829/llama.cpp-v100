@@ -1988,8 +1988,10 @@ bool llama_context::link_h_nextn(llama_context * ctx_dft) {
     embd_link          = link;
     ctx_dft->embd_link = link;
 
+    // the draft keeps its own backend_h_sink (set by enable_h_nextn_sink above): the sink events
+    // are cross-stream, one context writes and the other reads, so each side must queue its event
+    // wait/record on its own stream. the sink tensor itself is shared (t_h_sink below)
     ctx_dft->t_h_sink       = t_h_sink;
-    ctx_dft->backend_h_sink = backend_h_sink;
     ctx_dft->h_sink_extra   = h_sink_extra;
 
     // the draft graphs switch to the device gather path
@@ -2093,8 +2095,12 @@ bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols
         ggml_tensor * dst = ggml_view_2d(ctx_view.get(), t_h_sink, t_h_sink->ne[0], 1,
                 t_h_sink->nb[1], (size_t) (n_batch + i) * t_h_sink->nb[1]);
 
-        // same buffer and stream as the target graph, so the copy is ordered after the write
-        ggml_backend_tensor_copy(src, dst);
+        GGML_ASSERT(ggml_backend_view_init(src) == GGML_STATUS_SUCCESS);
+        GGML_ASSERT(ggml_backend_view_init(dst) == GGML_STATUS_SUCCESS);
+
+        // on CUDA the copy is queued async on the sink backend's own stream, after the graph that
+        // wrote these columns; a backend without async copy is synchronized by the API instead
+        ggml_backend_tensor_copy_async(backend_h_sink, backend_h_sink, src, dst);
     }
 
     // the next draft read must not start before the pending rows are in place

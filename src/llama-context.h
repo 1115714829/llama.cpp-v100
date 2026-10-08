@@ -431,7 +431,10 @@ private:
     ggml_backend_buffer_ptr buf_h_sink;
     ggml_tensor *           t_h_sink = nullptr;
     bool                    h_sink_is_target = false; // true: this sink holds the target h rows
-    ggml_backend_t          backend_h_sink = nullptr; // non-owning: the backend that holds the sink
+    // non-owning: this context's own backend, its stream queues the h sink event waits/records and
+    // the pending capture copy. The target backend owns the sink buffer; the draft queues on its
+    // own stream so the cross-context events order the two streams
+    ggml_backend_t          backend_h_sink = nullptr;
     uint32_t                h_sink_extra = 0;         // target: extra columns after n_batch
 
     // r-mtpdev: the (seq_id, pos) of each h-sink column written by the last batch, in column order
