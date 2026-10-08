@@ -124,7 +124,7 @@ static void run_pipeline(int n_backends) {
 // pipeline. The views make sure that a view of an input is treated as a user input too.
 static struct ggml_cgraph * build_graph_gpu(
         struct ggml_context * ctx, struct ggml_tensor * w0, struct ggml_tensor * w1,
-        int a_len, struct ggml_tensor ** a, struct ggml_tensor ** b, struct ggml_tensor ** out) {
+        int a_len, bool w1_view, struct ggml_tensor ** a, struct ggml_tensor ** b, struct ggml_tensor ** out) {
     *a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, a_len);
     *b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_tokens/4, 4);
     ggml_set_input(*a);
@@ -135,7 +135,10 @@ static struct ggml_cgraph * build_graph_gpu(
     struct ggml_tensor * x0 = ggml_add(ctx, w0, ggml_view_1d(ctx, *a, n_tokens, 8*sizeof(float)));
     struct ggml_tensor * x1;
     if (w1 != NULL) {
-        x1 = ggml_add(ctx, w1, ggml_add(ctx, x0, ggml_reshape_1d(ctx, *b, n_tokens)));
+        // w1_view wraps the weight in a view of the same shape, so it is a cross-backend constant
+        // that is a graph node instead of a leaf (the weight itself is a leaf)
+        struct ggml_tensor * w1_arg = w1_view ? ggml_view_1d(ctx, w1, n_tokens, 0) : w1;
+        x1 = ggml_add(ctx, w1_arg, ggml_add(ctx, x0, ggml_reshape_1d(ctx, *b, n_tokens)));
     } else {
         x1 = ggml_add(ctx, x0, ggml_reshape_1d(ctx, *b, n_tokens));
     }
@@ -152,14 +155,17 @@ static struct ggml_cgraph * build_graph_gpu(
 // and sliced, so the ops stay pinned on the GPUs.
 static struct ggml_cgraph * build_graph_gpu_grow(
         struct ggml_context * ctx, struct ggml_tensor * w0, struct ggml_tensor * w1,
-        int a_len, struct ggml_tensor ** a, struct ggml_tensor ** out) {
+        int a_len, bool w1_view, struct ggml_tensor ** a, struct ggml_tensor ** out) {
     *a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, a_len);
     ggml_set_input(*a);
 
     struct ggml_tensor * x0 = ggml_add(ctx, ggml_view_1d(ctx, w0, a_len, 0), *a);
     struct ggml_tensor * x1 = x0;
     if (w1 != NULL) {
-        x1 = ggml_add(ctx, ggml_view_1d(ctx, w1, a_len, 0), x0);
+        // w1_view wraps the weight in a view of the same shape, so it is a cross-backend constant
+        // that is a graph node instead of a leaf
+        struct ggml_tensor * w1_arg = w1_view ? ggml_view_1d(ctx, w1, a_len, 0) : w1;
+        x1 = ggml_add(ctx, w1_arg, x0);
     }
     ggml_set_output(x1);
 
@@ -169,7 +175,7 @@ static struct ggml_cgraph * build_graph_gpu_grow(
     return gf;
 }
 
-static int run_pipeline_gpu(bool growing) {
+static int run_pipeline_gpu(bool growing, bool reserve, bool w1_view) {
     std::vector<ggml_backend_dev_t> gpu_devs;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -187,7 +193,10 @@ static int run_pipeline_gpu(bool growing) {
     }
     const int n_gpu = (int) gpu_devs.size();
 
-    printf("pipeline gpu%s: %d GPU ... ", growing ? " grow" : "", n_gpu);
+    printf("pipeline gpu%s%s: %d GPU ... ",
+            growing ? (reserve ? " grow" : " grow-noreserve") : "",
+            w1_view ? "-w1view" : "-w1direct",
+            n_gpu);
     fflush(stdout);
 
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -253,7 +262,7 @@ static int run_pipeline_gpu(bool growing) {
     // previous one. reserving the largest graph up front must fix the staging size, so the growing
     // ubatches below never reallocate the ring (the reserve-before-submit path)
     const auto a_len_of = [](int ub) { return n_tokens + 8 + 4*ub; };
-    if (growing) {
+    if (growing && reserve) {
         struct ggml_init_params rparams = {
             /* .mem_size   = */ (ggml_tensor_overhead() + ggml_graph_overhead()) * 16,
             /* .mem_buffer = */ NULL,
@@ -263,7 +272,7 @@ static int run_pipeline_gpu(bool growing) {
         struct ggml_tensor * ra = nullptr;
         struct ggml_tensor * rx = nullptr;
         struct ggml_cgraph * rgf = build_graph_gpu_grow(r_ctx, weights[0], n_gpu > 1 ? weights[1] : NULL,
-                a_len_of(n_ubatch - 1), &ra, &rx);
+                a_len_of(n_ubatch - 1), w1_view, &ra, &rx);
         if (!ggml_backend_sched_reserve(sched, rgf)) {
             fprintf(stderr, "FAILED: reserve gpu\n");
             exit(1);
@@ -288,8 +297,8 @@ static int run_pipeline_gpu(bool growing) {
         struct ggml_tensor * b = nullptr;
         struct ggml_tensor * x1 = nullptr;
         struct ggml_cgraph * gf = growing
-            ? build_graph_gpu_grow(ctxs[ub], weights[0], n_gpu > 1 ? weights[1] : NULL, a_len, &a, &x1)
-            : build_graph_gpu(ctxs[ub], weights[0], n_gpu > 1 ? weights[1] : NULL, a_len, &a, &b, &x1);
+            ? build_graph_gpu_grow(ctxs[ub], weights[0], n_gpu > 1 ? weights[1] : NULL, a_len, w1_view, &a, &x1)
+            : build_graph_gpu(ctxs[ub], weights[0], n_gpu > 1 ? weights[1] : NULL, a_len, w1_view, &a, &b, &x1);
 
         if (!ggml_backend_sched_pipeline_begin(sched, gf, ub)) {
             fail("pipeline_begin gpu", ub, -1);
@@ -456,7 +465,7 @@ static int run_pipeline_gpu_deep(void) {
         struct ggml_tensor * b = nullptr;
         struct ggml_tensor * x1 = nullptr;
         struct ggml_cgraph * gf = build_graph_gpu(ctxs[ub], weights[0], n_gpu > 1 ? weights[1] : NULL,
-                n_tokens + 8, &a, &b, &x1);
+                n_tokens + 8, false, &a, &b, &x1);
 
         if (!ggml_backend_sched_pipeline_begin(sched, gf, ub)) {
             fail("pipeline_begin gpu deep", ub, -1);
@@ -542,8 +551,13 @@ int main() {
     run_pipeline(2);
     printf("OK\n");
 
-    run_pipeline_gpu(false);
-    run_pipeline_gpu(true);
+    // w1direct is the control: the cross-backend constant is the weight leaf itself. w1view makes
+    // the constant a view node instead, which the producer detection must not treat as a producer.
+    // grow-noreserve is the case that exposed the bug; grow reserves the largest graph up front.
+    run_pipeline_gpu(false, false, false);
+    run_pipeline_gpu(false, false, true);
+    run_pipeline_gpu(true,  false, true);
+    run_pipeline_gpu(true,  true,  true);
     run_pipeline_gpu_deep();
 
     return 0;

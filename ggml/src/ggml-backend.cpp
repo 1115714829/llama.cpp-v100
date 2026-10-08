@@ -1805,6 +1805,14 @@ static bool ggml_backend_sched_is_user_input(const struct ggml_tensor * t) {
            (t->view_src != NULL && (t->view_src->flags & GGML_TENSOR_FLAG_INPUT));
 }
 
+// the root tensor that holds the data of an input. a view op only reinterprets the data of its
+// source, so it does not produce data: the producer of a view input is the split that computes the
+// root (ggml flattens view_src to the root). cpy and set_rows also carry a view_src but write the
+// data themselves, so they stay their own producer.
+static struct ggml_tensor * ggml_backend_sched_input_root(struct ggml_tensor * t) {
+    return ggml_is_view_op(t->op) && t->view_src != NULL ? t->view_src : t;
+}
+
 // process one split of the allocated graph synchronously on the calling thread
 // prev_backend_id is the backend of the previous split; it is updated here and left unchanged when
 // the split is skipped, matching the original loop
@@ -2165,8 +2173,9 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
     // a plain asynchronous submission on this scheduler
     const int entry    = sched->pipeline_stage >= 0 ? sched->pipeline_stage : sched->cur_copy;
 
-    // pass 1: find the split that produces each tensor consumed by another split. leafs (constants,
-    // host weights) never show up as node outputs and keep the -1 mark.
+    // pass 1: find the split that produces each tensor consumed by another split. the lookup is by
+    // the root tensor: a view does not produce data, so only a non-view node output can be a
+    // producer. leafs (constants, host weights) never show up as node outputs and keep the -1 mark.
     std::unordered_map<struct ggml_tensor *, int> producer_split;
     for (int s = 0; s < n_splits; s++) {
         for (int i = 0; i < splits[s].n_inputs; i++) {
@@ -2174,12 +2183,16 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
             if (ggml_backend_sched_is_user_input(input)) {
                 continue;
             }
-            producer_split[input] = -1;
+            producer_split[ggml_backend_sched_input_root(input)] = -1;
         }
     }
     for (int s = 0; s < n_splits; s++) {
         for (int j = 0; j < splits[s].graph.n_nodes; j++) {
-            auto it = producer_split.find(splits[s].graph.nodes[j]);
+            struct ggml_tensor * node = splits[s].graph.nodes[j];
+            if (ggml_is_view_op(node->op)) {
+                continue;
+            }
+            auto it = producer_split.find(node);
             if (it != producer_split.end()) {
                 it->second = s;
             }
@@ -2209,7 +2222,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
                 continue;
             }
             struct ggml_tensor * input_cpy = tensor_copy(input, splits[s].backend_id, copy_id);
-            auto it = producer_split.find(input);
+            auto it = producer_split.find(ggml_backend_sched_input_root(input));
             if (it == producer_split.end() || it->second < 0) {
                 // nothing in this graph computes the input: copy it in the consumer task
                 consts[s].push_back({ ggml_backend_sched_get_tensor_backend(sched, input), input, input_cpy });
