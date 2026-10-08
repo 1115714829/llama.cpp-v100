@@ -1905,8 +1905,47 @@ bool llama_kv_cache::get_kq_range_reserve() const {
     // where one stream is shared by several sequences, keeps the dense mask
     // note: ubatches that fail get_kq_range_ok (e.g. holes from a context shift) fall back to the dense
     //       mask and grow the buffer as needed, same as for a single sequence
-    return kq_range_enabled && swa_type == LLAMA_SWA_TYPE_NONE &&
-        (n_seq_max == 1 ? n_stream == 1 : n_stream == n_seq_max);
+    // a SWA cache (ring) takes a two-segment range mask under the conditions in get_kq_range_ok
+    if (!kq_range_enabled) {
+        return false;
+    }
+    if (swa_type != LLAMA_SWA_TYPE_NONE) {
+        // capability: only the standard trailing window on a single-sequence cache maps to a
+        // contiguous cell run (see get_kq_range_ok); other SWA types and the unified multi-sequence
+        // cache keep the dense mask. a window covering the whole ring is not a trailing window
+        return swa_type == LLAMA_SWA_TYPE_STANDARD && n_seq_max == 1 && n_stream == 1 && n_swa < get_size();
+    }
+    return n_seq_max == 1 ? n_stream == 1 : n_stream == n_seq_max;
+}
+
+// true if the positions of the used cells strictly increase by one along the write order of the
+// ring (no shared M-RoPE positions, no holes): the standard SWA window [p1 - n_swa + 1, p1] is then
+// exactly min(n_swa, used) cells and set_input_kq_range can derive it from the cell count alone
+static bool kq_range_swa_order_ok(const llama_kv_cells & cells, uint32_t oldest) {
+    const uint32_t n    = cells.get_used();
+    const uint32_t size = cells.size();
+
+    const llama_pos * pos = cells.pos_data();
+
+    if (n < size) {
+        // append-only prefix [0, n): the array order is the write order
+        for (uint32_t j = 1; j < n; ++j) {
+            if (pos[j] != pos[j - 1] + 1) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    // full ring: the write order starts at the oldest cell
+    for (uint32_t k = 1; k < size; ++k) {
+        if (pos[(oldest + k) % size] != pos[(oldest + k - 1) % size] + 1) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch & ubatch) const {
@@ -1914,8 +1953,19 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
         return false;
     }
 
-    if (swa_type != LLAMA_SWA_TYPE_NONE) {
-        return false;
+    const bool swa = swa_type != LLAMA_SWA_TYPE_NONE;
+
+    if (swa) {
+        // capability: only the standard trailing window maps to a contiguous cell run; the chunked
+        // and symmetric windows are not a single trailing interval and keep the dense mask
+        if (swa_type != LLAMA_SWA_TYPE_STANDARD) {
+            return false;
+        }
+        // capability: the two-segment derivation is per single stream, one sequence (see
+        // get_kq_range_reserve)
+        if (sinfo.n_stream() != 1 || n_seq_max != 1) {
+            return false;
+        }
     }
 
     // single stream: keep the original single-stream logic, the multi-stream below scans per stream
@@ -1942,6 +1992,22 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
 
         if (cells.seq_n_cells(s) != n_used) {
             return false;
+        }
+
+        if (swa) {
+            // the ring must be large enough for the whole ubatch: the window of token i reaches
+            // back n_swa cells, which must not wrap onto cells this same batch writes later (they
+            // lie at most n_tokens - 1 - i cells after the token's own cell), and the oldest cell
+            // the batch overwrites must not still be in a window. A ring of size n_swa + n_tokens
+            // satisfies both; n_swa >= cells.size() is the special case n_tokens == 1.
+            if (n_swa + ubatch.n_tokens > cells.size()) {
+                return false;
+            }
+
+            // the ring write order is the position order (see set_input_kq_range)
+            const uint32_t oldest = n_used < cells.size() ? 0 : v_heads[sinfo.strm[0]] % cells.size();
+
+            return kq_range_swa_order_ok(cells, oldest);
         }
 
         // the range [0, cell + 1) of a token equals its causal mask (see set_input_kq_mask) when the cells are in
@@ -2057,7 +2123,7 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
 
 void llama_kv_cache::set_input_kq_range(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
-    GGML_ASSERT(dst->ne[0] == 2);
+    GGML_ASSERT(dst->ne[0] == 4);
     GGML_ASSERT(dst->ne[3] == (int64_t) sinfo.n_stream());
     GGML_ASSERT(dst->ne[1]*dst->ne[3] == ubatch->n_tokens);
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -2067,11 +2133,67 @@ void llama_kv_cache::set_input_kq_range(ggml_tensor * dst, const llama_ubatch * 
     const uint32_t n_stream = (uint32_t) sinfo.n_stream();
     const uint32_t n_tps    = ubatch->n_tokens/n_stream;
 
-    // the cells are in strict causal order (see get_kq_range_ok): a token sees the cells up to its own
+    const bool swa = swa_type != LLAMA_SWA_TYPE_NONE;
+
+    // non-SWA: the cells are in strict causal order (see get_kq_range_ok), so a token sees the cells
+    // up to and including its own. the second segment stays empty
+    if (!swa) {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            for (uint32_t i = 0; i < n_tps; ++i) {
+                int32_t * row = data + 4*(s*n_tps + i);
+                row[0] = 0;
+                row[1] = (int32_t) sinfo.idxs[s][i] + 1;
+                row[2] = 0;
+                row[3] = 0;
+            }
+        }
+
+        return;
+    }
+
+    // SWA (ring): the visible set of a token is the window [p1 - n_swa + 1, p1]. with the write order
+    // equal to the position order (see get_kq_range_ok) that is the cells from the token's own cell
+    // back to the oldest cell still inside the window. on the ring this run wraps the cell array at
+    // most once, so it is at most two linear segments [lo0, hi0) and [lo1, hi1). the newer cells of
+    // the batch (positions > p1) lie past the token's cell and stay out of the window
     for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[sinfo.strm[s]];
+
+        const uint32_t size = cells.size();
+        const uint32_t used = cells.get_used();
+
+        // when the cache is not full the used cells are the prefix [0, used): the write order is the
+        // array order, so the cells available to this token are [0, end]
+        const bool full = used == size;
+
         for (uint32_t i = 0; i < n_tps; ++i) {
-            data[2*(s*n_tps + i) + 0] = 0;
-            data[2*(s*n_tps + i) + 1] = (int32_t) sinfo.idxs[s][i] + 1;
+            const uint32_t end = sinfo.idxs[s][i];       // the token's own cell, the newest in the window
+            const uint32_t avail = full ? size : end + 1;
+            const uint32_t span = std::min<uint32_t>(n_swa, avail);
+
+            int32_t * row = data + 4*(s*n_tps + i);
+
+            if (span == 0) {
+                row[0] = 0;
+                row[1] = 0;
+                row[2] = 0;
+                row[3] = 0;
+                continue;
+            }
+
+            const uint32_t start = (end + size - (span - 1)) % size;
+
+            if (start <= end) {
+                row[0] = (int32_t) start;
+                row[1] = (int32_t) end + 1;
+                row[2] = 0;
+                row[3] = 0;
+            } else {
+                row[0] = (int32_t) start;
+                row[1] = (int32_t) size;
+                row[2] = 0;
+                row[3] = (int32_t) end + 1;
+            }
         }
     }
 }

@@ -86,7 +86,7 @@ bool ggml_cuda_flash_attn_ext_sm70_grouped_supported(const ggml_tensor * dst, in
     if (sinks != nullptr) {
         return false;
     }
-    if (mask && mask->type != GGML_TYPE_F16 && !(mask->type == GGML_TYPE_I32 && mask->ne[0] == 2 && mask->nb[0] == sizeof(int32_t))) {
+    if (mask && mask->type != GGML_TYPE_F16 && !(mask->type == GGML_TYPE_I32 && mask->ne[0] == 4 && mask->nb[0] == sizeof(int32_t))) {
         return false;
     }
     if (ggml_get_op_params_i32(dst, 4) != 0) { // n_kv_max hint

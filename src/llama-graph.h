@@ -360,7 +360,7 @@ public:
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-                                              // or I32 [2, n_batch/n_stream, 1, n_stream] range mask
+                                              // or I32 [4, n_batch/n_stream, 1, n_stream] range mask
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
     // whether the graph was built with a range mask allowed, and the n_kv it was built with

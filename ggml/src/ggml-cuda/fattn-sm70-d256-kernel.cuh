@@ -32,7 +32,7 @@
 //    llama.cpp mask carries the causal/padding semantics and test masks are
 //    arbitrary;
 //  * one explicit mask add after the range mask: an f16 mask is added, an I32
-//    range mask sets every column outside [lo, hi) to -inf;
+//    range mask sets every column outside its two [lo, hi) windows to -inf;
 //  * a mask pre-scan (sm70_d256_mask_bounds_kernel) gives, per (batch, q
 //    block), the first non-zero and the last above -inf column: the explicit
 //    mask add skips the all-zero prefix and the KV walk stops at the last
@@ -472,13 +472,14 @@ __device__ __forceinline__ void splitd_add_explicit_mask(
     }
 }
 
-// Range mask: the row's [lo, hi) KV window stays visible, every other column
-// is -inf. Row and column traversal are identical to splitd_add_explicit_mask;
-// the pair is read once per row (8-byte load) before the column loop.
+// Range mask: the row's visible KV columns are the union of two [lo, hi) windows, every other
+// column is -inf. The second window is empty when hi1 <= lo1. Row and column traversal are
+// identical to splitd_add_explicit_mask; the four ints are read once per row (16-byte load)
+// before the column loop.
 template <typename TensorScores>
 __device__ __forceinline__ void splitd_apply_range_mask(
     TensorScores &acc_s,
-    const int2 *__restrict__ range,
+    const int4 *__restrict__ range,
     const int64_t range_row_stride,
     const int64_t range_batch_offset,
     const int q_len_real,
@@ -505,7 +506,7 @@ __device__ __forceinline__ void splitd_apply_range_mask(
         (((lane_id >> 1) & 0x1) << 1) |
         (((lane_id >> 2) & 0x1) << 3) |
         (((lane_id >> 3) & 0x1) << 4);
-    const int2 *range_batch = range + range_batch_offset;
+    const int4 *range_batch = range + range_batch_offset;
 #pragma unroll
     for (int mi = 0; mi < size<0, 1>(scores); ++mi) {
 #pragma unroll
@@ -513,12 +514,16 @@ __device__ __forceinline__ void splitd_apply_range_mask(
             const int row = FLASH_NAMESPACE::sm70_mask_row_idx<8>(
                 lane_row_base, row_base, i, mi);
             const bool row_ok = row < q_len_real;
-            int lo = 0;
-            int hi = 0;
+            int lo0 = 0;
+            int hi0 = 0;
+            int lo1 = 0;
+            int hi1 = 0;
             if (row_ok) {
-                const int2 r = range_batch[(int64_t) row * range_row_stride];
-                lo = r.x < 0 ? 0 : (r.x > kv_len ? kv_len : r.x);
-                hi = r.y < 0 ? 0 : (r.y > kv_len ? kv_len : r.y);
+                const int4 r = range_batch[(int64_t) row * range_row_stride];
+                lo0 = r.x < 0 ? 0 : (r.x > kv_len ? kv_len : r.x);
+                hi0 = r.y < 0 ? 0 : (r.y > kv_len ? kv_len : r.y);
+                lo1 = r.z < 0 ? 0 : (r.z > kv_len ? kv_len : r.z);
+                hi1 = r.w < 0 ? 0 : (r.w > kv_len ? kv_len : r.w);
             }
 #pragma unroll
             for (int n = 0; n < size<1, 2>(scores); ++n) {
@@ -530,7 +535,9 @@ __device__ __forceinline__ void splitd_apply_range_mask(
                             lane_col_base, col_base, j, nj, n);
                         auto coord = make_coord(
                             make_coord(i, mi), make_coord(j, nj, n));
-                        if (row_ok && col < kv_len && (col < lo || col >= hi)) {
+                        const bool visible =
+                            (col >= lo0 && col < hi0) || (col >= lo1 && col < hi1);
+                        if (row_ok && col < kv_len && !visible) {
                             scores(coord) = -INFINITY;
                         }
                     }
@@ -938,7 +945,7 @@ void sm70_d256_splitd_dense_kernel(
         if (mask != nullptr && n_block >= mask_z_end) {
             if (mask_is_range) {
                 splitd_apply_range_mask(
-                    acc_s, reinterpret_cast<const int2 *>(mask), mask_row_stride,
+                    acc_s, reinterpret_cast<const int4 *>(mask), mask_row_stride,
                     static_cast<int64_t>(batch) * mask_batch_stride,
                     kv_len - kv_offset, kv_len,
                     query_row_base + qk_row_base, n_block * kBlockN);
