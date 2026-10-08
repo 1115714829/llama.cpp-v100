@@ -1240,6 +1240,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        const bool spec_dflash = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
 
         common_params params_dft = common_base_params_to_speculative(params);
 
@@ -1255,6 +1257,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.mparams      =*/ &mparams_dft,
             /*.cparams      =*/ &cparams_dft,
             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+            /*.dflash_sink  =*/ spec_dflash,
         };
 
         if (common_fit_params(params.model.path.c_str(), &mparams, &cparams,

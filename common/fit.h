@@ -19,6 +19,11 @@ struct common_fit_extra_model {
     llama_model_params * mparams;
     llama_context_params * cparams;
     bool shares_model;
+
+    // DFlash2 keeps the target layer inputs in device sinks that are raw backend buffers
+    // outside any memory breakdown (see llama_context::enable_layer_inp_sink/link_embd);
+    // the fit reserves their bytes on the devices that hold them
+    bool dflash_sink = false;
 };
 
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)

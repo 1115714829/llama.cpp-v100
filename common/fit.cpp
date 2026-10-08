@@ -487,13 +487,14 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
     }
 
-    llama_free(ctx);
-
     // measure the extra model while the target model is still alive: a draft head borrows
     // its shared tensors from the target (borrow_shared_tensor), so the measurement graph
     // matches the real load - real tensor types, real devices, and the borrowed tensors
     // add no bytes to the model breakdown of the extra model (they are counted in the
-    // target measurement above).
+    // target measurement above). The draft context also links itself to the target while
+    // it is constructed (shared embeddings/output, device sinks), so the measured target
+    // context is handed to the draft as ctx_other below - same as the real load in
+    // common_speculative_init_result - and outlives the extra measurement.
     if (extra != nullptr && extra_mem != nullptr) {
         llama_model_params mparams_extra = *extra->mparams;
         mparams_extra.no_alloc      = true;
@@ -502,13 +503,21 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
         llama_model * model_extra = llama_model_load_from_file(extra->path_model, mparams_extra);
         if (model_extra == nullptr) {
+            llama_free(ctx);
             llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
             throw std::runtime_error(std::string("failed to load the extra model '") + extra->path_model + "'");
         }
 
+        // the draft context is created against the measured target context, exactly like the
+        // real draft context: architectures that take the embeddings and the lm head from the
+        // target (shared-head drafts) require ctx_other here, and the memory module of a draft
+        // that borrows target cells sizes itself from it (mem_other)
+        extra->cparams->ctx_other = ctx;
+
         llama_context * ctx_extra = llama_init_from_model(model_extra, *extra->cparams);
         if (ctx_extra == nullptr) {
             llama_model_free(model_extra);
+            llama_free(ctx);
             llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
             throw std::runtime_error(std::string("failed to create llama_context from the extra model '") + extra->path_model + "'");
         }
@@ -517,6 +526,22 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         std::vector<llama_device_memory_data> ret_extra(nd_extra + 1);
 
         collect_device_memory_breakdown(model_extra, ctx_extra, ret_extra);
+
+        // the DFlash2 device sinks are raw backend buffers, so no memory breakdown covers them.
+        // Reserve their bytes on the devices the real load allocates them on: the target
+        // layer-input sink on the first target device (llama_context::enable_layer_inp_sink)
+        // and the draft staging sink on the first draft device (llama_context::link_embd)
+        if (extra->dflash_sink) {
+            const uint32_t n_lids = llama_model_target_layer_ids_n(model_extra);
+            if (n_lids > 0) {
+                const size_t sink_row  = (size_t) llama_model_n_embd(model) * sizeof(float);
+                const size_t tgt_bytes = sink_row * n_lids * cparams->n_batch;
+                const size_t dft_bytes = sink_row * n_lids * extra->cparams->n_ubatch;
+
+                ret      [0].mb.context += tgt_bytes; // the host entry when there is no device
+                ret_extra[0].mb.context += dft_bytes;
+            }
+        }
 
         llama_free(ctx_extra);
         if (extra_devs != nullptr) {
@@ -530,6 +555,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         *extra_mem = std::move(ret_extra);
     }
 
+    if (extra != nullptr) {
+        // the measured target context dies here, do not leave a dangling ctx_other behind
+        extra->cparams->ctx_other = nullptr;
+    }
+    llama_free(ctx);
     llama_model_free(model);
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 
