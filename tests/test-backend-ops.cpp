@@ -14367,6 +14367,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_qsa_select(4096, 3, 20, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(100, 0, 9, 4, 100, type_K));
+        // the 1024-thread kernels: at the register kernel's bound (1024*33) and past it (the wide kernel)
+        test_cases.emplace_back(new test_qsa_select(6000, 8, 4, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(33792, 8, 4, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(40000, 8, 4, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(50000, 8, 4, 4, 512, type_K));
     }
 
     // qsa_attn: the chunked kernel (<= 16 tokens) and the prompt kernel, partial chunks, streams, both cache types
@@ -14924,6 +14929,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     }
                 }
             }
+        }
+    }
+
+    // qsa_select top-k dispatch: the 256-thread kernel, the 1024-thread register kernel (at and below its
+    // 1024*33-pool bound) and the wide kernel, so the three can be timed against each other.
+    // production prefill shape: 2048 tokens per batch
+    for (ggml_type type_K : { GGML_TYPE_F16 }) {
+        for (int64_t n_pool : { 512, 6000, 33792, 46080, 65536 }) {
+            test_cases.emplace_back(new test_qsa_select(n_pool, 8, 2048, 4, 512, type_K));
         }
     }
 
