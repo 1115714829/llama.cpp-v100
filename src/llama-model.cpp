@@ -2182,6 +2182,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
+            // a registered mapped context must have its whole data in the mmap range: an empty
+            // set of ranges would silently leave buf_map empty and the loader would upload the
+            // tensors it cannot bind
+            if (bufs.empty()) {
+                throw std::runtime_error(format("%s: no mmap range found for the registered mapped buffer %s",
+                        __func__, ggml_backend_buft_name(buft)));
+            }
             // cudaHostRegister faults the pages in, so this reports the full pin cost
             LLAMA_LOG_INFO("%s: pinned %.2f MiB of mmap weights in %.2f s\n",
                     __func__, total / 1024.0 / 1024.0, (ggml_time_us() - t_start) / 1e6);

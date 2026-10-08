@@ -294,6 +294,11 @@ llama_build(test-backend-ops.cpp)
 # Multi-GPU AllReduce comm test; skips when CUDA or < 2 devices are available.
 llama_build(test-cuda-allreduce.cpp)
 
+# CUDA host registration test; skips when no CUDA device is available.
+if (GGML_CUDA)
+    llama_build_and_test(test-cuda-host-register.cpp)
+endif()
+
 llama_build_and_test(test-tiled-mulmat.cpp)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")

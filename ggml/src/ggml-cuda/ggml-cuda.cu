@@ -200,6 +200,129 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
     return err;
 }
 
+// Host ranges pinned in place with cudaHostRegister, either by the registered mapped
+// buffer type or through the ggml_backend_register_host_buffer proc.
+//
+// A cudaMemcpy with a host pointer is classified by its starting address: when the range
+// starts inside a registered allocation but ends outside it, the runtime fails the copy
+// with "invalid argument". A registered mapped buffer covers whole pages, so its last
+// page can hold the start of the next tensor in the mmap-ed file; loading that tensor
+// starts inside the registered range and ends outside it. Copies that touch a host range
+// are therefore split at the end of every registered range they enter.
+struct ggml_cuda_registered_host_range {
+    uintptr_t begin;
+    uintptr_t end;
+};
+
+static std::mutex ggml_cuda_registered_host_ranges_mutex;
+static std::vector<ggml_cuda_registered_host_range> ggml_cuda_registered_host_ranges; // protected by the mutex
+
+static void ggml_cuda_registered_host_range_add(void * ptr, size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_ranges_mutex);
+    ggml_cuda_registered_host_ranges.push_back({(uintptr_t) ptr, (uintptr_t) ptr + size});
+}
+
+static void ggml_cuda_registered_host_range_remove(void * ptr) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_ranges_mutex);
+    for (auto it = ggml_cuda_registered_host_ranges.begin(); it != ggml_cuda_registered_host_ranges.end(); ++it) {
+        if (it->begin == (uintptr_t) ptr) {
+            ggml_cuda_registered_host_ranges.erase(it);
+            return;
+        }
+    }
+}
+
+// end of the registered range that contains ptr, or 0 when ptr is in no range
+static uintptr_t ggml_cuda_registered_host_range_end(const void * ptr) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_ranges_mutex);
+    const uintptr_t addr = (uintptr_t) ptr;
+    for (const ggml_cuda_registered_host_range & range : ggml_cuda_registered_host_ranges) {
+        if (addr >= range.begin && addr < range.end) {
+            return range.end;
+        }
+    }
+    return 0;
+}
+
+// true when [ptr, ptr+size) overlaps any registered range
+static bool ggml_cuda_registered_host_range_intersects(const void * ptr, size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_registered_host_ranges_mutex);
+    const uintptr_t begin = (uintptr_t) ptr;
+    const uintptr_t end   = begin + size;
+    for (const ggml_cuda_registered_host_range & range : ggml_cuda_registered_host_ranges) {
+        if (begin < range.end && range.begin < end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// split at the range boundary so that no chunk starts inside a registered range and ends
+// outside it; a chunk that starts outside a range may span it (the runtime only looks at
+// the starting address)
+void ggml_cuda_memcpy_h2d_async(void * dst, const void * src, size_t size, cudaStream_t stream) {
+    const char * src_bytes = (const char *) src;
+    char * dst_bytes = (char *) dst;
+
+    while (size > 0) {
+        const uintptr_t range_end = ggml_cuda_registered_host_range_end(src_bytes);
+        size_t chunk = size;
+        if (range_end != 0 && (uintptr_t) src_bytes + size > range_end) {
+            chunk = (size_t) (range_end - (uintptr_t) src_bytes);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(dst_bytes, src_bytes, chunk, cudaMemcpyHostToDevice, stream));
+        src_bytes += chunk;
+        dst_bytes += chunk;
+        size      -= chunk;
+    }
+}
+
+// D2H is the mirror image: the host side is the destination
+void ggml_cuda_memcpy_d2h_async(void * dst, const void * src, size_t size, cudaStream_t stream) {
+    const char * src_bytes = (const char *) src;
+    char * dst_bytes = (char *) dst;
+
+    while (size > 0) {
+        const uintptr_t range_end = ggml_cuda_registered_host_range_end(dst_bytes);
+        size_t chunk = size;
+        if (range_end != 0 && (uintptr_t) dst_bytes + size > range_end) {
+            chunk = (size_t) (range_end - (uintptr_t) dst_bytes);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(dst_bytes, src_bytes, chunk, cudaMemcpyDeviceToHost, stream));
+        src_bytes += chunk;
+        dst_bytes += chunk;
+        size      -= chunk;
+    }
+}
+
+// only the host side of a 2D copy can fall inside a registered range; when the whole
+// host-side span stays clear of every range, keep the copy 2D, otherwise split per row
+static void ggml_cuda_memcpy_2d_h2d_async(char * dst, size_t dpitch, const char * src, size_t spitch, size_t width, size_t height, cudaStream_t stream) {
+    if (height == 0 || width == 0) {
+        return;
+    }
+    if (!ggml_cuda_registered_host_range_intersects(src, (height - 1)*spitch + width)) {
+        CUDA_CHECK(cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyHostToDevice, stream));
+        return;
+    }
+    for (size_t y = 0; y < height; ++y) {
+        ggml_cuda_memcpy_h2d_async(dst + y*dpitch, src + y*spitch, width, stream);
+    }
+}
+
+static void ggml_cuda_memcpy_2d_d2h_async(char * dst, size_t dpitch, const char * src, size_t spitch, size_t width, size_t height, cudaStream_t stream) {
+    if (height == 0 || width == 0) {
+        return;
+    }
+    if (!ggml_cuda_registered_host_range_intersects(dst, (height - 1)*dpitch + width)) {
+        CUDA_CHECK(cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToHost, stream));
+        return;
+    }
+    for (size_t y = 0; y < height; ++y) {
+        ggml_cuda_memcpy_d2h_async(dst + y*dpitch, src + y*spitch, width, stream);
+    }
+}
+
 #if defined(GGML_USE_HIP)
 static int ggml_cuda_parse_id(char devName[]) {
     // A list of possible Target IDs can be found under the rocclr/clr repo in device.cpp
@@ -812,7 +935,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    ggml_cuda_memcpy_h2d_async((char *) tensor->data + offset, data, size, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -820,7 +943,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    ggml_cuda_memcpy_d2h_async(data, (const char *) tensor->data + offset, size, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -829,8 +952,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    ggml_cuda_memcpy_2d_h2d_async((char *) tensor->data + offset, stride_tensor, (const char *) data, stride_data, size, n_copies, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -839,8 +961,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    ggml_cuda_memcpy_2d_d2h_async((char *) data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -2582,6 +2703,7 @@ struct ggml_backend_cuda_mapped_buffer_context {
     ~ggml_backend_cuda_mapped_buffer_context() {
         if (registered()) {
             cudaHostUnregister(reg_base);
+            ggml_cuda_registered_host_range_remove(reg_base);
         } else if (host_ptr != nullptr) {
             CUDA_CHECK(cudaFreeHost(host_ptr));
         }
@@ -2896,12 +3018,14 @@ ggml_backend_buffer_t ggml_backend_cuda_mapped_buffer_from_host_ptr(int device, 
                        __func__, size / 1024.0 / 1024.0, device, cudaGetErrorString(err));
         return nullptr;
     }
+    ggml_cuda_registered_host_range_add(reg_base, reg_size);
 
     void * dev_base = nullptr;
     err = cudaHostGetDevicePointer(&dev_base, reg_base, 0);
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
         cudaHostUnregister(reg_base);
+        ggml_cuda_registered_host_range_remove(reg_base);
         GGML_LOG_ERROR("%s: device pointer for registered host memory on device %d: %s\n",
                        __func__, device, cudaGetErrorString(err));
         return nullptr;
@@ -4504,7 +4628,7 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    ggml_cuda_memcpy_h2d_async((char *) tensor->data + offset, data, size, cuda_ctx->stream());
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -4513,7 +4637,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    ggml_cuda_memcpy_d2h_async(data, (const char *) tensor->data + offset, size, cuda_ctx->stream());
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -4523,8 +4647,7 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    ggml_cuda_memcpy_2d_h2d_async((char *) tensor->data + offset, stride_tensor, (const char *) data, stride_data, size, n_copies, cuda_ctx->stream());
 }
 
 static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
@@ -4534,8 +4657,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpy2DAsync(
-        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    ggml_cuda_memcpy_2d_d2h_async((char *) data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cuda_ctx->stream());
 }
 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
@@ -8341,6 +8463,7 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
                            size / 1024.0 / 1024.0, cudaGetErrorString(err));
         return false;
     }
+    ggml_cuda_registered_host_range_add(buffer, size);
     return true;
 #else
     GGML_UNUSED(buffer);
@@ -8359,6 +8482,7 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
         // clear the error
         (void)cudaGetLastError();
     }
+    ggml_cuda_registered_host_range_remove(buffer);
 }
 
 
