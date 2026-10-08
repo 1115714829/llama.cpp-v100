@@ -1199,7 +1199,6 @@ int ggml_cuda_get_device();
 // (defined in ggml-cuda.cu): a copy that starts inside a registered range and ends outside
 // it fails with "invalid argument", so it is split at the range boundary
 void ggml_cuda_memcpy_h2d_async(void * dst, const void * src, size_t size, cudaStream_t stream);
-void ggml_cuda_memcpy_d2h_async(void * dst, const void * src, size_t size, cudaStream_t stream);
 
 // shared by the regular CUDA buffer type and the expert buffer type
 struct ggml_backend_cuda_buffer_type_context {

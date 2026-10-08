@@ -184,8 +184,7 @@ static void ggml_cuda_expert_copy_h2d(void * user, void * dst_dev, const void * 
 static void ggml_cuda_expert_copy_d2h(void * user, void * dst_host, const void * src_dev, size_t size) {
     const int device = (int) (intptr_t) user;
     ggml_cuda_set_device(device);
-    ggml_cuda_memcpy_d2h_async(dst_host, src_dev, size, cudaStreamPerThread);
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    CUDA_CHECK(cudaMemcpy(dst_host, src_dev, size, cudaMemcpyDeviceToHost));
 }
 
 static void ggml_cuda_expert_table_upload(void * user, void * dst_dev, const char * const * src_host, size_t n) {
@@ -908,7 +907,7 @@ static void ggml_backend_cuda_expert_buffer_get_tensor(ggml_backend_buffer_t buf
     if (tensor_id < 0) {
         // plain tensor: same behavior as the regular CUDA buffer type
         ggml_cuda_set_device(ctx->device);
-        ggml_cuda_memcpy_d2h_async(data, (const char *) tensor->data + offset, size, cudaStreamPerThread);
+        CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         return;
     }

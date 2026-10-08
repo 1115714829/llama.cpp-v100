@@ -1,14 +1,15 @@
-// Tests the handling of cudaHostRegister-ed host ranges in the CUDA backend.
+// Tests the H2D handling of cudaHostRegister-ed host ranges in the CUDA backend.
 //
 // A cudaMemcpy whose host side starts inside a registered range but ends outside it fails
 // with "invalid argument" (the runtime classifies the copy by the starting address). The
 // registered mapped buffer type pins whole pages in place, so its first/last page can hold
 // the neighboring tensor of the mmap-ed model file; loading that tensor then copies from a
 // pointer inside the registered range. The backend must split such copies at the range end.
+// Host ranges are registered read-only, so only H2D copies can have a registered source.
 //
-// The test uses only the public backend API: the registered mapped buffer and the host
-// buffer registration are reached through the proc addresses of the CUDA backend. It skips
-// (and passes) when no CUDA device is present or the backend is too old.
+// The test uses only the public backend API: the registered mapped buffer is reached
+// through the proc addresses of the CUDA backend. It skips (and passes) when no CUDA device
+// is present or the backend is too old.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -37,8 +38,6 @@ int main() {
 
 typedef ggml_backend_buffer_type_t (*cuda_dev_mapped_registered_buft_t)(ggml_backend_dev_t dev);
 typedef ggml_backend_buffer_t (*cuda_mapped_buffer_from_host_ptr_buft_t)(ggml_backend_buffer_type_t buft, void * ptr, size_t size);
-typedef bool (*cuda_register_host_buffer_t)(void * buffer, size_t size);
-typedef void (*cuda_unregister_host_buffer_t)(void * buffer);
 
 static bool check_bytes(const char * what, const uint8_t * got, const uint8_t * want, size_t n) {
     for (size_t i = 0; i < n; ++i) {
@@ -75,12 +74,7 @@ int main() {
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_dev_mapped_registered_buft");
     auto from_host_ptr = (cuda_mapped_buffer_from_host_ptr_buft_t)
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_mapped_buffer_from_host_ptr_buft");
-    auto register_host = (cuda_register_host_buffer_t)
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
-    auto unregister_host = (cuda_unregister_host_buffer_t)
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
-    if (registered_buft == nullptr || from_host_ptr == nullptr ||
-        register_host == nullptr || unregister_host == nullptr) {
+    if (registered_buft == nullptr || from_host_ptr == nullptr) {
         printf("SKIP: the CUDA backend does not expose the registered host buffer procs\n");
         return 0;
     }
@@ -88,9 +82,6 @@ int main() {
         printf("SKIP: host memory cannot be registered read-only\n");
         return 0;
     }
-
-    // the host buffer registration of the backend is behind an environment switch
-    setenv("GGML_CUDA_REGISTER_HOST", "1", 1);
 
     // a file-backed read-only mapping, the same kind of memory a model file is mmap-ed as
     char path[] = "/tmp/ggml-cuda-host-register-XXXXXX";
@@ -110,13 +101,6 @@ int main() {
     }
     if (mprotect(file, nbytes, PROT_READ) != 0) {
         fprintf(stderr, "FAIL: mprotect failed\n");
-        return 1;
-    }
-
-    // a plain mapping used as the destination of the D2H test
-    uint8_t * plain = (uint8_t *) mmap(nullptr, nbytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (plain == MAP_FAILED) {
-        fprintf(stderr, "FAIL: anonymous mmap failed\n");
         return 1;
     }
 
@@ -207,38 +191,9 @@ int main() {
         }
     }
 
-    // D2H: register the middle pages of the plain mapping, then read back into a range
-    // that starts inside the registered range and ends outside it
-    std::vector<uint8_t> pattern(nbytes);
-    for (size_t i = 0; i < nbytes; ++i) {
-        pattern[i] = (uint8_t) ((i * 13 + 5) & 0xff);
-    }
-    ggml_backend_tensor_set(tensor, pattern.data(), 0, nbytes);
-
-    // the range is registered read-only, so it is only written before the registration
-    memset(plain, 0, nbytes);
-    if (!register_host(plain + 16 * page, 16 * page)) {
-        fprintf(stderr, "FAIL: cannot register the plain host range\n");
-        return 1;
-    }
-    ggml_backend_tensor_get(tensor, plain + 30 * page, 0, 4 * page);
-    if (!check_bytes("D2H leave through", plain + 30 * page, pattern.data() + 30 * page, 4 * page)) {
-        return 1;
-    }
-
-    // 2D D2H into the registered range: the target span [30, 49) overlaps [16, 32) and
-    // row 0 starts inside the range and ends outside it
-    ggml_backend_tensor_get_2d(tensor, plain + 30 * page, 0, row_w, n_rows, stride_t, stride_d);
-    for (size_t y = 0; y < n_rows; ++y) {
-        if (!check_bytes("2D D2H overlap", plain + (30 + y * 8) * page, pattern.data() + y * 12 * page, row_w)) {
-            return 1;
-        }
-    }
-
-    // release the registrations: the same ranges must copy directly afterwards
+    // release the registration: the same range must copy directly afterwards
     ggml_backend_buffer_free(registered);
     registered = nullptr;
-    unregister_host(plain + 16 * page);
 
     ggml_backend_tensor_set(tensor, file + 30 * page, 0, 4 * page);
     memset(got.data(), 0, 4 * page);
@@ -247,13 +202,6 @@ int main() {
         return 1;
     }
 
-    memset(plain, 0, nbytes);
-    ggml_backend_tensor_get(tensor, plain + 30 * page, 0, 4 * page);
-    if (!check_bytes("released plain range", plain + 30 * page, file + 30 * page, 4 * page)) {
-        return 1;
-    }
-
-    munmap(plain, nbytes);
     munmap(file, nbytes);
     close(fd);
     ggml_backend_buffer_free(device_buffer);
