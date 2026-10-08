@@ -519,7 +519,25 @@ llama_context::llama_context(
         // TODO: move these checks to ggml_backend_sched
         // pipeline parallelism makes the scheduler keep n_copies input copies and events, which is
         // required for multi-batch prefill overlap. it does not require the whole model to be offloaded.
+        // it only applies when the layers this context computes span more than one device: the MTP
+        // context computes the nextn layer on a single device, and its single-token draft steps would
+        // only pay for the input copy rotation and the synchronous pipeline input copies
+        bool layers_span_devices = false;
+        if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+            ggml_backend_dev_t dev0 = nullptr;
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                ggml_backend_dev_t dev = model.dev_layer(il);
+                if (dev0 == nullptr) {
+                    dev0 = dev;
+                } else if (dev != dev0) {
+                    layers_span_devices = true;
+                    break;
+                }
+            }
+        }
+
         bool pipeline_parallel =
+            layers_span_devices &&
             model.n_devices() > 1 &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
