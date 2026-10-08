@@ -44,10 +44,10 @@ void ggml_backend_sched_set_n_stages(ggml_backend_sched_t sched, int n_stages) {
         for (int s = 0; s < n_stages; s++) {
             for (int b = 0; b < sched->n_backends; b++) {
                 if (sched->stages[s].done[b] == NULL) {
-                    sched->stages[s].done[b] = ggml_backend_event_new(sched->backends[b]->device);
+                    sched->stages[s].done[b] = ggml_backend_event_new(ggml_backend_get_device(sched->backends[b]));
                 }
                 if (sched->staging[b].done[s] == NULL) {
-                    sched->staging[b].done[s] = ggml_backend_event_new(sched->backends[b]->device);
+                    sched->staging[b].done[s] = ggml_backend_event_new(ggml_backend_get_device(sched->backends[b]));
                 }
             }
         }
