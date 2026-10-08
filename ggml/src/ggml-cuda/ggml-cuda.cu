@@ -555,20 +555,51 @@ static ggml_cuda_device_info ggml_cuda_init() {
     // configure logging to stdout
     // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, nullptr));
 
-    if (getenv("GGML_CUDA_P2P") != nullptr) {
-        for (int id = 0; id < info.physical_device_count; ++id) {
-            CUDA_CHECK(cudaSetDevice(id));
-            for (int id_other = 0; id_other < info.physical_device_count; ++id_other) {
-                if (id == id_other) {
-                    continue;
-                }
-                int can_access_peer;
-                CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id, id_other));
-                if (can_access_peer) {
-                    CUDA_CHECK(cudaDeviceEnablePeerAccess(id_other, 0));
-                }
+    // enable peer access between every pair of physical devices that the driver reports as
+    // capable; without it cudaMemcpyPeerAsync bounces transfers through host memory.
+    // can_access_peer == 0 means the hardware/topology does not support it (e.g. some x86
+    // PCIe/IOMMU configs): those pairs keep the host path inside cudaMemcpyPeerAsync.
+    // that is a capability branch, not a fallback.
+    bool p2p_enabled[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};
+    for (int id = 0; id < info.physical_device_count; ++id) {
+        CUDA_CHECK(cudaSetDevice(id));
+        for (int id_other = 0; id_other < info.physical_device_count; ++id_other) {
+            if (id == id_other) {
+                continue;
+            }
+            int can_access_peer = 0;
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id, id_other));
+            if (!can_access_peer) {
+                continue;
+            }
+            const cudaError_t err = cudaDeviceEnablePeerAccess(id_other, 0);
+            if (err == cudaErrorPeerAccessAlreadyEnabled) {
+                // already enabled, e.g. by a previous call in this loop
+                (void) cudaGetLastError();
+            } else if (err != cudaSuccess) {
+                (void) cudaGetLastError();
+                GGML_LOG_ERROR("%s: cudaDeviceEnablePeerAccess(%d -> %d) failed: %s\n",
+                               __func__, id, id_other, cudaGetErrorString(err));
+                continue;
+            }
+            p2p_enabled[id][id_other] = true;
+        }
+    }
+
+    std::string p2p_summary;
+    for (int id = 0; id < info.physical_device_count; ++id) {
+        for (int id_other = id + 1; id_other < info.physical_device_count; ++id_other) {
+            if (p2p_enabled[id][id_other] && p2p_enabled[id_other][id]) {
+                p2p_summary += " " + std::to_string(id) + "<->" + std::to_string(id_other);
+            } else if (p2p_enabled[id][id_other]) {
+                p2p_summary += " " + std::to_string(id) + "->" + std::to_string(id_other);
+            } else if (p2p_enabled[id_other][id]) {
+                p2p_summary += " " + std::to_string(id_other) + "->" + std::to_string(id);
             }
         }
+    }
+    if (!p2p_summary.empty()) {
+        GGML_LOG_INFO("%s: P2P enabled:%s\n", __func__, p2p_summary.c_str());
     }
 
     return info;
@@ -769,50 +800,37 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // the memory allocation handle is no longer needed after mapping
             CU_CHECK(cuMemRelease(handle));
 
-            // VMM Bug fix for P2P access if GGML_CUDA_P2P is set, or if NCCL build
-            bool use_peer_access = getenv("GGML_CUDA_P2P") != nullptr;
-#if defined(GGML_USE_NCCL)
-            use_peer_access = true;
-#endif // defined(GGML_USE_NCCL)
-
-            if (use_peer_access) {
-                // NCCL implicitly enables peer access (cudaDeviceEnablePeerAccess), and
-                // GGML_CUDA_P2P enables it explicitly. Unlike cudaMalloc buffers, VMM
-                // allocations do not become peer-accessible from that alone, so access
-                // must be granted explicitly here. With virtual devices, grant access
-                // on the backing *physical* devices (deduplicated, since several
-                // virtual devices can map to the same physical GPU).
-                std::vector<CUmemAccessDesc> access_descs;
-                bool physical_seen[GGML_CUDA_MAX_DEVICES] = {};
-                const int device_count = ggml_cuda_info().device_count;
-                for (int id = 0; id < device_count; ++id) {
-                    const int id_physical = ggml_cuda_get_physical_device(id);
-                    if (id_physical != physical_device) {
-                        int can_access_peer = 0;
-                        CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id_physical, physical_device));
-                        if (!can_access_peer) {
-                            continue;
-                        }
-                    }
-                    if (physical_seen[id_physical]) {
+            // cudaDeviceEnablePeerAccess alone does not make VMM pages peer-accessible, so
+            // access must be granted here explicitly. Grant it to this physical device and to
+            // every other physical device that the driver reports as able to reach it
+            // (cudaDeviceCanAccessPeer). Devices without that capability (e.g. some x86
+            // PCIe/IOMMU configs) are left out and keep the host path; that is a capability
+            // branch, not a fallback. With virtual devices, grant access on the backing
+            // *physical* devices (deduplicated, since several virtual devices can map to the
+            // same physical GPU).
+            std::vector<CUmemAccessDesc> access_descs;
+            bool physical_seen[GGML_CUDA_MAX_DEVICES] = {};
+            const int device_count = ggml_cuda_info().device_count;
+            for (int id = 0; id < device_count; ++id) {
+                const int id_physical = ggml_cuda_get_physical_device(id);
+                if (id_physical != physical_device) {
+                    int can_access_peer = 0;
+                    CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id_physical, physical_device));
+                    if (!can_access_peer) {
                         continue;
                     }
-                    physical_seen[id_physical] = true;
-                    CUmemAccessDesc access = {};
-                    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-                    access.location.id = id_physical;
-                    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-                    access_descs.push_back(access);
                 }
-                CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, access_descs.data(), access_descs.size()));
-            } else {
-                // set access for non P2P
+                if (physical_seen[id_physical]) {
+                    continue;
+                }
+                physical_seen[id_physical] = true;
                 CUmemAccessDesc access = {};
                 access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-                access.location.id = physical_device;
+                access.location.id = id_physical;
                 access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-                CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, &access, 1));
+                access_descs.push_back(access);
             }
+            CU_CHECK(cuMemSetAccess(start_ptr, reserve_size, access_descs.data(), access_descs.size()));
 
             // add to the pool
             pool_size += reserve_size;
