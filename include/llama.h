@@ -393,6 +393,7 @@ extern "C" {
         float    yarn_beta_slow;   // YaRN high correction dim
         uint32_t yarn_orig_ctx;    // YaRN original context size
         uint32_t n_swa_mtp;        // SWA window of the MTP draft context, in tokens (0 = attend the whole context) [EXPERIMENTAL]
+        uint32_t n_h_sink_rows;    // MTP draft context: extra nextn h sink columns on top of n_batch (0 = no sink) [EXPERIMENTAL]
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
 
         ggml_backend_sched_eval_callback cb_eval;

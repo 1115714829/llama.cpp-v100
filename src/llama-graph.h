@@ -160,6 +160,11 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
 
+    // r-mtpdev: device path, the h rows are gathered from the target sink in the graph. h is not
+    // created then and the column of each row is an input
+    ggml_tensor * h_cols = nullptr;       // I32 [n_batch]
+    const int32_t * h_cols_src = nullptr; // host values for h_cols
+
     const int64_t n_embd = 0;
 };
 
@@ -837,6 +842,14 @@ struct llm_graph_params {
     std::vector<uint32_t> layer_inp_sink_layers; // target: row order within the sink
     size_t token_offset = 0;                     // target: first sink column written by this ubatch
 
+    // r-mtpdev device sink for the nextn hidden state
+    ggml_tensor * t_h_sink      = nullptr;       // both: the local sink, written by this graph
+    ggml_tensor * t_embd_h_src  = nullptr;       // draft: sink read in place by the mtp graph
+    const int32_t * h_src_cols  = nullptr;       // draft: sink column of each h row, host side
+    size_t h_token_offset = 0;                   // draft: first sink column written by this ubatch
+    bool h_sink_is_target = false;               // true: the local sink is the target h sink
+    bool h_sink_write = true;                    // false: this graph does not write the sink
+
     // 6-card FA assist: whether this ubatch marks the FA nodes as shareable (see qwen35). The
     // marked/unmarked nodes are different graphs, so reuse must not cross this flag
     bool fa_assist = false;
@@ -916,6 +929,11 @@ struct llm_graph_params {
             t_layer_inp_sink      == other.t_layer_inp_sink      &&
             t_embd_src            == other.t_embd_src            &&
             token_offset          == other.token_offset          &&
+            t_h_sink              == other.t_h_sink              &&
+            t_embd_h_src          == other.t_embd_h_src          &&
+            h_token_offset        == other.h_token_offset        &&
+            h_sink_is_target      == other.h_sink_is_target      &&
+            h_sink_write          == other.h_sink_write          &&
             fa_assist             == other.fa_assist             &&
             layer_inp_sink_layers == other.layer_inp_sink_layers;
     }
@@ -1082,6 +1100,12 @@ struct llm_graph_context {
     ggml_tensor * const t_embd_src;          // draft: staging sink read by the injection graph
     const std::vector<uint32_t> layer_inp_sink_layers;
     const size_t token_offset;               // target: first sink column written by this ubatch
+    ggml_tensor * const t_h_sink;            // r-mtpdev: the local nextn sink written by this graph
+    ggml_tensor * const t_embd_h_src;        // r-mtpdev draft: nextn sink read in place
+    const int32_t * const h_src_cols;        // r-mtpdev draft: sink column of each h row
+    const size_t h_token_offset;             // r-mtpdev draft: first sink column written by this ubatch
+    const bool h_sink_is_target;             // r-mtpdev: true when the local sink is the target h sink
+    const bool h_sink_write;                 // r-mtpdev: false when this graph skips the sink write
     const bool fa_assist;                    // mark the FA nodes for the 6-card assist path
 
     ggml_context * ctx0 = nullptr;
@@ -1448,6 +1472,13 @@ struct llm_graph_context {
 
     // append copies of the extracted layer inputs into the device sink (target side, no-op when not enabled)
     void build_layer_inp_sink() const;
+
+    //
+    // r-mtpdev device nextn sink
+    //
+
+    // append a copy of the nextn hidden state into the device sink (no-op when not enabled)
+    void build_h_nextn_sink() const;
 };
 
 // TODO: better name

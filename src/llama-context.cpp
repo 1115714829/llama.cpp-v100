@@ -58,6 +58,17 @@ static bool llm_devices_compatible(ggml_backend_t a, ggml_backend_t b) {
            strcmp(ggml_backend_dev_name(dev_a), ggml_backend_dev_name(dev_b)) == 0;
 }
 
+// the backend of the context that runs on the given device, or nullptr
+static ggml_backend_t llm_backend_for_device(const std::vector<ggml_backend_ptr> & backends, ggml_backend_dev_t dev) {
+    for (const auto & backend : backends) {
+        if (ggml_backend_get_device(backend.get()) == dev) {
+            return backend.get();
+        }
+    }
+
+    return nullptr;
+}
+
 // copy n_tokens columns [src_col, src_col + n_tokens) of the target sink into the draft staging
 // sink, starting at column 0; both tensors are static and MIRRORED
 static void llm_embd_src_copy(ggml_backend_t backend, ggml_tensor * src, size_t src_col, ggml_tensor * dst, size_t n_tokens) {
@@ -576,6 +587,31 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // r-mtpdev: the MTP graph reads its h rows from the device sink and the host h input is
+        // gone, so the sink link has to exist before the reserve graphs below are built
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && model.h_nextn_sink_ok) {
+            if (params.ctx_other == nullptr || params.n_h_sink_rows == 0) {
+                throw std::runtime_error("MTP context requires the target context and the h sink layout (ctx_other, n_h_sink_rows)");
+            }
+
+            if (!params.ctx_other->enable_h_nextn_sink(true, params.n_h_sink_rows)) {
+                throw std::runtime_error("failed to enable the target nextn h sink");
+            }
+            if (!enable_h_nextn_sink(false, params.n_h_sink_rows) ||
+                !params.ctx_other->link_h_nextn(this)) {
+                throw std::runtime_error("failed to link the MTP h sink to the target context");
+            }
+
+            // the device gather is the only h input of an MTP draft, so it is enabled from the
+            // start. the initial column map just fills the buffer of the graph input; the
+            // speculative driver sets the real columns before every decode
+            std::vector<int32_t> h_cols(cparams.n_batch);
+            for (size_t i = 0; i < h_cols.size(); ++i) {
+                h_cols[i] = (int32_t) i;
+            }
+            set_h_source(true, h_cols.data(), h_cols.size());
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -979,6 +1015,25 @@ void llama_context::pipeline_drain() {
     }
 
     ggml_backend_sched_pipeline_advance(sched.get());
+}
+
+bool llama_context::synchronize_ubatch(int64_t ubatch_id) {
+    if (!sched || pipeline_ubatch_last < 0) {
+        return false;
+    }
+
+    // a negative id waits for the most recent pipeline ubatch
+    if (ubatch_id < 0) {
+        ubatch_id = pipeline_ubatch_last;
+    } else if (ubatch_id > pipeline_ubatch_last) {
+        return false;
+    }
+
+    // wait for this pipeline ubatch only: the other in-flight ubatches keep running and the
+    // pipeline is not drained
+    ggml_backend_sched_pipeline_wait(sched.get(), ubatch_id);
+
+    return true;
 }
 
 void llama_context::synchronize() {
@@ -1782,6 +1837,314 @@ int32_t llama_context::layer_inp_sink_col(llama_seq_id seq_id, llama_pos pos) co
     return lo->second;
 }
 
+bool llama_context::enable_h_nextn_sink(bool is_target, uint32_t n_h_rows) {
+    if (t_h_sink != nullptr) {
+        return h_sink_is_target == is_target;
+    }
+
+    if (backends.empty()) {
+        return false;
+    }
+
+    // capability branch, not a fallback: only the architectures whose MTP graph reads the h
+    // rows from the sink can use it (t_embd_h_src branch in graph_mtp, see h_nextn_sink_ok)
+    if (!model.h_nextn_sink_ok) {
+        LLAMA_LOG_ERROR("%s: this architecture does not read the nextn h from the device sink\n", __func__);
+        return false;
+    }
+
+    const int64_t n_embd_out = model.hparams.n_embd_out();
+    if (n_embd_out <= 0) {
+        return false;
+    }
+
+    // the rows are produced on the output device, so the sink lives on that device and only there
+    // (a single copy, not mirrored). the draft is pinned to the same device
+    // (common_speculative_init_result), so it reads the sink in place
+    ggml_backend_dev_t dev = model.dev_output();
+
+    // capability branch, not a fallback: the single-stream sink requires the output layer to run
+    // on one device. with a meta output device (tensor split) the rows are sliced across devices
+    // and there is nothing to hand over between the two contexts
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META) {
+        LLAMA_LOG_ERROR("%s: the nextn h sink requires the output layer on a single device\n", __func__);
+        return false;
+    }
+
+    ggml_backend_t backend_h = llm_backend_for_device(backends, dev);
+    if (backend_h == nullptr) {
+        LLAMA_LOG_ERROR("%s: the output device is not one of the context backends\n", __func__);
+        return false;
+    }
+
+    // the draft context does not allocate a sink of its own: link_h_nextn binds it to the target
+    // sink so that both sides read and write the same rows
+    if (!is_target) {
+        t_h_sink         = nullptr;
+        h_sink_is_target = false;
+        backend_h_sink   = backend_h;
+        h_sink_extra     = n_h_rows;
+        return true;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+
+    const ggml_init_params params = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ctx_h_sink.reset(ggml_init(params));
+
+    // n_batch columns hold the rows of one batch (token order), the next n_h_rows hold the MTP
+    // bookkeeping rows (pending rows and draft-step rows), see the callers in common/speculative.cpp
+    ggml_tensor * sink = ggml_new_tensor_2d(ctx_h_sink.get(), GGML_TYPE_F32, n_embd_out, (int64_t) cparams.n_batch + n_h_rows);
+    ggml_set_name(sink, "h_nextn_sink");
+
+    buf_h_sink.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_h_sink.get(), buft));
+    if (!buf_h_sink) {
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        LLAMA_LOG_ERROR("%s: %s h sink allocation failed: need %.1f MiB, device has %.1f MiB free of %.1f MiB\n",
+                __func__, is_target ? "target" : "draft",
+                n_embd_out * ((int64_t) cparams.n_batch + n_h_rows) * sizeof(float) / 1024.0 / 1024.0,
+                free / 1024.0 / 1024.0, total / 1024.0 / 1024.0);
+        ctx_h_sink.reset();
+        return false;
+    }
+
+    t_h_sink         = sink;
+    h_sink_is_target = is_target;
+    backend_h_sink   = backend_h;
+    h_sink_extra     = n_h_rows;
+
+    // the reserved pending columns start as zero rows, matching the zero-initialized pending h of
+    // the first process() call (there is no previous target row to pair with yet)
+    llama_clear_tensor_data(sink, 0, ggml_nbytes(sink));
+
+    // the graph reads/writes the sink, so its scheduler needs a fresh allocation
+    sched_need_reserve = true;
+
+    return true;
+}
+
+bool llama_context::link_h_nextn(llama_context * ctx_dft) {
+    if (t_h_sink == nullptr || !h_sink_is_target || ctx_dft == nullptr || ctx_dft == this) {
+        return false;
+    }
+
+    if (ctx_dft->h_sink_is_target || ctx_dft->backend_h_sink == nullptr) {
+        return false;
+    }
+
+    if (backends.empty() || ctx_dft->backends.empty()) {
+        return false;
+    }
+
+    // the DFlash2 link may already exist for this pair: extend it, do not create a second one
+    if (embd_link || ctx_dft->embd_link) {
+        if (embd_link == nullptr || embd_link != ctx_dft->embd_link) {
+            return false;
+        }
+        if (embd_link->t_h_sink_tgt != nullptr) {
+            return embd_link->t_h_sink_tgt == t_h_sink;
+        }
+    }
+
+    if (!llm_devices_compatible(backend_h_sink, ctx_dft->backend_h_sink)) {
+        LLAMA_LOG_WARN("%s: target and draft h sinks are not on compatible devices\n", __func__);
+        return false;
+    }
+
+    if ((int64_t) ctx_dft->model.hparams.n_embd_out() != t_h_sink->ne[0]) {
+        LLAMA_LOG_WARN("%s: draft h width does not match the target sink\n", __func__);
+        return false;
+    }
+
+    // the draft does not allocate a sink: it reads and writes the target sink in place, so both
+    // contexts must use the exact same extra-column layout
+    if (ctx_dft->h_sink_extra != h_sink_extra) {
+        LLAMA_LOG_WARN("%s: draft and target h sink layouts do not match\n", __func__);
+        return false;
+    }
+
+    ggml_backend_event_t ev_h_tgt_done  = ggml_backend_event_new(ggml_backend_get_device(backend_h_sink));
+    ggml_backend_event_t ev_h_read_done = ggml_backend_event_new(ggml_backend_get_device(ctx_dft->backend_h_sink));
+    if (ev_h_tgt_done == nullptr || ev_h_read_done == nullptr) {
+        ggml_backend_event_free(ev_h_tgt_done);
+        ggml_backend_event_free(ev_h_read_done);
+        return false;
+    }
+
+    std::shared_ptr<llama_embd_link> link = embd_link;
+    if (!link) {
+        link = std::make_shared<llama_embd_link>();
+    }
+    link->ev_h_tgt_done  = ev_h_tgt_done;
+    link->ev_h_read_done = ev_h_read_done;
+    link->t_h_sink_tgt   = t_h_sink;
+
+    embd_link          = link;
+    ctx_dft->embd_link = link;
+
+    ctx_dft->t_h_sink       = t_h_sink;
+    ctx_dft->backend_h_sink = backend_h_sink;
+    ctx_dft->h_sink_extra   = h_sink_extra;
+
+    // the draft graphs switch to the device gather path
+    ctx_dft->h_src_enable = false;
+    ctx_dft->sched_need_reserve = true;
+
+    return true;
+}
+
+void llama_context::set_h_source(bool enable, const int32_t * cols, size_t n_cols) {
+    if (!embd_link || embd_link->t_h_sink_tgt == nullptr || t_h_sink == nullptr || h_sink_is_target) {
+        return;
+    }
+
+    // the device gather path needs the columns of all rows, otherwise fall back to the host input
+    const bool gather = enable && cols != nullptr && n_cols > 0;
+
+    if (gather) {
+        // keep the capacity: the graph input holds a pointer into this vector across batches
+        if (h_src_cols.capacity() < n_cols) {
+            h_src_cols.reserve(std::max(n_cols, (size_t) cparams.n_batch));
+        }
+        h_src_cols.assign(cols, cols + n_cols);
+    } else {
+        h_src_cols.clear();
+    }
+
+    if (h_src_enable != gather) {
+        h_src_enable = gather;
+
+        // the host input path and the device gather path are different graphs
+        sched_need_reserve = true;
+    }
+}
+
+void llama_context::set_h_sink_offset(int32_t offset) {
+    if (h_sink_is_target || t_h_sink == nullptr) {
+        return;
+    }
+
+    if (h_sink_offset == offset) {
+        return;
+    }
+
+    // the offset is part of the graph parameters and enters the graph reuse check, so a changed
+    // offset rebuilds the graph without a new scheduler reserve
+    h_sink_offset = offset;
+}
+
+void llama_context::set_h_sink_write(bool write) {
+    if (h_sink_is_target || t_h_sink == nullptr) {
+        return;
+    }
+
+    if (h_sink_write == write) {
+        return;
+    }
+
+    // the write flag is part of the graph parameters and enters the graph reuse check, so a
+    // changed flag rebuilds the graph. the cpy node it adds needs no new scheduler buffers, so
+    // no reserve is needed; the first reserve of this context runs with the flag off
+    h_sink_write = write;
+}
+
+bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols) {
+    if (t_h_sink == nullptr || !h_sink_is_target || src_cols == nullptr || n_cols == 0) {
+        return false;
+    }
+
+    // the reserved pending columns are the first n_h_rows columns after n_batch
+    const size_t n_batch = cparams.n_batch;
+    if (n_batch + n_cols > (size_t) t_h_sink->ne[1]) {
+        return false;
+    }
+
+    // the draft may still be reading the rows from the previous capture
+    if (embd_link && embd_link->t_h_sink_tgt != nullptr) {
+        ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_read_done);
+    }
+
+    const ggml_init_params params = {
+        /*.mem_size   =*/ (2*n_cols + 1)*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx_view(ggml_init(params));
+
+    for (size_t i = 0; i < n_cols; ++i) {
+        const int32_t src_col = src_cols[i];
+        if (src_col < 0) {
+            // this sequence had no rows in the batch: keep its pending column as it is
+            continue;
+        }
+        if ((size_t) src_col >= n_batch) {
+            // a source outside the batch columns means the caller passed a stale column
+            return false;
+        }
+
+        ggml_tensor * src = ggml_view_2d(ctx_view.get(), t_h_sink, t_h_sink->ne[0], 1,
+                t_h_sink->nb[1], (size_t) src_col * t_h_sink->nb[1]);
+        ggml_tensor * dst = ggml_view_2d(ctx_view.get(), t_h_sink, t_h_sink->ne[0], 1,
+                t_h_sink->nb[1], (size_t) (n_batch + i) * t_h_sink->nb[1]);
+
+        // same buffer and stream as the target graph, so the copy is ordered after the write
+        ggml_backend_tensor_copy(src, dst);
+    }
+
+    // the next draft read must not start before the pending rows are in place
+    if (embd_link && embd_link->t_h_sink_tgt != nullptr) {
+        ggml_backend_event_record(embd_link->ev_h_tgt_done, backend_h_sink);
+    }
+
+    return true;
+}
+
+bool llama_context::h_nextn_sink_get(size_t token_offset, size_t n_tokens, float * dst) {
+    if (t_h_sink == nullptr || !h_sink_is_target || dst == nullptr) {
+        return false;
+    }
+
+    const size_t row = (size_t) t_h_sink->ne[0];
+    GGML_ASSERT(row == (size_t) model.hparams.n_embd_out());
+
+    if (token_offset + n_tokens > (size_t) t_h_sink->ne[1]) {
+        return false;
+    }
+
+    // the sink may still be written by the target graph
+    synchronize();
+    ggml_backend_tensor_get(t_h_sink, dst, token_offset*row*sizeof(float), n_tokens*row*sizeof(float));
+
+    return true;
+}
+
+int32_t llama_context::h_nextn_sink_col(llama_seq_id seq_id, llama_pos pos) const {
+    if (t_h_sink == nullptr || !h_sink_is_target || cparams.n_seq_max == 1) {
+        return -1;
+    }
+
+    const auto it = h_sink_cols_by_seq.find(seq_id);
+    if (it == h_sink_cols_by_seq.end()) {
+        return -1;
+    }
+
+    const auto & cols = it->second;
+
+    // the positions of one sequence grow within a batch
+    const auto lo = std::lower_bound(cols.begin(), cols.end(), std::make_pair(pos, -1));
+    if (lo == cols.end() || lo->first != pos) {
+        return -1;
+    }
+
+    return lo->second;
+}
+
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
@@ -2037,9 +2400,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const bool writes_sink = embd_link && t_layer_inp_sink != nullptr;
     const bool copies_src  = embd_link && embd_src_enable && t_embd_src_sink != nullptr && ubatch.embd != nullptr;
 
+    // r-mtpdev cross-context ordering for the nextn h sink: the target write waits for the draft
+    // to finish reading the previous write, the draft read waits for the target graph to finish
+    const bool writes_h_sink = embd_link && embd_link->t_h_sink_tgt != nullptr && t_h_sink != nullptr && h_sink_is_target;
+    const bool reads_h_sink  = embd_link && embd_link->t_h_sink_tgt != nullptr && h_src_enable && !h_sink_is_target;
+
     if (writes_sink) {
         // the draft may still be copying the previous write
         ggml_backend_event_wait(backends[0].get(), embd_link->ev_copy_done);
+    }
+
+    if (writes_h_sink) {
+        // the draft may still be reading the previous target write
+        ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_read_done);
     }
 
     if (copies_src) {
@@ -2049,6 +2422,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // token_offset: this ubatch within the draft batch, whose first token is target-sink column embd_src_offset
         llm_embd_src_copy(backends[0].get(), embd_link->t_layer_inp_sink, embd_src_offset + token_offset, embd_link->t_embd_src_sink, ubatch.n_tokens);
         ggml_backend_event_record(embd_link->ev_copy_done, backends[0].get());
+    }
+
+    if (reads_h_sink) {
+        // the draft graph reads the target sink in place
+        ggml_backend_event_wait(backend_h_sink, embd_link->ev_h_tgt_done);
     }
 
     ggml_status status;
@@ -2068,10 +2446,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ggml_backend_event_record(embd_link->ev_tgt_done, backends[0].get());
     }
 
+    if (writes_h_sink) {
+        // the draft can read the sink once this graph completed on the output device stream
+        ggml_backend_event_record(embd_link->ev_h_tgt_done, backend_h_sink);
+    }
+
+    if (reads_h_sink) {
+        // the draft is done with the sink, the target may overwrite it
+        ggml_backend_event_record(embd_link->ev_h_read_done, backend_h_sink);
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (pipeline) {
+        // MTP can wait for this ubatch individually without draining the pipeline
+        pipeline_ubatch_last = ubatch_id;
     }
 
     ret = GGML_STATUS_SUCCESS;
@@ -2496,6 +2889,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         sink_cols_by_seq.clear();
     }
 
+    // r-mtpdev: same column bookkeeping for the target h sink
+    if (t_h_sink != nullptr && h_sink_is_target && cparams.n_seq_max > 1) {
+        h_sink_cols.clear();
+        h_sink_cols_by_seq.clear();
+    }
+
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
@@ -2610,7 +3009,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
             const int64_t offset = masked ? n_outputs_prev  : n_tokens_prev;
 
-            if (cparams.embeddings_nextn &&
+            // r-mtpdev: with the device sink enabled the rows are written by the graph, no D2H
+            const bool nextn_on_device = t_h_sink != nullptr;
+
+            if (cparams.embeddings_nextn && !nextn_on_device &&
                     !(embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE)) {
                 // the MTP draft reads nothing useful if any of these is false - surface which one
                 LLAMA_LOG_MTP("%s: ctx=%s nextn extract SKIPPED: embd_nextn.data=%d t_h_nextn=%d n_rows=%" PRId64 " pooling=%d\n",
@@ -2743,6 +3145,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
         }
 
+        // r-mtpdev: same mapping for the target h sink (the draft reads it through this mapping)
+        if (t_h_sink != nullptr && h_sink_is_target && cparams.n_seq_max > 1) {
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                const llama_seq_id seq_id = ubatch.seq_id[i][0];
+                h_sink_cols.emplace_back(seq_id, ubatch.pos[i]);
+                h_sink_cols_by_seq[seq_id].emplace_back(ubatch.pos[i], (int32_t) h_sink_cols.size() - 1);
+            }
+        }
+
         // plot the computation graph in dot format (for debugging purposes)
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
@@ -2835,7 +3246,8 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     bool has_logits     = true;
     bool has_embd       = cparams.embeddings;
-    bool has_embd_nextn = cparams.embeddings_nextn;
+    // r-mtpdev: with the device sink enabled the nextn rows stay on the device, no host buffer
+    bool has_embd_nextn = cparams.embeddings_nextn && t_h_sink == nullptr;
 
     // TODO: hacky enc-dec support
     if (model.arch == LLM_ARCH_T5) {
@@ -3401,7 +3813,14 @@ llm_graph_params llama_context::graph_params(
         /*.t_layer_inp_sink      =*/ t_layer_inp_sink,
         /*.t_embd_src            =*/ embd_src_enable ? t_embd_src_sink : nullptr,
         /*.layer_inp_sink_layers =*/ layer_inp_sink_layers,
-        /*.token_offset          =*/ t_layer_inp_sink != nullptr ? token_offset : 0,
+        // the sink column offset of this ubatch: shared by the DFlash2 sink and the nextn h sink
+        /*.token_offset          =*/ (t_layer_inp_sink != nullptr || t_h_sink != nullptr) ? token_offset : 0,
+        /*.t_h_sink              =*/ t_h_sink,
+        /*.t_embd_h_src          =*/ (!h_sink_is_target && h_src_enable && embd_link && embd_link->t_h_sink_tgt != nullptr) ? embd_link->t_h_sink_tgt : nullptr,
+        /*.h_src_cols            =*/ (!h_sink_is_target && h_src_enable && !h_src_cols.empty()) ? h_src_cols.data() : nullptr,
+        /*.h_token_offset        =*/ (size_t) h_sink_offset,
+        /*.h_sink_is_target      =*/ h_sink_is_target,
+        /*.h_sink_write          =*/ h_sink_write,
         /*.fa_assist             =*/ fa_assist,
     };
 }
@@ -4615,6 +5034,7 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.n_swa_mtp                   =*/ 0,
+        /*.n_h_sink_rows               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
@@ -4920,6 +5340,42 @@ bool llama_layer_inp_sink_get(struct llama_context * ctx, size_t token_offset, s
 
 int32_t llama_layer_inp_sink_col(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
     return ctx->layer_inp_sink_col(seq_id, pos);
+}
+
+bool llama_enable_h_nextn_sink(struct llama_context * ctx, bool is_target, uint32_t n_h_rows) {
+    return ctx->enable_h_nextn_sink(is_target, n_h_rows);
+}
+
+bool llama_context_link_h_nextn(struct llama_context * ctx_tgt, struct llama_context * ctx_dft) {
+    return ctx_tgt->link_h_nextn(ctx_dft);
+}
+
+void llama_set_h_source(struct llama_context * ctx, bool enable, const int32_t * cols, size_t n_cols) {
+    ctx->set_h_source(enable, cols, n_cols);
+}
+
+void llama_set_h_sink_offset(struct llama_context * ctx, int32_t offset) {
+    ctx->set_h_sink_offset(offset);
+}
+
+void llama_set_h_sink_write(struct llama_context * ctx, bool write) {
+    ctx->set_h_sink_write(write);
+}
+
+bool llama_h_nextn_sink_capture(struct llama_context * ctx, const int32_t * src_cols, size_t n_cols) {
+    return ctx->h_nextn_sink_capture(src_cols, n_cols);
+}
+
+bool llama_h_nextn_sink_get(struct llama_context * ctx, size_t token_offset, size_t n_tokens, float * dst) {
+    return ctx->h_nextn_sink_get(token_offset, n_tokens, dst);
+}
+
+int32_t llama_h_nextn_sink_col(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos) {
+    return ctx->h_nextn_sink_col(seq_id, pos);
+}
+
+bool llama_synchronize_ubatch(struct llama_context * ctx, int64_t ubatch_id) {
+    return ctx->synchronize_ubatch(ubatch_id);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

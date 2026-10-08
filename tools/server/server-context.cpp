@@ -4423,7 +4423,14 @@ private:
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
-                if (ok && has_output) {
+                // the MTP draft reads the target h rows on the device through the sink, so it
+                // does not need the target context synchronized here; the logits are read at
+                // sampling time, which synchronizes only when it actually samples
+                const bool spec_mtp = std::find(
+                        params_base.speculative.types.begin(),
+                        params_base.speculative.types.end(),
+                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+                if (ok && has_output && !spec_mtp) {
                     llama_synchronize(ctx_tgt);
                 }
             });
@@ -4485,6 +4492,16 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        // MTP with the device h sink no longer synchronizes the target in process_batch: the
+        // draft read the sink rows on the device. The sampling below reads the host logits, so
+        // the target context must be idle right before the first sample of this call. Prefill
+        // chunks that only queue tokens do not sample and keep the pipeline in flight
+        const bool spec_mtp = std::find(
+                params_base.speculative.types.begin(),
+                params_base.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        bool tgt_synced = false;
+
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -4535,6 +4552,12 @@ private:
 
             if (slot.can_speculate() && !slot.spec_draft.empty()) {
                 return; // sample using speculative decoding
+            }
+
+            // MTP: the target must be idle before the first host logits read of this call
+            if (spec_mtp && !tgt_synced) {
+                tgt_synced = true;
+                llama_synchronize(ctx_tgt);
             }
 
             // shifted according to the current sub-batch
@@ -4589,6 +4612,12 @@ private:
             if (slot.state != SLOT_STATE_GENERATING || !slot.can_speculate() ||
                     slot.spec_draft.empty() || slot.spec_i_batch.empty()) {
                 return;
+            }
+
+            // MTP: the target must be idle before the first host logits read of this call
+            if (spec_mtp && !tgt_synced) {
+                tgt_synced = true;
+                llama_synchronize(ctx_tgt);
             }
 
             // save the original draft size

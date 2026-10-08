@@ -3225,6 +3225,9 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // DFlash2: copy the extracted layer inputs into the device sink (if enabled)
     llm->build_layer_inp_sink();
 
+    // r-mtpdev: copy the nextn hidden state into the device sink (if enabled)
+    llm->build_h_nextn_sink();
+
     llm->res->set_outputs(params);
 
     return llm->res->get_gf();

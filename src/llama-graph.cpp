@@ -179,10 +179,16 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
     //       for now, we assume that the hidden state is always provided as an embedding
     //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
-    if (ubatch->embd) {
-        GGML_ASSERT(n_embd == h->ne[0]);
+    if (h != nullptr) {
+        if (ubatch->embd) {
+            GGML_ASSERT(n_embd == h->ne[0]);
 
-        ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+            ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        }
+    } else if (h_cols != nullptr && h_cols_src != nullptr) {
+        // r-mtpdev device path: the h rows are gathered from the target sink in the graph, only
+        // the column of each row is copied from the host
+        ggml_backend_tensor_set(h_cols, h_cols_src, 0, n_tokens*ggml_element_size(h_cols));
     }
 }
 
@@ -190,8 +196,14 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+
+    if (params.t_embd_h_src != nullptr) {
+        // r-mtpdev device path
+        res &= h_cols != nullptr && h_cols->ne[0] == params.ubatch.n_tokens;
+    } else {
+        res &= (!params.ubatch.embd) || (embd && embd->ne[1] == params.ubatch.n_tokens);
+        res &= (!params.ubatch.embd) || (h    && h->ne[1]    == params.ubatch.n_tokens);
+    }
 
     return res;
 }
@@ -1531,6 +1543,12 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     t_embd_src       (params.t_embd_src),
     layer_inp_sink_layers(params.layer_inp_sink_layers),
     token_offset     (params.token_offset),
+    t_h_sink         (params.t_h_sink),
+    t_embd_h_src     (params.t_embd_h_src),
+    h_src_cols       (params.h_src_cols),
+    h_token_offset   (params.h_token_offset),
+    h_sink_is_target (params.h_sink_is_target),
+    h_sink_write     (params.h_sink_write),
     fa_assist        (params.fa_assist),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -3830,6 +3848,30 @@ void llm_graph_context::build_layer_inp_sink() const {
         ggml_format_name(cpy, "layer_inp_sink_cpy_l%d", il);
         ggml_build_forward_expand(gf, cpy);
     }
+}
+
+void llm_graph_context::build_h_nextn_sink() const {
+    if (t_h_sink == nullptr || !h_sink_write) {
+        return;
+    }
+
+    ggml_tensor * cur = res->get_h_nextn();
+    if (cur == nullptr) {
+        return;
+    }
+
+    const size_t col0 = token_offset + (size_t) h_token_offset;
+
+    GGML_ASSERT(cur->type == GGML_TYPE_F32);
+    GGML_ASSERT(cur->ne[0] == t_h_sink->ne[0]);
+    GGML_ASSERT(col0 + (size_t) cur->ne[1] <= (size_t) t_h_sink->ne[1]);
+
+    // the column offset is part of the graph parameters, so a reused graph writes the same columns
+    ggml_tensor * dst = ggml_view_2d(ctx0, t_h_sink, cur->ne[0], cur->ne[1],
+            t_h_sink->nb[1], col0 * t_h_sink->nb[1]);
+    ggml_tensor * cpy = ggml_cpy(ctx0, cur, dst);
+    ggml_set_name(cpy, "h_nextn_sink_cpy");
+    ggml_build_forward_expand(gf, cpy);
 }
 
 

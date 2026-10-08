@@ -19,6 +19,11 @@ struct common_fit_extra_model {
     llama_model_params * mparams;
     llama_context_params * cparams;
     bool shares_model;
+
+    // device feature sinks that are not part of the memory breakdown of any context: the fit
+    // reserves their bytes on the devices that will hold them
+    bool     dflash_sink = false; // DFlash2: reserve the layer-input sink (target + draft staging)
+    uint32_t h_sink_rows = 0;     // r-mtpdev: MTP nextn sink extra columns on top of n_batch (0 = off)
 };
 
 // fits mparams and cparams to free device memory (assumes system memory is unlimited)

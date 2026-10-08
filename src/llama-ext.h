@@ -129,6 +129,9 @@ LLAMA_API bool llama_batch_ext_set_decision_order(struct llama_batch_ext * batch
 
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
+// Both force a full synchronize() to read the host copy. The MTP draft no longer uses them
+// (it reads the device sink), but the other draft implementations (dflash, eagle3, dspark)
+// and tools/imatrix still do
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
@@ -162,6 +165,51 @@ LLAMA_API bool llama_layer_inp_sink_get(struct llama_context * ctx, size_t token
 
 // DFlash2: the target sink column of token (seq_id, pos) of the last decoded batch, -1 if not in the sink
 LLAMA_API int32_t llama_layer_inp_sink_col(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
+
+// r-mtpdev: keep the nextn hidden state in a device sink. The target writes its t_h_nextn rows
+// there; the draft reads and writes the same sink through the link. is_target selects the role
+// of the context; n_h_rows is the number of extra sink columns the MTP draft needs on top of
+// n_batch (pending rows and draft-step rows). Returns false if unsupported or the allocation
+// failed - the caller reports the failure instead of silently going back to the host path.
+LLAMA_API bool llama_enable_h_nextn_sink(struct llama_context * ctx, bool is_target, uint32_t n_h_rows);
+
+// r-mtpdev: link a target and a draft context for the direct device access to the target h sink.
+// Creates the events that order the target writes, the captures and the draft reads/writes.
+// Returns false if the devices are not compatible or the events are not available.
+LLAMA_API bool llama_context_link_h_nextn(struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
+
+// r-mtpdev: select the h source of the next draft batch: true gathers the h rows in the graph
+// from the sink columns [cols, cols + n_cols), false disables the device gather. No-op when the
+// context is not linked.
+LLAMA_API void llama_set_h_source(struct llama_context * ctx, bool enable, const int32_t * cols, size_t n_cols);
+
+// r-mtpdev draft: column offset of the next sink write. The chained-head draft uses it to keep
+// one row per draft step; the non-chained draft keeps the first draft-step column. No-op for a
+// target context.
+LLAMA_API void llama_set_h_sink_offset(struct llama_context * ctx, int32_t offset);
+
+// r-mtpdev draft: enable/disable the sink write of the next draft graph. The catch-up decode
+// does not consume its own h rows, so it must not write the sink; the draft steps write their
+// output rows for the next step to read
+LLAMA_API void llama_set_h_sink_write(struct llama_context * ctx, bool write);
+
+// r-mtpdev target: copy the sink rows src_cols into the reserved pending columns
+// [n_batch, n_batch + n_cols), so that the next batch may overwrite the source columns. The
+// copy is ordered on the sink device after the target write and before the next draft read.
+// Returns false if the context has no target sink or n_cols exceeds the reserved space.
+LLAMA_API bool llama_h_nextn_sink_capture(struct llama_context * ctx, const int32_t * src_cols, size_t n_cols);
+
+// r-mtpdev: copy the target sink rows [token_offset, token_offset + n_tokens) into dst.
+// Requires a target sink.
+LLAMA_API bool llama_h_nextn_sink_get(struct llama_context * ctx, size_t token_offset, size_t n_tokens, float * dst);
+
+// r-mtpdev: the h-sink column of token (seq_id, pos) of the last decoded batch, -1 if not in the sink
+LLAMA_API int32_t llama_h_nextn_sink_col(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
+
+// r-mtpdev: wait for one prefill pipeline ubatch without draining the pipeline. A negative id
+// waits for the most recent one. Returns false if the context has no scheduler or the ubatch is
+// not tracked by the pipeline (decode-sized batches).
+LLAMA_API bool llama_synchronize_ubatch(struct llama_context * ctx, int64_t ubatch_id);
 
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
