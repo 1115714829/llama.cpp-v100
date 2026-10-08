@@ -2070,6 +2070,83 @@ static void ggml_backend_sched_push_split_outputs(
     }
 }
 
+// a split runs on the main thread when its backend has no submission worker (CPU backend; judged
+// by device type so it also holds before the workers are started, e.g. at reserve time), or when it
+// reads a non-user-input host tensor (host weights: the MoE expert copy branch reads the ids on the
+// host) and therefore needs the original synchronous semantics
+static bool ggml_backend_sched_split_on_main(
+        ggml_backend_sched_t sched, const struct ggml_backend_sched_split * split) {
+    if (ggml_backend_dev_type(ggml_backend_get_device(sched->backends[split->backend_id])) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return true;
+    }
+    for (int i = 0; i < split->n_inputs; i++) {
+        struct ggml_tensor * input = split->inputs[i];
+        if (!ggml_backend_sched_is_user_input(input) && input->buffer != NULL &&
+                ggml_backend_buffer_is_host(input->buffer)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// sum of the user inputs of every split that is not handled on the main thread, per backend: the
+// pinned staging entry of a backend must hold all of them at once
+static void ggml_backend_sched_staging_need(ggml_backend_sched_t sched, std::vector<size_t> & need) {
+    need.assign(sched->n_backends, 0);
+    for (int s = 0; s < sched->n_splits; s++) {
+        const struct ggml_backend_sched_split * split = &sched->splits[s];
+        if (ggml_backend_sched_split_on_main(sched, split)) {
+            continue;
+        }
+        for (int i = 0; i < split->n_inputs; i++) {
+            struct ggml_tensor * input = split->inputs[i];
+            if (ggml_backend_sched_is_user_input(input)) {
+                need[split->backend_id] += ggml_nbytes(input);
+            }
+        }
+    }
+}
+
+// grow the pinned staging ring of backend b so that one entry holds at least `need` bytes. the
+// reserve graph (the whole context) fixes the steady-state size, so graphs no larger than the
+// reserve never grow again; a graph beyond it doubles the entry, which is logarithmic in the
+// number of distinct graph sizes. returns false if the allocation failed
+static bool ggml_backend_sched_staging_grow(ggml_backend_sched_t sched, int b, size_t need) {
+    if (need == 0) {
+        return true;
+    }
+    size_t target = std::max(need, sched->staging_reserve[b]);
+    if (target <= sched->staging[b].size) {
+        return true;
+    }
+    target = std::max(target, 2 * sched->staging[b].size);
+
+    // drain the workers, then wait for every entry upload to complete before the old buffer is
+    // released (freeing pinned host memory synchronizes the device)
+    ggml_backend_sched_workers_drain(sched);
+    for (int e = 0; e < sched->n_stages; e++) {
+        if (sched->staging[b].done[e] != NULL) {
+            ggml_backend_event_synchronize(sched->staging[b].done[e]);
+        }
+    }
+    ggml_backend_buffer_t buf_new = NULL;
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(sched->backends[b]->device);
+    if (buft != NULL) {
+        // capability check: uploading the staged inputs without blocking the main thread needs
+        // pinned host memory
+        buf_new = ggml_backend_buft_alloc_buffer(buft, target * sched->n_stages);
+    }
+    if (buf_new == NULL) {
+        GGML_LOG_ERROR("%s: failed to allocate %zu bytes of pinned staging for backend %d\n",
+                __func__, target * (size_t) sched->n_stages, b);
+        return false;
+    }
+    ggml_backend_buffer_free(sched->staging[b].buf);
+    sched->staging[b].buf = buf_new;
+    sched->staging[b].size = target;
+    return true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_sched_t sched) {
     struct ggml_backend_sched_split * splits = sched->splits;
     const int n_splits = sched->n_splits;
@@ -2104,18 +2181,7 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
     // main thread
     std::vector<char> on_main(n_splits, 0);
     for (int s = 0; s < n_splits; s++) {
-        if (sched->workers->at(splits[s].backend_id) == NULL) {
-            on_main[s] = 1;
-            continue;
-        }
-        for (int i = 0; i < splits[s].n_inputs; i++) {
-            struct ggml_tensor * input = splits[s].inputs[i];
-            if (!ggml_backend_sched_is_user_input(input) && input->buffer != NULL &&
-                    ggml_backend_buffer_is_host(input->buffer)) {
-                on_main[s] = 1;
-                break;
-            }
-        }
+        on_main[s] = ggml_backend_sched_split_on_main(sched, &splits[s]) ? 1 : 0;
     }
 
     // pass 3: collect the output copies and the cross-backend input dependencies
@@ -2180,47 +2246,13 @@ static enum ggml_status ggml_backend_sched_compute_splits_pipeline(ggml_backend_
 
     // host inputs are staged per backend in a pinned host ring, one entry per stage. the total size
     // of the user inputs of one ubatch fixes the entry size of its backend
-    std::vector<size_t> staging_need(sched->n_backends, 0);
-    for (int s = 0; s < n_splits; s++) {
-        if (on_main[s]) {
-            continue;
-        }
-        for (int i = 0; i < splits[s].n_inputs; i++) {
-            struct ggml_tensor * input = splits[s].inputs[i];
-            if (ggml_backend_sched_is_user_input(input)) {
-                staging_need[splits[s].backend_id] += ggml_nbytes(input);
-            }
-        }
-    }
+    std::vector<size_t> staging_need;
+    ggml_backend_sched_staging_need(sched, staging_need);
 
     for (int b = 0; b < sched->n_backends; b++) {
-        if (staging_need[b] == 0 || staging_need[b] <= sched->staging[b].size) {
-            continue;
-        }
-
-        // grow the ring: drain the workers, then wait for every entry upload to complete before the
-        // old buffer is released. rare: only when the input sizes of the prefill change
-        ggml_backend_sched_workers_drain(sched);
-        for (int e = 0; e < sched->n_stages; e++) {
-            if (sched->staging[b].done[e] != NULL) {
-                ggml_backend_event_synchronize(sched->staging[b].done[e]);
-            }
-        }
-        ggml_backend_buffer_t buf_new = NULL;
-        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(sched->backends[b]->device);
-        if (buft != NULL) {
-            // capability check: uploading the staged inputs without blocking the main thread needs
-            // pinned host memory
-            buf_new = ggml_backend_buft_alloc_buffer(buft, staging_need[b] * sched->n_stages);
-        }
-        if (buf_new == NULL) {
-            GGML_LOG_ERROR("%s: failed to allocate %zu bytes of pinned staging for backend %d\n",
-                    __func__, staging_need[b] * (size_t) sched->n_stages, b);
+        if (!ggml_backend_sched_staging_grow(sched, b, staging_need[b])) {
             return GGML_STATUS_ALLOC_FAILED;
         }
-        ggml_backend_buffer_free(sched->staging[b].buf);
-        sched->staging[b].buf = buf_new;
-        sched->staging[b].size = staging_need[b];
     }
 
     std::vector<uint8_t *> staging_entry(sched->n_backends, nullptr);
@@ -2750,6 +2782,21 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
+    }
+
+    // the reserved graph (the whole context) is the worst case the scheduler will ever see, so its
+    // staging sizes fix the steady-state ring size. record them now, and size an already running
+    // pipeline immediately: no submission is in flight during reserve
+    std::vector<size_t> staging_need;
+    ggml_backend_sched_staging_need(sched, staging_need);
+    for (int b = 0; b < sched->n_backends; b++) {
+        sched->staging_reserve[b] = std::max(sched->staging_reserve[b], staging_need[b]);
+        if (sched->n_stages > 1 && ggml_backend_sched_has_workers(sched) &&
+                sched->staging_reserve[b] > sched->staging[b].size) {
+            if (!ggml_backend_sched_staging_grow(sched, b, sched->staging_reserve[b])) {
+                return false;
+            }
+        }
     }
 
     ggml_backend_sched_reset(sched);

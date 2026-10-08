@@ -124,8 +124,8 @@ static void run_pipeline(int n_backends) {
 // pipeline. The views make sure that a view of an input is treated as a user input too.
 static struct ggml_cgraph * build_graph_gpu(
         struct ggml_context * ctx, struct ggml_tensor * w0, struct ggml_tensor * w1,
-        struct ggml_tensor ** a, struct ggml_tensor ** b, struct ggml_tensor ** out) {
-    *a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_tokens + 8);
+        int a_len, struct ggml_tensor ** a, struct ggml_tensor ** b, struct ggml_tensor ** out) {
+    *a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, a_len);
     *b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_tokens/4, 4);
     ggml_set_input(*a);
     ggml_set_input(*b);
@@ -147,7 +147,29 @@ static struct ggml_cgraph * build_graph_gpu(
     return gf;
 }
 
-static int run_pipeline_gpu() {
+// Growing variant: the input and the weight slice span the whole a_len, so the staging entry of the
+// backend must hold a different size for every ubatch. The weight is allocated at the largest size
+// and sliced, so the ops stay pinned on the GPUs.
+static struct ggml_cgraph * build_graph_gpu_grow(
+        struct ggml_context * ctx, struct ggml_tensor * w0, struct ggml_tensor * w1,
+        int a_len, struct ggml_tensor ** a, struct ggml_tensor ** out) {
+    *a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, a_len);
+    ggml_set_input(*a);
+
+    struct ggml_tensor * x0 = ggml_add(ctx, ggml_view_1d(ctx, w0, a_len, 0), *a);
+    struct ggml_tensor * x1 = x0;
+    if (w1 != NULL) {
+        x1 = ggml_add(ctx, ggml_view_1d(ctx, w1, a_len, 0), x0);
+    }
+    ggml_set_output(x1);
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, x1);
+    *out = x1;
+    return gf;
+}
+
+static int run_pipeline_gpu(bool growing) {
     std::vector<ggml_backend_dev_t> gpu_devs;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
@@ -165,7 +187,7 @@ static int run_pipeline_gpu() {
     }
     const int n_gpu = (int) gpu_devs.size();
 
-    printf("pipeline gpu: %d GPU ... ", n_gpu);
+    printf("pipeline gpu%s: %d GPU ... ", growing ? " grow" : "", n_gpu);
     fflush(stdout);
 
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -195,7 +217,8 @@ static int run_pipeline_gpu() {
     ggml_backend_sched_set_n_stages(sched, n_stages);
 
     // constant weights, one per GPU, pre-allocated on that GPU's default buffer so the ops that
-    // consume them are pinned there
+    // consume them are pinned there. the growing variant slices the weight to the current length
+    const int w_len = growing ? n_tokens + 8 + 4*(n_ubatch - 1) : n_tokens;
     std::vector<struct ggml_context *>      w_ctxs;
     std::vector<ggml_backend_buffer_t>      w_bufs;
     std::vector<struct ggml_tensor *>       weights;
@@ -206,14 +229,14 @@ static int run_pipeline_gpu() {
             /* .no_alloc   = */ true,
         };
         struct ggml_context * w_ctx = ggml_init(wparams);
-        struct ggml_tensor * w = ggml_new_tensor_1d(w_ctx, GGML_TYPE_F32, n_tokens);
+        struct ggml_tensor * w = ggml_new_tensor_1d(w_ctx, GGML_TYPE_F32, w_len);
         ggml_backend_buffer_t w_buf = ggml_backend_alloc_ctx_tensors(w_ctx, backends[g]);
         if (w_buf == NULL) {
             fprintf(stderr, "FAILED: weight alloc\n");
             exit(1);
         }
-        std::vector<float> host(n_tokens);
-        for (int i = 0; i < n_tokens; i++) {
+        std::vector<float> host(w_len);
+        for (int i = 0; i < w_len; i++) {
             host[i] = (float) (100*g + i);
         }
         ggml_backend_tensor_set(w, host.data(), 0, ggml_nbytes(w));
@@ -224,7 +247,29 @@ static int run_pipeline_gpu() {
     }
 
     std::vector<struct ggml_context *> ctxs(n_ubatch, nullptr);
-    std::vector<float> out(n_tokens);
+    std::vector<float> out(n_tokens + 8 + 4*(n_ubatch - 1));
+
+    // the input grows with the ubatch index: every ubatch needs a larger staging entry than the
+    // previous one. reserving the largest graph up front must fix the staging size, so the growing
+    // ubatches below never reallocate the ring (the reserve-before-submit path)
+    const auto a_len_of = [](int ub) { return n_tokens + 8 + 4*ub; };
+    if (growing) {
+        struct ggml_init_params rparams = {
+            /* .mem_size   = */ (ggml_tensor_overhead() + ggml_graph_overhead()) * 16,
+            /* .mem_buffer = */ NULL,
+            /* .no_alloc   = */ true,
+        };
+        struct ggml_context * r_ctx = ggml_init(rparams);
+        struct ggml_tensor * ra = nullptr;
+        struct ggml_tensor * rx = nullptr;
+        struct ggml_cgraph * rgf = build_graph_gpu_grow(r_ctx, weights[0], n_gpu > 1 ? weights[1] : NULL,
+                a_len_of(n_ubatch - 1), &ra, &rx);
+        if (!ggml_backend_sched_reserve(sched, rgf)) {
+            fprintf(stderr, "FAILED: reserve gpu\n");
+            exit(1);
+        }
+        ggml_free(r_ctx);
+    }
 
     for (int ub = 0; ub < n_ubatch; ub++) {
         struct ggml_init_params params = {
@@ -238,20 +283,23 @@ static int run_pipeline_gpu() {
             exit(1);
         }
 
+        const int a_len = growing ? a_len_of(ub) : n_tokens + 8;
         struct ggml_tensor * a = nullptr;
         struct ggml_tensor * b = nullptr;
         struct ggml_tensor * x1 = nullptr;
-        struct ggml_cgraph * gf = build_graph_gpu(ctxs[ub], weights[0], n_gpu > 1 ? weights[1] : NULL, &a, &b, &x1);
+        struct ggml_cgraph * gf = growing
+            ? build_graph_gpu_grow(ctxs[ub], weights[0], n_gpu > 1 ? weights[1] : NULL, a_len, &a, &x1)
+            : build_graph_gpu(ctxs[ub], weights[0], n_gpu > 1 ? weights[1] : NULL, a_len, &a, &b, &x1);
 
         if (!ggml_backend_sched_pipeline_begin(sched, gf, ub)) {
             fail("pipeline_begin gpu", ub, -1);
         }
 
         // distinct input values per ubatch
-        for (int i = 0; i < n_tokens + 8; i++) {
+        for (int i = 0; i < a_len; i++) {
             ((float *) a->data)[i] = (float) (ub*1000 + i);
         }
-        for (int i = 0; i < n_tokens; i++) {
+        for (int i = 0; !growing && i < n_tokens; i++) {
             ((float *) b->data)[i] = (float) (ub*7 + i);
         }
 
@@ -262,18 +310,24 @@ static int run_pipeline_gpu() {
         // overwrite the inputs immediately: the ubatch must have taken its own copy, including the
         // data read through the views of a and b
         memset(a->data, 0, ggml_nbytes(a));
-        memset(b->data, 0, ggml_nbytes(b));
+        if (!growing) {
+            memset(b->data, 0, ggml_nbytes(b));
+        }
 
         ggml_backend_sched_pipeline_wait(sched, ub);
 
+        const int out_len = growing ? a_len : n_tokens;
         ggml_backend_tensor_get(x1, out.data(), 0, ggml_nbytes(x1));
-        for (int i = 0; i < n_tokens; i++) {
-            const float av = (float) (ub*1000 + i + 8); // view of a at offset 8
-            const float bv = (float) (ub*7 + i);         // reshape of b
-            float expect = (float) i + av;               // w0 + view
-            expect += bv;                                // + reshape(b)
+        for (int i = 0; i < out_len; i++) {
+            const float av = (float) (ub*1000 + i); // full a
+            // w0 slice: (float) i, w1 slice: (float) (100 + i)
+            float expect = (float) i + av;
+            if (!growing) {
+                const float bv = (float) (ub*7 + i); // reshape of b
+                expect = (float) i + (float) (ub*1000 + i + 8) + bv; // w0 + view of a + reshape(b)
+            }
             if (n_gpu > 1) {
-                expect += (float) (100 + i);             // + w1
+                expect += (float) (100 + i); // + w1
             }
             if (memcmp(&out[i], &expect, sizeof(float)) != 0) {
                 fail("wrong output gpu", ub, i);
@@ -310,7 +364,8 @@ int main() {
     run_pipeline(2);
     printf("OK\n");
 
-    run_pipeline_gpu();
+    run_pipeline_gpu(false);
+    run_pipeline_gpu(true);
 
     return 0;
 }

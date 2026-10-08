@@ -137,6 +137,9 @@ struct ggml_backend_sched {
 
     // pinned host staging of the pipeline user inputs, indexed by backend
     struct ggml_backend_sched_staging staging[GGML_SCHED_MAX_BACKENDS];
+    // worst case staging entry size of the reserved graph, per backend. the ring is sized from this
+    // at reserve time, so the steady state (graphs no larger than the reserve) never grows again
+    size_t staging_reserve[GGML_SCHED_MAX_BACKENDS];
 
     // pipeline depth; 1 = no pipeline (single ubatch at a time)
     int n_stages;
