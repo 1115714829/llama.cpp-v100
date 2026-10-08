@@ -1105,9 +1105,9 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
-// the registered mapped buffer type of a device, or nullptr when the device (or its backend)
+// the mapped weights buffer type of a device, or nullptr when the device (or its backend)
 // does not offer one. this is a capability query, not a fallback: only CUDA exposes it
-static ggml_backend_buffer_type_t llama_buft_device_mapped_registered(ggml_backend_dev_t dev) {
+static ggml_backend_buffer_type_t llama_buft_device_mapped_weights(ggml_backend_dev_t dev) {
     if (dev == nullptr) {
         return nullptr;
     }
@@ -1116,12 +1116,12 @@ static ggml_backend_buffer_type_t llama_buft_device_mapped_registered(ggml_backe
         return nullptr;
     }
     typedef ggml_backend_buffer_type_t (*get_buft_t)(ggml_backend_dev_t);
-    auto get_buft = (get_buft_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_dev_mapped_registered_buft");
+    auto get_buft = (get_buft_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_dev_mapped_weights_buft");
     return get_buft != nullptr ? get_buft(dev) : nullptr;
 }
 
 ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() const {
-    if (ggml_backend_buffer_type_t mapped = llama_buft_device_mapped_registered(dev)) {
+    if (ggml_backend_buffer_type_t mapped = llama_buft_device_mapped_weights(dev)) {
         return mapped;
     }
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -1132,10 +1132,10 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() const {
 }
 
 // unlike a lazy table, the token embedding table is always read as a whole: when the device
-// does not offer a registered mapped buffer there is no buffer type for it here, and the table
+// does not offer a mapped weights buffer there is no buffer type for it here, and the table
 // keeps the buffer type of the input layer (a CPU buffer), see load_tensors()
 ggml_backend_buffer_type_t llama_model_loader::embd_read::buft() const {
-    return llama_buft_device_mapped_registered(dev);
+    return llama_buft_device_mapped_weights(dev);
 }
 
 bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
@@ -1378,13 +1378,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             return lazy.buft();
         }
 
-        // the token embedding table is pinned in place on the device that reads it. a converted
-        // BF16 table is rewritten while loading, so it cannot point into the read-only mapping.
-        // load_tensors() only sets embd.dev after checking that the device offers the buffer type
+        // the token embedding table is loaded into mapped host memory read by the device that
+        // consumes it. a converted BF16 table is rewritten while loading and needs a writable
+        // buffer; load_tensors() only sets embd.dev after checking that the device offers the
+        // buffer type
         if (!bf16_as_f16 && tn.tensor == LLM_TENSOR_TOKEN_EMBD && !(flags & TENSOR_DUPLICATED) && embd.dev != nullptr) {
-            ggml_backend_buffer_type_t registered = embd.buft();
-            GGML_ASSERT(registered != nullptr);
-            return registered;
+            ggml_backend_buffer_type_t mapped = embd.buft();
+            GGML_ASSERT(mapped != nullptr);
+            return mapped;
         }
 
         // select the buffer type for this tensor
@@ -1798,7 +1799,7 @@ bool llama_model_loader::load_all_data(
         tensors.push_back(cur);
     }
 
-    // a device-readable host buffer (e.g. the CUDA mapped host buffer) is copied into, so the page
+    // a device-readable host buffer (the CUDA mapped host buffers) is copied into, so the page
     // cache of the source file range can be dropped right after each tensor to avoid keeping a
     // second copy of the weights in host memory
     auto is_device_readable_buft = [](ggml_backend_buffer_type_t buft) -> bool {
@@ -1814,43 +1815,6 @@ bool llama_model_loader::load_all_data(
         auto is_mapped = (ggml_backend_buft_is_mapped_t)
             ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_mapped");
         return is_mapped != nullptr && is_mapped(buft);
-    };
-
-    // device address of a host address inside a registered mapped buffer, or nullptr when the
-    // buffer is not one (its tensors are then addressed by the host pointer itself)
-    auto mapped_buffer_host_to_device = [](ggml_backend_buffer_t buffer, void * host_ptr) -> void * {
-        if (buffer == nullptr) {
-            return nullptr;
-        }
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
-        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
-        if (reg == nullptr) {
-            return nullptr;
-        }
-        typedef void * (*host_to_device_t)(ggml_backend_buffer_t, void *);
-        auto host_to_device = (host_to_device_t)
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_mapped_buffer_host_to_device");
-        return host_to_device != nullptr ? host_to_device(buffer, host_ptr) : nullptr;
-    };
-
-    // a buffer built in place from an mmap range: its tensors are the file pages themselves
-    // (pinned in place, read over UVA through the device alias), so loading only binds the
-    // tensor to them and never copies. this is checked from the buffer type, not from the
-    // state of the tensor: every tensor of such a buffer must be treated the same way
-    auto is_registered_mapped_buffer = [](ggml_backend_buffer_t buffer) -> bool {
-        if (buffer == nullptr) {
-            return false;
-        }
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buffer);
-        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
-        if (reg == nullptr) {
-            return false;
-        }
-        typedef bool (*is_registered_t)(ggml_backend_buffer_type_t);
-        auto is_registered = (is_registered_t)
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_mapped_registered");
-        return is_registered != nullptr && is_registered(buft);
     };
 
     // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
@@ -1899,8 +1863,6 @@ bool llama_model_loader::load_all_data(
                 throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
             }
 
-            // a converted tensor is rewritten, so it cannot be a read-only registered mapped buffer
-            GGML_ASSERT(cur->buffer == nullptr || !is_registered_mapped_buffer(cur->buffer));
             ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
 
             // the weights are now in a buffer the device reads directly, drop the page cache
@@ -1929,24 +1891,8 @@ bool llama_model_loader::load_all_data(
             }
 
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
-            const bool buf_mmap_registered = is_registered_mapped_buffer(buf_mmap);
-            if (buf_mmap && (cur->data == nullptr || buf_mmap_registered)) {
-                // a registered mapped buffer holds the mmap pages themselves: the tensor is
-                // addressed by the device alias of its range and nothing is copied. this must
-                // hold for every tensor of the buffer, so it does not depend on cur->data
-                void * tensor_data = data;
-                if (buf_mmap_registered) {
-                    if (cur->data != nullptr) {
-                        throw std::runtime_error(format("%s: tensor '%s' is already bound to registered mapped buffer %s",
-                                __func__, ggml_get_name(cur), ggml_backend_buffer_name(buf_mmap)));
-                    }
-                    tensor_data = mapped_buffer_host_to_device(buf_mmap, data);
-                    if (tensor_data == nullptr) {
-                        throw std::runtime_error(format("%s: tensor '%s' is outside registered mapped buffer %s",
-                                __func__, ggml_get_name(cur), ggml_backend_buffer_name(buf_mmap)));
-                    }
-                }
-                if (ggml_backend_tensor_alloc(buf_mmap, cur, tensor_data) != GGML_STATUS_SUCCESS) {
+            if (buf_mmap && cur->data == nullptr) {
+                if (ggml_backend_tensor_alloc(buf_mmap, cur, data) != GGML_STATUS_SUCCESS) {
                     throw std::runtime_error(format("%s: failed to bind tensor '%s' to %s",
                             __func__, ggml_get_name(cur), ggml_backend_buffer_name(buf_mmap)));
                 }
@@ -1961,9 +1907,6 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
-                // a registered mapped tensor is the mmap range itself: it is never uploaded
-                GGML_ASSERT(!buf_mmap_registered);
-                GGML_ASSERT(cur->buffer == nullptr || !is_registered_mapped_buffer(cur->buffer));
                 ggml_backend_tensor_set(cur, data, 0, n_size);
 
                 // the weights are now in a buffer the device reads directly, drop the page cache
@@ -1973,10 +1916,6 @@ bool llama_model_loader::load_all_data(
             }
         } else {
             const auto & file = files.at(weight->idx);
-
-            // a registered mapped buffer can only be built from an mmap range, so a tensor of
-            // this type never appears on a non-mmap load path
-            GGML_ASSERT(cur->buffer == nullptr || !is_registered_mapped_buffer(cur->buffer));
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
