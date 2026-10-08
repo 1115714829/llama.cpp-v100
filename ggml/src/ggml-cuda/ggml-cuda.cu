@@ -202,12 +202,17 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
 // Host ranges pinned in place with cudaHostRegister, either by the registered mapped
 // buffer type or through the ggml_backend_register_host_buffer proc.
 //
+// Both registration sites pass cudaHostRegisterReadOnly, so the device only reads from
+// these ranges: the host side is always the source of a copy, and only H2D copies can
+// start inside a range and need splitting. If a writable registration is ever added,
+// the D2H direction must be re-evaluated.
+//
 // A cudaMemcpy with a host pointer is classified by its starting address: when the range
 // starts inside a registered allocation but ends outside it, the runtime fails the copy
 // with "invalid argument". A registered mapped buffer covers whole pages, so its last
 // page can hold the start of the next tensor in the mmap-ed file; loading that tensor
-// starts inside the registered range and ends outside it. Copies that touch a host range
-// are therefore split at the end of every registered range they enter.
+// starts inside the registered range and ends outside it. H2D copies that touch a host
+// range are therefore split at the end of every registered range they enter.
 struct ggml_cuda_registered_host_range {
     uintptr_t begin;
     uintptr_t end;
@@ -276,24 +281,6 @@ void ggml_cuda_memcpy_h2d_async(void * dst, const void * src, size_t size, cudaS
     }
 }
 
-// D2H is the mirror image: the host side is the destination
-void ggml_cuda_memcpy_d2h_async(void * dst, const void * src, size_t size, cudaStream_t stream) {
-    const char * src_bytes = (const char *) src;
-    char * dst_bytes = (char *) dst;
-
-    while (size > 0) {
-        const uintptr_t range_end = ggml_cuda_registered_host_range_end(dst_bytes);
-        size_t chunk = size;
-        if (range_end != 0 && (uintptr_t) dst_bytes + size > range_end) {
-            chunk = (size_t) (range_end - (uintptr_t) dst_bytes);
-        }
-        CUDA_CHECK(cudaMemcpyAsync(dst_bytes, src_bytes, chunk, cudaMemcpyDeviceToHost, stream));
-        src_bytes += chunk;
-        dst_bytes += chunk;
-        size      -= chunk;
-    }
-}
-
 // only the host side of a 2D copy can fall inside a registered range; when the whole
 // host-side span stays clear of every range, keep the copy 2D, otherwise split per row
 static void ggml_cuda_memcpy_2d_h2d_async(char * dst, size_t dpitch, const char * src, size_t spitch, size_t width, size_t height, cudaStream_t stream) {
@@ -306,19 +293,6 @@ static void ggml_cuda_memcpy_2d_h2d_async(char * dst, size_t dpitch, const char 
     }
     for (size_t y = 0; y < height; ++y) {
         ggml_cuda_memcpy_h2d_async(dst + y*dpitch, src + y*spitch, width, stream);
-    }
-}
-
-static void ggml_cuda_memcpy_2d_d2h_async(char * dst, size_t dpitch, const char * src, size_t spitch, size_t width, size_t height, cudaStream_t stream) {
-    if (height == 0 || width == 0) {
-        return;
-    }
-    if (!ggml_cuda_registered_host_range_intersects(dst, (height - 1)*dpitch + width)) {
-        CUDA_CHECK(cudaMemcpy2DAsync(dst, dpitch, src, spitch, width, height, cudaMemcpyDeviceToHost, stream));
-        return;
-    }
-    for (size_t y = 0; y < height; ++y) {
-        ggml_cuda_memcpy_d2h_async(dst + y*dpitch, src + y*spitch, width, stream);
     }
 }
 
@@ -942,7 +916,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    ggml_cuda_memcpy_d2h_async(data, (const char *) tensor->data + offset, size, cudaStreamPerThread);
+    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -960,7 +934,8 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    ggml_cuda_memcpy_2d_d2h_async((char *) data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaStreamPerThread);
+    CUDA_CHECK(cudaMemcpy2DAsync(
+        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
@@ -4609,7 +4584,7 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    ggml_cuda_memcpy_d2h_async(data, (const char *) tensor->data + offset, size, cuda_ctx->stream());
+    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -4629,7 +4604,8 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    ggml_cuda_memcpy_2d_d2h_async((char *) data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cuda_ctx->stream());
+    CUDA_CHECK(cudaMemcpy2DAsync(
+        data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
