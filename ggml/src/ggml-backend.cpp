@@ -1097,18 +1097,18 @@ static char causes[GGML_DEFAULT_GRAPH_SIZE*16 + GGML_SCHED_MAX_SPLITS_DEBUG*GGML
 #define GET_CAUSE(node) ""
 #endif
 
-// true when the buffer type wraps host memory pinned so that every device of the backend can
-// read it in place (the CUDA registered mapped buffer type). capability query: backends that
-// do not expose the hook return false
-static bool ggml_backend_buft_is_device_mapped_registered(ggml_backend_buffer_type_t buft) {
+// true when the buffer type holds host memory of the weights that every device of the
+// backend can read in place (the CUDA mapped weights buffer type). capability query: backends
+// that do not expose the hook return false
+static bool ggml_backend_buft_is_device_mapped_weights(ggml_backend_buffer_type_t buft) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
     ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
     if (reg == nullptr) {
         return false;
     }
-    typedef bool (*is_registered_t)(ggml_backend_buffer_type_t);
-    auto is_registered = (is_registered_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_mapped_registered");
-    return is_registered != nullptr && is_registered(buft);
+    typedef bool (*is_mapped_weights_t)(ggml_backend_buffer_type_t);
+    auto is_mapped_weights = (is_mapped_weights_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_mapped_weights");
+    return is_mapped_weights != nullptr && is_mapped_weights(buft);
 }
 
 // returns the backend that should be used for the node based on the current locations
@@ -1159,11 +1159,11 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
                 continue;
             }
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-                // a weight in a registered mapped buffer is host memory that every device can
-                // read in place: it does not decide where the op runs. leave the backend to the
+                // a mapped weights buffer is host memory that every device can read in
+                // place: it does not decide where the op runs. leave the backend to the
                 // graph around the op, so the op runs on the device that consumes its result
                 // instead of copying the result there. capability query only
-                if (ggml_backend_buft_is_device_mapped_registered(src->buffer->buft)) {
+                if (ggml_backend_buft_is_device_mapped_weights(src->buffer->buft)) {
                     continue;
                 }
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);

@@ -1,21 +1,16 @@
-// Tests the H2D handling of cudaHostRegister-ed host ranges in the CUDA backend.
+// Tests the CUDA mapped weights buffer type: pinned host memory owned by the buffer that the
+// device reads in place over UVA.
 //
-// A cudaMemcpy whose host side starts inside a registered range but ends outside it fails
-// with "invalid argument" (the runtime classifies the copy by the starting address). The
-// registered mapped buffer type pins whole pages in place, so its first/last page can hold
-// the neighboring tensor of the mmap-ed model file; loading that tensor then copies from a
-// pointer inside the registered range. The backend must split such copies at the range end.
-// Host ranges are registered read-only, so only H2D copies can have a registered source.
+// The weights that GPU kernels read in place (the token embedding table, the PLE table) use
+// this buffer type. The buffer is allocated with cudaHostAlloc mapped, the host side is
+// written through the ordinary backend API (set_tensor), and the data is copied in by the
+// model loader, which then drops the page cache of the source range in the order of the
+// weights. The test checks allocation, host writes, a GET_ROWS graph computed on the device
+// with the weights read over UVA, and release.
 //
-// The test uses only the public backend API: the registered mapped buffer is reached
-// through the proc addresses of the CUDA backend. It skips (and passes) when no CUDA device
-// is present or the backend is too old.
-//
-// cudaHostRegister also refuses a range that is already registered, and the page-aligned
-// ranges of two nearby weights can share an edge page, so the backend merges overlapping
-// or adjacent ranges into one segment with a reference count. The test checks two such
-// ranges in both build orders and both release orders, and that the segment table is empty
-// once both buffers are freed.
+// The test uses only the public backend API: the buffer type is reached through the proc
+// address of the CUDA backend. It skips (and passes) when no CUDA device is present or the
+// backend is too old.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -26,25 +21,7 @@
 #include <cstring>
 #include <vector>
 
-#if !defined(_WIN32)
-#include <cstdlib>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
-#endif
-
-#if defined(_WIN32)
-
-int main() {
-    printf("SKIP: this test maps a file with mmap\n");
-    return 0;
-}
-
-#else
-
-typedef ggml_backend_buffer_type_t (*cuda_dev_mapped_registered_buft_t)(ggml_backend_dev_t dev);
-typedef ggml_backend_buffer_t (*cuda_mapped_buffer_from_host_ptr_buft_t)(ggml_backend_buffer_type_t buft, void * ptr, size_t size);
-typedef size_t (*cuda_registered_host_segment_count_t)(void);
+typedef ggml_backend_buffer_type_t (*cuda_dev_mapped_weights_buft_t)(ggml_backend_dev_t dev);
 
 static bool check_bytes(const char * what, const uint8_t * got, const uint8_t * want, size_t n) {
     for (size_t i = 0; i < n; ++i) {
@@ -57,10 +34,6 @@ static bool check_bytes(const char * what, const uint8_t * got, const uint8_t * 
 }
 
 int main() {
-    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
-    const size_t n_pages = 64;
-    const size_t nbytes = n_pages * page;
-
     // find the CUDA backend through the public device API
     ggml_backend_dev_t dev = nullptr;
     for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -77,230 +50,103 @@ int main() {
     }
 
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    auto registered_buft = (cuda_dev_mapped_registered_buft_t)
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_dev_mapped_registered_buft");
-    auto from_host_ptr = (cuda_mapped_buffer_from_host_ptr_buft_t)
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_mapped_buffer_from_host_ptr_buft");
-    if (registered_buft == nullptr || from_host_ptr == nullptr) {
-        printf("SKIP: the CUDA backend does not expose the registered host buffer procs\n");
+    auto mapped_weights_buft = (cuda_dev_mapped_weights_buft_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_dev_mapped_weights_buft");
+    if (mapped_weights_buft == nullptr) {
+        printf("SKIP: the CUDA backend does not expose the mapped weights buffer proc\n");
         return 0;
     }
-    if (registered_buft(dev) == nullptr) {
-        printf("SKIP: host memory cannot be registered read-only\n");
+    ggml_backend_buffer_type_t buft = mapped_weights_buft(dev);
+    if (buft == nullptr) {
+        printf("SKIP: the CUDA backend does not offer a mapped weights buffer type\n");
         return 0;
     }
 
-    // a file-backed read-only mapping, the same kind of memory a model file is mmap-ed as
-    char path[] = "/tmp/ggml-cuda-host-register-XXXXXX";
-    const int fd = mkstemp(path);
-    if (fd < 0 || ftruncate(fd, (off_t) nbytes) != 0) {
-        fprintf(stderr, "FAIL: cannot create the test file\n");
-        return 1;
-    }
-    unlink(path);
-    uint8_t * file = (uint8_t *) mmap(nullptr, nbytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (file == MAP_FAILED) {
-        fprintf(stderr, "FAIL: mmap failed\n");
-        return 1;
-    }
-    for (size_t i = 0; i < nbytes; ++i) {
-        file[i] = (uint8_t) ((i * 7 + 3) & 0xff);
-    }
-    // the loading path flushes the mapped range before pinning it (llama_mmap::flush_range):
-    // pinning a page that still has to be written back can wedge the file system writeback,
-    // so the test must not register dirty pages either
-    if (msync(file, nbytes, MS_SYNC) != 0) {
-        fprintf(stderr, "FAIL: msync before registering failed\n");
-        return 1;
-    }
-    if (mprotect(file, nbytes, PROT_READ) != 0) {
-        fprintf(stderr, "FAIL: mprotect failed\n");
-        return 1;
-    }
-
-    // an ordinary device buffer
     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
     if (backend == nullptr) {
         fprintf(stderr, "FAIL: cannot initialize the CUDA backend\n");
         return 1;
     }
+
+    const int64_t n_embd   = 64;
+    const int64_t n_rows   = 32;
+    const int64_t n_tokens = 4;
+
     struct ggml_init_params params = {
-        /* .mem_size   = */ 16 * 1024,
+        /* .mem_size   = */ 1024 * 1024,
         /* .mem_buffer = */ nullptr,
         /* .no_alloc   = */ true,
     };
-    ggml_context * ctx = ggml_init(params);
-    if (ctx == nullptr) {
+    ggml_context * ctx_w = ggml_init(params); // the table, in the mapped weights buffer
+    ggml_context * ctx_g = ggml_init(params); // ids, output and the graph, on the device
+    if (ctx_w == nullptr || ctx_g == nullptr) {
         fprintf(stderr, "FAIL: ggml_init failed\n");
         return 1;
     }
-    ggml_tensor * tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) (nbytes / sizeof(float)));
-    ggml_backend_buffer_t device_buffer = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (device_buffer == nullptr) {
-        fprintf(stderr, "FAIL: cannot allocate the device tensor\n");
+
+    printf("device: %s\n", ggml_backend_dev_description(dev));
+
+    ggml_tensor * table = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F16, n_embd, n_rows);
+    ggml_backend_buffer_t table_buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx_w, buft);
+    if (table_buffer == nullptr) {
+        fprintf(stderr, "FAIL: cannot allocate the mapped weights buffer\n");
         return 1;
     }
 
-    printf("device: %s, page size: %zu\n", ggml_backend_dev_description(dev), page);
+    // F16 bit patterns of 1.x .. 7.x values, so no comparison trips over NaN or denormals
+    std::vector<uint16_t> rows((size_t) (n_embd * n_rows));
+    for (size_t i = 0; i < rows.size(); ++i) {
+        rows[i] = (uint16_t) ((((i % 7) + 1) << 10) | (i & 0x3ff));
+    }
 
-    // pin pages [16, 32) of the file mapping in place through the registered mapped buffer
-    ggml_backend_buffer_t registered = from_host_ptr(registered_buft(dev), file + 16 * page, 16 * page);
-    if (registered == nullptr) {
-        fprintf(stderr, "FAIL: cannot build the registered mapped buffer\n");
+    // write through the backend API and read the same bytes back: the host side of the buffer
+    // must hold, and the device address must map, exactly the bytes that were written
+    ggml_backend_tensor_set(table, rows.data(), 0, rows.size() * sizeof(uint16_t));
+    std::vector<uint16_t> readback(rows.size(), 0);
+    ggml_backend_tensor_get(table, readback.data(), 0, rows.size() * sizeof(uint16_t));
+    if (!check_bytes("host round trip", (const uint8_t *) readback.data(), (const uint8_t *) rows.data(), rows.size() * sizeof(uint16_t))) {
         return 1;
     }
 
-    // ranges in pages; [30, 34) starts inside the registered range and ends outside it,
-    // which is the case that fails with "invalid argument" without the splitting
-    const struct {
-        size_t first;
-        size_t last;
-        const char * name;
-    } ranges[] = {
-        { 17, 21, "inside"          },
-        {  2,  6, "outside"         },
-        { 14, 18, "enter from out"  },
-        { 30, 34, "leave through"   },
-        { 10, 40, "span the whole"  },
-    };
+    // GPU reads the table over UVA: a GET_ROWS graph on the device, ids and output in an
+    // ordinary device buffer
+    ggml_tensor * ids = ggml_new_tensor_1d(ctx_g, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(ids, "ids");
+    ggml_tensor * out = ggml_get_rows(ctx_g, table, ids);
+    ggml_set_name(out, "out");
+    ggml_backend_buffer_t graph_buffer = ggml_backend_alloc_ctx_tensors_from_buft(ctx_g, ggml_backend_dev_buffer_type(dev));
+    if (graph_buffer == nullptr) {
+        fprintf(stderr, "FAIL: cannot allocate the device buffer\n");
+        return 1;
+    }
 
-    std::vector<uint8_t> got(nbytes);
-    for (const auto & r : ranges) {
-        const uint8_t * src = file + r.first * page;
-        const size_t n = (r.last - r.first) * page;
+    const int32_t ids_data[n_tokens] = { 3, 0, 31, 7 };
+    ggml_backend_tensor_set(ids, ids_data, 0, sizeof(ids_data));
 
-        ggml_backend_tensor_set(tensor, src, 0, n);
-        memset(got.data(), 0, n);
-        ggml_backend_tensor_get(tensor, got.data(), 0, n);
-        if (!check_bytes(r.name, got.data(), src, n)) {
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx_g, 16, false);
+    ggml_build_forward_expand(gf, out);
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "FAIL: GET_ROWS graph compute failed\n");
+        return 1;
+    }
+
+    std::vector<uint16_t> got((size_t) (n_embd * n_tokens), 0);
+    ggml_backend_tensor_get(out, got.data(), 0, got.size() * sizeof(uint16_t));
+    for (int64_t t = 0; t < n_tokens; ++t) {
+        const uint16_t * want = rows.data() + (size_t) ids_data[t] * n_embd;
+        const uint16_t * have = got.data() + (size_t) t * n_embd;
+        if (!check_bytes("GET_ROWS over UVA", (const uint8_t *) have, (const uint8_t *) want, n_embd * sizeof(uint16_t))) {
             return 1;
         }
     }
 
-    // 2D copies: the host-side span of the whole copy decides whether it can stay 2D.
-    // (a) the span overlaps the registered range and its first row starts inside the
-    // range and ends outside it; (b) the span stays clear of the registered range.
-    const size_t row_w    = 3 * page;  // bytes per row
-    const size_t stride_d = 8 * page;  // host-side stride between rows
-    const size_t stride_t = 12 * page; // tensor-side stride between rows
-    const size_t n_rows   = 3;
-
-    // (a) rows start at pages 30, 38, 46: the span [30, 49) overlaps [16, 32) and row 0
-    // ends outside the range
-    std::vector<uint8_t> round(nbytes, 0);
-    ggml_backend_tensor_set_2d(tensor, file + 30 * page, 0, row_w, n_rows, stride_t, stride_d);
-    ggml_backend_tensor_get_2d(tensor, round.data() + 30 * page, 0, row_w, n_rows, stride_t, stride_d);
-    for (size_t y = 0; y < n_rows; ++y) {
-        if (!check_bytes("2D overlap", round.data() + (30 + y * 8) * page, file + (30 + y * 8) * page, row_w)) {
-            return 1;
-        }
-    }
-
-    // (b) rows start at pages 40, 48, 56: the span [40, 59) is clear of [16, 32)
-    ggml_backend_tensor_set_2d(tensor, file + 40 * page, 0, row_w, n_rows, stride_t, stride_d);
-    ggml_backend_tensor_get_2d(tensor, round.data() + 40 * page, 0, row_w, n_rows, stride_t, stride_d);
-    for (size_t y = 0; y < n_rows; ++y) {
-        if (!check_bytes("2D outside", round.data() + (40 + y * 8) * page, file + (40 + y * 8) * page, row_w)) {
-            return 1;
-        }
-    }
-
-    // release the registration: the same range must copy directly afterwards
-    ggml_backend_buffer_free(registered);
-    registered = nullptr;
-
-    ggml_backend_tensor_set(tensor, file + 30 * page, 0, 4 * page);
-    memset(got.data(), 0, 4 * page);
-    ggml_backend_tensor_get(tensor, got.data(), 0, 4 * page);
-    if (!check_bytes("released file range", got.data(), file + 30 * page, 4 * page)) {
-        return 1;
-    }
-
-    // Two weights of the same file less than a page apart produce page-aligned ranges
-    // that share an edge page. Registering both must succeed (the shared page is
-    // registered once) and the data of both must stay readable. Cover both build orders
-    // and both release orders.
-    auto segment_count = (cuda_registered_host_segment_count_t)
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_registered_host_segment_count");
-    if (segment_count == nullptr) {
-        printf("SKIP: the CUDA backend does not expose the registered segment diagnostics\n");
-        return 0;
-    }
-    auto expect_segments = [&](size_t want, const char * what) -> bool {
-        const size_t n = segment_count();
-        if (n != want) {
-            fprintf(stderr, "FAIL: %s: %zu registered segments, want %zu\n", what, n, want);
-            return false;
-        }
-        return true;
-    };
-    auto copy_range = [&](size_t offset, size_t nbytes_check, const char * what) -> bool {
-        ggml_backend_tensor_set(tensor, file + offset, 0, nbytes_check);
-        memset(got.data(), 0, nbytes_check);
-        ggml_backend_tensor_get(tensor, got.data(), 0, nbytes_check);
-        return check_bytes(what, got.data(), file + offset, nbytes_check);
-    };
-
-    // (a) small first, then large: [16, 19) + [18, 22) merge into [16, 22)
-    ggml_backend_buffer_t small = from_host_ptr(registered_buft(dev), file + 16 * page + 100, 2 * page);
-    ggml_backend_buffer_t large = from_host_ptr(registered_buft(dev), file + 18 * page + 100, 3 * page);
-    if (small == nullptr || large == nullptr) {
-        fprintf(stderr, "FAIL: cannot register two overlapping mapped buffers\n");
-        return 1;
-    }
-    if (!expect_segments(1, "after the small-then-large build")) {
-        return 1;
-    }
-    if (!copy_range(16 * page, 2 * page, "merged small first") ||
-        !copy_range(19 * page, 2 * page, "merged small second") ||
-        !copy_range(20 * page + 100, 2 * page, "merged leaving the segment")) {
-        return 1;
-    }
-    ggml_backend_buffer_free(small);
-    if (!expect_segments(1, "after releasing the small buffer")) {
-        return 1;
-    }
-    ggml_backend_buffer_free(large);
-    if (!expect_segments(0, "after releasing the large buffer")) {
-        return 1;
-    }
-    // the merged range is a normal unregistered range again
-    if (!copy_range(18 * page, 3 * page, "released merged range")) {
-        return 1;
-    }
-
-    // (b) large first, then small: [16, 21) + [20, 22) merge into [16, 22)
-    ggml_backend_buffer_t large2 = from_host_ptr(registered_buft(dev), file + 16 * page + 100, 4 * page);
-    ggml_backend_buffer_t small2 = from_host_ptr(registered_buft(dev), file + 20 * page + 100, 1 * page);
-    if (large2 == nullptr || small2 == nullptr) {
-        fprintf(stderr, "FAIL: cannot register two overlapping mapped buffers\n");
-        return 1;
-    }
-    if (!expect_segments(1, "after the large-then-small build")) {
-        return 1;
-    }
-    if (!copy_range(16 * page, 2 * page, "merged large first") ||
-        !copy_range(21 * page, 1 * page, "merged large second") ||
-        !copy_range(21 * page + 100, 1 * page, "merged leaving the segment")) {
-        return 1;
-    }
-    ggml_backend_buffer_free(large2);
-    if (!expect_segments(1, "after releasing the large buffer")) {
-        return 1;
-    }
-    ggml_backend_buffer_free(small2);
-    if (!expect_segments(0, "after releasing the small buffer")) {
-        return 1;
-    }
-
-    munmap(file, nbytes);
-    close(fd);
-    ggml_backend_buffer_free(device_buffer);
-    ggml_free(ctx);
+    // release both buffers: the mapped one frees its host allocation
+    ggml_backend_buffer_free(table_buffer);
+    ggml_backend_buffer_free(graph_buffer);
+    ggml_free(ctx_w);
+    ggml_free(ctx_g);
     ggml_backend_free(backend);
 
     printf("ALL_OK\n");
     return 0;
 }
-
-#endif // defined(_WIN32)

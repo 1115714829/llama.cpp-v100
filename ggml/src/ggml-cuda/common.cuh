@@ -1204,9 +1204,10 @@ void ggml_cuda_memcpy_h2d_async(void * dst, const void * src, size_t size, cudaS
 struct ggml_backend_cuda_buffer_type_context {
     int device;
     std::string name;
-    // set for the registered mapped buffer type: it wraps an existing host range pinned in
-    // place, instead of an allocation owned by the mapped buffer type
-    bool registered = false;
+    // set for the mapped weights buffer type: a device-readable host buffer without row
+    // padding that any device of the backend may read (the mapped buffer type itself places
+    // its memory per device)
+    bool mapped_weights = false;
 };
 
 int ggml_backend_cuda_get_device_count();
