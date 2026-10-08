@@ -155,13 +155,12 @@ bool ggml_cuda_moe_grouped_mul_mat_id_supported(const ggml_tensor * dst, const i
         default:
             return false;
     }
-    // T = 1..8 is the decode and verify window, n > 8 is prefill. The entries of one expert are
-    // staged into shared memory in groups and the weight row is read once per group, so the same
-    // kernel serves both ranges; the group width follows the average columns per expert. There is
-    // no upper token bound: the kernel loops over the columns of one expert, a hot expert with
-    // more columns than the group width stays correct.
-    // decode and verify windows (T <= MOE_GROUPED_MAX_TOKENS) stay on MMVQ: a few tokens rarely
-    // share an expert, so grouping saves no weight reads and only adds empty blocks (t54)
+    // prefill only: the entries of one expert are staged into shared memory in groups and the
+    // weight row is read once per group; the group width follows the average columns per expert.
+    // There is no upper token bound: the kernel loops over the columns of one expert, a hot
+    // expert with more columns than the group width stays correct. Decode and verify windows
+    // (T <= MOE_GROUPED_MAX_TOKENS) stay on MMVQ: a few tokens rarely share an expert, so
+    // grouping saves no weight reads and only adds empty blocks (t54)
     if (dst->ne[2] <= MOE_GROUPED_MAX_TOKENS) {
         return false;
     }
