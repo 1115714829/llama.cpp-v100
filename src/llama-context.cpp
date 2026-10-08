@@ -148,6 +148,24 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
 static constexpr uint32_t LLAMA_DEC_SLOT_MAX_TOKENS       = 16;
 static constexpr uint32_t LLAMA_DEC_SLOT_MAX_TOKENS_MULTI = 64;
 
+// number of distinct devices the layers of this context span. this is the prefill pipeline depth:
+// one stage per compute segment. the MTP context computes a single layer on one device
+static int count_layer_devices(const llama_model & model, const llama_cparams & cparams) {
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return 0;
+    }
+
+    std::vector<ggml_backend_dev_t> devices;
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        ggml_backend_dev_t dev = model.dev_layer(il);
+        if (std::find(devices.begin(), devices.end(), dev) == devices.end()) {
+            devices.push_back(dev);
+        }
+    }
+
+    return (int) devices.size();
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -517,24 +535,13 @@ llama_context::llama_context(
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
         // TODO: move these checks to ggml_backend_sched
-        // pipeline parallelism makes the scheduler keep n_copies input copies and events, which is
+        // pipeline parallelism makes the scheduler keep two input copies and events, which is
         // required for multi-batch prefill overlap. it does not require the whole model to be offloaded.
         // it only applies when the layers this context computes span more than one device: the MTP
         // context computes the nextn layer on a single device, and its single-token draft steps would
         // only pay for the input copy rotation and the synchronous pipeline input copies
-        bool layers_span_devices = false;
-        if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
-            ggml_backend_dev_t dev0 = nullptr;
-            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
-                ggml_backend_dev_t dev = model.dev_layer(il);
-                if (dev0 == nullptr) {
-                    dev0 = dev;
-                } else if (dev != dev0) {
-                    layers_span_devices = true;
-                    break;
-                }
-            }
-        }
+        const int n_layer_devices = count_layer_devices(model, cparams);
+        const bool layers_span_devices = n_layer_devices > 1;
 
         bool pipeline_parallel =
             layers_span_devices &&
@@ -771,13 +778,10 @@ void llama_context::sched_reserve() {
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_async_inputs(sched.get(), true);
-    // prefill pipeline depth: one stage per compute segment (device), capped by the number of input
-    // copies so each in-flight ubatch has its own copy. n_stages == 1 keeps submit/wait/advance
-    // equivalent to the single-batch path
+    // prefill pipeline depth: one stage per compute segment (device) the layers of this context
+    // span. input copies stay at two (double buffering), independent of the depth
     if (cparams.pipeline_parallel) {
-        const int n_stages = std::min(ggml_backend_sched_get_n_backends(sched.get()),
-                                      ggml_backend_sched_get_n_copies(sched.get()));
-        ggml_backend_sched_set_n_stages(sched.get(), n_stages);
+        ggml_backend_sched_set_n_stages(sched.get(), count_layer_devices(model, cparams));
     }
 
     // the injection graph of a DFlash draft gets its own scheduler, see gf_res_slot
@@ -1996,7 +2000,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             // split and allocate this ubatch on the next pipeline stage, without waiting for the
             // in-flight ubatches. the graph result must not be reused while a ubatch is in flight,
             // so the caller rebuilds the graph for every pipeline ubatch
-            if (!ggml_backend_sched_pipeline_begin(sched_cur, gf)) {
+            if (!ggml_backend_sched_pipeline_begin(sched_cur, gf, ubatch_id)) {
                 LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
                 ret = GGML_STATUS_ALLOC_FAILED;
                 return nullptr;

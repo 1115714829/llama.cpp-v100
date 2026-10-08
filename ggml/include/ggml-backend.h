@@ -375,8 +375,9 @@ extern "C" {
     // n_stages is the pipeline depth: the number of ubatches that may be in flight at once.
     // n_stages == 1 means no overlap, equivalent to ggml_backend_sched_graph_compute_async.
     GGML_API void                 ggml_backend_sched_set_n_stages(ggml_backend_sched_t sched, int n_stages);
-    // Split and allocate one ubatch graph on the next stage's input copy, without computing it.
-    GGML_API bool                 ggml_backend_sched_pipeline_begin(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
+    // Split and allocate one ubatch graph on its input copy slot (ubatch_id % n_copies), without
+    // computing it. ubatch_id must increase across calls.
+    GGML_API bool                 ggml_backend_sched_pipeline_begin(ggml_backend_sched_t sched, struct ggml_cgraph * graph, int64_t ubatch_id);
     // Enqueue all splits of the graph prepared by ggml_backend_sched_pipeline_begin, without waiting.
     // ubatch_id must increase across calls.
     GGML_API enum ggml_status     ggml_backend_sched_pipeline_submit(ggml_backend_sched_t sched, int64_t ubatch_id);
