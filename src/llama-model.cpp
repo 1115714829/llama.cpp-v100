@@ -1345,6 +1345,34 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
     return buft_list;
 }
 
+// true when the buffer type is a device-readable host buffer built in place from an existing
+// host range (the CUDA registered mapped buffer)
+static bool ggml_backend_buft_is_device_mapped_registered(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return false;
+    }
+    typedef bool (*is_registered_t)(ggml_backend_buffer_type_t);
+    auto is_registered = (is_registered_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_mapped_registered");
+    return is_registered != nullptr && is_registered(buft);
+}
+
+// build a registered mapped buffer for the given registered mapped buffer type from a host range
+static ggml_backend_buffer_t ggml_backend_buft_mapped_buffer_from_host_ptr(ggml_backend_buffer_type_t buft, void * ptr, size_t size) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    typedef ggml_backend_buffer_t (*from_ptr_t)(ggml_backend_buffer_type_t, void *, size_t);
+    auto from_ptr = (from_ptr_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_mapped_buffer_from_host_ptr_buft");
+    return from_ptr != nullptr ? from_ptr(buft, ptr, size) : nullptr;
+}
+
 struct llama_model::impl {
     impl() = default;
     ~impl() = default;
@@ -1853,6 +1881,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
+    // the lazy PLE table is consumed by the device that holds the PLE layer: pin it in place
+    // and read it there. this is a capability branch (only CUDA offers a registered mapped
+    // buffer); without it the table stays in a CPU mmap buffer and GET_ROWS runs on the CPU
+    if (hparams.ple_n_heads > 0) {
+        for (uint32_t il = 0; il < (uint32_t) n_layer_all; ++il) {
+            if (hparams.is_ple(il)) {
+                ml.lazy.dev = pimpl->dev_layer[il].dev;
+                LLAMA_LOG_INFO("%s: lazy PLE table assigned to device %s\n", __func__, ggml_backend_dev_name(ml.lazy.dev));
+                break;
+            }
+        }
+    }
+
+    // the token embedding table is read by the device that holds layer 0: pin it in place and
+    // run the input layer GET_ROWS there. this is a capability branch (only CUDA offers a
+    // registered mapped buffer, and only mmap gives a range to register); without it the table
+    // stays in a CPU mmap buffer and GET_ROWS runs on the CPU. with --no-mmap there is no
+    // mapping to register and the table follows the regular input layer path: a CPU buffer.
+    // the memory-fit pass keeps the regular accounting (no_alloc)
+    if (ml.use_mmap && !ml.no_alloc && n_layer_all > 0) {
+        ml.embd.dev = pimpl->dev_layer[0].dev;
+        if (ml.embd.buft() == nullptr) {
+            ml.embd.dev = nullptr;
+        } else {
+            LLAMA_LOG_INFO("%s: token embedding table assigned to device %s\n", __func__, ggml_backend_dev_name(ml.embd.dev));
+        }
+    }
+
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
     // create tensors for the weights
@@ -2100,7 +2156,36 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && !ctx_has_bf16_as_f16 && buffer_from_host_ptr_supported && is_default_buft) {
+        // a context whose buffer type is a registered mapped buffer (a lazy table, or the token
+        // embedding table) points into the mmap range instead of allocating: build the mapped
+        // buffer in place. this is a capability branch (only CUDA offers the buffer type)
+        const bool is_registered_mapped = !ml.no_alloc && !ctx_has_bf16_as_f16 &&
+            ggml_backend_buft_is_device_mapped_registered(buft);
+
+        if (is_registered_mapped) {
+            GGML_ASSERT(!ml.no_alloc);
+            const int64_t t_start = ggml_time_us();
+            size_t total = 0;
+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                void * addr = nullptr;
+                size_t first, last; // NOLINT
+                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
+                if (first >= last) {
+                    continue;
+                }
+                ggml_backend_buffer_t buf = ggml_backend_buft_mapped_buffer_from_host_ptr(buft, (char *) addr + first, last - first);
+                if (buf == nullptr) {
+                    throw std::runtime_error(format("unable to register %s buffer (%.2f MiB of pinned host memory)",
+                                                    ggml_backend_buft_name(buft), (last - first) / 1024.0 / 1024.0));
+                }
+                total += last - first;
+                bufs.emplace_back(buf);
+                buf_map.emplace(idx, buf);
+            }
+            // cudaHostRegister faults the pages in, so this reports the full pin cost
+            LLAMA_LOG_INFO("%s: pinned %.2f MiB of mmap weights in %.2f s\n",
+                    __func__, total / 1024.0 / 1024.0, (ggml_time_us() - t_start) / 1e6);
+        } else if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && !ctx_has_bf16_as_f16 && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer

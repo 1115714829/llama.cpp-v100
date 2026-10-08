@@ -36,6 +36,11 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(v
 // mapped host buffer: pinned host memory that a device can read directly through its device pointer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_mapped_buffer_type(int device);
 
+// registered mapped host buffer: an existing host range pinned in place with cudaHostRegister
+// (e.g. a read-only mmap of a model file), exposed as a device-readable buffer without copying
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_mapped_registered_buffer_type(int device);
+GGML_BACKEND_API ggml_backend_buffer_t ggml_backend_cuda_mapped_buffer_from_host_ptr(int device, void * ptr, size_t size);
+
 GGML_BACKEND_API int  ggml_backend_cuda_get_device_count(void);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
 GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);

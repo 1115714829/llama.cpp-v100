@@ -109,13 +109,31 @@ struct llama_model_loader {
             return it == ranges.end() ? none : it->second;
         }
 
-        // lazy tensors are gathered on the host, so no offload setting applies to them
-        static ggml_backend_buffer_type_t buft();
+        // device that consumes the lazy tensors, set by the model before the tensors are created.
+        // when it is a CUDA device the lazy table is pinned in place and read on the device
+        // (registered mapped buffer); otherwise it stays in a CPU mmap buffer
+        ggml_backend_dev_t dev = nullptr;
+
+        // buffer type of a lazy tensor: a device-readable registered mapped buffer when the
+        // consuming device offers one, otherwise the CPU buffer type
+        ggml_backend_buffer_type_t buft() const;
 
     private:
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
     } lazy;
+
+    // handle the token embedding table of the input layer: the input layer stays on the CPU,
+    // but the table is pinned in place and read on the device that holds layer 0, so that
+    // GET_ROWS runs there instead of splitting the graph back to the CPU for it
+    struct embd_read {
+        // set by the model before the create_tensor() calls
+        ggml_backend_dev_t dev = nullptr;
+
+        // buffer type of the token embedding table: the device-readable registered mapped
+        // buffer of dev, or nullptr when the device does not offer one
+        ggml_backend_buffer_type_t buft() const;
+    } embd;
 
     // target model a draft head borrows the shared tensors from, see borrow_shared_tensor()
     // from unsloth PR #142

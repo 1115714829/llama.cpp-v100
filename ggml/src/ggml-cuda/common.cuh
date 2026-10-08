@@ -1199,6 +1199,9 @@ int ggml_cuda_get_device();
 struct ggml_backend_cuda_buffer_type_context {
     int device;
     std::string name;
+    // set for the registered mapped buffer type: it wraps an existing host range pinned in
+    // place, instead of an allocation owned by the mapped buffer type
+    bool registered = false;
 };
 
 int ggml_backend_cuda_get_device_count();

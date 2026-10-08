@@ -420,6 +420,18 @@ static __device__ __forceinline__ void dequantize_iq4_nl(const void * vx, const 
     }
 }
 
+// one QK4_NL (32 value) sub-block; one thread per value, tid in [0, QK4_NL)
+// used by get_rows for rows that are not a multiple of QK_K
+template<typename dst_t>
+static __device__ __forceinline__ void dequantize_iq4_nl_32(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
+
+    const block_iq4_nl * x = (const block_iq4_nl *) vx + ibs;
+
+    const uint8_t byte = x->qs[tid & 15];
+    const int code = tid < 16 ? (byte & 0xf) : (byte >> 4);
+    yy[tid] = ggml_cuda_cast<dst_t>((float)x->d * kvalues_iq4nl[code]);
+}
+
 template<typename dst_t>
 static __device__ __forceinline__ void dequantize_iq4_xs(const void * vx, const int64_t ibs, dst_t * yy, const int tid) {
     const block_iq4_xs * x = (const block_iq4_xs *)vx;
