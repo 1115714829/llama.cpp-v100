@@ -10,6 +10,12 @@
 // The test uses only the public backend API: the registered mapped buffer is reached
 // through the proc addresses of the CUDA backend. It skips (and passes) when no CUDA device
 // is present or the backend is too old.
+//
+// cudaHostRegister also refuses a range that is already registered, and the page-aligned
+// ranges of two nearby weights can share an edge page, so the backend merges overlapping
+// or adjacent ranges into one segment with a reference count. The test checks two such
+// ranges in both build orders and both release orders, and that the segment table is empty
+// once both buffers are freed.
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -38,6 +44,7 @@ int main() {
 
 typedef ggml_backend_buffer_type_t (*cuda_dev_mapped_registered_buft_t)(ggml_backend_dev_t dev);
 typedef ggml_backend_buffer_t (*cuda_mapped_buffer_from_host_ptr_buft_t)(ggml_backend_buffer_type_t buft, void * ptr, size_t size);
+typedef size_t (*cuda_registered_host_segment_count_t)(void);
 
 static bool check_bytes(const char * what, const uint8_t * got, const uint8_t * want, size_t n) {
     for (size_t i = 0; i < n; ++i) {
@@ -199,6 +206,83 @@ int main() {
     memset(got.data(), 0, 4 * page);
     ggml_backend_tensor_get(tensor, got.data(), 0, 4 * page);
     if (!check_bytes("released file range", got.data(), file + 30 * page, 4 * page)) {
+        return 1;
+    }
+
+    // Two weights of the same file less than a page apart produce page-aligned ranges
+    // that share an edge page. Registering both must succeed (the shared page is
+    // registered once) and the data of both must stay readable. Cover both build orders
+    // and both release orders.
+    auto segment_count = (cuda_registered_host_segment_count_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_registered_host_segment_count");
+    if (segment_count == nullptr) {
+        printf("SKIP: the CUDA backend does not expose the registered segment diagnostics\n");
+        return 0;
+    }
+    auto expect_segments = [&](size_t want, const char * what) -> bool {
+        const size_t n = segment_count();
+        if (n != want) {
+            fprintf(stderr, "FAIL: %s: %zu registered segments, want %zu\n", what, n, want);
+            return false;
+        }
+        return true;
+    };
+    auto copy_range = [&](size_t offset, size_t nbytes_check, const char * what) -> bool {
+        ggml_backend_tensor_set(tensor, file + offset, 0, nbytes_check);
+        memset(got.data(), 0, nbytes_check);
+        ggml_backend_tensor_get(tensor, got.data(), 0, nbytes_check);
+        return check_bytes(what, got.data(), file + offset, nbytes_check);
+    };
+
+    // (a) small first, then large: [16, 19) + [18, 22) merge into [16, 22)
+    ggml_backend_buffer_t small = from_host_ptr(registered_buft(dev), file + 16 * page + 100, 2 * page);
+    ggml_backend_buffer_t large = from_host_ptr(registered_buft(dev), file + 18 * page + 100, 3 * page);
+    if (small == nullptr || large == nullptr) {
+        fprintf(stderr, "FAIL: cannot register two overlapping mapped buffers\n");
+        return 1;
+    }
+    if (!expect_segments(1, "after the small-then-large build")) {
+        return 1;
+    }
+    if (!copy_range(16 * page, 2 * page, "merged small first") ||
+        !copy_range(19 * page, 2 * page, "merged small second") ||
+        !copy_range(20 * page + 100, 2 * page, "merged leaving the segment")) {
+        return 1;
+    }
+    ggml_backend_buffer_free(small);
+    if (!expect_segments(1, "after releasing the small buffer")) {
+        return 1;
+    }
+    ggml_backend_buffer_free(large);
+    if (!expect_segments(0, "after releasing the large buffer")) {
+        return 1;
+    }
+    // the merged range is a normal unregistered range again
+    if (!copy_range(18 * page, 3 * page, "released merged range")) {
+        return 1;
+    }
+
+    // (b) large first, then small: [16, 21) + [20, 22) merge into [16, 22)
+    ggml_backend_buffer_t large2 = from_host_ptr(registered_buft(dev), file + 16 * page + 100, 4 * page);
+    ggml_backend_buffer_t small2 = from_host_ptr(registered_buft(dev), file + 20 * page + 100, 1 * page);
+    if (large2 == nullptr || small2 == nullptr) {
+        fprintf(stderr, "FAIL: cannot register two overlapping mapped buffers\n");
+        return 1;
+    }
+    if (!expect_segments(1, "after the large-then-small build")) {
+        return 1;
+    }
+    if (!copy_range(16 * page, 2 * page, "merged large first") ||
+        !copy_range(21 * page, 1 * page, "merged large second") ||
+        !copy_range(21 * page + 100, 1 * page, "merged leaving the segment")) {
+        return 1;
+    }
+    ggml_backend_buffer_free(large2);
+    if (!expect_segments(1, "after releasing the large buffer")) {
+        return 1;
+    }
+    ggml_backend_buffer_free(small2);
+    if (!expect_segments(0, "after releasing the small buffer")) {
         return 1;
     }
 
