@@ -35,6 +35,12 @@ void ggml_backend_sched_set_n_stages(ggml_backend_sched_t sched, int n_stages) {
     sched->oldest_stage = 0;
     sched->pipeline_stage = -1;
     sched->pipeline_last_ubatch_id = -1;
+
+    // the submission workers only exist when the scheduler overlaps pipeline stages. a scheduler
+    // with double buffered inputs but no overlap (n_stages == 1) submits synchronously
+    if (n_stages > 1) {
+        ggml_backend_sched_workers_start(sched);
+    }
 }
 
 static void ggml_backend_sched_pipeline_wait_stage(ggml_backend_sched_t sched, int stage_id) {

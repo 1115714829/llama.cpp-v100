@@ -173,7 +173,9 @@ struct ggml_backend_sched {
 #ifdef  __cplusplus
 }
 
-// per-backend submission workers, implemented in ggml-backend.cpp; pipeline mode only
+// per-backend submission workers, implemented in ggml-backend.cpp; started by
+// ggml_backend_sched_set_n_stages when pipeline overlap is enabled
+void ggml_backend_sched_workers_start(ggml_backend_sched_t sched);
 uint64_t ggml_backend_sched_worker_post(ggml_backend_sched_t sched, int backend_id, std::function<void()> fn);
 void ggml_backend_sched_worker_wait_done(ggml_backend_sched_t sched, int backend_id, uint64_t seq);
 void ggml_backend_sched_workers_drain(ggml_backend_sched_t sched);
