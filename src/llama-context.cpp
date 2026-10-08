@@ -4020,6 +4020,14 @@ llm_graph_params llama_context::graph_params(
         fa_assist = n_kv >= GGML_BACKEND_META_ASSIST_MIN_KV;
     }
 
+    // the MTP catch-up batch (every draft token output=false) only needs the K/V cache writes.
+    // The decode step of the draft chain has n_outputs > 0 and keeps the full layer. Only the
+    // qwen4exp MTP graph handles the kv-only build (its build_layer_attn/graph_mtp stop early);
+    // other MTP archs (qwen35moe and friends) keep the full layer, so they must not get the flag.
+    // The arch check is a capability gate, not a fallback: the kv-only path exists only there
+    const bool mtp_kv_only = n_outputs == 0 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+            gtype == LLM_GRAPH_TYPE_DECODER_MTP && model.arch == LLM_ARCH_QWEN4EXP;
+
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
@@ -4049,6 +4057,7 @@ llm_graph_params llama_context::graph_params(
         /*.h_sink_is_target      =*/ h_sink_is_target,
         /*.h_sink_write          =*/ h_sink_write && !h_sink_skip,
         /*.fa_assist             =*/ fa_assist,
+        /*.mtp_kv_only           =*/ mtp_kv_only,
     };
 }
 

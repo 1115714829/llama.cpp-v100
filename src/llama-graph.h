@@ -854,6 +854,11 @@ struct llm_graph_params {
     // marked/unmarked nodes are different graphs, so reuse must not cross this flag
     bool fa_assist = false;
 
+    // MTP catch-up builds only the subgraph that produces the K/V cache writes (n_outputs == 0).
+    // A kv-only graph and a full-layer graph have different topologies, so reuse must not cross
+    // this flag. Only the MTP context can set it, all other contexts leave it false
+    bool mtp_kv_only = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -935,6 +940,7 @@ struct llm_graph_params {
             h_sink_is_target      == other.h_sink_is_target      &&
             h_sink_write          == other.h_sink_write          &&
             fa_assist             == other.fa_assist             &&
+            mtp_kv_only           == other.mtp_kv_only           &&
             layer_inp_sink_layers == other.layer_inp_sink_layers;
     }
 };
@@ -1107,6 +1113,7 @@ struct llm_graph_context {
     const bool h_sink_is_target;             // r-mtpdev: true when the local sink is the target h sink
     const bool h_sink_write;                 // r-mtpdev: false when this graph skips the sink write
     const bool fa_assist;                    // mark the FA nodes for the 6-card assist path
+    const bool mtp_kv_only;                  // MTP catch-up: build only the K/V subgraph
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;

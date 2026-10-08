@@ -594,7 +594,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     }
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    // MTP catch-up has no output rows: the out_ids input would stay unallocated and set_input asserts
+    ggml_tensor * inp_out_ids = mtp_kv_only ? nullptr : build_inp_out_ids();
 
     ggml_tensor * h_norm = build_norm(ggml_reshape_3d(ctx0, h, n_embd, hc, n_tokens), layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
     cb(h_norm, "mtp_hnorm", il);
@@ -607,8 +608,21 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(res_hc, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;
-    ggml_tensor * cur = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, &inject, il);
+    // MTP catch-up needs no inject: it only feeds build_hc_combine, which is not built below
+    ggml_tensor * cur = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, mtp_kv_only ? nullptr : &inject, il);
     cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
+
+    // MTP catch-up (n_outputs == 0): build_layer_attn has written the K/V cache and returned
+    // nullptr. Nothing downstream consumes this layer's output, so stop here. The KQ mask of the
+    // cut attention stays unallocated: llm_graph_input_mem_hybrid::set_input skips filling it when
+    // its buffer is null, same as the qwen4exp QSA layers
+    if (mtp_kv_only) {
+        res->t_h_nextn = nullptr;
+        res->t_embd    = nullptr;
+        res->t_logits  = nullptr;
+        return;
+    }
+
     res_hc = build_hc_combine(res_hc, cur, inject, il);
 
     cur    = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, &inject, il);
@@ -974,6 +988,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
                     nullptr, nullptr, nullptr,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     }
+
+    // MTP catch-up: build_attn has expanded the K/V cache writes and returns nullptr. The gate
+    // and wo have no consumer, so stop before touching the null attention output
+    if (mtp_kv_only) {
+        return nullptr;
+    }
+
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
