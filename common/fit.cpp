@@ -29,21 +29,13 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-// a device-readable host buffer (e.g. the CUDA mapped host buffer) keeps the weights in host
-// memory while the device reads them in place; such buffers are not device memory
-static bool common_buft_is_device_mapped(ggml_backend_buffer_type_t buft) {
-    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-    if (dev == nullptr) {
-        return false;
-    }
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    if (reg == nullptr) {
-        return false;
-    }
-    typedef bool (*ggml_backend_buft_is_mapped_t)(ggml_backend_buffer_type_t);
-    auto is_mapped = (ggml_backend_buft_is_mapped_t)
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_mapped");
-    return is_mapped != nullptr && is_mapped(buft);
+// buffer type whose bytes are host memory: a host buffer, or a device-readable host buffer (e.g.
+// the CUDA mapped host buffer) that the device reads in place. The meta buffer types ask the meta
+// backend, every other type its own backend. no_alloc gives every weight and cache tensor a
+// zero-size buffer of the buffer type the real load uses, so this is where the placement of a
+// table is read.
+static bool common_buft_is_host_memory(ggml_backend_buffer_type_t buft) {
+    return ggml_backend_buft_is_host(buft) || ggml_backend_buft_is_device_mapped(buft);
 }
 
 // the device-readable host buffer type of a device, or nullptr if the device has none
@@ -60,7 +52,7 @@ static ggml_backend_buffer_type_t common_dev_mapped_buft(ggml_backend_dev_t dev)
     }
     ggml_backend_buffer_type_t * extra = get_extra(dev);
     while (extra != nullptr && *extra != nullptr) {
-        if (common_buft_is_device_mapped(*extra)) {
+        if (ggml_backend_buft_is_device_mapped(*extra)) {
             return *extra;
         }
         ++extra;
@@ -367,7 +359,7 @@ static void collect_device_memory_breakdown(
             }
             continue;
         }
-        if (ggml_backend_buft_is_host(buft) || common_buft_is_device_mapped(buft)) {
+        if (common_buft_is_host_memory(buft)) {
             // a device-readable host buffer is host memory, not device memory
             ret.back().mb.model   += mb.model;
             ret.back().mb.context += mb.context;
@@ -756,9 +748,10 @@ static void common_fit_ep(
     // contribute their per-device slice, replicated ones the full tensor. Routed experts are
     // skipped: they are placed by the expert store, not counted as dense weights. ggml_nbytes
     // is exact for the contiguous weight layout, so no per-tensor stride math is needed.
-    // Tensors that end up in a host buffer (lazy embeddings, PLE, a CPU token embedding) take
-    // no device VRAM at all: the no-alloc load gives every weight tensor a zero-size dummy
-    // buffer of its real buffer type, so its placement is readable here.
+    // Tensors that end up in host memory (a CPU buffer, or the shared mapped host buffer that
+    // holds the lazy PLE table and the token embedding table) take no device VRAM at all: the
+    // no-alloc load gives every weight tensor a zero-size dummy buffer of its real buffer type,
+    // so its placement is readable here.
     std::vector<int64_t> dev_model(nd, 0);
     for (const auto & kv : llama_internal_get_tensor_map(model)) {
         const ggml_tensor * t = kv.second;
@@ -768,7 +761,7 @@ static void common_fit_ep(
         if ((t->flags & GGML_TENSOR_FLAG_EXPERT) != 0) {
             continue;
         }
-        if (t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
+        if (t->buffer == nullptr || common_buft_is_host_memory(ggml_backend_buffer_get_type(t->buffer))) {
             continue;
         }
         const ggml_backend_meta_split_state ss = llama_model_tensor_split_state(model, t);
@@ -847,7 +840,7 @@ static void common_fit_ep(
         if (t == nullptr || t->view_src != nullptr || ggml_nelements(t) == 0) {
             continue;
         }
-        if (t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
+        if (t->buffer == nullptr || common_buft_is_host_memory(ggml_backend_buffer_get_type(t->buffer))) {
             continue;
         }
         if (!counted.insert(t).second) {
@@ -879,7 +872,7 @@ static void common_fit_ep(
     {
         const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx);
         for (const auto & [buft, data] : mb) {
-            if (ggml_backend_buft_is_host(buft)) {
+            if (common_buft_is_host_memory(buft)) {
                 // host memory, no device VRAM
                 continue;
             }
@@ -939,7 +932,7 @@ static void common_fit_ep(
             if (t == nullptr || t->view_src != nullptr || ggml_nelements(t) == 0) {
                 continue;
             }
-            if (t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
+            if (t->buffer == nullptr || common_buft_is_host_memory(ggml_backend_buffer_get_type(t->buffer))) {
                 continue;
             }
             bool borrowed = false;
@@ -979,7 +972,7 @@ static void common_fit_ep(
             if (t == nullptr || t->view_src != nullptr || ggml_nelements(t) == 0) {
                 continue;
             }
-            if (t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
+            if (t->buffer == nullptr || common_buft_is_host_memory(ggml_backend_buffer_get_type(t->buffer))) {
                 continue;
             }
             if (!counted.insert(t).second) {
@@ -1008,7 +1001,7 @@ static void common_fit_ep(
         {
             const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx_extra);
             for (const auto & [buft, data] : mb) {
-                if (ggml_backend_buft_is_host(buft)) {
+                if (common_buft_is_host_memory(buft)) {
                     continue;
                 }
                 draft_compute_total  += (int64_t) data.compute;
@@ -1834,7 +1827,7 @@ static void common_params_fit_impl(
                 tbo_out[itbo].buft    = moe_bufts[id_dev];
                 itbo++;
 
-                if (common_buft_is_device_mapped(moe_bufts[id_dev])) {
+                if (ggml_backend_buft_is_device_mapped(moe_bufts[id_dev])) {
                     LOG_TRC("%s: layer %" PRIu32 " (compute device %s): MoE weights on %s (device %s)\n",
                         __func__, il, ggml_backend_dev_name(devs[id]),
                         ggml_backend_buft_name(moe_bufts[id_dev]),
@@ -1903,7 +1896,7 @@ static void common_params_fit_impl(
             // the MoE tensors of every partial layer overflow to the device-readable host buffer;
             // with the expert store this check is skipped, its host complement is checked after
             // the placement plan is known (apply_expert_budgets), which is the smaller number
-            if (ngl_per_device[id].n_part > 0 && common_buft_is_device_mapped(moe_bufts[id]) &&
+            if (ngl_per_device[id].n_part > 0 && ggml_backend_buft_is_device_mapped(moe_bufts[id]) &&
                     !common_buft_is_device_expert(moe_bufts[id])) {
                 uses_mapped = true;
                 break;
@@ -2832,7 +2825,7 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
             seen_buffer_types.insert(buft);
             continue;
         }
-        if (ggml_backend_buft_is_host(buft) || common_buft_is_device_mapped(buft)) {
+        if (common_buft_is_host_memory(buft)) {
             // a device-readable host buffer is host memory, not device memory
             mb_host.model   += mb.model;
             mb_host.context += mb.context;

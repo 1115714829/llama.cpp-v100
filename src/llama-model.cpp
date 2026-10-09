@@ -1435,25 +1435,6 @@ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model)
     }
 }
 
-// buffer types whose weights sit in device-readable host memory (the CUDA mapped type and the
-// CUDA expert type), looked up through the backend reg like the fit code does. the mapped type
-// belongs to a GPU device but keeps the weights on the host, so a device-type check alone
-// cannot tell it apart.
-static bool buft_is_device_mapped(ggml_backend_buffer_type_t buft) {
-    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-    if (dev == nullptr) {
-        return false;
-    }
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    if (reg == nullptr) {
-        return false;
-    }
-    typedef bool (*ggml_backend_buft_is_mapped_t)(ggml_backend_buffer_type_t);
-    auto is_mapped = (ggml_backend_buft_is_mapped_t)
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_mapped");
-    return is_mapped != nullptr && is_mapped(buft);
-}
-
 static bool buft_is_device_expert(ggml_backend_buffer_type_t buft) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
     if (dev == nullptr) {
@@ -1485,7 +1466,7 @@ static bool tensor_override_is_on_gpu(const llama_model_tensor_buft_override & o
     if (buft_is_device_expert(over.buft)) {
         return true;
     }
-    if (buft_is_device_mapped(over.buft)) {
+    if (ggml_backend_buft_is_device_mapped(over.buft)) {
         return false;
     }
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(over.buft);

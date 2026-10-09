@@ -502,6 +502,16 @@ extern "C" {
     // of the devices offers such a buffer type, the caller then keeps the CPU path.
     GGML_API ggml_backend_buffer_type_t ggml_backend_meta_mapped_weights_buffer_type(ggml_backend_dev_t meta_dev);
 
+    // true when the tensors of this buffer type live in device-readable host memory instead of
+    // device memory (a mapped host buffer): they take no device VRAM. A meta buffer type is host
+    // memory when its simple buffers are views of one shared host allocation (the mapped weights
+    // buffer type) or when all of its simple buffer types are device mapped themselves.
+    GGML_API bool ggml_backend_meta_buft_is_device_mapped(ggml_backend_buffer_type_t buft);
+
+    // the same query for any buffer type: the meta backend answers for its buffer types, every
+    // other backend through its own registry proc
+    GGML_API bool ggml_backend_buft_is_device_mapped(ggml_backend_buffer_type_t buft);
+
     // Copies nbytes from src (at byte offset src_offs) to dst (at dst_offs) asynchronously on every
     // device of the meta backend. src and dst are static (non-view) meta tensors that are MIRRORED,
     // so every device holds a full copy of each; the copy is device local.

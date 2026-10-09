@@ -446,8 +446,53 @@ static const struct ggml_backend_buffer_type_i ggml_backend_meta_buffer_type_ifa
     /* .is_host             = */ ggml_backend_meta_buffer_type_is_host,
 };
 
+// ask the backend of this buffer type whether it is device-readable host memory (the CUDA mapped
+// and expert types); a backend that does not export the query has no such buffer type
+static bool ggml_backend_meta_buft_is_device_mapped_via_reg(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return false;
+    }
+    typedef bool (*ggml_backend_buft_is_mapped_t)(ggml_backend_buffer_type_t);
+    auto is_mapped = (ggml_backend_buft_is_mapped_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_mapped");
+    return is_mapped != nullptr && is_mapped(buft);
+}
+
 bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
     return buft != nullptr && buft->iface.get_name == ggml_backend_meta_buffer_type_iface.get_name;
+}
+
+bool ggml_backend_meta_buft_is_device_mapped(ggml_backend_buffer_type_t buft) {
+    if (!ggml_backend_buft_is_meta(buft)) {
+        return false;
+    }
+    // the shared type is one mapped host allocation that every device reads over UVA
+    if (ggml_backend_meta_buft_is_shared(buft)) {
+        return true;
+    }
+    // otherwise the bytes are host memory only when every simple buffer type keeps its own data
+    // in device-readable host memory
+    const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+    for (size_t i = 0; i < n_simple_bufts; i++) {
+        if (!ggml_backend_meta_buft_is_device_mapped_via_reg(ggml_backend_meta_buft_simple_buft(buft, i))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ggml_backend_buft_is_device_mapped(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr) {
+        return false;
+    }
+    return ggml_backend_buft_is_meta(buft) ?
+        ggml_backend_meta_buft_is_device_mapped(buft) :
+        ggml_backend_meta_buft_is_device_mapped_via_reg(buft);
 }
 
 // expert buffer type a simple device offers through its backend: the first extra buffer type
