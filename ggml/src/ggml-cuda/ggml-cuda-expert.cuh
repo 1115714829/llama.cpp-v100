@@ -33,8 +33,10 @@ struct ggml_cuda_expert_table {
     const char * const * main  = nullptr;   // device table, one entry per local expert
     const char * const * stage = nullptr;   // device table through the prefill staging area
     // host shadow of the main table: the ids of the fallback path are read on the host, which
-    // cannot dereference the device table. Same entries, same expert_start offset.
-    const char * const * main_host = nullptr;
+    // cannot dereference the device table. Same entries, same expert_start offset. The entries
+    // are device addresses held in a host array (the store owns it as char **), the host only
+    // reads the addresses and never dereferences them, so the entries are plain char *.
+    char * const * main_host = nullptr;
     int64_t     n_expert   = 0;
     size_t      blob_bytes = 0;
     const char * stage_dev = nullptr;       // staging area base of the stream (shared)

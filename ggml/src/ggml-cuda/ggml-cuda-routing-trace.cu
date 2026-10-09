@@ -98,17 +98,17 @@ trace_device_state * g_trace_dev[GGML_CUDA_MAX_DEVICES] = {};
 
 // 1: on, 0: off. The flag lives in the expert store module and is set by the CLI before the
 // model loads, so this is a lock-free load on the per-launch path.
-bool trace_enabled_cached() {
+static bool trace_enabled_cached() {
     return ggml_expert_store_trace_enabled();
 }
 
-void put16(uint8_t * p, uint16_t v) { memcpy(p, &v, 2); }
-void put32(uint8_t * p, uint32_t v) { memcpy(p, &v, 4); }
-void put64(uint8_t * p, uint64_t v) { memcpy(p, &v, 8); }
+static void put16(uint8_t * p, uint16_t v) { memcpy(p, &v, 2); }
+static void put32(uint8_t * p, uint32_t v) { memcpy(p, &v, 4); }
+static void put64(uint8_t * p, uint64_t v) { memcpy(p, &v, 8); }
 
 // rewrite the 32-byte header of the device file. The drain thread is the only writer after
 // init, so no lock is needed; fseek flushes the buffered records first.
-void trace_write_header(trace_device_state * state) {
+static void trace_write_header(trace_device_state * state) {
     if (state->file == nullptr) {
         return;
     }
@@ -133,7 +133,7 @@ void trace_write_header(trace_device_state * state) {
 
 // open the trace file of one device. A file that already holds a valid header is appended to,
 // so several short runs (llama-cli, restarted server) accumulate one trace.
-void trace_open_file(trace_device_state * state, bool multi_device) {
+static void trace_open_file(trace_device_state * state, bool multi_device) {
     const std::string base = ggml_expert_store_get_trace_path();
     if (base.empty()) {
         return;
@@ -187,7 +187,7 @@ void trace_open_file(trace_device_state * state, bool multi_device) {
 
 // drain one descriptor: wait for its kernel, copy the ids out of the ring (handling a wrap)
 // and append the record to the device file. Runs on the device drain thread.
-void drain_record(trace_device_state * state, const trace_record & rec) {
+static void drain_record(trace_device_state * state, const trace_record & rec) {
     if (rec.ev != nullptr) {
         CUDA_CHECK(cudaEventSynchronize(rec.ev));
     }
@@ -238,7 +238,7 @@ void drain_record(trace_device_state * state, const trace_record & rec) {
     }
 }
 
-void drain_thread(trace_device_state * state) {
+static void drain_thread(trace_device_state * state) {
     ggml_cuda_set_device(state->device);
     for (;;) {
         trace_record rec;
@@ -258,7 +258,7 @@ void drain_thread(trace_device_state * state) {
     }
 }
 
-trace_device_state * get_device_state(int device) {
+static trace_device_state * get_device_state(int device) {
     if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
         return nullptr;
     }
@@ -315,7 +315,7 @@ __global__ void routing_trace_kernel(
 
 // layer number of an expert tensor from its name ("blk.<n>.ffn_*_exps"), the same rule the
 // expert store uses; -1 when the name carries none
-int trace_tensor_layer(const ggml_tensor * t) {
+static int trace_tensor_layer(const ggml_tensor * t) {
     const char * p = strstr(t->name, "blk.");
     if (p == nullptr) {
         return -1;

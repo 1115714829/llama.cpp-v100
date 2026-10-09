@@ -3436,7 +3436,8 @@ static bool ggml_backend_buft_is_cuda_mapped_or_expert(ggml_backend_buffer_type_
 // is included by the kernel files and must not depend on ggml-backend-impl.h (internal).
 extern const ggml_backend_buffer_type_i ggml_backend_cuda_expert_buffer_type_interface;
 
-ggml_backend_buffer_type_t ggml_backend_cuda_expert_buffer_type(int device) {
+// only used by the fit code below in this translation unit
+static ggml_backend_buffer_type_t ggml_backend_cuda_expert_buffer_type(int device) {
     if (!ggml_cuda_expert_supported() || device >= ggml_backend_cuda_get_device_count()) {
         return nullptr;
     }
@@ -4443,7 +4444,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // expert store: the per-expert base comes from the host shadow of the pointer table,
         // the device table cannot be dereferenced on the host
         GGML_ASSERT(!is_expert_store || ex_table.main_host != nullptr);
-        src0_slice.data     = is_expert_store ? (char *) ex_table.main_host[i02] : (char *) src0->data + i02*nb02;
+        // the per-expert base is a plain char * (device address from the host shadow of the
+        // pointer table), the view only ever reads it
+        src0_slice.data     = is_expert_store ? ex_table.main_host[i02]
+                                              : (char *) src0->data + i02*nb02;
 
         ggml_tensor src1_slice;
         memset(&src1_slice, 0, sizeof(src1_slice));

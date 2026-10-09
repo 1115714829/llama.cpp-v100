@@ -329,7 +329,7 @@ int main(int argc, char ** argv) {
     llama_sampler * smpl = llama_sampler_init_greedy();
 
     llama_token id = llama_sampler_sample(smpl, ctx, -1);
-    llama_sampler_accept(smpl, id, true);
+    llama_sampler_accept(smpl, id);
 
     g_stats.prefill = false;
 
@@ -350,7 +350,7 @@ int main(int argc, char ** argv) {
         ++n_decode;
 
         id = llama_sampler_sample(smpl, ctx, -1);
-        llama_sampler_accept(smpl, id, true);
+        llama_sampler_accept(smpl, id);
     }
 
     llama_sampler_free(smpl);
