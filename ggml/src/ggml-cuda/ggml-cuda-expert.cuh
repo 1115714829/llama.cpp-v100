@@ -166,25 +166,32 @@ bool ggml_backend_cuda_expert_get_host_peak(ggml_backend_buffer_type_t buft, siz
 void ggml_cuda_expert_set_slot_limit(ggml_backend_buffer_type_t buft, size_t bytes);
 
 // Host NUMA placement of the expert host arena, shared with the CUDA<n>_Mapped buffer type
-// (defined in ggml-cuda.cu): the same one-time bandwidth probe and the same cudaHostAlloc
-// path, so both halves of the host tier follow one placement. The node of every tensor arena
-// is picked from the measured bandwidth matrix: the best node of the device first, then the
-// next best node when a node cannot hold the arena (the nodes fill up in bandwidth order).
+// (defined in ggml-cuda.cu): the machine is planned once from the bytes every device reads, the
+// node capacities (MemTotal of the nodes) and the read times measured while all the devices
+// read at the same time, and every host arena of a device then goes to the node of that plan.
+// The plan is made by ggml_cuda_numa_plan::plan() (ggml-cuda-numa-plan.h), which fit and the
+// real allocation share, so a fit that passes does not fail later.
 // The return values of ggml_cuda_numa_reserve() that are not a node number:
 #define GGML_CUDA_NUMA_NODE_ANY  (-2) // no NUMA node information: allocate with no policy
-#define GGML_CUDA_NUMA_NODE_FAIL (-1) // no candidate node has enough available memory
+#define GGML_CUDA_NUMA_NODE_FAIL (-1) // the bytes do not fit into the node capacities
 
-// reserve `size` bytes on a node for the device and return it (or GGML_CUDA_NUMA_NODE_ANY /
-// GGML_CUDA_NUMA_NODE_FAIL). The bytes count as placed while the allocation is live; a
-// failed allocation must call ggml_cuda_numa_release().
+// host bytes the most recent expert store plan of the device asked for. The allocation records
+// it before it allocates the first arena, so the NUMA planner knows the whole size of the device
+// when the first arena picks its node.
+size_t ggml_cuda_expert_recorded_host_bytes(int device);
+
+// reserve `size` bytes on the node of the plan for the device and return it (or
+// GGML_CUDA_NUMA_NODE_ANY / GGML_CUDA_NUMA_NODE_FAIL). The bytes count as placed while the
+// allocation is live; a failed allocation must call ggml_cuda_numa_release().
 int ggml_cuda_numa_reserve(int device, size_t size);
 
 // release a reservation of ggml_cuda_numa_reserve(), e.g. when cudaHostAlloc failed
 void ggml_cuda_numa_release(int device, int node, size_t size);
 
-// allocate pinned mapped host memory on the node, nullptr when the allocation fails
+// allocate pinned mapped host memory on the node, nullptr when the allocation fails or when
+// the pages can not be bound to that node
 void * ggml_cuda_numa_host_alloc(size_t size, int node);
 
-// startup log: the live host arena bytes of one device per NUMA node and the measured
-// read bandwidth for those nodes (one line)
-void ggml_cuda_numa_log_placement(int device, const char * what);
+// startup log of the placement: one line per device with its node and bytes, then one line with
+// the estimated step time and the two placements it is compared against
+void ggml_cuda_numa_log_placement(const char * what);

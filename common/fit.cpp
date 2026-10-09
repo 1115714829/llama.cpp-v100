@@ -290,14 +290,13 @@ static void common_expert_record_plan(ggml_backend_buffer_type_t buft, size_t sl
     }
 }
 
-// NUMA check of the expert host arenas: hand the host complement allocations of all devices
-// to the backend in the order the real load performs them (the model tensor order), the
-// backend simulates the node selection of the real allocations against the per-node
-// available memory (MemFree plus reclaimable file pages minus the margin, the same figures
-// the real selection uses). On success the bytes placed on every node are written to
-// node_bytes/node_ids (up to the capacity in *n_nodes, which receives the actual number of
-// nodes). Returns 1 when the placement fits, -1 when some node cannot hold its planned
-// bytes (the failing node, allocation size and available memory are returned), and 0 when
+// NUMA check of the expert host arenas: hand the host complement allocations of all devices to
+// the backend, which plans the machine once (the same plan the real load reads) from the per
+// device bytes, the node capacities (MemTotal minus the margin) and the read times measured
+// while all the devices read at the same time. On success the bytes the plan places on every
+// node are written to node_bytes/node_ids (up to the capacity in *n_nodes, which receives the
+// actual number of nodes). Returns 1 when the placement fits, -1 when the nodes cannot hold the
+// arenas (the bytes needed and the capacity of all nodes together are returned), and 0 when
 // there is no NUMA information at all; the caller then falls back to a plain total check.
 static int common_expert_check_host_nodes(
         const std::vector<ggml_backend_dev_t> & devs,
@@ -1204,9 +1203,10 @@ static void common_fit_ep(
         if (check < 0) {
             const int64_t deficit = (int64_t) fail_bytes - fail_avail;
             throw std::runtime_error(
-                "expert store host complement: a slice of " + std::to_string(fail_bytes/MiB) + " MiB does not fit on NUMA node " +
-                std::to_string(fail_node) + ", which has only " + std::to_string(fail_avail/MiB) +
-                " MiB available (short by " + std::to_string((deficit > 0 ? deficit : 0)/MiB) +
+                "expert store host complement: the host arenas need " + std::to_string(fail_bytes/MiB) +
+                " MiB of NUMA node memory, the nodes hold " + std::to_string(fail_avail/MiB) +
+                " MiB (MemTotal of every node minus the reserved margin; short by " +
+                std::to_string((deficit > 0 ? deficit : 0)/MiB) +
                 " MiB); reduce the context size, use more devices or a lower quantization");
         }
         if (check > 0) {
@@ -2262,10 +2262,11 @@ static void common_params_fit_impl(
                 // a physical limit, not a fallback: report the deficit at error level
                 const int64_t deficit = (int64_t) fail_bytes - fail_avail;
                 throw std::runtime_error(
-                    "expert store host complement: a slice of " + std::to_string(fail_bytes/MiB) + " MiB does not fit on NUMA node " +
-                    std::to_string(fail_node) + ", which has only " + std::to_string(fail_avail/MiB) +
-                    " MiB available (MemFree plus reclaimable page cache, minus the reserved margin; short by " +
-                    std::to_string((deficit > 0 ? deficit : 0)/MiB) + " MiB); reduce the context size, use more devices or a lower quantization");
+                    "expert store host complement: the host arenas need " + std::to_string(fail_bytes/MiB) +
+                    " MiB of NUMA node memory, the nodes hold " + std::to_string(fail_avail/MiB) +
+                    " MiB (MemTotal of every node minus the reserved margin; short by " +
+                    std::to_string((deficit > 0 ? deficit : 0)/MiB) +
+                    " MiB); reduce the context size, use more devices or a lower quantization");
             }
             if (check == 0) {
                 const int64_t host_free   = dmds_full.back().free;

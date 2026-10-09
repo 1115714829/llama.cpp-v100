@@ -297,6 +297,12 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     target_include_directories(test-expert-store PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 endif()
 
+# needs the non-public ggml-cuda-numa-plan.h
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    llama_build_and_test(test-numa-plan.cpp)
+    target_include_directories(test-numa-plan PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+endif()
+
 llama_build_and_test(test-sched-pipeline.cpp)
 
 # Multi-GPU AllReduce comm test; skips when CUDA or < 2 devices are available.

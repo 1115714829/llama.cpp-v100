@@ -116,9 +116,9 @@ static void * ggml_cuda_expert_alloc_host(void * user, size_t size, void ** dev_
     const int device = (int) (intptr_t) user;
     ggml_cuda_set_device(device);
 
-    // the host arena follows the same NUMA placement as the CUDA<n>_Mapped buffer type:
-    // reserve picks the best measured node of the device; when that node cannot hold the
-    // arena, the next best node with room takes it, so the arena spills in bandwidth order
+    // the host arena of the device follows the node of the machine plan: the plan is computed
+    // once for all devices from their bytes and the measured read times, so every arena of this
+    // device goes to the same node
     const int node = ggml_cuda_numa_reserve(device, size);
     ggml_cuda_set_device(device); // the probe may have left another device current
 
@@ -508,6 +508,16 @@ static void ggml_cuda_expert_set_allocation(int device, size_t slot_bytes, size_
     g_expert_alloc_host [device] = host_bytes;
     g_expert_alloc_stage[device] = stage_bytes;
     g_expert_alloc_host_peak[device] = host_peak;
+}
+
+// host bytes of the most recent plan of the device. The NUMA planner reads this before the first
+// arena is allocated, so the recorded bytes have to be in place before the store allocates.
+size_t ggml_cuda_expert_recorded_host_bytes(int device) {
+    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(g_expert_budget_mutex);
+    return g_expert_alloc_host[device];
 }
 
 // drop the allocation accounting of all devices. The fit code calls this before its no-alloc
@@ -1213,6 +1223,11 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
         return nullptr;
     }
 
+    // the plan bytes are recorded before the first host arena is allocated: the NUMA planner
+    // reads them to plan the machine once, before it picks the node of the first arena
+    ggml_cuda_expert_set_allocation(device, (size_t) plan.slot_used, (size_t) plan.host_bytes,
+        stage_budget, (size_t) plan.host_peak);
+
     // invariant before the first cudaMalloc of this buffer: the bytes this buffer still has to
     // allocate (slots + staging + the plain block of the non-expert tensors of the same load)
     // must be present as free device memory right now. fit planned them from a free-memory
@@ -1352,9 +1367,9 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
             __func__, device, plan.slot_used / 1024.0 / 1024.0, plan.host_bytes / 1024.0 / 1024.0,
             stage_budget / 1024.0 / 1024.0);
 
-        // host arena placement: the NUMA nodes, the bytes on each of them and the measured
-        // read bandwidth of this device for those nodes, one line per device
-        ggml_cuda_numa_log_placement(device, "expert host complement");
+        // host arena placement: the node of every device and the bytes it reads there, one line
+        // per device plus the summary with the estimated step time
+        ggml_cuda_numa_log_placement("expert host placement");
     }
 
     // plain tensors: one block of device memory, laid out like the regular CUDA buffer type
@@ -1691,6 +1706,11 @@ bool ggml_backend_cuda_expert_get_host_peak(ggml_backend_buffer_type_t buft, siz
     GGML_UNUSED(buft);
     GGML_UNUSED(peak_bytes);
     return false;
+}
+
+size_t ggml_cuda_expert_recorded_host_bytes(int device) {
+    GGML_UNUSED(device);
+    return 0;
 }
 
 void ggml_cuda_expert_reset_allocation(ggml_backend_buffer_type_t buft) {
