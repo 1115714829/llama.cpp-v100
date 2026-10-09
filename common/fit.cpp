@@ -705,7 +705,7 @@ void common_fit_log_memory_stage_devs(struct ggml_backend_device ** devs, int nd
 // cache, the compute buffers and the margin to the expert slots of that device.
 static void common_fit_ep(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
-        size_t * margins_s, enum ggml_log_level log_level) {
+        size_t * margins_s, enum ggml_log_level log_level, const common_fit_extra_model * extra) {
     constexpr int64_t MiB = 1024*1024;
 
     llama_model_params mparams_copy = *mparams;
@@ -755,6 +755,9 @@ static void common_fit_ep(
     // contribute their per-device slice, replicated ones the full tensor. Routed experts are
     // skipped: they are placed by the expert store, not counted as dense weights. ggml_nbytes
     // is exact for the contiguous weight layout, so no per-tensor stride math is needed.
+    // Tensors that end up in a host buffer (lazy embeddings, PLE, a CPU token embedding) take
+    // no device VRAM at all: the no-alloc load gives every weight tensor a zero-size dummy
+    // buffer of its real buffer type, so its placement is readable here.
     std::vector<int64_t> dev_model(nd, 0);
     for (const auto & kv : llama_internal_get_tensor_map(model)) {
         const ggml_tensor * t = kv.second;
@@ -762,6 +765,9 @@ static void common_fit_ep(
             continue;
         }
         if ((t->flags & GGML_TENSOR_FLAG_EXPERT) != 0) {
+            continue;
+        }
+        if (t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
             continue;
         }
         const ggml_backend_meta_split_state ss = llama_model_tensor_split_state(model, t);
@@ -831,9 +837,137 @@ static void common_fit_ep(
     {
         const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx);
         for (const auto & [buft, data] : mb) {
+            if (ggml_backend_buft_is_host(buft)) {
+                // host memory, no device VRAM
+                continue;
+            }
             context_total += (int64_t) data.context;
             compute_total += (int64_t) data.compute;
         }
+    }
+
+    // per-simple-device dense model bytes of the draft (MTP) model. The draft runs next to the
+    // target on every step, so its weights come out of the same per-device VRAM; they are also
+    // the reason why the expert store cannot take them: it has a per-device slot budget and a
+    // second model would be planned against the same budget again. Borrowed tensors (the draft
+    // takes shared weights from the target, borrow_shared_tensor) live in the target's buffers
+    // and are already counted there, so a same-name same-pointer tensor is skipped.
+    std::vector<int64_t> dev_draft(nd, 0);
+    int64_t draft_context_total = 0;
+    int64_t draft_compute_total  = 0;
+    int64_t sinks_total          = 0;
+    if (extra != nullptr) {
+        // the draft context runs at the context size of the target, like the real draft load
+        // (cparams.n_ctx = llama_n_ctx(ctx_tgt) in common_speculative_init_result)
+        extra->cparams->n_ctx = cparams->n_ctx;
+
+        llama_model_params mparams_extra = *extra->mparams;
+        mparams_extra.no_alloc       = true;
+        mparams_extra.load_mode      = LLAMA_LOAD_MODE_NONE;
+        mparams_extra.model_shared   = model;
+        mparams_extra.no_expert_store = true;
+
+        llama_model * model_extra = llama_model_load_from_file(extra->path_model, mparams_extra);
+        if (model_extra == nullptr) {
+            llama_free(ctx);
+            llama_model_free(model);
+            throw common_params_fit_exception(std::string("failed to load the extra model '") + extra->path_model + "'");
+        }
+
+        // the draft context links itself to the target context during construction (shared
+        // embeddings/output, device sinks, the MTP h sink), so it must point at the measured
+        // target context, exactly like the real draft load does
+        extra->cparams->ctx_other = ctx;
+        if (extra->h_sink_rows > 0) {
+            extra->cparams->n_h_sink_rows = extra->h_sink_rows;
+        }
+
+        llama_context * ctx_extra = llama_init_from_model(model_extra, *extra->cparams);
+        if (ctx_extra == nullptr) {
+            extra->cparams->ctx_other = nullptr;
+            llama_model_free(model_extra);
+            llama_free(ctx);
+            llama_model_free(model);
+            throw common_params_fit_exception(std::string("failed to create llama_context from the extra model '") + extra->path_model + "'");
+        }
+
+        // a borrowed tensor is the target's own tensor (same pointer), already counted above
+        const auto & map_main = llama_internal_get_tensor_map(model);
+        for (const auto & kv : llama_internal_get_tensor_map(model_extra)) {
+            const ggml_tensor * t = kv.second;
+            if (t == nullptr || t->view_src != nullptr || ggml_nelements(t) == 0) {
+                continue;
+            }
+            if (t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            bool borrowed = false;
+            for (const auto & kv_main : map_main) {
+                if (kv_main.first == kv.first && kv_main.second == t) {
+                    borrowed = true;
+                    break;
+                }
+            }
+            if (borrowed) {
+                continue;
+            }
+            const ggml_backend_meta_split_state ss = llama_model_tensor_split_state(model_extra, t);
+            if (!(ss.axis >= 0 && ss.axis < GGML_MAX_DIMS)) {
+                for (size_t j = 0; j < nd; j++) {
+                    dev_draft[j] += (int64_t) ggml_nbytes(t);
+                }
+                continue;
+            }
+            const int64_t ne_axis = t->ne[ss.axis];
+            if (ne_axis <= 0) {
+                continue;
+            }
+            for (size_t j = 0; j < nd; j++) {
+                int64_t ne_j = 0;
+                for (size_t s = 0; s < ss.n_segments; s++) {
+                    ne_j += ss.ne[s*nd + j] * ss.nr[s];
+                }
+                dev_draft[j] += (int64_t) ggml_nbytes(t) * ne_j / ne_axis;
+            }
+        }
+
+        {
+            const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx_extra);
+            for (const auto & [buft, data] : mb) {
+                if (ggml_backend_buft_is_host(buft)) {
+                    continue;
+                }
+                draft_context_total += (int64_t) data.context;
+                draft_compute_total  += (int64_t) data.compute;
+            }
+        }
+
+        // device sinks are raw backend buffers, no memory breakdown covers them. With a tensor
+        // split a mirrored sink is one full copy per device.
+        {
+            const size_t sink_row = (size_t) llama_model_n_embd(model) * sizeof(float);
+
+            if (extra->dflash_sink) {
+                const uint32_t n_lids = llama_model_target_layer_ids_n(model_extra);
+                if (n_lids > 0) {
+                    // DFlash2 layer-input sink [n_embd * n_lids, n_batch] plus the draft staging
+                    // sink [n_embd * n_lids, n_ubatch], both on the first device
+                    sinks_total += (int64_t) (sink_row * n_lids * cparams->n_batch +
+                                              sink_row * n_lids * extra->cparams->n_ubatch);
+                }
+            }
+
+            if (extra->h_sink_rows > 0) {
+                // MTP nextn sink [n_embd_out, n_batch + extra rows], allocated once by the
+                // target on its output device
+                const size_t row = (size_t) llama_model_n_embd_out(model) * sizeof(float);
+                sinks_total += (int64_t) (row * ((size_t) cparams->n_batch + extra->h_sink_rows));
+            }
+        }
+
+        llama_free(ctx_extra);
+        llama_model_free(model_extra);
+        extra->cparams->ctx_other = nullptr;
     }
 
     llama_free(ctx);
@@ -875,12 +1009,27 @@ static void common_fit_ep(
     // the real load.
     LOG_TRC("%s: expert parallel: context %.0f MiB total, compute %.0f MiB per rank, %zu devices\n",
         __func__, context_total/(1024.0*1024.0), compute_total/(1024.0*1024.0), nd);
+    if (extra != nullptr) {
+        LOG_TRC("%s: expert parallel draft: context %.0f MiB total, compute %.0f MiB per rank, sinks %.0f MiB per device\n",
+            __func__, draft_context_total/(1024.0*1024.0), draft_compute_total/(1024.0*1024.0), sinks_total/(1024.0*1024.0));
+    }
 
     for (size_t j = 0; j < nd; j++) {
         const int64_t context_j = context_total / (int64_t) nd;
         const int64_t compute_j = compute_total;
+        const int64_t draft_context_j = draft_context_total / (int64_t) nd;
+        const int64_t draft_compute_j  = draft_compute_total;
         const int64_t margin_j  = margins_s[j];
-        const int64_t surplus   = free_mem[j] - dev_model[j] - context_j - compute_j - margin_j;
+        const int64_t surplus   = free_mem[j] - dev_model[j] - context_j - compute_j
+                                 - dev_draft[j] - draft_context_j - draft_compute_j - sinks_total - margin_j;
+
+        LOG_INF("%s: device %zu: free %.0f MiB, dense %.0f MiB, context %.0f MiB, compute %.0f MiB,"
+                " draft %.0f MiB, draft context %.0f MiB, draft compute %.0f MiB, sinks %.0f MiB,"
+                " margin %.0f MiB -> surplus %.0f MiB\n",
+            __func__, j, (double) free_mem[j]/MiB, (double) dev_model[j]/MiB, (double) context_j/MiB,
+            (double) compute_j/MiB, (double) dev_draft[j]/MiB, (double) draft_context_j/MiB,
+            (double) draft_compute_j/MiB, (double) sinks_total/MiB, (double) margin_j/MiB,
+            (double) surplus/MiB);
 
         for (const ep_tensor & t : expert_tensors) {
             dev_tensors[j].push_back({ t.layer, t.expert_base[j], t.n_expert[j], t.blob_bytes, t.type, t.ne0 });
@@ -1146,7 +1295,7 @@ static void common_params_fit_impl(
         if (hp_nex == 0) {
             throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
         }
-        common_fit_ep(path_model, mparams, cparams, margins_s, log_level);
+        common_fit_ep(path_model, mparams, cparams, margins_s, log_level, extra);
         return;
     }
 

@@ -3358,6 +3358,11 @@ common_speculative_init_result::common_speculative_init_result(
         // from unsloth PR #142
         mparams.model_shared = model_tgt;
 
+        // the draft uses every expert on every step and is on the critical path, so its
+        // experts stay plain device weights: the expert store has one slot budget per device
+        // and a second model would be planned against the same budget again
+        mparams.no_expert_store = true;
+
         llama_model * model_dft = llama_model_load_from_file(model_path.c_str(), mparams);
         if (model_dft == NULL) {
             LOG_ERR("%s: failed to load draft model, '%s'\n", __func__, model_path.c_str());

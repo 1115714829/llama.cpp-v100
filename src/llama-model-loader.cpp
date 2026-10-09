@@ -540,6 +540,7 @@ llama_model_loader::llama_model_loader(
         bool check_tensors,
         bool no_alloc,
         bool load_mtp,
+        bool no_expert_store,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
@@ -558,6 +559,7 @@ llama_model_loader::llama_model_loader(
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+    this->no_expert_store = no_expert_store;
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -1272,7 +1274,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // (device, host, and the no-alloc fit trials); the store decides from its own buffer type
     // and the layout whether it can place the tensor.
     auto mark_expert_tensor = [&](ggml_tensor * tensor) {
-        if (llm_tensor_is_expert_weight(tn)) {
+        if (!no_expert_store && llm_tensor_is_expert_weight(tn)) {
             tensor->flags |= GGML_TENSOR_FLAG_EXPERT;
         }
     };

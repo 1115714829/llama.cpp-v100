@@ -83,6 +83,9 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    // do not mark the routed experts: they stay plain device weights instead of going into
+    // the expert store (draft models, which use every expert every step)
+    bool no_expert_store = false;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
@@ -214,6 +217,7 @@ struct llama_model_loader {
         bool check_tensors,
         bool no_alloc,
         bool load_mtp,
+        bool no_expert_store,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
 

@@ -1247,6 +1247,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
         auto mparams_dft = common_model_params_to_llama(params_dft);
         auto cparams_dft = common_context_params_to_llama(params_dft);
+        // the draft experts stay plain device weights, same as in the real draft load
+        mparams_dft.no_expert_store = true;
         if (spec_mtp) {
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         }

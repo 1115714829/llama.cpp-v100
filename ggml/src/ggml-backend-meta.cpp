@@ -2877,7 +2877,7 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
         // Plain tensors and expert tensors of one device live in two contexts (and two buffer
         // types). Each is allocated with the same zero-tensor rule.
         auto alloc_container = [&](ggml_context * ctx, ggml_backend_buffer_type_t container_buft,
-                                   ggml_backend_buffer_ptr & out_buf) {
+                                   ggml_backend_buffer_ptr & out_buf) -> bool {
             // If a ggml_context only has zero-sized tensors, ggml_backend_alloc_ctx_tensors_from_buft returns NULL.
             // For those edge cases, allocate a dummy buffer instead.
             bool any_nonzero_slice = false;
@@ -2895,18 +2895,35 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
                     t->buffer = out_buf.get();
                 }
             }
-            GGML_ASSERT(out_buf);
+            if (!out_buf) {
+                // the device ran out of memory for this container: report it and let the caller
+                // tear the whole meta buffer down, the loading layer turns NULL into its
+                // regular "unable to allocate" error
+                GGML_LOG_ERROR("%s: device %zu: failed to allocate the %s buffer\n",
+                        __func__, i, ggml_backend_buft_name(container_buft));
+                return false;
+            }
             meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(out_buf.get()));
+            return true;
         };
 
-        alloc_container(meta_buf_ctx->stc_static.ctxs[i].get(), simple_buft, meta_buf_ctx->bufs[i]);
+        bool ok = alloc_container(meta_buf_ctx->stc_static.ctxs[i].get(), simple_buft, meta_buf_ctx->bufs[i]);
 
         // the expert buffer type of the device: only when the device has one and the model
         // actually placed an expert tensor on it. A device with an empty expert context keeps
         // a null expert buffer, so a dense model allocates none.
         ggml_backend_buffer_type_t simple_expert_buft = ggml_backend_meta_buft_simple_expert_buft(buft, i);
-        if (simple_expert_buft != nullptr && ggml_get_first_tensor(meta_buf_ctx->stc_static.expert_ctxs[i].get()) != nullptr) {
-            alloc_container(meta_buf_ctx->stc_static.expert_ctxs[i].get(), simple_expert_buft, meta_buf_ctx->expert_bufs[i]);
+        if (ok && simple_expert_buft != nullptr && ggml_get_first_tensor(meta_buf_ctx->stc_static.expert_ctxs[i].get()) != nullptr) {
+            ok = alloc_container(meta_buf_ctx->stc_static.expert_ctxs[i].get(), simple_expert_buft, meta_buf_ctx->expert_bufs[i]);
+        }
+
+        if (!ok) {
+            // meta_buf owns the buffers allocated so far, freeing it frees them
+            for (int k = 0; k < n_tensors; k++) {
+                tensors[k]->buffer = nullptr;
+            }
+            ggml_backend_buffer_free(meta_buf);
+            return nullptr;
         }
     }
     return meta_buf;
