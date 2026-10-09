@@ -6781,6 +6781,7 @@ struct test_mul_mat_id_ep : public test_case {
             ggml_tensor * out_s = ggml_mul_mat_id(ctx, as_s, b, ids);
             ggml_mul_mat_id_set_expert_parallel(out_s, true);
             ggml_mul_mat_id_set_expert_offset(out_s, (int32_t) start);
+            ggml_mul_mat_id_set_n_expert_total(out_s, n_mats);
             ggml_set_name(out_s, "out_s");
             out = out == nullptr ? out_s : ggml_add(ctx, out, out_s);
         }
@@ -6909,6 +6910,7 @@ struct test_mul_mat_id_expert_ep : public test_mul_mat_id_ep {
             ggml_tensor * out_s = ggml_mul_mat_id(ctx, as_s, b, ids);
             ggml_mul_mat_id_set_expert_parallel(out_s, true);
             ggml_mul_mat_id_set_expert_offset(out_s, (int32_t) start);
+            ggml_mul_mat_id_set_n_expert_total(out_s, n_mats);
             ggml_set_name(out_s, "out_s");
             out = out == nullptr ? out_s : ggml_add(ctx, out, out_s);
         }
@@ -7128,9 +7130,11 @@ struct test_mul_mat_id_ep_fusion : public test_case {
             ggml_tensor * gate_mm = ggml_mul_mat_id(ctx, gate_s, b, ids);
             ggml_mul_mat_id_set_expert_parallel(gate_mm, true);
             ggml_mul_mat_id_set_expert_offset(gate_mm, (int32_t) start);
+            ggml_mul_mat_id_set_n_expert_total(gate_mm, n_mats);
             ggml_tensor * up_mm = ggml_mul_mat_id(ctx, up_s, b, ids);
             ggml_mul_mat_id_set_expert_parallel(up_mm, true);
             ggml_mul_mat_id_set_expert_offset(up_mm, (int32_t) start);
+            ggml_mul_mat_id_set_n_expert_total(up_mm, n_mats);
             ggml_tensor * glu_s = ggml_swiglu_split(ctx, gate_mm, up_mm);
             out = out == nullptr ? glu_s : ggml_add(ctx, out, glu_s);
         }
@@ -13024,9 +13028,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // expert parallelism: split the experts along the expert dim and compare the sum of the
     // per-shard results against the full computation. n covers the MMVQ single-token path,
-    // the MMVQ mmid path (n = 9..16), the grouped kernel (n = 9..64) and the MMQ path.
+    // the MMVQ mmid path (n = 9..16), the grouped kernel (n = 9..64), the MMQ path and the
+    // 2048 prefill batch whose per-expert column count is estimated from the global expert count.
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_Q2_0}) {
-        for (int n : {1, 8, 12, 16, 24, 64, 128, 512}) {
+        for (int n : {1, 8, 12, 16, 24, 64, 128, 512, 2048}) {
             // gate/up shape, broadcast activation (this is what the model graph uses)
             test_cases.emplace_back(new test_mul_mat_id_ep(type_a, GGML_TYPE_F32, 512, 10, 6,  640, n, 2560, true));
             if (640 % ggml_blck_size(type_a) == 0) {
@@ -13034,6 +13039,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_id_ep(type_a, GGML_TYPE_F32, 512, 10, 6, 2560, n,  640, false));
             }
         }
+    }
+
+    // Q5_1 as in UD-Q4_K_XL (the down projection uses Q5_1/Q8_0): the gate/up and down shapes at
+    // the grouped, MMQ and prefill batch sizes.
+    for (int n : {64, 512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_id_ep(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, 6,  640, n, 2560, true));
+        test_cases.emplace_back(new test_mul_mat_id_ep(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, 6, 2560, n,  640, false));
     }
 
     // expert parallelism with the gate/up GLU fusion: the shards must sum to the full fused result.

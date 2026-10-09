@@ -1815,6 +1815,9 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 }
                 ggml_mul_mat_id_set_expert_parallel(t_ij, true);
                 ggml_mul_mat_id_set_expert_offset(t_ij, (int32_t) expert_offset);
+                // the global expert count of the unsplit weight: as->ne[2] is only this device's
+                // slice, the kernels need the global count to estimate the columns per expert
+                ggml_mul_mat_id_set_n_expert_total(t_ij, (int32_t) tensor->src[0]->ne[2]);
             }
         }
         if (tensor->op == GGML_OP_FLASH_ATTN_EXT && ggml_get_op_params_i32(tensor, 5) < 0) {

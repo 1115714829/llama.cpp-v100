@@ -287,8 +287,10 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
     }
 
     // Average columns one expert receives. The grouped kernel picks its staged-entry width from
-    // it: a small batch stays on the decode width, prefill uses the wider group.
-    const int64_t ncols_avg = (ne12 * n_expert_used + ne02 - 1) / ne02;
+    // it: a small batch stays on the decode width, prefill uses the wider group. The global expert
+    // count is used under expert parallelism, where ne02 is only this device's slice.
+    const int64_t n_experts = ggml_cuda_mul_mat_id_n_expert_density(dst);
+    const int64_t ncols_avg = (ne12 * n_expert_used + n_experts - 1) / n_experts;
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);

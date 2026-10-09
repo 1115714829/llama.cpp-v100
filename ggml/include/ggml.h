@@ -1522,6 +1522,11 @@ extern "C" {
     GGML_API bool    ggml_mul_mat_id_is_expert_parallel(const struct ggml_tensor * a);
     GGML_API void    ggml_mul_mat_id_set_expert_offset(struct ggml_tensor * a, int32_t expert_offset);
     GGML_API int32_t ggml_mul_mat_id_get_expert_offset(const struct ggml_tensor * a);
+    // expert parallelism: expert count of the whole (unsplit) weight tensor. as->ne[2] is only the
+    // expert count of this device, so heuristics that estimate the average columns per expert must
+    // use this global count instead. Returns 0 when the node is not MUL_MAT_ID or it is not set.
+    GGML_API void    ggml_mul_mat_id_set_n_expert_total(struct ggml_tensor * a, int32_t n_expert_total);
+    GGML_API int32_t ggml_mul_mat_id_get_n_expert_total(const struct ggml_tensor * a);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

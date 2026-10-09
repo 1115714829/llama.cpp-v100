@@ -1760,3 +1760,17 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
+
+// Expert count used to estimate the average columns per expert in MUL_MAT_ID heuristics.
+// Under expert parallelism dst->src[0]->ne[2] is only the expert count of this device, so the
+// density is overestimated by the split factor; use the global expert count recorded on the node.
+// A non-expert-parallel node keeps src0->ne[2], so the dense behavior is unchanged.
+static inline int64_t ggml_cuda_mul_mat_id_n_expert_density(const ggml_tensor * dst) {
+    if (ggml_mul_mat_id_is_expert_parallel(dst)) {
+        const int32_t n_expert_total = ggml_mul_mat_id_get_n_expert_total(dst);
+        if (n_expert_total > 0) {
+            return n_expert_total;
+        }
+    }
+    return dst->src[0]->ne[2];
+}
