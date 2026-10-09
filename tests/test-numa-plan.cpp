@@ -215,7 +215,7 @@ bool test_descent(void) {
 
 // the committed plan is what the load reads: a device gets the node of the plan no matter how
 // many bytes it has when its arena is allocated
-bool test_committed_plan(void) {
+static bool test_committed_plan(void) {
     // the placement of the 6 card machine: 0,0,8,0,0,0 is what the machines measure
     ggml_cuda_numa_plan::committed c;
     const std::vector<int>     node  = { 1, 1, 1, 0, 0, 0 };
