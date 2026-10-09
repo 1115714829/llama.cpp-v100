@@ -10,9 +10,10 @@
 // the Strata contributors, see licenses/LICENSE-strata). Only the expert addressing and the
 // interface are adapted to our grouped tables (expert_bounds / ids_src1 / ids_dst).
 //
-// Without the SwiGLU epilogue flag (op_params[4]) the output is plain F32 and the graph does the
-// SwiGLU. With the flag the 256 kernel pairs the weight rows (2c gate, 2c+1 up) and writes the
-// F16 H itself; only this kernel can produce that dst, so the predicate is the single gate.
+// Without the SwiGLU epilogue (ggml_mul_mat_id_get_epilogue(dst) == GGML_MUL_MAT_ID_EPILOGUE_NONE)
+// the output is plain F32 and the graph does the SwiGLU. With it the 256 kernel pairs the weight
+// rows (2c gate, 2c+1 up) and writes the F16 H itself; only this kernel can produce that dst,
+// so the predicate is the single gate.
 //
 // This is a capability branch: Volta's only tensor core instruction is mma.sync.m8n8k4, so
 // int8 tensor cores (sm_80+) are unavailable and the supported quant types are the four the

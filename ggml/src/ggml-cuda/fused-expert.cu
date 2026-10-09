@@ -16,8 +16,9 @@
 // addressing uses our grouped tables (expert_bounds / ids_src1 / ids_dst).
 //
 // Two output layouts, one per SWIGLU instantiation of the 256 kernel: plain F32 (the SwiGLU
-// epilogue stays in the graph) or, when the MUL_MAT_ID carries the SwiGLU epilogue flag
-// (op_params[4]), the F16 H written by the paired-row epilogue below, as in Strata's gu_kernel.
+// epilogue stays in the graph) or, when the MUL_MAT_ID carries the SwiGLU epilogue
+// (ggml_mul_mat_id_get_epilogue(dst) == GGML_MUL_MAT_ID_EPILOGUE_SWIGLU), the F16 H written by
+// the paired-row epilogue below, as in Strata's gu_kernel.
 // The weights are read row interleaved in that case: row 2c of the tile is the gate row of pair
 // c, row 2c+1 its up row, so one BN-row weight tile is exactly BN/2 (gate, up) pairs.
 
@@ -478,11 +479,11 @@ bool ggml_cuda_fused_expert_mul_mat_id_supported(const ggml_tensor * dst, const 
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
-    // the MUL_MAT_ID epilogue flag (op_params[4], GGML_MUL_MAT_ID_EPILOGUE_SWIGLU in ggml.h)
-    // selects the paired-row epilogue: the dst is the F16 H of silu(gate) * up built from the row
-    // interleaved weights. The op task adds the named constant, the test here is the value it maps
-    // to, so the kernel does not depend on the macro being visible here.
-    const bool swiglu = ggml_get_op_params_i32(dst, 4) == 1;
+    // the MUL_MAT_ID epilogue (op_params[7], read through ggml_mul_mat_id_get_epilogue: [4]/[5]/[6]
+    // are the expert offset / expert parallel flag / expert count of a MUL_MAT_ID) selects the
+    // paired-row epilogue: the dst is the F16 H of silu(gate) * up built from the row
+    // interleaved weights.
+    const bool swiglu = ggml_mul_mat_id_get_epilogue(dst) == GGML_MUL_MAT_ID_EPILOGUE_SWIGLU;
 
     // Capability branch: Volta's only tensor core instruction is mma.sync.m8n8k4, so the int8
     // tensor cores of sm_80+ are unavailable and only these four quant types have a dequantizer
@@ -582,7 +583,7 @@ bool ggml_cuda_fused_expert_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_ten
 
     // the SwiGLU epilogue writes the F16 H instead of the plain F32 rows, the kernel takes the
     // layout from this flag and the supported predicate has already checked the shapes for it
-    const bool swiglu = ggml_get_op_params_i32(dst, 4) == 1;
+    const bool swiglu = ggml_mul_mat_id_get_epilogue(dst) == GGML_MUL_MAT_ID_EPILOGUE_SWIGLU;
 
     cudaStream_t stream = ctx.stream();
 
