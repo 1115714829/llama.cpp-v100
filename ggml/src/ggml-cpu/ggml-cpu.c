@@ -1647,8 +1647,6 @@ static void ggml_compute_forward_mul_mat_id(
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
 
-        const size_t nbww1 = ggml_row_size(GGML_TYPE_F32, ne10);
-
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
 
@@ -1678,7 +1676,9 @@ static void ggml_compute_forward_mul_mat_id(
                         continue;
                     }
 
-                    float * wide_row = wdata_wide + i13*nbww1*ne12*ne11 + i12*nbww1*ne11 + i11*nbww1 + ne10_block_start;
+                    // the widened copy is a compact F32 [ne10, ne11, ne12, ne13] array: element strides, and the block
+                    // start is in blocks of vec_dot_type
+                    float * wide_row = wdata_wide + ((i13*ne12 + i12)*ne11 + i11)*ne10 + ne10_block_start*bs;
                     if (src1->type == GGML_TYPE_F16) {
                         ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row, wide_row, n_block);
                     } else {
