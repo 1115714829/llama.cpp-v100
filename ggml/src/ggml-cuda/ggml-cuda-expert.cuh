@@ -191,6 +191,14 @@ int ggml_cuda_numa_reserve(int device, size_t size);
 // release a reservation of ggml_cuda_numa_reserve(), e.g. when cudaHostAlloc failed
 void ggml_cuda_numa_release(int device, int node, size_t size);
 
+// Reserve `size` bytes of host memory for an allocation that the machine plan does not place:
+// the mapped weights tables (the n-gram table and the token embedding table) are read by every
+// device, so they go on the node with the most free capacity and their bytes leave the capacity
+// of that node, which the plan of the expert arenas then sees. Returns the node, or
+// GGML_CUDA_NUMA_NODE_ANY when the machine has no host NUMA node and GGML_CUDA_NUMA_NODE_FAIL
+// when the bytes do not fit into the node capacities.
+int ggml_cuda_numa_fixed_alloc(size_t size);
+
 // allocate pinned mapped host memory on the node, nullptr when the allocation fails or when
 // the pages can not be bound to that node
 void * ggml_cuda_numa_host_alloc(int device, size_t size, int node);

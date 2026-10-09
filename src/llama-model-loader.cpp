@@ -1108,17 +1108,21 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
 }
 
 // the mapped weights buffer type of a device, or nullptr when the device (or its backend)
-// does not offer one. this is a capability query, not a fallback: only CUDA exposes it
+// does not offer one. this is a capability query, not a fallback: only CUDA exposes it, and a
+// meta device asks its devices for the buffer type it puts on top of them
 static ggml_backend_buffer_type_t llama_buft_device_mapped_weights(ggml_backend_dev_t dev) {
     if (dev == nullptr) {
         return nullptr;
+    }
+    if (ggml_backend_dev_is_meta(dev)) {
+        return ggml_backend_meta_mapped_weights_buffer_type(dev);
     }
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     if (reg == nullptr) {
         return nullptr;
     }
     typedef ggml_backend_buffer_type_t (*get_buft_t)(ggml_backend_dev_t);
-    auto get_buft = (get_buft_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_dev_mapped_weights_buft");
+    auto get_buft = (get_buft_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_mapped_weights_buft");
     return get_buft != nullptr ? get_buft(dev) : nullptr;
 }
 
@@ -1809,6 +1813,10 @@ bool llama_model_loader::load_all_data(
         if (dev == nullptr) {
             return false;
         }
+        // a meta device puts its devices' mapped weights buffers into one shared buffer
+        if (ggml_backend_dev_is_meta(dev)) {
+            return buft == llama_buft_device_mapped_weights(dev);
+        }
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         if (reg == nullptr) {
             return false;
@@ -1831,6 +1839,11 @@ bool llama_model_loader::load_all_data(
             return staged_a && ggml_nbytes(a) > ggml_nbytes(b);
         });
     }
+
+    // bytes copied into the device-readable host buffers (the n-gram table, the token embedding
+    // table) and the time that took, reported at the end of the load
+    size_t n_devread_bytes = 0;
+    int64_t ms_devread = 0;
 
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
@@ -1909,10 +1922,18 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
+                const bool devread = cur->buffer != nullptr && is_device_readable_buft(ggml_backend_buffer_get_type(cur->buffer));
+                const int64_t t0 = devread ? ggml_time_us() : 0;
+
                 ggml_backend_tensor_set(cur, data, 0, n_size);
 
+                if (devread) {
+                    ms_devread += ggml_time_us() - t0;
+                    n_devread_bytes += n_size;
+                }
+
                 // the weights are now in a buffer the device reads directly, drop the page cache
-                if (cur->buffer != nullptr && is_device_readable_buft(ggml_backend_buffer_get_type(cur->buffer))) {
+                if (devread) {
                     mapping->drop_page_cache(weight->offs, weight->offs + n_size);
                 }
             }
@@ -2025,6 +2046,11 @@ bool llama_model_loader::load_all_data(
         if (n_bf16_converted > 0) {
             LLAMA_LOG_INFO("%s: converted %zu BF16 weight values to F16 (%zu clamped to +-65504)\n",
                     __func__, n_bf16_converted, n_bf16_clamped);
+        }
+        if (n_devread_bytes > 0) {
+            const double t_s = std::max<int64_t>(ms_devread, 1)/1e6;
+            LLAMA_LOG_INFO("%s: copied %.2f GiB into the device-readable host buffers in %.1f s (%.1f GiB/s)\n",
+                    __func__, n_devread_bytes/1024.0/1024.0/1024.0, t_s, n_devread_bytes/1024.0/1024.0/1024.0/t_s);
         }
 
         // unmap offloaded tensors and metadata

@@ -496,6 +496,12 @@ extern "C" {
     // returns true if the buffer belongs to a meta backend
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
 
+    // The buffer type of a meta device for the weights that its GPUs read in place (the n-gram
+    // table and the token embedding table): all devices share one mapped host allocation, so the
+    // tables are MIRRORED and every device reads the same rows over UVA. Returns NULL when none
+    // of the devices offers such a buffer type, the caller then keeps the CPU path.
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_mapped_weights_buffer_type(ggml_backend_dev_t meta_dev);
+
     // Copies nbytes from src (at byte offset src_offs) to dst (at dst_offs) asynchronously on every
     // device of the meta backend. src and dst are static (non-view) meta tensors that are MIRRORED,
     // so every device holds a full copy of each; the copy is device local.

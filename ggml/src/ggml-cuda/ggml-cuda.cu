@@ -2903,6 +2903,57 @@ void ggml_cuda_numa_release(int device, int node, size_t size) {
     ggml_cuda_numa_unplace_locked(device, node, size);
 }
 
+// the mapped weights tables are read by every device, so they do not belong to one device of the
+// plan: they go on the node with the most free capacity and their bytes leave its capacity, so
+// the plan of the expert arenas is made with the rest
+int ggml_cuda_numa_fixed_alloc(size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
+
+    ggml_cuda_mapped_numa_state & state = ggml_cuda_mapped_numa;
+    if (!state.probed) {
+        ggml_cuda_numa_discover(state);
+    }
+    if (state.nodes.empty()) {
+        return GGML_CUDA_NUMA_NODE_ANY;
+    }
+
+    size_t best = 0;
+    size_t best_free = 0;
+    for (size_t n = 0; n < state.nodes.size(); n++) {
+        const size_t cap  = state.cap[n] > 0 ? (size_t) state.cap[n] : 0;
+        const size_t used = n < state.placed_node.size() ? state.placed_node[n] : 0;
+        const size_t free_bytes = cap > used ? cap - used : 0;
+        if (free_bytes > best_free) {
+            best_free = free_bytes;
+            best = n;
+        }
+    }
+
+    if (best_free < size) {
+        GGML_LOG_ERROR("%s: %.2f GiB of mapped host memory do not fit: node %d has %.2f GiB left of %.2f GiB\n",
+                __func__, (double) size / 1024.0/1024.0/1024.0, state.nodes[best],
+                (double) best_free / 1024.0/1024.0/1024.0,
+                (double) state.cap[best] / 1024.0/1024.0/1024.0);
+        return GGML_CUDA_NUMA_NODE_FAIL;
+    }
+
+    state.cap[best]         -= (int64_t) size;
+    state.placed_node[best] += size;
+
+    std::string capacity;
+    for (size_t n = 0; n < state.nodes.size(); n++) {
+        const size_t cap  = state.cap[n] > 0 ? (size_t) state.cap[n] : 0;
+        const size_t used = n < state.placed_node.size() ? state.placed_node[n] : 0;
+        const size_t free_bytes = cap > used ? cap - used : 0;
+        capacity += (n == 0 ? "" : ", ") + std::to_string(state.nodes[n]) + ": " +
+            std::to_string(free_bytes / (1024*1024)) + " MiB";
+    }
+
+    GGML_LOG_INFO("%s: mapped weights tables: %.2f GiB on NUMA node %d (left for the expert arenas: %s)\n",
+            __func__, (double) size / 1024.0/1024.0/1024.0, state.nodes[best], capacity.c_str());
+    return state.nodes[best];
+}
+
 // allocate pinned mapped host memory on the given node, with the same cudaHostAlloc path as
 // the CUDA<n>_Mapped buffer type
 void * ggml_cuda_numa_host_alloc(int device, size_t size, int node) {
@@ -3117,6 +3168,11 @@ void ggml_cuda_numa_release(int device, int node, size_t size) {
     GGML_UNUSED(device);
     GGML_UNUSED(node);
     GGML_UNUSED(size);
+}
+
+int ggml_cuda_numa_fixed_alloc(size_t size) {
+    GGML_UNUSED(size);
+    return GGML_CUDA_NUMA_NODE_ANY;
 }
 
 void * ggml_cuda_numa_host_alloc(int device, size_t size, int node) {
@@ -3362,11 +3418,12 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_mapped_buffer_type_int
 
 // mapped weights buffer: a device-readable host buffer for the weights that GPU kernels read
 // in place (the PLE table and the token embedding table). Unlike the mapped buffer type above
-// its memory is not placed by the NUMA bandwidth planner: it is allocated on the loading
-// thread and the loader copies the tensor data in, then drops the source page cache. There is
-// no row padding either, the GET_ROWS kernels read the file bytes as they are. Every device of
-// the backend may read the buffer, so the scheduler does not have to keep the ops that read it
-// on the device the buffer was allocated for.
+// its memory is not placed per device: every device reads these tables, so the buffer goes on
+// the host node with the most free capacity and its bytes leave that node for the expert
+// arenas. The loader copies the tensor data in and drops the source page cache. There is no row
+// padding either, the GET_ROWS kernels read the file bytes as they are. Every device of the
+// backend may read the buffer, so the scheduler does not have to keep the ops that read it on
+// the device the buffer was allocated for.
 static ggml_backend_buffer_t ggml_backend_cuda_mapped_weights_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 
@@ -3379,19 +3436,18 @@ static ggml_backend_buffer_t ggml_backend_cuda_mapped_weights_buffer_type_alloc_
 
     ggml_cuda_set_device(buft_ctx->device);
 
-    // cudaHostAlloc mapped: the device reads the pages in place over UVA. The pages land on the
-    // NUMA node of this (loading) thread, which is all the placement this buffer needs
-    void * host_ptr = nullptr;
-    cudaError_t err = cudaHostAlloc(&host_ptr, size, cudaHostAllocMapped | cudaHostAllocPortable);
-    if (err != cudaSuccess) {
-        (void) cudaGetLastError();
-        GGML_LOG_ERROR("%s: allocating %.2f MiB of mapped host memory for device %d: cudaHostAlloc failed: %s\n",
-                       __func__, size / 1024.0 / 1024.0, buft_ctx->device, cudaGetErrorString(err));
+    // every device reads the table, so the pages go on the host node with the most free
+    // capacity and leave the plan of the expert arenas the rest of it
+    const int node = ggml_cuda_numa_fixed_alloc(size);
+
+    // cudaHostAlloc mapped: the device reads the pages in place over UVA
+    void * host_ptr = ggml_cuda_numa_host_alloc(buft_ctx->device, size, node);
+    if (host_ptr == nullptr) {
         return nullptr;
     }
 
     void * dev_ptr = nullptr;
-    err = cudaHostGetDevicePointer(&dev_ptr, host_ptr, 0);
+    cudaError_t err = cudaHostGetDevicePointer(&dev_ptr, host_ptr, 0);
     if (err != cudaSuccess) {
         (void) cudaGetLastError();
         CUDA_CHECK(cudaFreeHost(host_ptr));
@@ -3400,11 +3456,17 @@ static ggml_backend_buffer_t ggml_backend_cuda_mapped_weights_buffer_type_alloc_
         return nullptr;
     }
 
-    GGML_LOG_INFO("%s: mapped weights host buffer for device %d: %.2f MiB\n",
-                  __func__, buft_ctx->device, size / 1024.0 / 1024.0);
+    if (node >= 0) {
+        GGML_LOG_INFO("%s: mapped weights host buffer for device %d: %.2f MiB on NUMA node %d\n",
+                      __func__, buft_ctx->device, size / 1024.0 / 1024.0, node);
+    } else {
+        GGML_LOG_INFO("%s: mapped weights host buffer for device %d: %.2f MiB without a NUMA policy\n",
+                      __func__, buft_ctx->device, size / 1024.0 / 1024.0);
+    }
 
+    // the bytes are accounted per node by ggml_cuda_numa_fixed_alloc(), not per device
     ggml_backend_cuda_mapped_buffer_context * ctx =
-        new ggml_backend_cuda_mapped_buffer_context(buft_ctx->device, GGML_CUDA_NUMA_NODE_ANY, host_ptr, dev_ptr, false, "_Mapped_Weights");
+        new ggml_backend_cuda_mapped_buffer_context(buft_ctx->device, node, host_ptr, dev_ptr, false, "_Mapped_Weights");
     return ggml_backend_buffer_init(buft, ggml_backend_cuda_mapped_buffer_interface, ctx, size);
 }
 
@@ -9806,6 +9868,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_buft_is_cuda_mapped_weights;
     }
     if (strcmp(name, "ggml_backend_cuda_dev_mapped_weights_buft") == 0) {
+        return (void *)ggml_backend_cuda_dev_mapped_weights_buft;
+    }
+    // the backend independent name of the same buffer type, the meta backend builds its own
+    // buffer type for the devices that offer it
+    if (strcmp(name, "ggml_backend_dev_mapped_weights_buft") == 0) {
         return (void *)ggml_backend_cuda_dev_mapped_weights_buft;
     }
     if (strcmp(name, "ggml_backend_cuda_expert_set_slot_limit") == 0) {
