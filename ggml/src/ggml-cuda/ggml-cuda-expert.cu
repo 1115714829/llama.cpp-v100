@@ -122,7 +122,7 @@ static void * ggml_cuda_expert_alloc_host(void * user, size_t size, void ** dev_
     const int node = ggml_cuda_numa_reserve(device, size);
     ggml_cuda_set_device(device); // the probe may have left another device current
 
-    void * host_ptr = ggml_cuda_numa_host_alloc(size, node);
+    void * host_ptr = ggml_cuda_numa_host_alloc(device, size, node);
     if (host_ptr == nullptr) {
         if (node != GGML_CUDA_NUMA_NODE_FAIL) {
             ggml_cuda_numa_release(device, node, size);
@@ -451,11 +451,20 @@ static size_t g_expert_plan_slot[GGML_CUDA_MAX_DEVICES] = {};
 static size_t g_expert_plan_host[GGML_CUDA_MAX_DEVICES] = {};
 static bool   g_expert_plan_valid[GGML_CUDA_MAX_DEVICES] = {};
 
+// host bytes of a device, once they are known: the plan fit recorded for the device, or the bytes
+// its last allocation used. The NUMA placement of the machine is computed from the bytes of all
+// the devices at once, so this has to outlive the fit plan check above.
+static bool   g_expert_host_known [GGML_CUDA_MAX_DEVICES] = {};
+static size_t g_expert_host_bytes[GGML_CUDA_MAX_DEVICES] = {};
+
 static void ggml_cuda_expert_set_budget_impl(int device, size_t slot_bytes, size_t stage_bytes) {
     std::lock_guard<std::mutex> lock(g_expert_budget_mutex);
     g_expert_slot_budget [device] = slot_bytes;
     g_expert_stage_budget[device] = stage_bytes;
     g_expert_plan_valid[device] = false;
+    // a new budget invalidates the recorded bytes; the plan of the new budget is recorded next
+    g_expert_host_known [device] = false;
+    g_expert_host_bytes[device] = 0;
 }
 
 // record the fit plan (slot and host bytes) of one device: the allocation of the same budget
@@ -465,6 +474,8 @@ static void ggml_cuda_expert_set_plan_impl(int device, size_t slot_bytes, size_t
     g_expert_plan_slot[device] = slot_bytes;
     g_expert_plan_host[device] = host_bytes;
     g_expert_plan_valid[device] = true;
+    g_expert_host_known [device] = true;
+    g_expert_host_bytes[device] = host_bytes;
 }
 
 static size_t ggml_cuda_expert_get_slot_budget(int device) {
@@ -508,16 +519,52 @@ static void ggml_cuda_expert_set_allocation(int device, size_t slot_bytes, size_
     g_expert_alloc_host [device] = host_bytes;
     g_expert_alloc_stage[device] = stage_bytes;
     g_expert_alloc_host_peak[device] = host_peak;
+    // the host bytes of the device are known from here on: the NUMA placement of the machine
+    // needs them for every device, not only for the one that allocates first
+    g_expert_host_known [device] = true;
+    g_expert_host_bytes[device] = host_bytes;
 }
 
-// host bytes of the most recent plan of the device. The NUMA planner reads this before the first
-// arena is allocated, so the recorded bytes have to be in place before the store allocates.
-size_t ggml_cuda_expert_recorded_host_bytes(int device) {
-    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) {
-        return 0;
+// Register the host bytes of every device with the NUMA placement before this device allocates
+// its first arena. The bytes of the other devices come from the plans fit recorded for them
+// (ggml_cuda_expert_record_plan); the bytes of this device come from the plan just computed, and
+// become the recorded ones, so the whole machine is known before any arena exists. A device
+// that has an expert VRAM budget but no plan leaves its bytes unknown: planning the machine
+// without them would place it from partial information, which is the single-card placement, so
+// this is an error instead.
+static bool ggml_cuda_expert_register_host_plan(int device, size_t slot_bytes, size_t host_bytes,
+        size_t stage_bytes, size_t host_peak) {
+    const int n_dev = ggml_backend_cuda_get_device_count();
+
+    std::vector<size_t> bytes((size_t) n_dev, 0);
+    {
+        std::lock_guard<std::mutex> lock(g_expert_budget_mutex);
+        for (int d = 0; d < n_dev; d++) {
+            if (d == device) {
+                bytes[(size_t) d] = host_bytes;
+                continue;
+            }
+            if (g_expert_host_known[d]) {
+                bytes[(size_t) d] = g_expert_host_bytes[d];
+                continue;
+            }
+            if (g_expert_slot_budget[d] == 0 && g_expert_stage_budget[d] == 0) {
+                continue; // no expert store on that device: it reads no host arena
+            }
+            GGML_LOG_ERROR("%s: device %d has an expert VRAM budget but no host byte plan, so the host bytes it reads are unknown; the NUMA placement of the machine needs the bytes of every device. Run fit (it records a plan per device before the load) or load one model per process.\n",
+                __func__, d);
+            return false;
+        }
+
+        g_expert_alloc_slot [device] = slot_bytes;
+        g_expert_alloc_host [device] = host_bytes;
+        g_expert_alloc_stage[device] = stage_bytes;
+        g_expert_alloc_host_peak[device] = host_peak;
+        g_expert_host_known [device] = true;
+        g_expert_host_bytes[device] = host_bytes;
     }
-    std::lock_guard<std::mutex> lock(g_expert_budget_mutex);
-    return g_expert_alloc_host[device];
+
+    return ggml_cuda_numa_prepare_host_plan(bytes.data(), bytes.size()) == 1;
 }
 
 // drop the allocation accounting of all devices. The fit code calls this before its no-alloc
@@ -533,6 +580,8 @@ void ggml_cuda_expert_reset_allocation(ggml_backend_buffer_type_t buft) {
         g_expert_alloc_stage[i] = 0;
         g_expert_alloc_host_peak[i] = 0;
         g_expert_plan_valid[i] = false;
+        g_expert_host_known [i] = false;
+        g_expert_host_bytes[i] = 0;
     }
 }
 
@@ -1223,10 +1272,14 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
         return nullptr;
     }
 
-    // the plan bytes are recorded before the first host arena is allocated: the NUMA planner
-    // reads them to plan the machine once, before it picks the node of the first arena
-    ggml_cuda_expert_set_allocation(device, (size_t) plan.slot_used, (size_t) plan.host_bytes,
-        stage_budget, (size_t) plan.host_peak);
+    // The bytes of every device are registered with the NUMA placement before the first arena of
+    // this buffer exists: the placement of the machine is planned from all of them, not from this
+    // device alone, and the plan fit committed is the one the arenas then follow.
+    if (!ggml_cuda_expert_register_host_plan(device, (size_t) plan.slot_used, (size_t) plan.host_bytes,
+            stage_budget, (size_t) plan.host_peak)) {
+        delete ctx;
+        return nullptr;
+    }
 
     // invariant before the first cudaMalloc of this buffer: the bytes this buffer still has to
     // allocate (slots + staging + the plain block of the non-expert tensors of the same load)
@@ -1465,6 +1518,10 @@ void ggml_backend_cuda_expert_verify_all(void) {
             }
         }
     }
+
+    // every arena of the model is allocated now: report the placement they got, the bytes and
+    // the pages move_pages confirmed, and whether it is the placement fit committed
+    ggml_cuda_numa_log_final_placement();
 }
 
 // pure placement plan for the fit code: the same store function that alloc_buffer_n uses, so
@@ -1706,11 +1763,6 @@ bool ggml_backend_cuda_expert_get_host_peak(ggml_backend_buffer_type_t buft, siz
     GGML_UNUSED(buft);
     GGML_UNUSED(peak_bytes);
     return false;
-}
-
-size_t ggml_cuda_expert_recorded_host_bytes(int device) {
-    GGML_UNUSED(device);
-    return 0;
 }
 
 void ggml_cuda_expert_reset_allocation(ggml_backend_buffer_type_t buft) {

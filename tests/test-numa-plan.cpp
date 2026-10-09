@@ -213,12 +213,81 @@ bool test_descent(void) {
 
 } // namespace
 
+// the committed plan is what the load reads: a device gets the node of the plan no matter how
+// many bytes it has when its arena is allocated
+bool test_committed_plan(void) {
+    // the placement of the 6 card machine: 0,0,8,0,0,0 is what the machines measure
+    ggml_cuda_numa_plan::committed c;
+    const std::vector<int>     node  = { 1, 1, 1, 0, 0, 0 };
+    const std::vector<size_t>  bytes = { 1514*1024*1024, 1500*1024*1024, 1494*1024*1024,
+                                          1501*1024*1024, 1502*1024*1024, 1490*1024*1024 };
+    if (ggml_cuda_numa_plan::committed_node(c, 0, bytes[0], nullptr) != -1) {
+        fprintf(stderr, "%s: an empty plan returned a node\n", __func__);
+        return false;
+    }
+
+    ggml_cuda_numa_plan::commit_plan(&c, node, bytes, true);
+
+    // every device gets the node of the plan, with the bytes it reads in the plan
+    for (size_t d = 0; d < node.size(); d++) {
+        bool     match = false;
+        const int got = ggml_cuda_numa_plan::committed_node(c, d, bytes[d], &match);
+        if (got != node[d]) {
+            fprintf(stderr, "%s: device %zu got node %d, want %d\n", __func__, d, got, node[d]);
+            return false;
+        }
+        if (!match) {
+            fprintf(stderr, "%s: device %zu with the planned bytes reports a mismatch\n", __func__, d);
+            return false;
+        }
+    }
+
+    // other bytes than the plan was made for: the node stays, only the mismatch is reported.
+    // A load that only knows the bytes of one device must not place the machine again.
+    for (size_t d = 0; d < node.size(); d++) {
+        bool     match = true;
+        const int got = ggml_cuda_numa_plan::committed_node(c, d, bytes[d] + 512*1024*1024, &match);
+        if (got != node[d]) {
+            fprintf(stderr, "%s: device %zu with other bytes got node %d, want %d\n", __func__, d, got, node[d]);
+            return false;
+        }
+        if (match) {
+            fprintf(stderr, "%s: device %zu reads 512 MiB more than planned, no mismatch reported\n", __func__, d);
+            return false;
+        }
+    }
+
+    // a difference inside the tolerance is not a mismatch: the expert store rounds every arena
+    // to its expert pitch and every arena is a whole number of pages
+    {
+        bool match = false;
+        const size_t tol = ggml_cuda_numa_plan::BYTES_TOLERANCE;
+        if (ggml_cuda_numa_plan::committed_node(c, 0, bytes[0] + tol, &match) != node[0] || !match) {
+            fprintf(stderr, "%s: a difference of exactly the tolerance is a mismatch\n", __func__);
+            return false;
+        }
+        if (ggml_cuda_numa_plan::committed_node(c, 0, bytes[0] + tol + 1, &match) != node[0] || match) {
+            fprintf(stderr, "%s: a difference past the tolerance is not a mismatch\n", __func__);
+            return false;
+        }
+    }
+
+    // a device the plan does not cover has no node
+    if (ggml_cuda_numa_plan::committed_node(c, node.size(), 0, nullptr) != -1) {
+        fprintf(stderr, "%s: a device outside the plan returned a node\n", __func__);
+        return false;
+    }
+
+    return true;
+}
+
 int main(void) {
     if (!test_exhaustive_best() ||
         !test_capacity()      ||
         !test_tie_is_deterministic() ||
         !test_does_not_fit()  ||
-        !test_descent()) {
+        !test_descent()       ||
+        !test_committed_plan()) {
         return 1;
     }
 

@@ -9,7 +9,14 @@
 //
 // The estimated time of an assignment a is T(a) = max over the devices of
 // (bytes_d * read_ms[d][a[d]]): the devices read at the same time, so the slowest one sets
-// the step time. Units are byte*ms; the caller converts them to a step time.
+// the step time. Units are byte*ms; the caller divides them by the probe size to get a step
+// time in ms.
+//
+// The plan is decided once per machine and then frozen: fit computes it from the host bytes of
+// every device and commits it, the load reads the committed nodes. A device whose bytes differ
+// from the ones the plan was made for keeps the planned node, because the load only knows the
+// bytes of the devices that already allocated something and planning from those would place the
+// machine from partial information.
 
 #include <algorithm>
 #include <cstddef>
@@ -358,6 +365,43 @@ static int plan(size_t n_dev, size_t n_nodes,
     fits_of(out->node.data(), n_dev, n_nodes, dev_bytes, node_cap, out->node_bytes);
     out->cost = cost_of(out->node.data(), n_dev, n_nodes, dev_bytes, t_ms);
     return 1;
+}
+
+// the plan the load uses, once it is committed
+
+// the load may read a few MiB more or less than the plan was made for: the expert store rounds
+// every arena up to its expert pitch and every arena is a whole number of pages, and the fit
+// figure and the allocation are computed by the same plan function
+static constexpr size_t BYTES_TOLERANCE = 1ull << 20; // 1 MiB
+
+struct committed {
+    bool                 valid    = false; // a machine plan exists
+    bool                 from_fit = false; // it is the plan fit computed and committed for the load
+    std::vector<int>     node;     // [device] node index of every device
+    std::vector<size_t> bytes;    // [device] host bytes the plan was made for
+};
+
+// freeze a plan of the solver as the one the load uses
+static void commit_plan(committed * c, const std::vector<int> & node, const std::vector<size_t> & bytes, bool from_fit) {
+    c->valid    = true;
+    c->from_fit = from_fit;
+    c->node     = node;
+    c->bytes    = bytes;
+}
+
+// node index of one device of the committed plan, -1 when there is no plan or no node for the
+// device. bytes_match reports whether have_bytes is the byte count the plan was made for; a
+// mismatch does not change the node.
+static int committed_node(const committed & c, size_t device, size_t have_bytes, bool * bytes_match) {
+    if (!c.valid || device >= c.node.size() || c.node[device] < 0) {
+        return -1;
+    }
+    if (bytes_match != nullptr) {
+        const size_t want = device < c.bytes.size() ? c.bytes[device] : 0;
+        const size_t diff = want > have_bytes ? want - have_bytes : have_bytes - want;
+        *bytes_match = diff <= BYTES_TOLERANCE;
+    }
+    return c.node[device];
 }
 
 } // namespace ggml_cuda_numa_plan

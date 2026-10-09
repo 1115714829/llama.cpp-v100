@@ -172,15 +172,16 @@ void ggml_cuda_expert_set_slot_limit(ggml_backend_buffer_type_t buft, size_t byt
 // node capacities (MemTotal of the nodes) and the read times measured while all the devices
 // read at the same time, and every host arena of a device then goes to the node of that plan.
 // The plan is made by ggml_cuda_numa_plan::plan() (ggml-cuda-numa-plan.h), which fit and the
-// real allocation share, so a fit that passes does not fail later.
+// real allocation share: fit commits it and the load reads the committed nodes, so a fit that
+// passes does not fail later and the load never places the machine from the bytes of one card.
 // The return values of ggml_cuda_numa_reserve() that are not a node number:
 #define GGML_CUDA_NUMA_NODE_ANY  (-2) // no NUMA node information: allocate with no policy
-#define GGML_CUDA_NUMA_NODE_FAIL (-1) // the bytes do not fit into the node capacities
+#define GGML_CUDA_NUMA_NODE_FAIL (-1) // there is no placement, or the bytes do not fit the nodes
 
-// host bytes the most recent expert store plan of the device asked for. The allocation records
-// it before it allocates the first arena, so the NUMA planner knows the whole size of the device
-// when the first arena picks its node.
-size_t ggml_cuda_expert_recorded_host_bytes(int device);
+// hand the host bytes of every device to the placement before the first arena of the machine is
+// allocated: the plan needs all the devices, not only the one that allocates now. Returns 0 when
+// the machine has no placement afterwards (the bytes do not fit the node capacities).
+int ggml_cuda_numa_prepare_host_plan(const size_t * dev_bytes, size_t n_dev);
 
 // reserve `size` bytes on the node of the plan for the device and return it (or
 // GGML_CUDA_NUMA_NODE_ANY / GGML_CUDA_NUMA_NODE_FAIL). The bytes count as placed while the
@@ -192,8 +193,11 @@ void ggml_cuda_numa_release(int device, int node, size_t size);
 
 // allocate pinned mapped host memory on the node, nullptr when the allocation fails or when
 // the pages can not be bound to that node
-void * ggml_cuda_numa_host_alloc(size_t size, int node);
+void * ggml_cuda_numa_host_alloc(int device, size_t size, int node);
 
 // startup log of the placement: one line per device with its node and bytes, then one line with
 // the estimated step time and the two placements it is compared against
 void ggml_cuda_numa_log_placement(const char * what);
+
+// log the placement the arenas really got, once every arena of the model is allocated
+void ggml_cuda_numa_log_final_placement(void);

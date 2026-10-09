@@ -293,7 +293,9 @@ static void common_expert_record_plan(ggml_backend_buffer_type_t buft, size_t sl
 // NUMA check of the expert host arenas: hand the host complement allocations of all devices to
 // the backend, which plans the machine once (the same plan the real load reads) from the per
 // device bytes, the node capacities (MemTotal minus the margin) and the read times measured
-// while all the devices read at the same time. On success the bytes the plan places on every
+// while all the devices read at the same time. A successful check commits that plan for the
+// load: the arenas of the model then follow it, and the load never plans the machine again from
+// the bytes of the device that allocates first. On success the bytes the plan places on every
 // node are written to node_bytes/node_ids (up to the capacity in *n_nodes, which receives the
 // actual number of nodes). Returns 1 when the placement fits, -1 when the nodes cannot hold the
 // arenas (the bytes needed and the capacity of all nodes together are returned), and 0 when
