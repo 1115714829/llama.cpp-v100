@@ -1676,7 +1676,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 void llama_model_loader::done_getting_tensors(bool partial) const {
     // the file tensors that were merged into a synthesized tensor are not created, so they are
     // taken off the count of tensors the file has
-    const int n_expected = n_tensors - n_merged_sources;
+    // a merged tensor absorbs two file tensors but is created as one, so the expected count drops by
+    // one per merged tensor (n_merged_sources counts the absorbed sources, two per merged tensor)
+    const int n_expected = n_tensors - n_merged_sources/2;
     if (n_created > n_expected) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_expected, n_created));
     }
