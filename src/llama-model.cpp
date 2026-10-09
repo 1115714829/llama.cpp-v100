@@ -420,7 +420,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
     static const std::regex pattern_kv_rot          ("cache_(k|v)_rot");
-    static const std::regex pattern_layer_inp_sink  ("embd_(layer_inp|src)_sink");
+    static const std::regex pattern_layer_inp_sink  ("(embd_(layer_inp|src)_sink|h_nextn_sink)");
     static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
     static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
@@ -554,7 +554,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
         }
 
-        // the DFlash2 feature sinks are written and read by every device in full
+        // the DFlash2 feature sinks and the nextn h sink are written and read by every device in full
         if (std::regex_match(tensor_name, pattern_layer_inp_sink)) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
         }

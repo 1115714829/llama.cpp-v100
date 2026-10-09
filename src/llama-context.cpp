@@ -1873,20 +1873,22 @@ bool llama_context::enable_h_nextn_sink(bool is_target, uint32_t n_h_rows) {
         return false;
     }
 
-    // the rows are produced on the output device, so the sink lives on that device and only there
-    // (a single copy, not mirrored). the draft is pinned to the same device
-    // (common_speculative_init_result), so it reads the sink in place
+    // the rows are produced on the output device, so the sink lives there. the draft runs on
+    // the same device(s) (common_base_params_to_speculative), so it reads the sink in place
     ggml_backend_dev_t dev = model.dev_output();
-
-    // capability branch, not a fallback: the single-stream sink requires the output layer to run
-    // on one device. with a meta output device (tensor split) the rows are sliced across devices
-    // and there is nothing to hand over between the two contexts
-    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META) {
-        LLAMA_LOG_ERROR("%s: the nextn h sink requires the output layer on a single device\n", __func__);
+    if (dev == nullptr) {
+        LLAMA_LOG_ERROR("%s: the model has no output device\n", __func__);
         return false;
     }
 
-    ggml_backend_t backend_h = llm_backend_for_device(backends, dev);
+    // capability branch, not a fallback: with a meta output device (tensor split) every device
+    // produces the rows, so the sink is allocated from the meta buft and holds one full copy per
+    // device (the same layout as the DFlash2 feature sink). The rows (the nextn residual) are
+    // MIRRORED in that layout, so each device writes and reads its own copy and no device has to
+    // talk to another one
+    const bool dev_meta = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
+
+    ggml_backend_t backend_h = dev_meta ? backends[0].get() : llm_backend_for_device(backends, dev);
     if (backend_h == nullptr) {
         LLAMA_LOG_ERROR("%s: the output device is not one of the context backends\n", __func__);
         return false;
@@ -1902,7 +1904,9 @@ bool llama_context::enable_h_nextn_sink(bool is_target, uint32_t n_h_rows) {
         return true;
     }
 
-    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    // the meta buft gives one full copy of the sink per device, see the comment on dev_meta
+    ggml_backend_buffer_type_t buft = dev_meta ?
+        ggml_backend_get_default_buffer_type(backend_h) : ggml_backend_dev_buffer_type(dev);
 
     const ggml_init_params params = {
         /*.mem_size   =*/ 2*ggml_tensor_overhead(),
@@ -2181,6 +2185,11 @@ bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols
     };
     ggml_context_ptr ctx_view(ggml_init(params));
 
+    // with a meta sink every device holds its own copy of every column, so the copies are
+    // device local and are queued on the per-device streams of the draft context
+    const bool sink_meta = ggml_backend_buffer_is_meta(t_h_sink->buffer);
+    const size_t col_bytes = (size_t) t_h_sink->nb[1];
+
     for (size_t i = 0; i < n_cols; ++i) {
         const int32_t src_col = src_cols[i];
         if (src_col < 0) {
@@ -2192,10 +2201,18 @@ bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols
             return false;
         }
 
+        const size_t src_offs = (size_t) src_col * col_bytes;
+        const size_t dst_offs = (2*n_batch + i) * col_bytes;
+
+        if (sink_meta) {
+            ggml_backend_meta_copy_mirrored_async(backend_h_sink, t_h_sink, src_offs, t_h_sink, dst_offs, col_bytes);
+            continue;
+        }
+
         ggml_tensor * src = ggml_view_2d(ctx_view.get(), t_h_sink, t_h_sink->ne[0], 1,
-                t_h_sink->nb[1], (size_t) src_col * t_h_sink->nb[1]);
+                t_h_sink->nb[1], src_offs);
         ggml_tensor * dst = ggml_view_2d(ctx_view.get(), t_h_sink, t_h_sink->ne[0], 1,
-                t_h_sink->nb[1], (size_t) (2*n_batch + i) * t_h_sink->nb[1]);
+                t_h_sink->nb[1], dst_offs);
 
         GGML_ASSERT(ggml_backend_view_init(src) == GGML_STATUS_SUCCESS);
         GGML_ASSERT(ggml_backend_view_init(dst) == GGML_STATUS_SUCCESS);
