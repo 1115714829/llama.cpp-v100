@@ -3759,8 +3759,11 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
                         tn_gate.str().c_str(), tn_up.str().c_str(), tn_merged.str().c_str());
                 return;
             }
-        } else {
-            LLAMA_LOG_INFO("%s: '%s' and '%s' cannot be merged (%s / %s), loading them separately\n", __func__,
+        } else if (!(flags & TENSOR_NOT_REQUIRED)) {
+            // the model asked for the fused path and cannot get it: a warning, not an info line,
+            // because the common log drops INFO unless -lv 4 is given and a silent fallback to the
+            // two separate weights is exactly what must not go unnoticed
+            LLAMA_LOG_WARN("%s: '%s' and '%s' cannot be merged (%s / %s), loading them separately\n", __func__,
                     tn_gate.str().c_str(), tn_up.str().c_str(),
                     t_gate ? llama_format_tensor_shape(t_gate).c_str() : "missing",
                     t_up   ? llama_format_tensor_shape(t_up).c_str()   : "missing");
