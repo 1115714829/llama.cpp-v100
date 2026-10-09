@@ -15162,6 +15162,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q4_K, 512, 10, 640, 2048, 2560, 8));
     test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q4_K, 512, 10, 1280, 2048, 2560, 8));
 
+    // the same expert projections cut along the expert ff dimension for a 6-way tensor split
+    // (640 = 20 Q5_1 blocks -> 128/128/96/96/96/96 rows per device): every device runs all the
+    // routed experts at a sixth of the width, against a sixth of the routed entries at full
+    // width when the experts are split across the devices instead
+    for (int64_t n : {1, 4, 8, 512, 2048}) {
+        for (int64_t m : {128, 96}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false,   m, n, 2560)); // gate/up slice
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 2*m, n, 2560)); // merged gate_up slice
+            for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n, m)); // down slice
+            }
+        }
+    }
+
     return test_cases;
 }
 
