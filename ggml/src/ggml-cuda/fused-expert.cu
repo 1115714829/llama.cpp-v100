@@ -461,11 +461,11 @@ static void fused_expert_launch(const ggml_tensor * dst, const char * const * ex
                 break;
             case GGML_TYPE_Q5_1:
                 fused_expert_32_kernel<7><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
-                    ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
+                    ids_src1, ids_dst, X, (float *) D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
                 break;
             case GGML_TYPE_Q8_0:
                 fused_expert_32_kernel<8><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
-                    ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
+                    ids_src1, ids_dst, X, (float *) D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
                 break;
             default:
                 GGML_ABORT("fatal error");
