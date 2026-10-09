@@ -102,9 +102,9 @@ static int fastest_of(size_t device, size_t n_nodes, const double * t_ms) {
 // Returns 1 and fills `out` on success, 0 when there is no device or no node at all, and -1
 // when no assignment fits into the node capacities (out is then left empty and the caller
 // reports the total need against the total capacity).
-int plan(size_t n_dev, size_t n_nodes,
-         const size_t * dev_bytes, const int64_t * node_cap, const double * t_ms,
-         const int * topo_node, result * out) {
+static int plan(size_t n_dev, size_t n_nodes,
+                const size_t * dev_bytes, const int64_t * node_cap, const double * t_ms,
+                const int * topo_node, result * out) {
     out->node.clear();
     out->node_bytes.clear();
     out->cost = out->cost_fast = out->cost_local = 0.0;
