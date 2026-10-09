@@ -924,23 +924,66 @@ static enum ggml_status ggml_backend_cuda_expert_buffer_init_tensor(ggml_backend
     return GGML_STATUS_SUCCESS;
 }
 
+// The store addresses its bytes by an offset relative to the tensor start, one expert per
+// blob_bytes (see ggml_expert_store_write), so a view of an expert tensor is traced back to the
+// store tensor and its own offset added. The same view check as ggml_cuda_expert_table_get:
+// anything the store cannot express aborts instead of reading or writing the wrong experts.
+// Returns false for a plain tensor of the same buffer type (test sentinels, mixed contexts):
+// it has no store entry and is addressed through its data pointer.
+static bool ggml_backend_cuda_expert_buffer_store_target(
+        const ggml_tensor * tensor, ggml_backend_cuda_expert_buffer_context * ctx, const char * func,
+        int * tensor_id, size_t * store_offset) {
+    int64_t view_offset = 0;
+    const ggml_tensor * store_tensor = ggml_cuda_expert_trace_view(tensor, &view_offset);
+    if (store_tensor == nullptr) {
+        GGML_ABORT("%s: cannot trace view '%s' back to the expert store tensor\n", func, tensor->name);
+    }
+
+    const int id = ctx->store != nullptr ? ggml_expert_store_tensor_id(ctx->store, store_tensor) : -1;
+    if (id < 0) {
+        if (!ggml_cuda_expert_tensor_is_expert(store_tensor)) {
+            return false;
+        }
+        GGML_ABORT("%s: tensor '%s' is not registered in the expert store\n", func, tensor->name);
+    }
+
+    if (view_offset != 0) {
+        const ggml_expert_store_tensor * st = ggml_expert_store_tensor_at(ctx->store, id);
+        if (view_offset % (int64_t) st->blob_bytes != 0 || tensor->nb[0] != store_tensor->nb[0] ||
+                tensor->nb[1] != store_tensor->nb[1] || tensor->nb[2] != store_tensor->nb[2]) {
+            GGML_ABORT("%s: view '%s' is not a contiguous expert range of '%s'\n",
+                func, tensor->name, store_tensor->name);
+        }
+        if (view_offset / (int64_t) st->blob_bytes + tensor->ne[2] > st->n_expert) {
+            GGML_ABORT("%s: view '%s' exceeds the expert range of '%s'\n",
+                func, tensor->name, store_tensor->name);
+        }
+    }
+
+    *tensor_id    = id;
+    *store_offset = (size_t) view_offset;
+    return true;
+}
+
 static void ggml_backend_cuda_expert_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_expert_buffer_context * ctx = (ggml_backend_cuda_expert_buffer_context *) buffer->context;
-    const int tensor_id = ctx->store != nullptr ? ggml_expert_store_tensor_id(ctx->store, tensor) : -1;
-    if (tensor_id < 0) {
+    int tensor_id = -1;
+    size_t store_offset = 0;
+    if (!ggml_backend_cuda_expert_buffer_store_target(tensor, ctx, __func__, &tensor_id, &store_offset)) {
         // plain tensor: same behavior as the regular CUDA buffer type
         ggml_cuda_set_device(ctx->device);
         CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         return;
     }
-    ggml_expert_store_memset(ctx->store, tensor_id, value, offset, size);
+    ggml_expert_store_memset(ctx->store, tensor_id, value, store_offset + offset, size);
 }
 
 static void ggml_backend_cuda_expert_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_expert_buffer_context * ctx = (ggml_backend_cuda_expert_buffer_context *) buffer->context;
-    const int tensor_id = ctx->store != nullptr ? ggml_expert_store_tensor_id(ctx->store, tensor) : -1;
-    if (tensor_id < 0) {
+    int tensor_id = -1;
+    size_t store_offset = 0;
+    if (!ggml_backend_cuda_expert_buffer_store_target(tensor, ctx, __func__, &tensor_id, &store_offset)) {
         // plain tensor: same behavior as the regular CUDA buffer type
         ggml_cuda_set_device(ctx->device);
         ggml_cuda_memcpy_h2d_async((char *) tensor->data + offset, data, size, cudaStreamPerThread);
@@ -948,13 +991,14 @@ static void ggml_backend_cuda_expert_buffer_set_tensor(ggml_backend_buffer_t buf
         return;
     }
     ggml_cuda_set_device(ctx->device);
-    ggml_expert_store_write(ctx->store, tensor_id, data, offset, size);
+    ggml_expert_store_write(ctx->store, tensor_id, data, store_offset + offset, size);
 }
 
 static void ggml_backend_cuda_expert_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_expert_buffer_context * ctx = (ggml_backend_cuda_expert_buffer_context *) buffer->context;
-    const int tensor_id = ctx->store != nullptr ? ggml_expert_store_tensor_id(ctx->store, tensor) : -1;
-    if (tensor_id < 0) {
+    int tensor_id = -1;
+    size_t store_offset = 0;
+    if (!ggml_backend_cuda_expert_buffer_store_target(tensor, ctx, __func__, &tensor_id, &store_offset)) {
         // plain tensor: same behavior as the regular CUDA buffer type
         ggml_cuda_set_device(ctx->device);
         CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
@@ -962,7 +1006,7 @@ static void ggml_backend_cuda_expert_buffer_get_tensor(ggml_backend_buffer_t buf
         return;
     }
     ggml_cuda_set_device(ctx->device);
-    ggml_expert_store_read(ctx->store, tensor_id, data, offset, size);
+    ggml_expert_store_read(ctx->store, tensor_id, data, store_offset + offset, size);
 }
 
 static bool ggml_backend_cuda_expert_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
