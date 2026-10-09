@@ -112,16 +112,22 @@ void ggml_cuda_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_by
 // and before the model loads.
 void ggml_cuda_expert_record_plan(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t host_bytes);
 
+// register the global index of local expert 0 of one expert tensor before its buffer is
+// allocated. The meta backend creates one simple tensor per device and knows the axis-2 slice
+// start of every one of them; it calls this so the store profile and the routing dump address
+// global (layer, expert) entries. Without expert parallelism the base is 0.
+void ggml_cuda_expert_set_tensor_base(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor, int64_t expert_base);
+
 // pure placement plan of the expert tensors of one device: the same store function that
 // alloc_buffer_n uses, so fit sizes the staging area without a trial load. The tensors arrive
-// as parallel arrays (layer, n_expert, blob_bytes). slot_budget is the VRAM budget for the
-// slots. Outputs: slot bytes, host complement bytes, the largest single-tensor host
-// complement (the staging requirement of one prefill batch), and, when host_bytes_each is
-// not null, the host complement bytes of every tensor in allocation order (the fit code
-// checks their NUMA placement against the nodes).
+// as parallel arrays (layer, expert_base, n_expert, blob_bytes). expert_base may be null (all
+// bases 0). slot_budget is the VRAM budget for the slots. Outputs: slot bytes, host
+// complement bytes, the largest single-tensor host complement (the staging requirement of one
+// prefill batch), and, when host_bytes_each is not null, the host complement bytes of every
+// tensor in allocation order (the fit code checks their NUMA placement against the nodes).
 void ggml_cuda_expert_plan(
         ggml_backend_buffer_type_t buft,
-        const int * layer, const int64_t * n_expert, const size_t * blob_bytes,
+        const int * layer, const int64_t * expert_base, const int64_t * n_expert, const size_t * blob_bytes,
         const int * type, const int64_t * ne0, size_t n_tensors,
         size_t slot_budget,
         size_t * slot_bytes, size_t * host_bytes, size_t * host_peak, size_t * host_bytes_each);

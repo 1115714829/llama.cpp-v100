@@ -111,7 +111,9 @@ void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_device) {
         path += ".dev" + std::to_string(store->device);
     }
 
-    // tensors of the same layer (gate/up/down) share one profile row: sum their counts
+    // tensors of the same layer (gate/up/down) share one profile row: sum their counts.
+    // With expert parallelism a store holds a contiguous slice of the experts, so the local
+    // expert numbers are shifted by the tensor's global expert base.
     int64_t n_layer = 0;
     for (const ggml_expert_store_tensor & t : store->tensors) {
         if (!t.stat_experts.empty() && t.layer >= 0) {
@@ -129,9 +131,9 @@ void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_device) {
             continue;
         }
         std::vector<int64_t> & row = counts[(size_t) t.layer];
-        row.resize(std::max<size_t>(row.size(), t.stat_experts.size()), 0);
+        row.resize(std::max<size_t>(row.size(), (size_t) t.expert_base + t.stat_experts.size()), 0);
         for (size_t e = 0; e < t.stat_experts.size(); ++e) {
-            row[e] += t.stat_experts[e];
+            row[(size_t) t.expert_base + e] += t.stat_experts[e];
             any = any || t.stat_experts[e] > 0;
         }
     }
@@ -335,8 +337,8 @@ void ggml_expert_store_plan(
         }
         if (have_profile && in.layer >= 0 && profile.n_layer > in.layer && profile.n_expert > 0) {
             std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
-                const int64_t ca = a < profile.n_expert ? profile.at(in.layer, a) : 0;
-                const int64_t cb = b < profile.n_expert ? profile.at(in.layer, b) : 0;
+                const int64_t ca = a + in.expert_base < profile.n_expert ? profile.at(in.layer, a + in.expert_base) : 0;
+                const int64_t cb = b + in.expert_base < profile.n_expert ? profile.at(in.layer, b + in.expert_base) : 0;
                 return ca > cb;
             });
         }
@@ -357,7 +359,7 @@ void ggml_expert_store_plan(
 int ggml_expert_store_add_tensor(
         ggml_expert_store * store,
         int layer, int kind,
-        int64_t n_expert, size_t blob_bytes, size_t blob_pad,
+        int64_t expert_base, int64_t n_expert, size_t blob_bytes, size_t blob_pad,
         const int64_t * slot_experts, int64_t n_slot,
         int64_t host_budget) {
     GGML_ASSERT(store != nullptr);
@@ -385,6 +387,7 @@ int ggml_expert_store_add_tensor(
     ggml_expert_store_tensor t;
     t.layer      = layer;
     t.kind       = kind;
+    t.expert_base = expert_base;
     t.n_expert   = n_expert;
     t.blob_bytes = blob_bytes;
     t.blob_pad   = blob_pad;

@@ -4,6 +4,9 @@
 #include "log.h"
 
 #include "../src/llama-ext.h"
+#include "../src/llama-model.h"
+
+#include "ggml-backend-impl.h"
 
 #include <algorithm>
 #include <array>
@@ -85,6 +88,30 @@ static bool common_buft_is_device_expert(ggml_backend_buffer_type_t buft) {
     return is_expert != nullptr && is_expert(buft);
 }
 
+// the expert buffer type of one device: the same extra buffer type the meta backend uses for
+// the expert tensors of a device in tensor-parallel mode. Returns nullptr when the device has
+// no expert buffer type (non-CUDA backends).
+static ggml_backend_buffer_type_t common_dev_expert_buft(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t);
+    auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    if (get_extra == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t * extra = get_extra(dev);
+    while (extra != nullptr && *extra != nullptr) {
+        if (common_buft_is_device_expert(*extra)) {
+            return *extra;
+        }
+        ++extra;
+    }
+    return nullptr;
+}
+
 // drop the recorded expert allocation of the backend (a model loaded earlier in this process
 // would otherwise leak its slot/host bytes into the no-alloc trials of this fit)
 static void common_expert_reset_allocation(ggml_backend_buffer_type_t buft) {
@@ -164,6 +191,7 @@ static bool common_expert_get_allocation(ggml_backend_buffer_type_t buft, size_t
 // loaded model, then handed to the pure plan function of the device that computes the layer
 struct common_expert_tensor {
     int        layer      = -1; // block index from the tensor name
+    int64_t    expert_base = 0; // global index of local expert 0 (expert parallelism)
     int64_t    n_expert   = 0;
     size_t     blob_bytes = 0;  // data bytes of one expert
     ggml_type  type       = GGML_TYPE_COUNT; // for the per-expert row padding of the backend
@@ -208,7 +236,7 @@ static bool common_expert_plan(ggml_backend_buffer_type_t buft,
         return false;
     }
     typedef void (*ggml_backend_expert_plan_t)(ggml_backend_buffer_type_t,
-        const int *, const int64_t *, const size_t *, const int *, const int64_t *, size_t,
+        const int *, const int64_t *, const int64_t *, const size_t *, const int *, const int64_t *, size_t,
         size_t, size_t *, size_t *, size_t *, size_t *);
     auto plan = (ggml_backend_expert_plan_t)
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_plan");
@@ -217,17 +245,20 @@ static bool common_expert_plan(ggml_backend_buffer_type_t buft,
     }
 
     std::vector<int>     layers;
+    std::vector<int64_t> expert_bases;
     std::vector<int64_t> n_experts;
     std::vector<size_t>  blobs;
     std::vector<int>     types;
     std::vector<int64_t> ne0s;
     layers.reserve(tensors.size());
+    expert_bases.reserve(tensors.size());
     n_experts.reserve(tensors.size());
     blobs.reserve(tensors.size());
     types.reserve(tensors.size());
     ne0s.reserve(tensors.size());
     for (const common_expert_tensor & t : tensors) {
         layers.push_back(t.layer);
+        expert_bases.push_back(t.expert_base);
         n_experts.push_back(t.n_expert);
         blobs.push_back(t.blob_bytes);
         types.push_back((int) t.type);
@@ -237,7 +268,7 @@ static bool common_expert_plan(ggml_backend_buffer_type_t buft,
     if (host_each != nullptr) {
         host_each->assign(tensors.size(), 0);
     }
-    plan(buft, layers.data(), n_experts.data(), blobs.data(), types.data(), ne0s.data(), tensors.size(),
+    plan(buft, layers.data(), expert_bases.data(), n_experts.data(), blobs.data(), types.data(), ne0s.data(), tensors.size(),
         slot_budget, slot_bytes, host_bytes, host_peak, host_each != nullptr ? host_each->data() : nullptr);
     return true;
 }
@@ -483,7 +514,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             if (layer < 0) {
                 continue;
             }
-            expert_tensors->push_back({ layer, t->ne[2], (size_t) t->nb[2], t->type, t->ne[0] });
+            expert_tensors->push_back({ layer, 0, t->ne[2], (size_t) t->nb[2], t->type, t->ne[0] });
         }
     }
 
@@ -669,15 +700,330 @@ void common_fit_log_memory_stage_devs(struct ggml_backend_device ** devs, int nd
     prev_free = std::move(cur_free);
 }
 
+// Tensor-parallel split with routed experts (expert parallelism): one meta device wraps all
+// simple devices, every layer runs on every device and each device holds a contiguous slice of
+// the expert dim. There is no layer-to-device map, so the fit budgets the expert store of each
+// device directly: it measures the model no-alloc (the TP slice each device holds), reads the
+// free memory of every simple device, and gives what remains after the dense weights, the KV
+// cache, the compute buffers and the margin to the expert slots of that device.
+static void common_fit_ep(
+        const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
+        size_t * margins_s, enum ggml_log_level log_level) {
+    constexpr int64_t MiB = 1024*1024;
+
+    llama_model_params mparams_copy = *mparams;
+    mparams_copy.no_alloc  = true;
+    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+
+    llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
+    if (model == nullptr) {
+        throw common_params_fit_exception("failed to load model");
+    }
+    llama_context * ctx = llama_init_from_model(model, *cparams);
+    if (ctx == nullptr) {
+        llama_model_free(model);
+        throw common_params_fit_exception("failed to create llama_context from model");
+    }
+
+    // the model device is the meta device; its simple devices are the cards
+    std::vector<ggml_backend_dev_t> simple_devs;
+    if (llama_model_n_devices(model) == 1 && model->devices[0].is_meta) {
+        ggml_backend_dev_t meta_dev = llama_model_get_device(model, 0);
+        const size_t ns = ggml_backend_meta_dev_n_devs(meta_dev);
+        for (size_t j = 0; j < ns; j++) {
+            simple_devs.push_back(ggml_backend_meta_dev_simple_dev(meta_dev, j));
+        }
+    }
+    const size_t nd = simple_devs.size();
+    if (nd < 1) {
+        llama_free(ctx);
+        llama_model_free(model);
+        throw common_params_fit_exception("expert parallel fit needs a meta device with at least one simple device, abort");
+    }
+
+    // every simple device must offer an expert buffer type: the store is the only expert
+    // placement in tensor mode
+    std::vector<ggml_backend_buffer_type_t> expert_bufts(nd, nullptr);
+    for (size_t j = 0; j < nd; j++) {
+        expert_bufts[j] = common_dev_expert_buft(simple_devs[j]);
+        if (expert_bufts[j] == nullptr) {
+            llama_free(ctx);
+            llama_model_free(model);
+            throw common_params_fit_exception("device " + std::to_string(j) +
+                " has no expert buffer type, expert parallelism needs the expert store on every device, abort");
+        }
+    }
+
+    // per-simple-device dense model bytes: the TP slice each device holds. Sliced tensors
+    // contribute their per-device slice, replicated ones the full tensor. Routed experts are
+    // skipped: they are placed by the expert store, not counted as dense weights. ggml_nbytes
+    // is exact for the contiguous weight layout, so no per-tensor stride math is needed.
+    std::vector<int64_t> dev_model(nd, 0);
+    for (const auto & kv : llama_internal_get_tensor_map(model)) {
+        const ggml_tensor * t = kv.second;
+        if (t == nullptr || t->view_src != nullptr || ggml_nelements(t) == 0) {
+            continue;
+        }
+        if ((t->flags & GGML_TENSOR_FLAG_EXPERT) != 0) {
+            continue;
+        }
+        const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(
+            t, const_cast<llama_meta_device_get_split_state_userdata *>(&model->get_split_state_ud));
+        if (!(ss.axis >= 0 && ss.axis < GGML_MAX_DIMS)) {
+            // MIRRORED / PARTIAL / LOCAL_PARTIAL: every device holds the whole tensor
+            for (size_t j = 0; j < nd; j++) {
+                dev_model[j] += (int64_t) ggml_nbytes(t);
+            }
+            continue;
+        }
+        const int64_t ne_axis = t->ne[ss.axis];
+        if (ne_axis <= 0) {
+            continue;
+        }
+        for (size_t j = 0; j < nd; j++) {
+            int64_t ne_j = 0;
+            for (size_t s = 0; s < ss.n_segments; s++) {
+                ne_j += ss.ne[s*nd + j] * ss.nr[s];
+            }
+            dev_model[j] += (int64_t) ggml_nbytes(t) * ne_j / ne_axis;
+        }
+    }
+
+    // expert tensors of the model (loader mark), with the per-device expert counts and bases
+    // of the same split the meta backend applies (llama_meta_device_get_split_state).
+    struct ep_tensor { int layer; std::vector<int64_t> expert_base; std::vector<int64_t> n_expert; size_t blob_bytes; ggml_type type; int64_t ne0; };
+    std::vector<ep_tensor> expert_tensors;
+    for (const auto & kv : llama_internal_get_tensor_map(model)) {
+        const ggml_tensor * t = kv.second;
+        if (t == nullptr || (t->flags & GGML_TENSOR_FLAG_EXPERT) == 0) {
+            continue;
+        }
+        if (t->view_src != nullptr || t->ne[2] <= 1) {
+            continue;
+        }
+        if (!ggml_is_quantized(t->type) && t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_BF16) {
+            continue;
+        }
+        const int layer = common_expert_tensor_layer(kv.first);
+        if (layer < 0) {
+            continue;
+        }
+        const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(
+            t, const_cast<llama_meta_device_get_split_state_userdata *>(&model->get_split_state_ud));
+        if (ss.axis != GGML_BACKEND_SPLIT_AXIS_2) {
+            throw common_params_fit_exception("tensor split with experts: expert tensor '" + kv.first +
+                "' is not split along the expert dim, abort");
+        }
+        std::vector<int64_t> n_expert(nd, 0);
+        std::vector<int64_t> expert_base(nd, 0);
+        int64_t prefix = 0;
+        for (size_t j = 0; j < nd; j++) {
+            int64_t ne_j = 0;
+            for (size_t s = 0; s < ss.n_segments; s++) {
+                ne_j += ss.ne[s*nd + j] * ss.nr[s];
+            }
+            n_expert[j]   = ne_j;
+            expert_base[j] = prefix;
+            prefix += ne_j;
+        }
+        expert_tensors.push_back({ layer, std::move(expert_base), std::move(n_expert), (size_t) t->nb[2], t->type, t->ne[0] });
+    }
+
+    // context (KV cache) and compute bytes: the meta device reports one number per buffer
+    // type for the whole model
+    int64_t context_total = 0;
+    int64_t compute_total = 0;
+    {
+        const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx);
+        for (const auto & [buft, data] : mb) {
+            context_total += (int64_t) data.context;
+            compute_total += (int64_t) data.compute;
+        }
+    }
+
+    llama_free(ctx);
+    llama_model_free(model);
+
+    if (expert_tensors.empty()) {
+        throw common_params_fit_exception("tensor split with experts: the model carries no expert tensor, abort");
+    }
+
+    // drop the recorded allocation of an earlier model in this process and build the CUDA
+    // context of every device before sampling its free memory: a device without its context
+    // reports more free memory than the real load has, which would over-commit the slots
+    for (size_t j = 0; j < nd; j++) {
+        common_expert_reset_allocation(expert_bufts[j]);
+        common_expert_device_ready(expert_bufts[j]);
+    }
+
+    std::vector<int64_t> free_mem(nd, 0);
+    for (size_t j = 0; j < nd; j++) {
+        size_t free = 0;
+        size_t total = 0;
+        ggml_backend_dev_memory(simple_devs[j], &free, &total);
+        free_mem[j] = (int64_t) free;
+    }
+
+    // per-device expert tensors: the contiguous prefix split of every expert tensor
+    std::vector<std::vector<common_expert_tensor>> dev_tensors(nd);
+    int64_t host_complement = 0;
+    std::vector<std::vector<size_t>> host_each(nd);
+    std::vector<size_t> slot_budgets(nd, 0);
+    bool has_experts = false;
+
+    // The meta no-alloc measurement reports one context (KV) and one compute figure per
+    // buffer type. get_alloc_size is the maximum over the simple devices of the full tensor,
+    // so the context sum is the whole-cache size as if one device held it; the per-device
+    // slice is that divided by the device count. The compute figure is the scheduler buffer
+    // size of the single meta backend, which is the per-rank compute buffer already. Both are
+    // estimates; the exact per-device KV follows the attention-head split and is validated by
+    // the real load.
+    LOG_TRC("%s: expert parallel: context %.0f MiB total, compute %.0f MiB per rank, %zu devices\n",
+        __func__, context_total/(1024.0*1024.0), compute_total/(1024.0*1024.0), nd);
+
+    for (size_t j = 0; j < nd; j++) {
+        const int64_t context_j = context_total / (int64_t) nd;
+        const int64_t compute_j = compute_total;
+        const int64_t margin_j  = margins_s[j];
+        const int64_t surplus   = free_mem[j] - dev_model[j] - context_j - compute_j - margin_j;
+
+        for (const ep_tensor & t : expert_tensors) {
+            dev_tensors[j].push_back({ t.layer, t.expert_base[j], t.n_expert[j], t.blob_bytes, t.type, t.ne0 });
+        }
+
+        if (surplus <= 0) {
+            // no VRAM for slots: the prefill staging of the host complement could not exist
+            size_t slot_used_none = 0;
+            size_t host_bytes_none = 0;
+            size_t host_peak_none = 0;
+            if (!common_expert_plan(expert_bufts[j], dev_tensors[j], 0, &slot_used_none, &host_bytes_none,
+                    &host_peak_none, &host_each[j])) {
+                throw common_params_fit_exception("expert store: the buffer type of device " + std::to_string(j) +
+                    " has no placement plan, abort");
+            }
+            throw common_params_fit_exception(
+                "expert store: device " + std::to_string(j) + " has no VRAM surplus for expert slots,"
+                " so the " + std::to_string((host_peak_none + MiB - 1)/MiB) +
+                " MiB staging of one prefill batch cannot be allocated; reduce the context size,"
+                " use more devices or a lower quantization");
+        }
+
+        size_t stage_bytes = 0;
+        size_t stage_peak  = 0;
+        size_t slot_budget = (size_t) surplus;
+        size_t slot_used   = 0;
+        size_t host_bytes  = 0;
+        for (int round = 0; round < 64; ++round) {
+            if (!common_expert_plan(expert_bufts[j], dev_tensors[j], slot_budget, &slot_used, &host_bytes, &stage_peak)) {
+                throw common_params_fit_exception("expert store: the buffer type of device " + std::to_string(j) +
+                    " has no placement plan, abort");
+            }
+            const size_t next = std::min(stage_peak, (size_t) surplus);
+            if (next == stage_bytes) {
+                break;
+            }
+            stage_bytes = next;
+            slot_budget = (size_t) surplus - stage_bytes;
+        }
+        if (!common_expert_plan(expert_bufts[j], dev_tensors[j], slot_budget, &slot_used, &host_bytes, &stage_peak, &host_each[j])) {
+            throw common_params_fit_exception("expert store: the buffer type of device " + std::to_string(j) +
+                " has no placement plan, abort");
+        }
+        if (stage_peak > stage_bytes) {
+            throw common_params_fit_exception(
+                "expert store: device " + std::to_string(j) + " needs " +
+                std::to_string((stage_peak + MiB - 1)/MiB) + " MiB of staging for the host experts of one prefill batch, but only " +
+                std::to_string(stage_bytes/MiB) + " MiB fit (short by " +
+                std::to_string((stage_peak - stage_bytes + MiB - 1)/MiB) +
+                " MiB); reduce the context size, use more devices or a lower quantization");
+        }
+        common_expert_set_budget(expert_bufts[j], slot_budget, stage_bytes);
+        common_expert_record_plan(expert_bufts[j], slot_used, host_bytes);
+
+        const double hit = slot_used + host_bytes > 0
+            ? 100.0 * (double) slot_used / (double) (slot_used + host_bytes) : 0.0;
+        LOG_INF("%s: device %zu: dense %.0f MiB, context %.0f MiB, compute %.0f MiB, expert slots %.0f MiB (budget %.0f MiB), staging %.0f MiB, host complement %.0f MiB, decode hit %.0f%% (uniform)\n",
+            __func__, j,
+            (double) dev_model[j]/MiB, (double) context_j/MiB, (double) compute_j/MiB,
+            slot_used/1024.0/1024.0, slot_budget/1024.0/1024.0, stage_bytes/1024.0/1024.0,
+            host_bytes/1024.0/1024.0, hit);
+        slot_budgets[j] = slot_budget;
+        host_complement += (int64_t) host_bytes;
+        has_experts = true;
+    }
+
+    if (has_experts) {
+        size_t min_slot = SIZE_MAX;
+        size_t max_slot = 0;
+        size_t min_id   = 0;
+        size_t max_id   = 0;
+        for (size_t j = 0; j < nd; j++) {
+            if (slot_budgets[j] < min_slot) {
+                min_slot = slot_budgets[j];
+                min_id   = j;
+            }
+            if (slot_budgets[j] > max_slot) {
+                max_slot = slot_budgets[j];
+                max_id   = j;
+            }
+        }
+        LOG_INF("%s: expert slot budgets: min %.0f MiB (device %zu), max %.0f MiB (device %zu), difference %.0f MiB\n",
+            __func__, min_slot/1024.0/1024.0, min_id, max_slot/1024.0/1024.0, max_id,
+            (max_slot - min_slot)/1024.0/1024.0);
+    }
+
+    // host complement NUMA check, same backend proc the layer-split path uses
+    {
+        std::vector<int>    seq_dev;
+        std::vector<size_t> seq_size;
+        for (size_t j = 0; j < nd; j++) {
+            for (const size_t bytes : host_each[j]) {
+                seq_dev.push_back((int) j);
+                seq_size.push_back(bytes);
+            }
+        }
+        constexpr size_t max_nodes = 64;
+        int64_t node_bytes[max_nodes] = {};
+        int     node_ids  [max_nodes] = {};
+        size_t  n_nodes   = max_nodes;
+        int     fail_node  = -1;
+        size_t  fail_bytes = 0;
+        int64_t fail_avail = 0;
+        const int check = common_expert_check_host_nodes(simple_devs, seq_dev, seq_size,
+            node_bytes, node_ids, &n_nodes, &fail_node, &fail_bytes, &fail_avail);
+        if (check < 0) {
+            const int64_t deficit = (int64_t) fail_bytes - fail_avail;
+            throw std::runtime_error(
+                "expert store host complement: a slice of " + std::to_string(fail_bytes/MiB) + " MiB does not fit on NUMA node " +
+                std::to_string(fail_node) + ", which has only " + std::to_string(fail_avail/MiB) +
+                " MiB available (short by " + std::to_string((deficit > 0 ? deficit : 0)/MiB) +
+                " MiB); reduce the context size, use more devices or a lower quantization");
+        }
+        if (check > 0) {
+            std::string per_node;
+            int64_t total = 0;
+            for (size_t n = 0; n < n_nodes; n++) {
+                if (node_bytes[n] == 0) {
+                    continue;
+                }
+                total += node_bytes[n];
+                per_node += " node " + std::to_string(node_ids[n]) + ": " + std::to_string(node_bytes[n]/MiB) + " MiB,";
+            }
+            if (per_node.empty()) {
+                per_node = " none";
+            }
+            LOG_INF("%s: expert store host complement %" PRId64 " MiB fits, per NUMA node:%s\n",
+                __func__, total/MiB, per_node.c_str());
+        }
+    }
+    GGML_UNUSED(host_complement);
+    GGML_UNUSED(log_level);
+}
+
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
-    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
-        // in tensor mode every layer runs on every device, so there is no layer-to-device
-        // mapping that the MoE overrides could follow; keep the upstream abort
-        throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
-    }
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
     const llama_model_params default_mparams = llama_model_default_params();
@@ -793,6 +1139,21 @@ static void common_params_fit_impl(
     }
 
     const size_t nd = devs.size(); // number of devices
+
+    // Tensor split mode: every layer runs on every device. Without routed experts there is no
+    // per-device placement fit can choose, so dense models keep the abort and the caller treats
+    // the fit as "not possible" (the 27B tensor-split configuration has always logged it). With
+    // routed experts the EP branch budgets the per-device expert store; the expert count comes
+    // from the model metadata, not from an architecture name. This runs before the early
+    // "no changes needed" returns below, because in EP mode the expert budgets must be set even
+    // when the dense weights already fit.
+    if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
+        if (hp_nex == 0) {
+            throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
+        }
+        common_fit_ep(path_model, mparams, cparams, margins_s, log_level);
+        return;
+    }
 
     // baseline of the startup memory sampling series: the free memory the fit measures with.
     // model_loaded / sched_reserve / warmup / first_prefill / first_decode follow in the same

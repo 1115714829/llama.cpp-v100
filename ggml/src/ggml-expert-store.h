@@ -82,6 +82,10 @@ struct ggml_expert_store_backend {
 struct ggml_expert_store_tensor {
     int      layer      = -1;
     int      kind       = -1; // llm tensor id of one of the ffn_*_exps tensors
+    // global index of expert 0 of this tensor: with expert parallelism each device holds a
+    // contiguous slice of the expert dim, so the profile and the routing dump need the base
+    // to address global (layer, expert) entries. Always 0 for layer-split tensors.
+    int64_t  expert_base = 0;
     int64_t  n_expert   = 0;
     size_t   blob_bytes = 0;  // data bytes of one expert inside this tensor
     size_t   blob_pad   = 0;  // row padding after the data of one expert
@@ -184,6 +188,9 @@ GGML_API void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_de
 struct ggml_expert_store_plan_tensor {
     int     layer      = -1; // profile row of the tensor
     int64_t n_expert   = 0;
+    // global index of expert 0 of this tensor (expert parallelism). The profile is addressed
+    // with expert_base + local expert, so the per-device slices of a tensor share one row.
+    int64_t expert_base = 0;
     size_t  blob_bytes = 0;  // data bytes of one expert
     // trailing bytes one expert needs past its data for the row padding of the kernels.
     // The quantized MMQ/MMVQ loaders read the last row up to MATRIX_ROW_PADDING, which the
@@ -216,11 +223,13 @@ GGML_API void ggml_expert_store_plan(
 // register one expert tensor at the placement computed by ggml_expert_store_plan:
 // slot_experts[0..n_slot) are the experts that get slots 0..n_slot-1, the others are packed
 // into the host arena. host_budget < 0 means "as many experts as needed".
+// expert_base is the global index of local expert 0 (0 without expert parallelism); it only
+// shifts the profile/routing rows, the placement itself stays per local expert.
 // returns the tensor index, or -1 when it does not fit at all.
 GGML_API int ggml_expert_store_add_tensor(
         ggml_expert_store * store,
         int layer, int kind,
-        int64_t n_expert, size_t blob_bytes, size_t blob_pad,
+        int64_t expert_base, int64_t n_expert, size_t blob_bytes, size_t blob_pad,
         const int64_t * slot_experts, int64_t n_slot,
         int64_t host_budget);
 
