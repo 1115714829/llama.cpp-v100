@@ -1269,7 +1269,8 @@ struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL 
 
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        const LLM_TN_IMPL * tn_src_gate, const LLM_TN_IMPL * tn_src_up) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
     bool bf16_as_f16 = false;
@@ -1524,6 +1525,83 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return shared;
     }
 
+    // the fused SwiGLU path reads the gate and up rows of an expert as pairs from one tensor, so
+    // the model asks for a gate/up expert weight that the file does not ship: it is synthesized
+    // here from the gate and the up weight of the file, and its rows are interleaved while
+    // loading (see TENSOR_GATE_UP_INTERLEAVE and llama_load_merged_gate_up)
+    if (tn_src_gate != nullptr && tn_src_up != nullptr) {
+        const std::string name = tn.str();
+
+        const ggml_tensor * src_gate = get_tensor_meta(tn_src_gate->str().c_str());
+        const ggml_tensor * src_up   = get_tensor_meta(tn_src_up->str().c_str());
+
+        // a layer that does not need the weight (TENSOR_NOT_REQUIRED) has no sources to merge
+        if (src_gate == nullptr || src_up == nullptr) {
+            return nullptr;
+        }
+
+        // the merged dimensions are the gate dimensions with twice the rows: the file tensor must
+        // have exactly these rows per expert, otherwise its rows cannot be paired up
+        const std::vector<int64_t> ne_merged(ne.begin(), ne.end());
+        if (ne_merged.size() != 3 || ne_merged[0] != src_gate->ne[0] ||
+            ne_merged[1] != 2*src_gate->ne[1] || ne_merged[2] != src_gate->ne[2] ||
+            src_gate->ne[1] != src_up->ne[1]) {
+            throw std::runtime_error(
+                    format("%s: tensor '%s' cannot be merged from '%s' (%s) and '%s' (%s)",
+                        __func__, name.c_str(), tn_src_gate->str().c_str(), llama_format_tensor_shape(src_gate).c_str(),
+                        tn_src_up->str().c_str(), llama_format_tensor_shape(src_up).c_str()));
+        }
+
+        bf16_as_f16 = src_gate->type == GGML_TYPE_BF16 &&
+            (bf16_weights_as_f16(buft_list_input) || bf16_weights_as_f16(buft_list_output) || bf16_weights_as_f16(buft_list_layer));
+
+        ggml_tensor t_meta;
+        memset(&t_meta, 0, sizeof(ggml_tensor));
+        t_meta.type = bf16_as_f16 ? GGML_TYPE_F16 : src_gate->type;
+        for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+            t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+            if (dim == 0) {
+                t_meta.nb[dim] = ggml_type_size(t_meta.type);
+            } else if (dim == 1) {
+                t_meta.nb[dim] = ggml_row_size(t_meta.type, t_meta.ne[dim-1]);
+            } else {
+                t_meta.nb[dim] = t_meta.nb[dim-1]*t_meta.ne[dim-1];
+            }
+        }
+        ggml_set_name(&t_meta, name.c_str());
+
+        ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+        GGML_ASSERT(buft != nullptr);
+
+        ggml_context * ctx = ctx_for_buft(buft);
+
+        ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+        ggml_set_name(tensor, name.c_str());
+        mark_expert_tensor(tensor);
+
+        // the two file tensors are not created and not loaded on their own: their rows are read
+        // into this tensor and interleaved, so they are accounted for as merged sources here
+        llama_tensor_merged merged;
+        merged.bf16_as_f16 = bf16_as_f16;
+        const LLM_TN_IMPL * tn_src[2] = { tn_src_gate, tn_src_up };
+        for (int i = 0; i < 2; i++) {
+            const llama_tensor_weight & w = require_weight(tn_src[i]->str().c_str());
+            llama_tensor_weight_src src = { w.idx, w.offs, ggml_nbytes(w.tensor) };
+            GGML_ASSERT(src.size == (size_t) t_meta.ne[2]*t_meta.ne[1]/2*ggml_row_size(t_meta.type, t_meta.ne[0]));
+            if (i == 0) {
+                merged.gate = src;
+            } else {
+                merged.up = src;
+            }
+            n_merged_sources++;
+        }
+        merged_tensors[name] = merged;
+
+        n_created++;
+
+        return tensor;
+    }
+
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
     const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
@@ -1596,12 +1674,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
-    if (n_created > n_tensors) {
-        throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
+    // the file tensors that were merged into a synthesized tensor are not created, so they are
+    // taken off the count of tensors the file has
+    const int n_expected = n_tensors - n_merged_sources;
+    if (n_created > n_expected) {
+        throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_expected, n_created));
     }
-    if (n_created < n_tensors) {
+    if (n_created < n_expected) {
         if (!partial) {
-            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_expected, n_created));
         }
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
                 __func__, n_created, n_tensors);
@@ -1725,6 +1806,61 @@ static void llama_interleave_gate_up_rows(uint8_t * data, ggml_type type, int64_
             memcpy(scratch.data() + (2*r + 1)*row_size, dst_expert + (n_ff + r)*row_size, row_size);
         }
         memcpy(dst_expert, scratch.data(), expert_size);
+    }
+}
+
+// A gate/up expert weight that the file does not have is synthesized from the gate and the up
+// weight of the file: for every expert the n_ff rows of the gate weight and the n_ff rows of the
+// up weight are written to the even and the odd rows of the merged tensor, which is the order
+// ggml_mul_mat_id_swiglu reads. The file mapping and the destination buffer are both written
+// while loading, so the rows come from the file into private buffers and are written expert by
+// expert, which keeps the staging memory at one expert instead of the whole tensor.
+static void llama_load_merged_gate_up(
+        const llama_files & files, ggml_tensor * cur,
+        const llama_model_loader::llama_tensor_weight_src & gate,
+        const llama_model_loader::llama_tensor_weight_src & up,
+        bool bf16_as_f16, bool check_tensors) {
+    const int64_t n_ff    = cur->ne[1] / 2;
+    const size_t row_size = ggml_row_size(cur->type, cur->ne[0]);
+
+    // BF16 weights are loaded as F16 on devices without native BF16 support, see create_tensor()
+    const ggml_type         type_src   = bf16_as_f16 ? GGML_TYPE_F16 : cur->type;
+    const size_t            src_rows   = n_ff*ggml_row_size(type_src, cur->ne[0]);
+    const size_t            expert_size = 2*src_rows;
+
+    const llama_model_loader::llama_tensor_weight_src * src[2] = { &gate, &up };
+    GGML_ASSERT(gate.size == (size_t) cur->ne[2]*src_rows && up.size == (size_t) cur->ne[2]*src_rows);
+
+    std::vector<no_init<uint8_t>> buf_gate(src_rows);
+    std::vector<no_init<uint8_t>> buf_up(src_rows);
+    std::vector<no_init<uint8_t>> buf_merged(expert_size);
+
+    // the BF16 to F16 conversion keeps the row width, so a source row is a row of the tensor
+    std::vector<no_init<uint8_t>> * buf_src[2] = { &buf_gate, &buf_up };
+
+    for (int64_t e = 0; e < cur->ne[2]; e++) {
+        for (int s = 0; s < 2; s++) {
+            llama_file * file = files.at(src[s]->idx).get();
+
+            file->seek(src[s]->offs + e*src_rows, SEEK_SET);
+            file->read_raw(buf_src[s]->data(), src_rows);
+
+            if (bf16_as_f16) {
+                ggml_bf16_to_fp16_row((const ggml_bf16_t *) buf_src[s]->data(),
+                                      (ggml_fp16_t *) buf_src[s]->data(), src_rows/sizeof(ggml_bf16_t));
+            }
+        }
+
+        for (int64_t r = 0; r < n_ff; r++) {
+            memcpy(buf_merged.data() + (2*r    )*row_size, buf_gate.data() + r*row_size, row_size);
+            memcpy(buf_merged.data() + (2*r + 1)*row_size, buf_up  .data() + r*row_size, row_size);
+        }
+
+        if (check_tensors && !ggml_validate_row_data(cur->type, buf_merged.data(), expert_size)) {
+            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+        }
+
+        ggml_backend_tensor_set(cur, buf_merged.data(), e*expert_size, expert_size);
     }
 }
 
@@ -1887,7 +2023,34 @@ bool llama_model_loader::load_all_data(
     int64_t ms_devread = 0;
 
     for (struct ggml_tensor * cur : tensors) {
-        const auto * weight = get_weight(ggml_get_name(cur));
+        const std::string cur_name = ggml_get_name(cur);
+
+        // a gate/up expert weight that is synthesized from the gate and the up weight of the file:
+        // it is not in the file, so it never goes through the mapping below
+        if (auto mit = merged_tensors.find(cur_name); mit != merged_tensors.end()) {
+            if (progress_callback) {
+                if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                    return false;
+                }
+            }
+
+            const auto & merged = mit->second;
+
+            llama_load_merged_gate_up(files, cur, merged.gate, merged.up, merged.bf16_as_f16, check_tensors);
+
+            // the weights are now in a buffer the device reads directly, drop the page cache of
+            // the two source ranges, they are not mapped into a buffer
+            if (use_mmap && cur->buffer != nullptr && is_device_readable_buft(ggml_backend_buffer_get_type(cur->buffer))) {
+                for (const auto * src : { &merged.gate, &merged.up }) {
+                    mappings.at(src->idx)->drop_page_cache(src->offs, src->offs + src->size);
+                }
+            }
+
+            size_done += ggml_nbytes(cur);
+            continue;
+        }
+
+        const auto * weight = get_weight(cur_name.c_str());
         if (weight == nullptr) {
             // this can happen with split experts models
             continue;

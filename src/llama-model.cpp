@@ -2231,7 +2231,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
-ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        const LLM_TN_IMPL * tn_src_gate, const LLM_TN_IMPL * tn_src_up) {
     const buft_list_t * buft_list_layer = nullptr;
     if (tn.bid != -1) {
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
@@ -2239,7 +2240,7 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     }
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-        tn, ne, flags);
+        tn, ne, flags, tn_src_gate, tn_src_up);
 }
 
 std::string llama_model::arch_name() const {
@@ -3721,9 +3722,10 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY),
     TENSOR_GATE_UP_INTERLEAVE(llama_model_loader::TENSOR_GATE_UP_INTERLEAVE) {}
 
-ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        const LLM_TN_IMPL * tn_src_gate, const LLM_TN_IMPL * tn_src_up) {
     GGML_ASSERT(ml != nullptr);
-    return create_tensor(*ml, tn, ne, flags);
+    return create_tensor(*ml, tn, ne, flags, tn_src_gate, tn_src_up);
 }
 
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags, int flags_extra) {
@@ -3737,6 +3739,33 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
     }
 
     layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED | flags_extra);
+    if (layer.ffn_gate_up_exps == nullptr && (flags_extra & TENSOR_GATE_UP_INTERLEAVE)) {
+        // the file ships the gate and the up weight separately and the model wants the fused
+        // SwiGLU path, which reads them as pairs from one tensor: let the loader merge them while
+        // loading. their rows can only be interleaved when both weights have the same type and
+        // shape, otherwise the loader loads them as two separate tensors
+        const LLM_TN_IMPL tn_gate = tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid);
+        const LLM_TN_IMPL tn_up   = tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid);
+
+        const ggml_tensor * t_gate = ml->get_tensor_meta(tn_gate.str().c_str());
+        const ggml_tensor * t_up   = ml->get_tensor_meta(tn_up.str().c_str());
+
+        if (t_gate && t_up && t_gate->type == t_up->type &&
+            t_gate->ne[0] == t_up->ne[0] && t_gate->ne[1] == t_up->ne[1] && t_gate->ne[2] == t_up->ne[2]) {
+            const LLM_TN_IMPL tn_merged = tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid);
+            layer.ffn_gate_up_exps = create_tensor(tn_merged, {n_embd_, n_ff_ * 2, n_expert_}, flags, &tn_gate, &tn_up);
+            if (layer.ffn_gate_up_exps != nullptr) {
+                LLAMA_LOG_INFO("%s: merging '%s' and '%s' into '%s' while loading\n", __func__,
+                        tn_gate.str().c_str(), tn_up.str().c_str(), tn_merged.str().c_str());
+                return;
+            }
+        } else {
+            LLAMA_LOG_INFO("%s: '%s' and '%s' cannot be merged (%s / %s), loading them separately\n", __func__,
+                    tn_gate.str().c_str(), tn_up.str().c_str(),
+                    t_gate ? llama_format_tensor_shape(t_gate).c_str() : "missing",
+                    t_up   ? llama_format_tensor_shape(t_up).c_str()   : "missing");
+        }
+    }
     if (layer.ffn_gate_up_exps == nullptr) {
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);

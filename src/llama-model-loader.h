@@ -54,6 +54,23 @@ struct llama_model_loader {
         }
     };
 
+    // one file tensor whose bytes go into a synthesized tensor, see llama_tensor_merged
+    struct llama_tensor_weight_src {
+        uint16_t idx; // source file index
+        size_t   offs; // tensor data offset in the original file
+        size_t   size; // size of the source tensor data in the file
+    };
+
+    // a tensor that the file does not have, synthesized while loading from the gate and the up
+    // weight of the file: their rows are interleaved into it (row 2r = gate row r, row 2r+1 = up
+    // row r), see TENSOR_GATE_UP_INTERLEAVE and llama_load_merged_gate_up
+    struct llama_tensor_merged {
+        llama_tensor_weight_src gate;
+        llama_tensor_weight_src up;
+        // the sources are BF16 in the file and the tensor is F16 (bf16_weights_as_f16)
+        bool bf16_as_f16 = false;
+    };
+
     // custom comparator to sort weights more nicely by layer
     struct weight_name_comparer {
         bool operator()(const std::string & a, const std::string & b) const {
@@ -163,6 +180,12 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+    // tensors that the file does not have and that are synthesized from the gate and up weights
+    // of this file while loading, keyed by tensor name
+    std::map<std::string, llama_tensor_merged> merged_tensors;
+    // file tensors consumed by a synthesized tensor: they are neither created nor loaded on their
+    // own, their bytes are read into the synthesized tensor instead
+    int n_merged_sources = 0;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
@@ -284,9 +307,12 @@ struct llama_model_loader {
     // true if the tensor is a BF16 weight that is loaded as F16
     bool is_bf16_as_f16(const struct ggml_tensor * tensor) const;
 
+    // tn_src_gate and tn_src_up name the two file tensors a gate/up tensor is synthesized from,
+    // instead of looking the tensor up in the file. only valid when they are set
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        const LLM_TN_IMPL * tn_src_gate = nullptr, const LLM_TN_IMPL * tn_src_up = nullptr);
 
     // a draft head that shares the target's embeddings does not carry its own token_embd,
     // output or output_norm; take them from the target model instead. returns null unless the

@@ -854,12 +854,16 @@ struct llama_model_base : public llama_model {
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;
 
-    ggml_tensor * create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+    ggml_tensor * create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+            const LLM_TN_IMPL * tn_src_gate = nullptr, const LLM_TN_IMPL * tn_src_up = nullptr);
 
     // convenience overload of create_tensor that doesn't require llama_model_loader
-    ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+    ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+            const LLM_TN_IMPL * tn_src_gate = nullptr, const LLM_TN_IMPL * tn_src_up = nullptr);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
+    // when the file ships gate and up separately and the model wants the fused SwiGLU path
+    // (TENSOR_GATE_UP_INTERLEAVE), the two weights are merged into one tensor while loading
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
                 int64_t n_ff_, int64_t n_expert_, int flags, int flags_extra = 0);
 
