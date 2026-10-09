@@ -6395,8 +6395,9 @@ struct expert_plan_spec {
 
 static void record_expert_plan(ggml_backend_reg_t reg, ggml_backend_buffer_type_t buft,
         const std::vector<expert_plan_spec> & specs, size_t slot_budget) {
-    auto plan = (void (*)(ggml_backend_buffer_type_t, const int *, const int64_t *, const size_t *,
-            const int *, const int64_t *, size_t, size_t, size_t *, size_t *, size_t *, size_t *))
+    auto plan = (void (*)(ggml_backend_buffer_type_t, const int *, const int64_t *, const int64_t *,
+            const size_t *, const int *, const int64_t *, size_t, size_t,
+            size_t *, size_t *, size_t *, size_t *))
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_plan");
     auto record = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_record_plan");
@@ -6420,7 +6421,8 @@ static void record_expert_plan(ggml_backend_reg_t reg, ggml_backend_buffer_type_
     size_t slot = 0;
     size_t host = 0;
     size_t peak = 0;
-    plan(buft, layers.data(), n_experts.data(), blobs.data(), types.data(), ne0s.data(), specs.size(),
+    // expert_base is null: without expert parallelism every local expert 0 is global expert 0
+    plan(buft, layers.data(), nullptr, n_experts.data(), blobs.data(), types.data(), ne0s.data(), specs.size(),
         slot_budget, &slot, &host, &peak, nullptr);
     record(buft, slot, host);
 }
