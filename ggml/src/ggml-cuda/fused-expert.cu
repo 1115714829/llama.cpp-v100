@@ -1,5 +1,6 @@
 #include "fused-expert.cuh"
 
+#include "convert.cuh"
 #include "ggml-cuda-expert.cuh"
 #include "mmid.cuh"
 #include "moe-grouped.cuh"
@@ -52,23 +53,17 @@ __device__ __forceinline__ void scale_min_k4(int j, uint32_t s0, uint32_t s1, ui
 }
 
 // the X tile [TM][BK] through registers (fetched one step ahead); rows >= ne are zero. The row
-// of compact column r is ids_src1[col_start + r]; the activation is F32 and converted here, so
-// no separate F16 copy is needed.
+// of compact column r is ids_src1[col_start + r]. X is F16: an F32 activation is converted once
+// per launch by ggml_cuda_fused_expert_mul_mat_id, so this read is 16 bytes per chunk instead of
+// 32 and the same element is not converted by every block that reads it.
 struct XRegs { uint4 v[TM * BK / 8 / NT]; };
-__device__ __forceinline__ void fetch_x(XRegs& x, const float* __restrict__ X, const int32_t* __restrict__ rows,
+__device__ __forceinline__ void fetch_x(XRegs& x, const __half* __restrict__ X, const int32_t* __restrict__ rows,
                                         int64_t ld, int ne, int64_t k0) {
 #pragma unroll
     for (int j = 0; j < TM * BK / 8 / NT; ++j) {
         const int i = threadIdx.x + NT * j, r = i / (BK / 8), c = (i % (BK / 8)) * 8;
         if (r < ne) {
-            const float* p = X + (int64_t) rows[r] * ld + k0 + c;
-            const float4 f0 = *(const float4*) (p + 0), f1 = *(const float4*) (p + 4);
-            const __half2 h0 = __float22half2_rn(make_float2(f0.x, f0.y));
-            const __half2 h1 = __float22half2_rn(make_float2(f0.z, f0.w));
-            const __half2 h2 = __float22half2_rn(make_float2(f1.x, f1.y));
-            const __half2 h3 = __float22half2_rn(make_float2(f1.z, f1.w));
-            x.v[j] = make_uint4(*reinterpret_cast<const uint32_t*>(&h0), *reinterpret_cast<const uint32_t*>(&h1),
-                                *reinterpret_cast<const uint32_t*>(&h2), *reinterpret_cast<const uint32_t*>(&h3));
+            x.v[j] = *(const uint4*) (X + (int64_t) rows[r] * ld + k0 + c);   // 8 halves, one 16-byte chunk
         } else {
             x.v[j] = make_uint4(0, 0, 0, 0);
         }
@@ -175,7 +170,7 @@ __device__ __forceinline__ void store_acc(float (*E)[LDE], Acc (&acc)[2][2]) {
 // GT: Q4_K (12) or Q5_K (13, the fifth bit of each value in qh[32]: bit 2 jj + hi of qh[l] adds 16)
 template<int GT>
 __device__ __forceinline__ void fused_expert_256_tile(
-        unsigned char* sm, const char* __restrict__ wbase, const float* __restrict__ X, const int32_t* __restrict__ ids_dst,
+        unsigned char* sm, const char* __restrict__ wbase, const __half* __restrict__ X, const int32_t* __restrict__ ids_dst,
         float* __restrict__ D, const int32_t* __restrict__ rows, int ne, int rt, int col_start,
         int64_t K, int64_t nb01, int64_t Xld, int64_t dst_stride_col) {
     constexpr int BB = GT == 12 ? 144 : 176, QS = GT == 12 ? 16 : 48;   // block bytes, quants offset
@@ -255,7 +250,7 @@ __device__ __forceinline__ void fused_expert_256_tile(
 // down-type generic GEMM: DT = Q5_1 (7) or Q8_0 (8), K blocks of 32 values
 template<int DT>
 __device__ __forceinline__ void fused_expert_32_tile(
-        unsigned char* sm, const char* __restrict__ wbase, const float* __restrict__ X, const int32_t* __restrict__ ids_dst,
+        unsigned char* sm, const char* __restrict__ wbase, const __half* __restrict__ X, const int32_t* __restrict__ ids_dst,
         float* __restrict__ D, const int32_t* __restrict__ rows, int ne, int rt, int col_start,
         int64_t K, int64_t nb01, int64_t Xld, int64_t dst_stride_col) {
     __half* Xs = (__half*) sm;
@@ -341,7 +336,7 @@ template<int GT>
 __global__ void __launch_bounds__(NT) fused_expert_256_kernel(
         const char* __restrict__ vx, const int32_t* __restrict__ expert_bounds,
         const int32_t* __restrict__ ids_src1, const int32_t* __restrict__ ids_dst,
-        const float* __restrict__ X, float* __restrict__ D,
+        const __half* __restrict__ X, float* __restrict__ D,
         const int64_t K, const int64_t nb01, const int64_t nb02, const int64_t Xld, const int64_t dst_stride_col,
         const char* const* __restrict__ expert_ptrs) {
     const int e = blockIdx.y;
@@ -366,7 +361,7 @@ template<int DT>
 __global__ void __launch_bounds__(NT) fused_expert_32_kernel(
         const char* __restrict__ vx, const int32_t* __restrict__ expert_bounds,
         const int32_t* __restrict__ ids_src1, const int32_t* __restrict__ ids_dst,
-        const float* __restrict__ X, float* __restrict__ D,
+        const __half* __restrict__ X, float* __restrict__ D,
         const int64_t K, const int64_t nb01, const int64_t nb02, const int64_t Xld, const int64_t dst_stride_col,
         const char* const* __restrict__ expert_ptrs) {
     const int e = blockIdx.y;
@@ -389,6 +384,55 @@ __global__ void __launch_bounds__(NT) fused_expert_32_kernel(
 
 }  // namespace
 
+static void fused_expert_launch(const ggml_tensor * dst, const char * const * expert_ptrs,
+        const int32_t * expert_bounds, const int32_t * ids_src1, const int32_t * ids_dst,
+        const __half * X, const int64_t Xld, cudaStream_t stream) {
+    const ggml_tensor * src0 = dst->src[0];
+
+#if !defined(GGML_USE_HIP)
+    // SMEM is a compile-time constant, so the opt-in limit is raised once
+    static const bool smem_set = [] {
+        cudaFuncSetAttribute(fused_expert_256_kernel<12>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        cudaFuncSetAttribute(fused_expert_256_kernel<13>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        cudaFuncSetAttribute(fused_expert_32_kernel<7>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        cudaFuncSetAttribute(fused_expert_32_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        return true;
+    }();
+    (void) smem_set;
+#endif
+
+    const dim3 grid((unsigned) (src0->ne[1] / BN), (unsigned) src0->ne[2]);
+    const dim3 block(NT);
+
+    const int64_t K = src0->ne[0];
+    const int64_t nb01 = src0->nb[1];
+    const int64_t nb02 = src0->nb[2];
+    float * D = (float *) dst->data;
+    const int64_t dst_stride_col = dst->nb[1] / sizeof(float);
+
+    switch (src0->type) {
+        case GGML_TYPE_Q4_K:
+            fused_expert_256_kernel<12><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
+                ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
+            break;
+        case GGML_TYPE_Q5_K:
+            fused_expert_256_kernel<13><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
+                ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
+            break;
+        case GGML_TYPE_Q5_1:
+            fused_expert_32_kernel<7><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
+                ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
+            break;
+        case GGML_TYPE_Q8_0:
+            fused_expert_32_kernel<8><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
+                ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 bool ggml_cuda_fused_expert_mul_mat_id_supported(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -400,7 +444,10 @@ bool ggml_cuda_fused_expert_mul_mat_id_supported(const ggml_tensor * dst, const 
     if (cc != GGML_CUDA_CC_VOLTA) {
         return false;
     }
-    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
+    if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
         return false;
     }
     // decode and verify (T <= 8) keep the grouped dp4a kernel: the TM = 64 token tile of this
@@ -445,10 +492,10 @@ bool ggml_cuda_fused_expert_mul_mat_id_supported(const ggml_tensor * dst, const 
     if (src1->ne[3] != 1 || src0->ne[3] != 1) {
         return false;
     }
-    // X is read as rows of F32 elements; the row index of a compact column comes from
+    // X is read as rows of 2-byte elements; the row index of a compact column comes from
     // ids_src1, whose stride sis1 = nb[2] / nb[1] must be a whole number. The kernel loads
     // 16-byte chunks, so a row must start on a 16-byte boundary.
-    if (src1->nb[0] != sizeof(float) || src1->nb[1] % 16 != 0) {
+    if (src1->nb[0] != ggml_type_size(src1->type) || src1->nb[1] % 16 != 0) {
         return false;
     }
     if (src1->nb[2] % src1->nb[1] != 0) {
@@ -512,47 +559,26 @@ bool ggml_cuda_fused_expert_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_ten
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const float * X = (const float *) src1->data;
-    float * D = (float *) dst->data;
-    const int64_t Xld = nb11 / (int64_t) sizeof(float);
-    const int64_t dst_stride_col = dst->nb[1] / sizeof(float);
-
-    const dim3 grid((unsigned) (ne01 / BN), (unsigned) ne02);
-    const dim3 block(NT);
-
-#if !defined(GGML_USE_HIP)
-    // SMEM is a compile-time constant, so the opt-in limit is raised once
-    static const bool smem_set = [] {
-        cudaFuncSetAttribute(fused_expert_256_kernel<12>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-        cudaFuncSetAttribute(fused_expert_256_kernel<13>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-        cudaFuncSetAttribute(fused_expert_32_kernel<7>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-        cudaFuncSetAttribute(fused_expert_32_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-        return true;
-    }();
-    (void) smem_set;
-#endif
-
-    switch (src0->type) {
-        case GGML_TYPE_Q4_K:
-            fused_expert_256_kernel<12><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds.get(),
-                ids_src1.get(), ids_dst.get(), X, D, ne00, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
-            break;
-        case GGML_TYPE_Q5_K:
-            fused_expert_256_kernel<13><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds.get(),
-                ids_src1.get(), ids_dst.get(), X, D, ne00, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
-            break;
-        case GGML_TYPE_Q5_1:
-            fused_expert_32_kernel<7><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds.get(),
-                ids_src1.get(), ids_dst.get(), X, D, ne00, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
-            break;
-        case GGML_TYPE_Q8_0:
-            fused_expert_32_kernel<8><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds.get(),
-                ids_src1.get(), ids_dst.get(), X, D, ne00, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
-            break;
-        default:
-            GGML_ABORT("fatal error");
+    // The X tile in shared memory is F16. An F32 activation is converted here, once per launch,
+    // instead of once per (expert, n-tile) block inside fetch_x: the same element is read by
+    // ne01/BN blocks, so the conversion used to cost ne01/BN passes over the activation and now
+    // costs one, and the main kernel moves half the X bytes. Same value: convert.cuh rounds with
+    // __float2half_rn and the old fetch_x with __float22half2_rn, both round to nearest even.
+    if (src1->type == GGML_TYPE_F16) {
+        fused_expert_launch(dst, expert_ptrs, expert_bounds.get(), ids_src1.get(), ids_dst.get(),
+            (const __half *) src1->data, nb11 / (int64_t) sizeof(__half), stream);
+    } else {
+        ggml_cuda_pool_alloc<__half> X16(ctx.pool(), ggml_nelements(src1));
+        if (ggml_is_contiguous(src1)) {
+            ggml_get_to_fp16_cuda(GGML_TYPE_F32)(src1->data, X16.get(), ggml_nelements(src1), stream);
+        } else {
+            ggml_get_to_fp16_nc_cuda(GGML_TYPE_F32)(src1->data, X16.get(), ne00, ne11, ne12, ne13,
+                nb11 / (int64_t) sizeof(float), nb12 / (int64_t) sizeof(float), nb13 / (int64_t) sizeof(float), stream);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        // the rows are packed, so the row stride is K
+        fused_expert_launch(dst, expert_ptrs, expert_bounds.get(), ids_src1.get(), ids_dst.get(), X16.get(), ne00, stream);
     }
-    CUDA_CHECK(cudaGetLastError());
 
     return true;
 }

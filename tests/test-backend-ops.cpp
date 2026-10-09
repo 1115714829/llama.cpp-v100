@@ -15184,6 +15184,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // the fused-expert kernel keeps its X tile in F16, so it takes an F16 src1 as it is: the X
+    // traffic of the main kernel is halved against the F32 lines above (which the kernel
+    // converts once per launch, same halves). n <= 8 is left out, that window goes to MMVQ and
+    // reads the F32 activation.
+    for (int64_t n : {16, 64, 512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K,  GGML_TYPE_F16, 512, 10, false, 1280, n, 2560)); // merged gate_up
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F16, 512, 10, false, 2560, n, 640)); // down
+        }
+    }
+
     return test_cases;
 }
 

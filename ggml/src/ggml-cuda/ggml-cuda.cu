@@ -4199,7 +4199,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
-    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    if ((src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) || dst->type != GGML_TYPE_F32) {
         return true;
     }
 
@@ -4257,7 +4257,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
-    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
     GGML_TENSOR_BINARY_OP_LOCALS
@@ -4278,15 +4278,20 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_routing_trace_record(src0, ids, ctx.stream());
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
-    if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-        if (ggml_is_quantized(src0->type)) {
+    // An F16 activation belongs to the fused-expert kernel: its shared-memory X tile is F16, so
+    // the kernel converts an F32 activation itself (once per launch) and only it reads F16. The
+    // predicate is the single gate, so such a node always returns from the fused-expert branch
+    // below and never reaches the vector or MMQ paths, which take the F32 src1.
+    if (dst->type == GGML_TYPE_F32 &&
+        (src1->type == GGML_TYPE_F32 || ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc))) {
+        if (src1->type == GGML_TYPE_F32 && ggml_is_quantized(src0->type)) {
             // The MMVQ mmid kernel is a separate kernel whose block width is the token count,
             // so on Volta it can go past MMVQ_MAX_BATCH_SIZE.
             if (ne2 <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                 return;
             }
-        } else if (ne2 <= MMVF_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
+        } else if (src1->type == GGML_TYPE_F32 && ne2 <= MMVF_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
             ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
             return;
         }
@@ -9040,7 +9045,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 && !ggml_cuda_op_mul_mat_use_fwht(op)) {
-                    return false;
+                    // the fused-expert kernel is the only path that reads an F16 activation: its
+                    // shared-memory X tile is F16, so it takes the tensor as it is instead of
+                    // converting an F32 src1 itself (see fused-expert.cu)
+                    if (op->op != GGML_OP_MUL_MAT_ID ||
+                        !ggml_cuda_fused_expert_mul_mat_id_supported(op, ggml_cuda_info().devices[dev_ctx->device].cc)) {
+                        return false;
+                    }
                 }
                 if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32) {
                     return false;
