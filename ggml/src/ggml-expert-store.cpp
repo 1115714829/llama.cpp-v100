@@ -232,7 +232,7 @@ void ggml_expert_store_plan(
     std::vector<size_t> tensor_bytes(n_tensors, 0);
     size_t expert_bytes = 0;
     for (size_t i = 0; i < n_tensors; ++i) {
-        stride[i] = ggml_expert_store_stride(tensors[i].blob_bytes, tensors[i].blob_pad);
+        stride[i] = ggml_expert_store_stride(tensors[i].blob_bytes, tensors[i].blob_pad, tensors[i].type_size);
         tensor_bytes[i] = (size_t) tensors[i].n_expert * stride[i];
         expert_bytes += tensor_bytes[i];
     }
@@ -370,7 +370,7 @@ void ggml_expert_store_plan(
 int ggml_expert_store_add_tensor(
         ggml_expert_store * store,
         int layer, int kind,
-        int64_t expert_base, int64_t n_expert, size_t blob_bytes, size_t blob_pad,
+        int64_t expert_base, int64_t n_expert, size_t blob_bytes, size_t blob_pad, size_t type_size,
         const int64_t * slot_experts, int64_t n_slot,
         int64_t host_budget) {
     GGML_ASSERT(store != nullptr);
@@ -384,7 +384,7 @@ int ggml_expert_store_add_tensor(
         return -1;
     }
 
-    const size_t stride = ggml_expert_store_stride(blob_bytes, blob_pad);
+    const size_t stride = ggml_expert_store_stride(blob_bytes, blob_pad, type_size);
     const int64_t n_host = n_expert - n_slot;
 
     // the host tier stores the complement of the slot set; it must fit into the budget,
@@ -402,6 +402,7 @@ int ggml_expert_store_add_tensor(
     t.n_expert   = n_expert;
     t.blob_bytes = blob_bytes;
     t.blob_pad   = blob_pad;
+    t.type_size  = type_size;
     t.stride     = stride;
     t.n_slot     = n_slot;
     t.n_host     = n_host;

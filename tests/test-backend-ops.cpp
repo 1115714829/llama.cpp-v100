@@ -6373,12 +6373,23 @@ static void mark_expert_tensor(ggml_backend_reg_t reg, ggml_backend_buffer_type_
 
 // per-expert span the expert store uses: the data bytes, the trailing row padding the MMQ
 // loaders read past the last row (the same rule as the CUDA buffer get_alloc_size) and the
-// 256-byte alignment of the next expert. The budgets below use it as the expert pitch.
+// alignment of the next expert, which is lcm(256, type block size) so the pitch is a whole
+// number of blocks. The budgets below use it as the expert pitch.
 static size_t expert_store_stride(ggml_type type, int64_t k, int64_t m) {
     const size_t blob = (size_t) ggml_row_size(type, k) * (size_t) m;
     const size_t pad  = ggml_is_quantized(type) && k % 512 != 0
         ? ggml_row_size(type, 512 - k % 512) : 0;
-    return (blob + pad + 255) & ~(size_t) 255;
+    const size_t ts   = ggml_type_size(type);
+    size_t align = 256;
+    size_t b = ts;
+    while (b != 0) {
+        const size_t t = align % b;
+        align = b;
+        b = t;
+    }
+    align = 256 / align * ts;
+    // no power of two in general: round with a division
+    return (blob + pad + align - 1) / align * align;
 }
 
 // ask the backend for the placement plan of the given expert tensors under the budget that
@@ -13166,6 +13177,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_expert_pad(type_a, 32, 2560, 2048, 640));
     }
     test_cases.emplace_back(new test_mul_mat_id_expert_pad(GGML_TYPE_Q4_K, 32, 640, 2048, 768));
+
+    // A fully resident store addresses an expert as base + expert * pitch in units of
+    // quantization blocks, so the pitch must be a whole number of blocks. These shapes have
+    // an expert span whose 256-byte aligned pitch the block size does not divide (Q2_0 blocks
+    // are 18 bytes): without the type size in the alignment the read of expert e starts
+    // e * (pitch mod 18) bytes too early. n=2048 reaches the batched MMQ path, n=16 the
+    // MMVQ one, both of which divide the pitch by the block size.
+    test_cases.emplace_back(new test_mul_mat_id_expert_pad(GGML_TYPE_Q2_0, 32, 2560, 2048, 640));
+    test_cases.emplace_back(new test_mul_mat_id_expert_pad(GGML_TYPE_Q2_0, 32, 2560, 16, 640));
 
     // The same trailing-padding case through a view of the fully resident tensor: the view
     // starts at expert n_skip and the store pitch (data + padding) differs from the tensor's own

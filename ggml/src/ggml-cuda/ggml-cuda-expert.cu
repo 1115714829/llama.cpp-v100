@@ -611,6 +611,13 @@ bool ggml_cuda_expert_table_get(const ggml_tensor * src0, ggml_cuda_expert_table
     // without a host tier every expert is a slot and slot e holds expert e (see
     // ggml_expert_store_plan), so the slots are one strided block starting at expert_start
     table->uniform      = !s.has_host;
+    if (table->uniform) {
+        // the uniform (fully resident) kernels address an expert as base + expert * plain_pitch
+        // in units of type blocks, so the pitch has to be a whole number of blocks. The store
+        // aligns the pitch to lcm(GGML_EXPERT_STORE_ALIGN, type_size) to guarantee it.
+        const size_t ts = ggml_type_size(src0->type);
+        GGML_ASSERT(st->stride % ts == 0);
+    }
     table->plain_base   = st->slots_dev + expert_start * (int64_t) st->stride;
     table->plain_pitch  = st->stride;
     return true;
@@ -1063,7 +1070,7 @@ static size_t ggml_backend_cuda_expert_buft_get_alloc_size(ggml_backend_buffer_t
         // the store keeps its experts at the padded stride (data + row padding, aligned), so
         // the size reported here matches what alloc_buffer_n actually reserves per expert
         const size_t blob_pad = ggml_cuda_expert_blob_pad(tensor->type, tensor->ne[0]);
-        return (size_t) tensor->ne[2] * ggml_expert_store_stride((size_t) tensor->nb[2], blob_pad);
+        return (size_t) tensor->ne[2] * ggml_expert_store_stride((size_t) tensor->nb[2], blob_pad, ggml_type_size(tensor->type));
     }
     // plain tensor: the size the regular CUDA buffer type would allocate
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
@@ -1157,7 +1164,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
             // data bytes plus the per-expert row padding: the same span get_alloc_size and
             // the store use, so the reported buffer size matches the real allocation
             const size_t blob_pad = ggml_cuda_expert_blob_pad(t->type, t->ne[0]);
-            expert_bytes += (size_t) t->ne[2] * ggml_expert_store_stride((size_t) t->nb[2], blob_pad);
+            expert_bytes += (size_t) t->ne[2] * ggml_expert_store_stride((size_t) t->nb[2], blob_pad, ggml_type_size(t->type));
             expert_tensors.push_back(t);
         } else {
             plain_offset[i] = plain_size;
@@ -1192,7 +1199,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
     plan_in.reserve(expert_tensors.size());
     for (const ggml_tensor * t : expert_tensors) {
         plan_in.push_back({ ggml_cuda_expert_tensor_layer(t), t->ne[2], ggml_cuda_expert_get_tensor_base(t),
-            (size_t) t->nb[2], ggml_cuda_expert_blob_pad(t->type, t->ne[0]) });
+            (size_t) t->nb[2], ggml_cuda_expert_blob_pad(t->type, t->ne[0]), ggml_type_size(t->type) });
     }
     ggml_expert_store_placement plan;
     ggml_expert_store_plan(plan_in.data(), plan_in.size(), (int64_t) slot_budget, ctx->store->profile_path.c_str(), &plan);
@@ -1249,7 +1256,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
         const int tensor_id = ggml_expert_store_add_tensor(ctx->store,
             ggml_cuda_expert_tensor_layer(t), ggml_cuda_expert_tensor_kind(t),
             ggml_cuda_expert_get_tensor_base(t),
-            n_expert, blob_bytes, blob_pad,
+            n_expert, blob_bytes, blob_pad, ggml_type_size(t->type),
             plan.slot_experts[k].data(), plan.n_slot[k],
             -1); // the complement must always fit in host memory
         ggml_cuda_expert_clear_tensor_base(t);
@@ -1466,7 +1473,8 @@ void ggml_cuda_expert_plan(
         // the fit plan must use the same per-expert stride the real allocation uses, so the
         // row padding is derived here from the tensor type exactly like alloc_buffer_n does
         const size_t blob_pad = ggml_cuda_expert_blob_pad((ggml_type) type[i], ne0[i]);
-        tensors.push_back({ layer[i], n_expert[i], expert_base != nullptr ? expert_base[i] : 0, blob_bytes[i], blob_pad });
+        tensors.push_back({ layer[i], n_expert[i], expert_base != nullptr ? expert_base[i] : 0, blob_bytes[i], blob_pad,
+            ggml_type_size((ggml_type) type[i]) });
     }
 
     ggml_expert_store_placement plan;

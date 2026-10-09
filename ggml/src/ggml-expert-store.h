@@ -38,16 +38,34 @@
 // pointer table and copy whole experts with 64-bit loads, so every expert starts aligned.
 #define GGML_EXPERT_STORE_ALIGN 256
 
-static inline size_t ggml_expert_store_align_up(size_t v) {
-    return (v + GGML_EXPERT_STORE_ALIGN - 1) & ~(size_t) (GGML_EXPERT_STORE_ALIGN - 1);
+// align is a multiple of GGML_EXPERT_STORE_ALIGN but in general no power of two (see
+// ggml_expert_store_stride_align), so round with a division instead of a bit mask
+static inline size_t ggml_expert_store_align_up(size_t v, size_t align) {
+    return (v + align - 1) / align * align;
+}
+
+// alignment of the expert stride: the least common multiple of the store alignment and the
+// block size of the quantized type. The fully resident (uniform) kernels address an expert as
+// base + expert * stride in units of type blocks, so the stride has to be a whole number of
+// blocks; keeping the 256-byte store alignment in the lcm preserves the vectorized loads and
+// the MMQ tile requirement.
+static inline size_t ggml_expert_store_stride_align(size_t type_size) {
+    size_t a = GGML_EXPERT_STORE_ALIGN;
+    size_t b = type_size;
+    while (b != 0) {
+        const size_t t = a % b;
+        a = b;
+        b = t;
+    }
+    return GGML_EXPERT_STORE_ALIGN / a * type_size;
 }
 
 // bytes one expert occupies in a slot / in the host arena: the data bytes, the row padding
 // the backend needs past the last row (see ggml_expert_store_plan_tensor::blob_pad) and the
 // alignment of the next expert. The store, the plan and the backend all use this one rule,
 // so the fit estimate and the real allocation match byte for byte.
-static inline size_t ggml_expert_store_stride(size_t blob_bytes, size_t blob_pad) {
-    return ggml_expert_store_align_up(blob_bytes + blob_pad);
+static inline size_t ggml_expert_store_stride(size_t blob_bytes, size_t blob_pad, size_t type_size) {
+    return ggml_expert_store_align_up(blob_bytes + blob_pad, ggml_expert_store_stride_align(type_size));
 }
 
 // where an expert is served from
@@ -89,6 +107,7 @@ struct ggml_expert_store_tensor {
     int64_t  n_expert   = 0;
     size_t   blob_bytes = 0;  // data bytes of one expert inside this tensor
     size_t   blob_pad   = 0;  // row padding after the data of one expert
+    size_t   type_size  = 1;  // block size of the type of the tensor
     size_t   stride     = 0;  // bytes from one expert to the next in a slot / in the host arena
 
     // placement
@@ -201,6 +220,9 @@ struct ggml_expert_store_plan_tensor {
     // regular CUDA buffer covers with get_alloc_size(); the store keeps the same padding
     // after every expert so the kernels never read a neighbour's bytes.
     size_t  blob_pad   = 0;
+    // block size of the quantized type of the tensor (ggml_type_size). The expert stride is a
+    // multiple of it, which the fully resident kernels rely on.
+    size_t  type_size  = 1;
 };
 
 // result of ggml_expert_store_plan; sizes are bytes
@@ -233,7 +255,7 @@ GGML_API void ggml_expert_store_plan(
 GGML_API int ggml_expert_store_add_tensor(
         ggml_expert_store * store,
         int layer, int kind,
-        int64_t expert_base, int64_t n_expert, size_t blob_bytes, size_t blob_pad,
+        int64_t expert_base, int64_t n_expert, size_t blob_bytes, size_t blob_pad, size_t type_size,
         const int64_t * slot_experts, int64_t n_slot,
         int64_t host_budget);
 
