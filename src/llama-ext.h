@@ -108,6 +108,11 @@ const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_te
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
+// all cache tensors of a context (KV k/v, rotation matrices, recurrent states, indexer caches),
+// by name; the fit code reads their shapes to budget the context per device, since the meta
+// backend reports one number per buffer type and the tensors are split differently
+LLAMA_API const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_memory_tensors(const llama_context * ctx);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

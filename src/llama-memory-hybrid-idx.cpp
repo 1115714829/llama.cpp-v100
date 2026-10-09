@@ -251,6 +251,14 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
     }
 }
 
+void llama_memory_hybrid_idx::collect_tensors(std::vector<std::pair<std::string, ggml_tensor *>> & out) const {
+    llama_memory_hybrid::collect_tensors(out);
+
+    if (mem_idx) {
+        mem_idx->collect_tensors(out);
+    }
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = llama_memory_hybrid::memory_breakdown();
 

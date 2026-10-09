@@ -830,9 +830,50 @@ static void common_fit_ep(
         expert_tensors.push_back({ layer, std::move(expert_base), std::move(n_expert), (size_t) t->nb[2], t->type, t->ne[0] });
     }
 
-    // context (KV cache) and compute bytes: the meta device reports one number per buffer
-    // type for the whole model
-    int64_t context_total = 0;
+    // per-simple-device context (KV cache) bytes of the target: every cache tensor is split by the
+    // meta backend exactly like a model tensor, so the same slicing as the dense loop above gives
+    // what each device holds after the load. The memory breakdown cannot be used here: it reports
+    // one number per buffer type (get_alloc_size is the whole tensor), so the split cache tensors
+    // would be undercounted by the device count and the mirrored ones overcounted.
+    // Tensors that end up in a host buffer take no device VRAM and are skipped; under no_alloc the
+    // cache gives its tensors a dummy buffer of the real buffer type (llama_kv_cache ctor), so the
+    // test reads the same placement the real load has. A cache tensor can be shared between the
+    // target and the draft context (llama_kv_cache::share), so a pointer is counted once.
+    std::set<const ggml_tensor *> counted;
+    std::vector<int64_t> ctx_dev(nd, 0);
+    for (const auto & kv : llama_internal_get_memory_tensors(ctx)) {
+        const ggml_tensor * t = kv.second;
+        if (t == nullptr || t->view_src != nullptr || ggml_nelements(t) == 0) {
+            continue;
+        }
+        if (t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
+            continue;
+        }
+        if (!counted.insert(t).second) {
+            continue;
+        }
+        const ggml_backend_meta_split_state ss = llama_model_tensor_split_state(model, t);
+        if (!(ss.axis >= 0 && ss.axis < GGML_MAX_DIMS)) {
+            // MIRRORED / PARTIAL / LOCAL_PARTIAL: every device holds the whole tensor
+            for (size_t j = 0; j < nd; j++) {
+                ctx_dev[j] += (int64_t) ggml_nbytes(t);
+            }
+            continue;
+        }
+        const int64_t ne_axis = t->ne[ss.axis];
+        if (ne_axis <= 0) {
+            continue;
+        }
+        for (size_t j = 0; j < nd; j++) {
+            int64_t ne_j = 0;
+            for (size_t s = 0; s < ss.n_segments; s++) {
+                ne_j += ss.ne[s*nd + j] * ss.nr[s];
+            }
+            ctx_dev[j] += (int64_t) ggml_nbytes(t) * ne_j / ne_axis;
+        }
+    }
+
+    // compute bytes: the meta device reports one number per buffer type for the whole model
     int64_t compute_total = 0;
     {
         const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx);
@@ -841,7 +882,6 @@ static void common_fit_ep(
                 // host memory, no device VRAM
                 continue;
             }
-            context_total += (int64_t) data.context;
             compute_total += (int64_t) data.compute;
         }
     }
@@ -853,7 +893,7 @@ static void common_fit_ep(
     // takes shared weights from the target, borrow_shared_tensor) live in the target's buffers
     // and are already counted there, so a same-name same-pointer tensor is skipped.
     std::vector<int64_t> dev_draft(nd, 0);
-    int64_t draft_context_total = 0;
+    std::vector<int64_t> draft_ctx_dev(nd, 0);
     int64_t draft_compute_total  = 0;
     int64_t sinks_total          = 0;
     if (extra != nullptr) {
@@ -931,13 +971,45 @@ static void common_fit_ep(
             }
         }
 
+        // the draft cache is split by the meta backend like the target's, per device. A cache tensor
+        // shared with the target (llama_kv_cache::share) is already counted above.
+        for (const auto & kv : llama_internal_get_memory_tensors(ctx_extra)) {
+            const ggml_tensor * t = kv.second;
+            if (t == nullptr || t->view_src != nullptr || ggml_nelements(t) == 0) {
+                continue;
+            }
+            if (t->buffer == nullptr || ggml_backend_buffer_is_host(t->buffer)) {
+                continue;
+            }
+            if (!counted.insert(t).second) {
+                continue;
+            }
+            const ggml_backend_meta_split_state ss = llama_model_tensor_split_state(model_extra, t);
+            if (!(ss.axis >= 0 && ss.axis < GGML_MAX_DIMS)) {
+                for (size_t j = 0; j < nd; j++) {
+                    draft_ctx_dev[j] += (int64_t) ggml_nbytes(t);
+                }
+                continue;
+            }
+            const int64_t ne_axis = t->ne[ss.axis];
+            if (ne_axis <= 0) {
+                continue;
+            }
+            for (size_t j = 0; j < nd; j++) {
+                int64_t ne_j = 0;
+                for (size_t s = 0; s < ss.n_segments; s++) {
+                    ne_j += ss.ne[s*nd + j] * ss.nr[s];
+                }
+                draft_ctx_dev[j] += (int64_t) ggml_nbytes(t) * ne_j / ne_axis;
+            }
+        }
+
         {
             const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx_extra);
             for (const auto & [buft, data] : mb) {
                 if (ggml_backend_buft_is_host(buft)) {
                     continue;
                 }
-                draft_context_total += (int64_t) data.context;
                 draft_compute_total  += (int64_t) data.compute;
             }
         }
@@ -1000,24 +1072,18 @@ static void common_fit_ep(
     std::vector<size_t> slot_budgets(nd, 0);
     bool has_experts = false;
 
-    // The meta no-alloc measurement reports one context (KV) and one compute figure per
-    // buffer type. get_alloc_size is the maximum over the simple devices of the full tensor,
-    // so the context sum is the whole-cache size as if one device held it; the per-device
-    // slice is that divided by the device count. The compute figure is the scheduler buffer
-    // size of the single meta backend, which is the per-rank compute buffer already. Both are
-    // estimates; the exact per-device KV follows the attention-head split and is validated by
-    // the real load.
-    LOG_TRC("%s: expert parallel: context %.0f MiB total, compute %.0f MiB per rank, %zu devices\n",
-        __func__, context_total/(1024.0*1024.0), compute_total/(1024.0*1024.0), nd);
+    // The compute figure is the scheduler buffer size of the single meta backend, which is the
+    // per-rank compute buffer already. The context is budgeted per device from the cache tensors
+    // themselves (ctx_dev), so the INFO line below reports it per device.
     if (extra != nullptr) {
-        LOG_TRC("%s: expert parallel draft: context %.0f MiB total, compute %.0f MiB per rank, sinks %.0f MiB per device\n",
-            __func__, draft_context_total/(1024.0*1024.0), draft_compute_total/(1024.0*1024.0), sinks_total/(1024.0*1024.0));
+        LOG_TRC("%s: expert parallel draft: compute %.0f MiB per rank, sinks %.0f MiB per device\n",
+            __func__, draft_compute_total/(1024.0*1024.0), sinks_total/(1024.0*1024.0));
     }
 
     for (size_t j = 0; j < nd; j++) {
-        const int64_t context_j = context_total / (int64_t) nd;
+        const int64_t context_j = ctx_dev[j];
         const int64_t compute_j = compute_total;
-        const int64_t draft_context_j = draft_context_total / (int64_t) nd;
+        const int64_t draft_context_j = draft_ctx_dev[j];
         const int64_t draft_compute_j  = draft_compute_total;
         const int64_t margin_j  = margins_s[j];
         const int64_t surplus   = free_mem[j] - dev_model[j] - context_j - compute_j

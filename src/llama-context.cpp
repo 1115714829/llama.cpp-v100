@@ -514,6 +514,7 @@ llama_context::llama_context(
         memory.reset(model.create_memory(params_mem, cparams));
         if (memory) {
             memory->set_owner(this);
+            memory->collect_tensors(memory_tensors);
         }
     }
 
@@ -5022,6 +5023,10 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     return ret;
 }
 
+const std::vector<std::pair<std::string, ggml_tensor *>> & llama_context::get_memory_tensors() const {
+    return memory_tensors;
+}
+
 //
 // training
 //
@@ -6134,6 +6139,10 @@ int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_
 
 llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx) {
     return ctx->memory_breakdown();
+}
+
+const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_memory_tensors(const struct llama_context * ctx) {
+    return ctx->get_memory_tensors();
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

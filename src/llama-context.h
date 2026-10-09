@@ -294,6 +294,8 @@ struct llama_context {
 
     llama_memory_breakdown memory_breakdown() const;
 
+    const std::vector<std::pair<std::string, ggml_tensor *>> & get_memory_tensors() const;
+
     //
     // training
     //
@@ -417,6 +419,9 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+
+    // the cache tensors of memory, collected once after the memory module is built
+    std::vector<std::pair<std::string, ggml_tensor *>> memory_tensors;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

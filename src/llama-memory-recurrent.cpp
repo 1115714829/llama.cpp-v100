@@ -429,6 +429,21 @@ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
     rs_idx[seq_id] = idx;
 }
 
+void llama_memory_recurrent::collect_tensors(std::vector<std::pair<std::string, ggml_tensor *>> & out) const {
+    // r/s per layer, plus the separate PLE conv row where the model has one
+    auto add = [&](const std::vector<ggml_tensor *> & ts) {
+        for (ggml_tensor * t : ts) {
+            if (t != nullptr) {
+                out.push_back({ t->name, t });
+            }
+        }
+    };
+
+    add(r_l);
+    add(s_l);
+    add(p_l);
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {

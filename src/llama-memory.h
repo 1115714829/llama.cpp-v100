@@ -6,6 +6,9 @@
 #include <map>
 #include <memory>
 #include <functional>
+#include <string>
+#include <utility>
+#include <vector>
 
 struct llama_ubatch;
 
@@ -127,6 +130,10 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
+
+    // the tensors this memory holds in its cache buffers, by name; the fit code reads them to
+    // budget the cache per device (the per-tensor split is what the meta backend applies)
+    virtual void collect_tensors(std::vector<std::pair<std::string, ggml_tensor *>> & out) const = 0;
 
     //
     // state write/read

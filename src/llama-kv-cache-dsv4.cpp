@@ -1071,6 +1071,13 @@ uint32_t llama_dsv4_comp_state::get_n_rows() const {
     return state_size*n_stream;
 }
 
+void llama_dsv4_comp_state::collect_tensors(std::vector<std::pair<std::string, ggml_tensor *>> & out) const {
+    for (const auto & layer : layers) {
+        out.push_back({ layer.kv->name, layer.kv });
+        out.push_back({ layer.score->name, layer.score });
+    }
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_dsv4_comp_state::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [_, buf] : ctxs_bufs) {
@@ -1569,6 +1576,16 @@ llama_pos llama_kv_cache_dsv4::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return kv_raw->seq_pos_max(seq_id);
+}
+
+void llama_kv_cache_dsv4::collect_tensors(std::vector<std::pair<std::string, ggml_tensor *>> & out) const {
+    kv_raw->collect_tensors(out);
+    kv_csa->collect_tensors(out);
+    kv_hca->collect_tensors(out);
+    kv_lid->collect_tensors(out);
+    csa_state->collect_tensors(out);
+    hca_state->collect_tensors(out);
+    lid_state->collect_tensors(out);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdown() const {

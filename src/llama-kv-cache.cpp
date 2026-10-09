@@ -742,6 +742,18 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
     return cells.seq_pos_max(seq_id);
 }
 
+void llama_kv_cache::collect_tensors(std::vector<std::pair<std::string, ggml_tensor *>> & out) const {
+    for (const auto & layer : layers) {
+        if (layer.k)      { out.push_back({ layer.k->name,      layer.k      }); }
+        if (layer.v)      { out.push_back({ layer.v->name,      layer.v      }); }
+        if (layer.k_rot)  { out.push_back({ layer.k_rot->name,  layer.k_rot  }); }
+        if (layer.v_rot)  { out.push_back({ layer.v_rot->name,  layer.v_rot  }); }
+    }
+    for (ggml_tensor * t : attn_rot_tensors) {
+        out.push_back({ t->name, t });
+    }
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, buf] : ctxs_bufs) {
