@@ -91,6 +91,11 @@ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
+// per-device slice of a model tensor, as the meta backend splits it (MIRRORED/PARTIAL for
+// tensors every device holds whole)
+LLAMA_API struct ggml_backend_meta_split_state llama_model_tensor_split_state(
+        const struct llama_model * model, const struct ggml_tensor * tensor);
+
 // the devices llama uses when no explicit device list is given: RPC servers first, then
 // discrete GPUs, integrated GPUs only when no discrete GPU exists. Same selection as the
 // model load applies, so callers can match where a model will run without its own rules.

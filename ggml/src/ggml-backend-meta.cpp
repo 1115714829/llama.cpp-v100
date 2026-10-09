@@ -110,8 +110,6 @@ struct ggml_backend_meta_event_context {
     std::vector<ggml_backend_event_t> simple_events;
 };
 
-bool ggml_backend_dev_is_meta(ggml_backend_dev_t dev);
-
 static const char * ggml_backend_meta_device_get_name(ggml_backend_dev_t dev) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;

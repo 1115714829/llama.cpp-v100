@@ -4,9 +4,6 @@
 #include "log.h"
 
 #include "../src/llama-ext.h"
-#include "../src/llama-model.h"
-
-#include "ggml-backend-impl.h"
 
 #include <algorithm>
 #include <array>
@@ -727,7 +724,7 @@ static void common_fit_ep(
 
     // the model device is the meta device; its simple devices are the cards
     std::vector<ggml_backend_dev_t> simple_devs;
-    if (llama_model_n_devices(model) == 1 && model->devices[0].is_meta) {
+    if (llama_model_n_devices(model) == 1 && ggml_backend_dev_is_meta(llama_model_get_device(model, 0))) {
         ggml_backend_dev_t meta_dev = llama_model_get_device(model, 0);
         const size_t ns = ggml_backend_meta_dev_n_devs(meta_dev);
         for (size_t j = 0; j < ns; j++) {
@@ -767,8 +764,7 @@ static void common_fit_ep(
         if ((t->flags & GGML_TENSOR_FLAG_EXPERT) != 0) {
             continue;
         }
-        const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(
-            t, const_cast<llama_meta_device_get_split_state_userdata *>(&model->get_split_state_ud));
+        const ggml_backend_meta_split_state ss = llama_model_tensor_split_state(model, t);
         if (!(ss.axis >= 0 && ss.axis < GGML_MAX_DIMS)) {
             // MIRRORED / PARTIAL / LOCAL_PARTIAL: every device holds the whole tensor
             for (size_t j = 0; j < nd; j++) {
@@ -790,7 +786,7 @@ static void common_fit_ep(
     }
 
     // expert tensors of the model (loader mark), with the per-device expert counts and bases
-    // of the same split the meta backend applies (llama_meta_device_get_split_state).
+    // of the same split the meta backend applies (llama_model_tensor_split_state).
     struct ep_tensor { int layer; std::vector<int64_t> expert_base; std::vector<int64_t> n_expert; size_t blob_bytes; ggml_type type; int64_t ne0; };
     std::vector<ep_tensor> expert_tensors;
     for (const auto & kv : llama_internal_get_tensor_map(model)) {
@@ -808,8 +804,7 @@ static void common_fit_ep(
         if (layer < 0) {
             continue;
         }
-        const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(
-            t, const_cast<llama_meta_device_get_split_state_userdata *>(&model->get_split_state_ud));
+        const ggml_backend_meta_split_state ss = llama_model_tensor_split_state(model, t);
         if (ss.axis != GGML_BACKEND_SPLIT_AXIS_2) {
             throw common_params_fit_exception("tensor split with experts: expert tensor '" + kv.first +
                 "' is not split along the expert dim, abort");

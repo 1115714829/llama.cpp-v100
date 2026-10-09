@@ -3721,6 +3721,11 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
     return model->devices[i].dev;
 }
 
+ggml_backend_meta_split_state llama_model_tensor_split_state(const struct llama_model * model, const struct ggml_tensor * tensor) {
+    return llama_meta_device_get_split_state(
+        tensor, const_cast<llama_meta_device_get_split_state_userdata *>(&model->get_split_state_ud));
+}
+
 //
 // llama_model_base
 //
