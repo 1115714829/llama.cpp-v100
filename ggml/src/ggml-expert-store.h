@@ -44,6 +44,52 @@ static inline size_t ggml_expert_store_align_up(size_t v, size_t align) {
     return (v + align - 1) / align * align;
 }
 
+// floor(a * b / c) for 64-bit unsigned operands, exact for every a, b and c > 0 whose result
+// fits in 64 bits, without a 128-bit type: the product is formed in two 64-bit limbs and
+// divided limb-wise. Used where a byte quota must not lose a bit to rounding (the slot plan).
+static inline uint64_t ggml_expert_store_mul_div_floor(uint64_t a, uint64_t b, uint64_t c) {
+    GGML_ASSERT(c > 0);
+
+    // 64 x 64 -> 128 in 32-bit limbs. The four half products are exact in 64 bits; the middle
+    // column (p0 high half plus the low halves of p1 and p2) carries into both result halves.
+    const uint64_t a_lo = a & 0xFFFFFFFFULL;
+    const uint64_t a_hi = a >> 32;
+    const uint64_t b_lo = b & 0xFFFFFFFFULL;
+    const uint64_t b_hi = b >> 32;
+    const uint64_t p0   = a_lo * b_lo;
+    const uint64_t p1   = a_lo * b_hi;
+    const uint64_t p2   = a_hi * b_lo;
+    const uint64_t p3   = a_hi * b_hi;
+    const uint64_t mid  = (p0 >> 32) + (p1 & 0xFFFFFFFFULL) + (p2 & 0xFFFFFFFFULL);
+    const uint64_t lo   = (mid << 32) | (p0 & 0xFFFFFFFFULL);
+    const uint64_t hi   = p3 + (p1 >> 32) + (p2 >> 32) + (mid >> 32);
+
+    // the quotient needs more than 64 bits (a * b >= c * 2^64). No caller reaches this: the
+    // product is a byte budget times a byte count and the quotient is smaller than the budget.
+    GGML_ASSERT(hi < c);
+
+    // long division, top half first. hi < c, so the quotient bits all come from lo. The
+    // remainder stays below c, hence doubling it can wrap; the wrap is exact because the value
+    // subtracted brings it back below c.
+    uint64_t q = 0;
+    uint64_t r = hi;
+    for (int i = 63; i >= 0; --i) {
+        const uint64_t bit = (lo >> i) & 1;
+        if (r >> 63) {
+            // 2*r + bit >= 2^64 > c: the quotient bit is set whatever the value is
+            q |= (uint64_t) 1 << i;
+            r = (r << 1 | bit) - c;
+        } else {
+            r = r << 1 | bit;
+            if (r >= c) {
+                q |= (uint64_t) 1 << i;
+                r -= c;
+            }
+        }
+    }
+    return q;
+}
+
 // alignment of the expert stride: the least common multiple of the store alignment and the
 // block size of the quantized type. The fully resident (uniform) kernels address an expert as
 // base + expert * stride in units of type blocks, so the stride has to be a whole number of

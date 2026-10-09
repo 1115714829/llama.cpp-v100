@@ -266,23 +266,19 @@ void ggml_expert_store_plan(
             slot_used += (size_t) n_slots[i] * stride[i];
         }
     } else {
-        // floor(slot_budget * tensor_bytes[i] / expert_bytes / stride[i]); the 128-bit
-        // product keeps the division exact on the compilers that have it, the long double
-        // path is the same arithmetic on the ones that do not
+        // floor(slot_budget * tensor_bytes[i] / expert_bytes / stride[i]) in exact 64-bit
+        // arithmetic. Dividing by expert_bytes first does not change the result:
+        // floor(floor(x / c) / d) == floor(x / (c * d)) for positive integers.
         for (size_t i = 0; i < n_tensors; ++i) {
-#if defined(__SIZEOF_INT128__)
-            const unsigned __int128 num = (unsigned __int128) slot_budget * (unsigned __int128) tensor_bytes[i];
-            int64_t n = (int64_t) (num / expert_bytes / stride[i]);
-#else
-            int64_t n = (int64_t) ((long double) slot_budget * (long double) tensor_bytes[i]
-                / (long double) expert_bytes / (long double) stride[i]);
-#endif
+            const uint64_t quota = ggml_expert_store_mul_div_floor(
+                (uint64_t) slot_budget, (uint64_t) tensor_bytes[i], (uint64_t) expert_bytes);
+            int64_t n = (int64_t) (quota / (uint64_t) stride[i]);
             if (n > tensors[i].n_expert) {
                 n = tensors[i].n_expert;
             }
             // a rounding artifact must never push the running total past the budget: take
             // whole experts off this layer until it fits (integer-safe by construction)
-            while (n > 0 && slot_used + (size_t) n * stride[i] > slot_budget) {
+            while (n > 0 && slot_used + (size_t) n * stride[i] > (size_t) slot_budget) {
                 --n;
             }
             n_slots[i] = n;
@@ -294,8 +290,8 @@ void ggml_expert_store_plan(
         // slot_budget keeps the running total within the budget, so the result uses as much
         // of the budget as whole experts allow and never more.
         while (true) {
-            size_t best = SIZE_MAX;
-            long double best_gap = 0.0L;
+            size_t  best = SIZE_MAX;
+            int64_t best_gap = 0;
             for (const size_t i : order_redist) {
                 if (n_slots[i] >= tensors[i].n_expert) {
                     continue;
@@ -303,9 +299,15 @@ void ggml_expert_store_plan(
                 if (slot_used + stride[i] > (size_t) slot_budget) {
                     continue;
                 }
-                const long double ideal = (long double) slot_budget * (long double) tensor_bytes[i]
-                    / (long double) expert_bytes;
-                const long double gap = ideal - (long double) n_slots[i] * (long double) stride[i];
+                // exact byte share of the layer (floor(slot_budget * tensor_bytes[i] /
+                // expert_bytes)) minus the bytes it already holds. The quota is at most the
+                // budget and the held bytes at most the expert bytes of the tensor, so the
+                // difference fits in int64_t; ordering by it is ordering by the gap, because
+                // both gaps share the denominator expert_bytes and the fraction that floor
+                // drops is below one, which cannot change the order.
+                const int64_t gap = (int64_t) ggml_expert_store_mul_div_floor(
+                    (uint64_t) slot_budget, (uint64_t) tensor_bytes[i], (uint64_t) expert_bytes)
+                    - (int64_t) ((size_t) n_slots[i] * stride[i]);
                 if (best == SIZE_MAX || gap > best_gap) {
                     best     = i;
                     best_gap = gap;

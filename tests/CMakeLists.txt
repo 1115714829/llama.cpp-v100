@@ -291,6 +291,12 @@ endif()
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build(test-backend-ops.cpp)
 
+# needs the non-public ggml-expert-store.h
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    llama_build_and_test(test-expert-store.cpp)
+    target_include_directories(test-expert-store PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+endif()
+
 llama_build_and_test(test-sched-pipeline.cpp)
 
 # Multi-GPU AllReduce comm test; skips when CUDA or < 2 devices are available.
