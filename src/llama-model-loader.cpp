@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <new>
 #include <regex>
 #include <vector>
 
@@ -1815,27 +1816,43 @@ static void llama_interleave_gate_up_rows(uint8_t * data, ggml_type type, int64_
 // weight of the file: for every expert the n_ff rows of the gate weight and the n_ff rows of the
 // up weight are written to the even and the odd rows of the merged tensor, which is the order
 // ggml_mul_mat_id_swiglu reads. The file mapping and the destination buffer are both written
-// while loading, so the rows come from the file into private buffers and are written expert by
-// expert, which keeps the staging memory at one expert instead of the whole tensor.
+// while loading, so the rows come from the file into private buffers and are interleaved there.
+//
+// The whole tensor is written with one tensor_set(): the expert weights are split along the expert
+// axis, and a buffer that holds such a split tensor takes the whole tensor in one call (the split
+// chunks are contiguous in it), so a partial write would not be a valid write.
 static void llama_load_merged_gate_up(
         const llama_files & files, ggml_tensor * cur,
         const llama_model_loader::llama_tensor_weight_src & gate,
         const llama_model_loader::llama_tensor_weight_src & up,
         bool bf16_as_f16, bool check_tensors) {
+    const size_t n_size = ggml_nbytes(cur);
+
     const int64_t n_ff    = cur->ne[1] / 2;
     const size_t row_size = ggml_row_size(cur->type, cur->ne[0]);
 
     // BF16 weights are loaded as F16 on devices without native BF16 support, see create_tensor()
-    const ggml_type         type_src   = bf16_as_f16 ? GGML_TYPE_F16 : cur->type;
-    const size_t            src_rows   = n_ff*ggml_row_size(type_src, cur->ne[0]);
-    const size_t            expert_size = 2*src_rows;
+    const ggml_type  type_src    = bf16_as_f16 ? GGML_TYPE_F16 : cur->type;
+    const size_t     src_rows    = n_ff*ggml_row_size(type_src, cur->ne[0]);
+    const size_t     expert_size = 2*src_rows;
 
     const llama_model_loader::llama_tensor_weight_src * src[2] = { &gate, &up };
+    GGML_ASSERT(n_size == (size_t) cur->ne[2]*expert_size);
     GGML_ASSERT(gate.size == (size_t) cur->ne[2]*src_rows && up.size == (size_t) cur->ne[2]*src_rows);
 
+    std::vector<no_init<uint8_t>> buf_merged;
+
+    // the whole tensor is staged in host memory, so report how much is needed when it does not fit
+    try {
+        buf_merged.resize(n_size);
+    } catch (const std::bad_alloc &) {
+        throw std::runtime_error(format("%s: not enough host memory to load '%s' (%.2f GiB)",
+                    __func__, ggml_get_name(cur), n_size/(1024.0*1024.0*1024.0)));
+    }
+
+    // one expert of each source at a time, the merged rows go straight into the tensor buffer
     std::vector<no_init<uint8_t>> buf_gate(src_rows);
     std::vector<no_init<uint8_t>> buf_up(src_rows);
-    std::vector<no_init<uint8_t>> buf_merged(expert_size);
 
     // the BF16 to F16 conversion keeps the row width, so a source row is a row of the tensor
     std::vector<no_init<uint8_t>> * buf_src[2] = { &buf_gate, &buf_up };
@@ -1853,17 +1870,19 @@ static void llama_load_merged_gate_up(
             }
         }
 
+        no_init<uint8_t> * dst_expert = buf_merged.data() + e*expert_size;
+
         for (int64_t r = 0; r < n_ff; r++) {
-            memcpy(buf_merged.data() + (2*r    )*row_size, buf_gate.data() + r*row_size, row_size);
-            memcpy(buf_merged.data() + (2*r + 1)*row_size, buf_up  .data() + r*row_size, row_size);
+            memcpy(dst_expert + (2*r    )*row_size, buf_gate.data() + r*row_size, row_size);
+            memcpy(dst_expert + (2*r + 1)*row_size, buf_up  .data() + r*row_size, row_size);
         }
-
-        if (check_tensors && !ggml_validate_row_data(cur->type, buf_merged.data(), expert_size)) {
-            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
-        }
-
-        ggml_backend_tensor_set(cur, buf_merged.data(), e*expert_size, expert_size);
     }
+
+    if (check_tensors && !ggml_validate_row_data(cur->type, buf_merged.data(), n_size)) {
+        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+    }
+
+    ggml_backend_tensor_set(cur, buf_merged.data(), 0, n_size);
 }
 
 bool llama_model_loader::load_all_data(
@@ -2070,6 +2089,9 @@ bool llama_model_loader::load_all_data(
         // from the file into a private buffer, because neither the file mapping nor the destination
         // buffer may be read and written in place
         if (weight->interleave_gate_up) {
+            LLAMA_LOG_INFO("%s: tensor %s: interleaving the gate and up rows of the merged expert weight\n",
+                    __func__, ggml_get_name(cur));
+
             const auto & file = files.at(weight->idx);
 
             std::vector<no_init<uint8_t>> read_buf(n_size);
