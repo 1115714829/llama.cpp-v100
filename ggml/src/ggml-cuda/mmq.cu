@@ -247,11 +247,11 @@ void ggml_cuda_mul_mat_q(
     // Expert parallelism skips the ids of other devices, so the compact maps are sparse: the
     // inverse map marks the entries of the other devices with -1, which the scatter quantizer
     // skips (they are not part of any expert's compact range either).
-    // an expert store view shifts the weights (and the local expert numbers) by its start
+    // an expert store view addresses its weights from the view start, so the ids stay
+    // view-local numbers and expert_offset only carries the expert parallelism offset
     int expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
     ggml_cuda_expert_table ex_table;
     if (ggml_cuda_expert_table_get(src0, &ex_table)) {
-        expert_offset += (int) ex_table.expert_start;
         if (ex_table.uniform && expert_ptrs == nullptr) {
             // fully resident expert store tensor: the experts are one strided block of device
             // memory, so address them from the store base and pitch. Reading the pointer table

@@ -49,9 +49,11 @@ struct ggml_cuda_expert_table {
     bool        uniform     = false;
     const char * plain_base = nullptr;
     size_t       plain_pitch = 0;
-    // when src0 is a view of the store tensor: the first expert of the view. main already
-    // points at that entry, the dispatch adds expert_start to the expert offset so that the
-    // kernels index the view-local expert numbers.
+    // when src0 is a view of the store tensor: the store expert number of the first expert of
+    // the view. main / main_host / plain_base already point at that entry, so the ids of the
+    // view stay view-local expert numbers (ggml semantics). Only the arrays that are numbered
+    // by store expert number (residency, counts, the routing bitmap) use
+    // view-local number + expert_start.
     int64_t     expert_start = 0;
 };
 

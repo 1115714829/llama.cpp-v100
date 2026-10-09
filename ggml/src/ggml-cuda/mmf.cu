@@ -37,7 +37,6 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     // expert store: the weights are read through the device pointer table of the tensor
     ggml_cuda_expert_table ex_table;
     const bool is_expert_store = ids != nullptr && ggml_cuda_expert_table_get(src0, &ex_table);
-    const int  expert_start    = is_expert_store ? (int) ex_table.expert_start : 0;
     const char * const * expert_ptrs = is_expert_store ? ex_table.main : nullptr;
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -81,8 +80,9 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         const int64_t n_experts     = ne02;
         const int64_t n_tokens      = ne12;
         const int64_t ne_get_rows   = n_tokens * n_expert_used;
-        // an expert store view shifts the weights by its own expert start
-        const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst) + expert_start;
+        // an expert store view reads its weights from the view start (expert_ptrs is
+        // shifted there), so the ids stay view-local numbers
+        const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
 
         if (ggml_mul_mat_id_is_expert_parallel(dst)) {
             // the kernel only writes the local entries, zero the others

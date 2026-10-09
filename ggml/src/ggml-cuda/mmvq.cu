@@ -1672,10 +1672,10 @@ void ggml_cuda_mul_mat_vec_q(
 
     // expert parallelism: the per-device weights only cover the local experts. The fused kernels
     // write the GLU/ADD node, which has no expert state, so it is taken from the MUL_MAT_ID node.
-    // An expert store view shifts the weights by its own expert start.
+    // An expert store view reads its weights from the view start (the pointer table is shifted
+    // there), so the ids stay view-local numbers and only the parallelism offset is added.
     const bool expert_parallel = ids && (fusion != nullptr ? fusion->expert_parallel : ggml_mul_mat_id_is_expert_parallel(dst));
-    const int  expert_offset   = (expert_parallel ? (fusion != nullptr ? fusion->expert_offset : ggml_mul_mat_id_get_expert_offset(dst)) : 0) +
-                                 (is_expert_store ? (int) ex_table.expert_start : 0);
+    const int  expert_offset   = expert_parallel ? (fusion != nullptr ? fusion->expert_offset : ggml_mul_mat_id_get_expert_offset(dst)) : 0;
     const int  n_experts       = (fusion != nullptr && fusion->n_experts > 0) ? fusion->n_experts : (int) ne02;
 
     mul_mat_vec_q_switch_type(

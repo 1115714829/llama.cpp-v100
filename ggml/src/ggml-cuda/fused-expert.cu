@@ -489,12 +489,10 @@ bool ggml_cuda_fused_expert_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_ten
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
-    // an expert store view shifts the weights (and the local expert numbers) by its start
-    int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
-    ggml_cuda_expert_table ex_table;
-    if (ggml_cuda_expert_table_get(src0, &ex_table)) {
-        expert_offset += (int32_t) ex_table.expert_start;
-    }
+    // an expert store view addresses its weights from the view start (the pointer table
+    // the caller passes), so the ids stay view-local numbers and expert_offset only
+    // carries the expert parallelism offset
+    const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
 
     if (ggml_mul_mat_id_is_expert_parallel(dst)) {
         // the fused kernel only writes the local entries, zero the others

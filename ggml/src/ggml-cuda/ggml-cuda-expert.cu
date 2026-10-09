@@ -272,9 +272,13 @@ static int ggml_cuda_expert_tensor_kind(const ggml_tensor * t) {
 // and (for prefill) sets the routing bits. The bitmap is a plain u32 word per 32 experts.
 // The ids may be a view of a larger tensor, so the row stride is taken from the tensor
 // instead of assuming a contiguous [n_expert_used, n_tokens] array.
+// The ids hold view-local expert numbers, residency / counts / the bitmap are numbered by the
+// store expert number (global). expert_base is the store number of the first expert of the view
+// (0 when src0 is not a view), expert_offset the first expert of this device under expert
+// parallelism, so e = id + expert_base - expert_offset is the store number of the routed expert.
 static __global__ void expert_routing_kernel(
         const int32_t * __restrict__ ids, const int64_t n_entries, const int n_expert_used, const int64_t ids_stride,
-        const int expert_offset, const int n_local, const int32_t * __restrict__ residency, const int64_t host_bytes,
+        const int expert_offset, const int expert_base, const int n_local, const int32_t * __restrict__ residency, const int64_t host_bytes,
         unsigned long long * __restrict__ counters, uint32_t * __restrict__ counts,
         uint32_t * __restrict__ bitmap_or_null) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -283,7 +287,7 @@ static __global__ void expert_routing_kernel(
     }
     const int64_t token = i / n_expert_used;
     const int     slot  = (int) (i - token * n_expert_used);
-    const int e = ids[token*ids_stride + slot] - expert_offset;
+    const int e = ids[token*ids_stride + slot] + expert_base - expert_offset;
     if (e < 0 || e >= n_local) {
         return;
     }
@@ -744,11 +748,14 @@ void ggml_cuda_expert_record_usage(const ggml_tensor * src0, const ggml_tensor *
 
     const int nthreads = 256;
     const int nblocks = (int) ((n_entries + nthreads - 1) / nthreads);
+    // counts / residency are arrays of the whole store tensor, so the ids of the view are
+    // counted with their store expert number (id + expert_start) and the range check is against
+    // the expert count of the store tensor, not of the view.
     expert_routing_kernel<<<nblocks, nthreads, 0, stream>>>(
         (const int32_t *) ids->data, n_entries, (int) ids->ne[0], ids->nb[1] / sizeof(int32_t),
-        (int) (expert_offset + ex_table.expert_start), (int) ex_table.n_expert,
-        s.residency_dev + ex_table.expert_start, (int64_t) ex_table.blob_bytes,
-        ctx->usage_dev, s.counts_dev + ex_table.expert_start, nullptr);
+        expert_offset, (int) ex_table.expert_start, (int) s.n_expert,
+        s.residency_dev, (int64_t) ex_table.blob_bytes,
+        ctx->usage_dev, s.counts_dev, nullptr);
     // check right here: a sticky error would otherwise surface at the next unrelated API
     // call and hide which kernel actually faulted
     CUDA_CHECK(cudaGetLastError());
@@ -870,10 +877,12 @@ const char * const * ggml_cuda_expert_stage_prepare(
 
     if (n_entries > 0) {
         const int nblocks = (int) ((n_entries + nthreads - 1) / nthreads);
-        // counts == nullptr: the routing statistics of this launch were recorded separately
+        // counts == nullptr: the routing statistics of this launch were recorded separately.
+        // The bitmap is read by the plan kernel with store expert numbers, so the routing kernel
+        // writes it with the store number of the view (id + expert_start), not with the id itself.
         expert_routing_kernel<<<nblocks, nthreads, 0, stream>>>(
             (const int32_t *) ids->data, n_entries, (int) ids->ne[0], ids->nb[1] / sizeof(int32_t),
-            expert_offset, (int) s.n_expert,
+            expert_offset, (int) ex_table.expert_start, (int) s.n_expert,
             s.residency_dev, (int64_t) s.blob_bytes, ctx->usage_dev, nullptr, s.bitmap_dev);
         CUDA_CHECK(cudaGetLastError());
     }

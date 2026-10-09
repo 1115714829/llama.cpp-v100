@@ -6611,6 +6611,7 @@ struct test_mul_mat_id_expert_view : public test_mul_mat_id_expert {
     }
 
     // ids of the view range only, deterministic so that both graphs read the same rows
+    // ids are view-local expert numbers covering every expert of the view, as ggml requires
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type != GGML_TYPE_I32) {
@@ -6621,7 +6622,7 @@ struct test_mul_mat_id_expert_view : public test_mul_mat_id_expert {
             for (int64_t r = 0; r < ggml_nrows(t); r++) {
                 std::vector<int32_t> data(t->ne[0]);
                 for (int i = 0; i < t->ne[0]; i++) {
-                    data[i] = n_skip + (i % (n_mats - n_skip));
+                    data[i] = i % (n_mats - n_skip);
                 }
                 ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
             }

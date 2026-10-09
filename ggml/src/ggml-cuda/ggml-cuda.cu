@@ -4031,9 +4031,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // expert parallelism: ids outside the local expert range belong to other devices; they are
     // not scheduled on this device and their output slots are overwritten with the zero row.
-    // An expert store view shifts the weights by its own expert start.
-    const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst) +
-        (is_expert_store ? (int32_t) ex_table.expert_start : 0);
+    // An expert store view reads its weights from the view start (main_host is shifted there),
+    // so its ids stay view-local and expert_offset only carries the parallelism offset.
+    const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
 
     // non-local slots gather a dedicated zero row appended after the compact rows. The row is
     // also the target of the assert below when the compact rows end at ne_get_rows exactly.
@@ -4045,7 +4045,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             for (int64_t iex = 0; iex < n_expert_used; ++iex) {
                 const int32_t expert_to_use = *(const int32_t *)(ids_host.data() + i12*ids->nb[1] + iex*ids->nb[0]);
                 assert(expert_to_use >= 0);
-                // an expert store view is a sub range of the tensor; its ids start at expert_offset
+                // an expert store view covers a sub range of the tensor, so its ids are view-local
                 assert(ggml_mul_mat_id_is_expert_parallel(dst) || is_expert_store ||
                        expert_to_use < ne02);
                 if (expert_to_use == i02 + expert_offset) {
