@@ -54,6 +54,7 @@ static std::string g_dump_path;
 static std::string g_trace_path;
 static int         g_trace_size_mib = 4;
 static std::atomic<bool> g_trace_enabled{false};
+static std::atomic<bool> g_dump_enabled{false};
 
 void ggml_expert_store_set_profile(const char * path) {
     std::lock_guard<std::mutex> lock(g_profile_mutex);
@@ -68,6 +69,11 @@ static std::string ggml_expert_store_get_profile() {
 void ggml_expert_store_set_dump_path(const char * path) {
     std::lock_guard<std::mutex> lock(g_profile_mutex);
     g_dump_path = path != nullptr ? path : "";
+    g_dump_enabled.store(!g_dump_path.empty(), std::memory_order_relaxed);
+}
+
+bool ggml_expert_store_dump_enabled() {
+    return g_dump_enabled.load(std::memory_order_relaxed);
 }
 
 static std::string ggml_expert_store_get_dump_path() {
@@ -346,6 +352,11 @@ void ggml_expert_store_plan(
         placement->n_slot[i]    = n_slot;
         placement->host_used[i] = (in.n_expert - n_slot) * aligned;
         placement->slot_experts[i].assign(order.begin(), order.begin() + (size_t) n_slot);
+        // slot k holds the k-th selected expert in ascending expert order. The profile decides
+        // which experts get a slot, not in which order: numbering the slots by expert number
+        // makes a fully resident tensor an identity map (expert e at slot e), so its experts can
+        // be addressed arithmetically instead of through the pointer table.
+        std::sort(placement->slot_experts[i].begin(), placement->slot_experts[i].end());
         placement->slot_used += n_slot * aligned;
         placement->host_bytes += placement->host_used[i];
         placement->host_peak = std::max(placement->host_peak, placement->host_used[i]);

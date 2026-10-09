@@ -3974,7 +3974,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ggml_cuda_mul_mat_id_ncols_typ(dst, src1, ids->ne[0], cc), /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst, expert_ptrs);
+            // A fully resident store tensor is a plain strided tensor: MMQ reads it from the store
+            // base and pitch (see ggml_cuda_mul_mat_q), no per-block pointer table read. The
+            // grouped and fused kernels above keep the table, they index it per expert themselves.
+            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst,
+                    is_expert_store && ex_table.uniform ? nullptr : expert_ptrs);
             return;
         }
 

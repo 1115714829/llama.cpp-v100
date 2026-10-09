@@ -1593,18 +1593,34 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     // expert store: read the weights through the device pointer table of the tensor instead
-    // of src0->data + expert*nb02. A fused gate/up pair looks up the gate weight as well
-    // (the two lanes are separate store tensors unless the model merges them).
+    // of src0->data + expert*nb02. A fully resident tensor is one strided block of device
+    // memory, so it is addressed arithmetically instead - reading the table would put a
+    // dependent global load in front of every weight access of every block.
+    // A fused gate/up pair looks up the gate weight as well (the two lanes are separate store
+    // tensors unless the model merges them); that would need a second base, so a fused pair
+    // keeps the tables.
     ggml_cuda_expert_table ex_table;
     bool is_expert_store = false;
+    const char * vx_weights = src0->data;
+    int64_t s02_weights    = 0; // 0: take the expert pitch from src0->nb[2]
     if (ids != nullptr && ggml_cuda_expert_table_get(src0, &ex_table)) {
         is_expert_store = true;
-        fusion_local.expert_ptrs = ex_table.main;
+        if (ex_table.uniform) {
+            vx_weights  = ex_table.plain_base;
+            s02_weights = (int64_t) ex_table.plain_pitch / ts_src0;
+        } else {
+            fusion_local.expert_ptrs = ex_table.main;
+        }
     }
     if (ids != nullptr && fusion != nullptr && fusion->gate != nullptr && ggml_cuda_expert_is_store(fusion->gate)) {
         ggml_cuda_expert_table ex_table_gate;
         if (!ggml_cuda_expert_table_get(fusion->gate, &ex_table_gate)) {
             GGML_ABORT("%s: cannot look up the gate weight table\n", __func__);
+        }
+        if (is_expert_store && s02_weights > 0) {
+            vx_weights            = src0->data;
+            s02_weights           = 0;
+            fusion_local.expert_ptrs = ex_table.main;
         }
         fusion_local.expert_ptrs_gate = ex_table_gate.main;
         if (!is_expert_store) {
@@ -1635,7 +1651,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
     const int64_t s1  =  dst->nb[1] / ts_dst;
-    const int64_t s02 = src0->nb[2] / ts_src0;
+    const int64_t s02 = s02_weights > 0 ? s02_weights : src0->nb[2] / ts_src0;
     const int64_t s2  =  dst->nb[2] / ts_dst;
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
@@ -1663,7 +1679,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int  n_experts       = (fusion != nullptr && fusion->n_experts > 0) ? fusion->n_experts : (int) ne02;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        vx_weights, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, expert_offset, n_experts, stream);

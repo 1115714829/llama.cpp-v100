@@ -173,7 +173,7 @@ void ggml_cuda_mul_mat_q(
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s1  =  dst->nb[1] / ts_dst;
-    const int64_t s02 = src0->nb[2] / ts_src0;
+    int64_t s02 = src0->nb[2] / ts_src0;
     const int64_t s2  =  dst->nb[2] / ts_dst;
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
@@ -252,6 +252,13 @@ void ggml_cuda_mul_mat_q(
     ggml_cuda_expert_table ex_table;
     if (ggml_cuda_expert_table_get(src0, &ex_table)) {
         expert_offset += (int) ex_table.expert_start;
+        if (ex_table.uniform && expert_ptrs == nullptr) {
+            // fully resident expert store tensor: the experts are one strided block of device
+            // memory, so address them from the store base and pitch. Reading the pointer table
+            // instead would put a dependent global load in front of every weight access.
+            src0_d = ex_table.plain_base;
+            s02    = (int64_t) ex_table.plain_pitch / ts_src0;
+        }
     }
     const bool is_ep         = ggml_mul_mat_id_is_expert_parallel(dst);
     const bool dedup_bcast   = ne11 == 1 && n_expert_used > 1;

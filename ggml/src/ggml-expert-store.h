@@ -180,6 +180,10 @@ GGML_API int         ggml_expert_store_get_trace_size_mib();
 // true when a trace path is set; a lock-free check for the per-launch hot path
 GGML_API bool ggml_expert_store_trace_enabled();
 
+// true when a routing dump path is set. The per-launch routing counts only feed that dump, so
+// without it there is nothing to accumulate; this is the lock-free check for that decision.
+GGML_API bool ggml_expert_store_dump_enabled();
+
 // write the per-expert routing statistics collected in the tensor (see stat_experts) in the
 // profile format. Called by the backend when the buffer is released.
 GGML_API void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_device);

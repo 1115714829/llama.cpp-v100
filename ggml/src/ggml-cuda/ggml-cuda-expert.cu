@@ -413,6 +413,7 @@ struct ggml_backend_cuda_expert_buffer_context {
     // usage counters, updated on device and read back periodically
     unsigned long long * usage_dev = nullptr;
     unsigned long long * usage_host = nullptr; // pinned
+    cudaEvent_t usage_event = nullptr;          // marks the last async copy into usage_host
     int64_t launches = 0;
 
     ggml_cuda_expert_stream_state & get_stream(cudaStream_t stream);
@@ -603,6 +604,11 @@ bool ggml_cuda_expert_table_get(const ggml_tensor * src0, ggml_cuda_expert_table
     table->has_stage    = s.bitmap_dev != nullptr;
     table->tensor_id    = tensor_id;
     table->expert_start = expert_start;
+    // without a host tier every expert is a slot and slot e holds expert e (see
+    // ggml_expert_store_plan), so the slots are one strided block starting at expert_start
+    table->uniform      = !s.has_host;
+    table->plain_base   = st->slots_dev + expert_start * (int64_t) st->stride;
+    table->plain_pitch  = st->stride;
     return true;
 }
 
@@ -701,6 +707,9 @@ ggml_backend_cuda_expert_buffer_context::~ggml_backend_cuda_expert_buffer_contex
     if (usage_host) {
         CUDA_CHECK(cudaFreeHost(usage_host));
     }
+    if (usage_event) {
+        CUDA_CHECK(cudaEventDestroy(usage_event));
+    }
     if (plain_dev) {
         CUDA_CHECK(cudaFree(plain_dev));
     }
@@ -710,9 +719,16 @@ ggml_backend_cuda_expert_buffer_context::~ggml_backend_cuda_expert_buffer_contex
 // records the tier hits and the per-expert routing counts of one mul_mat_id launch. The
 // per-expert counts use the view-local expert numbers of the tensor, so a view of a store
 // tensor counts into its own range of the full count array.
+// The counts have exactly one reader: the routing dump that ggml_expert_store_dump_profile()
+// writes at unload. Without a dump path there is nothing to accumulate, and the kernel is pure
+// overhead - one launch per mul_mat_id plus every routing entry hammering the same counter
+// address - so it only runs when a dump is configured.
 void ggml_cuda_expert_record_usage(const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream) {
     ggml_backend_cuda_expert_buffer_context * ctx = ggml_cuda_expert_buffer_ctx(src0);
     if (ctx->usage_dev == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32) {
+        return;
+    }
+    if (!ggml_expert_store_dump_enabled()) {
         return;
     }
     ggml_cuda_expert_table ex_table;
@@ -738,10 +754,19 @@ void ggml_cuda_expert_record_usage(const ggml_tensor * src0, const ggml_tensor *
     CUDA_CHECK(cudaGetLastError());
 }
 
+// Tier counters of one tick. The copy is queued on the stream and the log line is printed from
+// the pinned buffer only once it has landed, so the host never waits for the GPU here: a
+// blocking readback in the middle of a decode step stops the launch queue and lets the cards
+// drift apart, which shows up as waiting in the tensor parallel all-reduce.
 static void ggml_cuda_expert_stats_readback(ggml_backend_cuda_expert_buffer_context * ctx, cudaStream_t stream) {
     cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
     if (cudaStreamIsCapturing(stream, &status) == cudaSuccess && status != cudaStreamCaptureStatusActive) {
-        CUDA_CHECK(cudaMemcpy(ctx->usage_host, ctx->usage_dev, 4 * sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpyAsync(ctx->usage_host, ctx->usage_dev, 4 * sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaEventRecord(ctx->usage_event, stream));
+        if (cudaEventQuery(ctx->usage_event) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
         const unsigned long long total = ctx->usage_host[0] + ctx->usage_host[1];
         if (total > 0) {
             GGML_LOG_DEBUG("%s: device %d: expert hits vram %llu / host %llu (%.2f%% vram), host hit %.2f MiB, staged %.2f MiB\n",
@@ -1157,6 +1182,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
     CUDA_CHECK(cudaMemset(ctx->usage_dev, 0, 4 * sizeof(unsigned long long)));
     CUDA_CHECK(cudaHostAlloc((void **) &ctx->usage_host, 4 * sizeof(unsigned long long), cudaHostAllocDefault));
     memset(ctx->usage_host, 0, 4 * sizeof(unsigned long long));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ctx->usage_event, cudaEventDisableTiming));
 
     ctx->tensors.reserve((size_t) n_tensors);
 

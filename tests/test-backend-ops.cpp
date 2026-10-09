@@ -6569,6 +6569,64 @@ struct test_mul_mat_id_expert_pad : public test_mul_mat_id_expert {
     }
 };
 
+// A view of a fully resident expert store tensor: the view starts at expert n_skip, so the
+// kernels must reach the experts through the store base of the view (slot array base +
+// n_skip * expert pitch). The store pitch is larger than the tensor's own expert stride when
+// the weights need trailing row padding (k not a multiple of MATRIX_ROW_PADDING), so a kernel
+// that used the view's data pointer instead of the store pitch would read the wrong experts.
+// The ids stay inside the view so the CPU reference reads the same experts.
+struct test_mul_mat_id_expert_view : public test_mul_mat_id_expert {
+    test_mul_mat_id_expert_view(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, int n_skip)
+        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, n_mats, n_used, m, n, k, /*all_slot=*/true), n_skip(n_skip) {
+        GGML_ASSERT(n_skip > 0 && n_skip < n_mats);
+    }
+
+    const int n_skip;
+
+    std::string vars() override {
+        return test_mul_mat_id_expert::vars() + " n_skip=" + std::to_string(n_skip);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(as, "blk.0.ffn_gate_expert.weight");
+        expert_weight = as;
+
+        ggml_tensor * as_v = ggml_view_3d(ctx_weights, as, k, m, n_mats - n_skip,
+            as->nb[1], as->nb[2], n_skip*as->nb[2]);
+        ggml_set_name(as_v, "blk.0.ffn_gate_expert.weight_view");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as_v, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    // ids of the view range only, deterministic so that both graphs read the same rows
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            if (ggml_is_view_op(t->op)) { continue; }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = n_skip + (i % (n_mats - n_skip));
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+};
+
 // MUL_MAT_ID with the expert weights in the plain device buffer, as model loading allocates
 // them. The skinny prepass scans such buffers and repacks eligible Q8_0/Q4_K weights in place,
 // so this verifies that the 3D expert tensors pass the repack admission untouched (the
@@ -13105,6 +13163,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_expert_pad(type_a, 32, 2560, 2048, 640));
     }
     test_cases.emplace_back(new test_mul_mat_id_expert_pad(GGML_TYPE_Q4_K, 32, 640, 2048, 768));
+
+    // The same trailing-padding case through a view of the fully resident tensor: the view
+    // starts at expert n_skip and the store pitch (data + padding) differs from the tensor's own
+    // expert stride, so the kernels must use the store base and pitch of the view.
+    test_cases.emplace_back(new test_mul_mat_id_expert_view(GGML_TYPE_Q5_1, 32, 4, 2560, 2048, 640, 7));
+    test_cases.emplace_back(new test_mul_mat_id_expert_view(GGML_TYPE_Q4_K, 32, 4, 640, 2048, 768, 7));
+    test_cases.emplace_back(new test_mul_mat_id_expert_view(GGML_TYPE_Q5_1, 32, 4, 640, 16, 2560, 3));
 
     // MoE FFN of the expert store: gate/up/down as separate store tensors, one shared ids, the
     // GLU between them. The MMQ prefill (n = 2048) stages the host experts of all three tensors

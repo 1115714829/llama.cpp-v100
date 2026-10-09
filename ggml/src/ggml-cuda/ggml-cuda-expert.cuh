@@ -42,6 +42,13 @@ struct ggml_cuda_expert_table {
     bool        has_host   = false;         // some experts live in the host arena
     bool        has_stage  = false;         // staging is possible for this tensor
     int         tensor_id  = -1;
+    // fully resident tensor: every expert sits at plain_base + e*plain_pitch, so the kernels can
+    // address it arithmetically like a plain tensor instead of reading the pointer table. Set
+    // together with plain_base / plain_pitch; the store numbers the slots by expert number, so a
+    // tensor without a host tier is exactly one strided block of device memory.
+    bool        uniform     = false;
+    const char * plain_base = nullptr;
+    size_t       plain_pitch = 0;
     // when src0 is a view of the store tensor: the first expert of the view. main already
     // points at that entry, the dispatch adds expert_start to the expert offset so that the
     // kernels index the view-local expert numbers.
