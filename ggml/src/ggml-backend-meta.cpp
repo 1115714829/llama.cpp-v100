@@ -320,10 +320,17 @@ ggml_backend_dev_t ggml_backend_meta_device(
 
 struct ggml_backend_meta_buffer_type_context {
     std::vector<ggml_backend_buffer_type_t> simple_bufts;
+    // per simple device: the expert buffer type of that device (VRAM slots + device-readable
+    // host complement), or nullptr when the device has none. Expert tensors of a device are
+    // allocated on this buffer type instead of the default one, so they enter the expert
+    // store. All other tensors use simple_bufts.
+    std::vector<ggml_backend_buffer_type_t> simple_expert_bufts;
 
     std::string name;
 
-    ggml_backend_meta_buffer_type_context(std::vector<ggml_backend_buffer_type_t> simple_bufts) : simple_bufts(std::move(simple_bufts)) {
+    ggml_backend_meta_buffer_type_context(std::vector<ggml_backend_buffer_type_t> simple_bufts,
+            std::vector<ggml_backend_buffer_type_t> simple_expert_bufts) :
+            simple_bufts(std::move(simple_bufts)), simple_expert_bufts(std::move(simple_expert_bufts)) {
         name = "Meta(";
         for (size_t i = 0; i < simple_bufts.size(); i++) {
             if (i > 0) {
@@ -358,6 +365,13 @@ static ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_buft(ggml_backen
     return meta_buft_ctx->simple_bufts[index];
 }
 
+static ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_expert_buft(ggml_backend_buffer_type_t meta_buft, size_t index) {
+    GGML_ASSERT(ggml_backend_buft_is_meta(meta_buft));
+    const ggml_backend_meta_buffer_type_context * meta_buft_ctx = (const ggml_backend_meta_buffer_type_context *) meta_buft->context;
+    GGML_ASSERT(index < meta_buft_ctx->simple_expert_bufts.size());
+    return meta_buft_ctx->simple_expert_bufts[index];
+}
+
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
 
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_backend_buffer_type_t buft, ggml_tensor ** tensors, int n_tensors);
@@ -383,10 +397,17 @@ static size_t ggml_backend_meta_buffer_type_get_max_size(ggml_backend_buffer_typ
 }
 
 static size_t ggml_backend_meta_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
-    const size_t n_simple_bufts = ggml_backend_meta_buft_n_bufts(buft);
+    const ggml_backend_meta_buffer_type_context * meta_buft_ctx = (const ggml_backend_meta_buffer_type_context *) buft->context;
+    const size_t n_simple_bufts = meta_buft_ctx->simple_bufts.size();
+    // an expert tensor is allocated on the expert buffer type of its device; report the size
+    // that type would allocate, so the no-alloc accounting matches the real load. Fall back to
+    // the default buffer types for the devices without an expert buffer type.
+    const bool is_expert = (tensor->flags & GGML_TENSOR_FLAG_EXPERT) != 0;
     size_t max_alloc_size = 0;
     for (size_t i = 0; i < n_simple_bufts; i++) {
-        const size_t alloc_size = ggml_backend_buft_get_alloc_size(ggml_backend_meta_buft_simple_buft(buft, i), tensor);
+        ggml_backend_buffer_type_t simple_buft = is_expert && meta_buft_ctx->simple_expert_bufts[i] != nullptr ?
+            meta_buft_ctx->simple_expert_bufts[i] : meta_buft_ctx->simple_bufts[i];
+        const size_t alloc_size = ggml_backend_buft_get_alloc_size(simple_buft, tensor);
         max_alloc_size = std::max(max_alloc_size, alloc_size);
     }
     return max_alloc_size;
@@ -417,6 +438,36 @@ bool ggml_backend_buft_is_meta(ggml_backend_buffer_type_t buft) {
     return buft != nullptr && buft->iface.get_name == ggml_backend_meta_buffer_type_iface.get_name;
 }
 
+// expert buffer type a simple device offers through its backend: the first extra buffer type
+// the backend reports as a device expert buffer type, or nullptr when the device has none
+// (non-CUDA backends). The same detection common/fit.cpp uses.
+static ggml_backend_buffer_type_t ggml_backend_meta_device_expert_buft(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    typedef ggml_backend_buffer_type_t * (*ggml_backend_dev_get_extra_bufts_t)(ggml_backend_dev_t);
+    auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+    if (get_extra == nullptr) {
+        return nullptr;
+    }
+    typedef bool (*ggml_backend_buft_is_expert_t)(ggml_backend_buffer_type_t);
+    auto is_expert = (ggml_backend_buft_is_expert_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_expert");
+    if (is_expert == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_buffer_type_t * extra = get_extra(dev);
+    while (extra != nullptr && *extra != nullptr) {
+        if (is_expert(*extra)) {
+            return *extra;
+        }
+        ++extra;
+    }
+    return nullptr;
+}
+
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_backend_dev_t dev) {
     static std::map<ggml_backend_dev_t, struct ggml_backend_buffer_type> meta_bufts;
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
@@ -429,11 +480,15 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
 
     const size_t n_devs = ggml_backend_meta_dev_n_devs(dev);
     std::vector<ggml_backend_buffer_type_t> simple_bufts;
+    std::vector<ggml_backend_buffer_type_t> simple_expert_bufts;
     simple_bufts.reserve(n_devs);
+    simple_expert_bufts.reserve(n_devs);
     for (size_t i = 0; i < n_devs; i++) {
-        simple_bufts.push_back(ggml_backend_dev_buffer_type(ggml_backend_meta_dev_simple_dev(dev, i)));
+        ggml_backend_dev_t simple_dev = ggml_backend_meta_dev_simple_dev(dev, i);
+        simple_bufts.push_back(ggml_backend_dev_buffer_type(simple_dev));
+        simple_expert_bufts.push_back(ggml_backend_meta_device_expert_buft(simple_dev));
     }
-    ggml_backend_meta_buffer_type_context * buft_ctx = new ggml_backend_meta_buffer_type_context(simple_bufts);
+    ggml_backend_meta_buffer_type_context * buft_ctx = new ggml_backend_meta_buffer_type_context(simple_bufts, simple_expert_bufts);
 
     struct ggml_backend_buffer_type meta_buft = {
         /*iface  =*/ ggml_backend_meta_buffer_type_iface,
@@ -472,12 +527,23 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(
 // Container to hold the tensor slices per simple ggml backend buffer.
 struct ggml_backend_meta_simple_tensor_container {
     std::vector<ggml_context_ptr> ctxs;
+    // one context per simple device for the expert tensors, allocated on the expert buffer
+    // type of the device instead of its default buffer type. Only the static container of a
+    // tensor-list allocation creates them (with_expert); the compute containers never hold an
+    // expert weight.
+    std::vector<ggml_context_ptr> expert_ctxs;
     std::unordered_map<const ggml_tensor *, std::vector<ggml_tensor *>> simple_tensors;
 
-    ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple) {
+    ggml_backend_meta_simple_tensor_container(const ggml_init_params & params, const int n_simple, const bool with_expert = false) {
         ctxs.reserve(n_simple);
         for (int i = 0; i < n_simple; i++) {
             ctxs.emplace_back(ggml_init(params));
+        }
+        if (with_expert) {
+            expert_ctxs.reserve(n_simple);
+            for (int i = 0; i < n_simple; i++) {
+                expert_ctxs.emplace_back(ggml_init(params));
+            }
         }
     }
     ggml_backend_meta_simple_tensor_container() {}
@@ -541,6 +607,10 @@ struct ggml_backend_meta_buffer_context {
     int stc_compute_index      = 0;
     int stc_compute_index_next = 0;
     std::vector<ggml_backend_buffer_ptr> bufs;
+    // per simple device: the buffer holding the expert tensors of that device, or nullptr
+    // when the device has no expert buffer type or no expert tensor of the model landed on
+    // it. Parallel to bufs.
+    std::vector<ggml_backend_buffer_ptr> expert_bufs;
 
     // FIXME
     // The size of the split state cache is unbounded and can theoretically grow infinitely large.
@@ -562,7 +632,8 @@ struct ggml_backend_meta_buffer_context {
     ggml_backend_meta_buffer_context(
             ggml_backend_meta_simple_tensor_container & stc_static,
             ggml_backend_meta_simple_tensor_container * stc_compute_in,
-            const std::vector<ggml_backend_buffer_t> & bufs)
+            const std::vector<ggml_backend_buffer_t> & bufs,
+            const std::vector<ggml_backend_buffer_t> & expert_bufs)
             : stc_static(std::move(stc_static)) {
         for (int i = 0; i < GGML_META_N_STC; i++) {
             stc_compute[i] = std::move(stc_compute_in[i]);
@@ -570,6 +641,10 @@ struct ggml_backend_meta_buffer_context {
         this->bufs.reserve(bufs.size());
         for (ggml_backend_buffer_t buf : bufs) {
             this->bufs.emplace_back(buf);
+        }
+        this->expert_bufs.reserve(expert_bufs.size());
+        for (ggml_backend_buffer_t buf : expert_bufs) {
+            this->expert_bufs.emplace_back(buf);
         }
         const char * GGML_META_DEBUG = getenv("GGML_META_DEBUG");
         debug = GGML_META_DEBUG ? atoi(GGML_META_DEBUG) : 0;
@@ -593,13 +668,6 @@ static size_t ggml_backend_meta_buffer_n_bufs(ggml_backend_buffer_t meta_buf) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(meta_buf));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) meta_buf->context;
     return buf_ctx->bufs.size();
-}
-
-static ggml_backend_buffer_t ggml_backend_meta_buffer_simple_buffer(ggml_backend_buffer_t meta_buf, size_t index) {
-    GGML_ASSERT(ggml_backend_buffer_is_meta(meta_buf));
-    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) meta_buf->context;
-    GGML_ASSERT(index < buf_ctx->bufs.size());
-    return buf_ctx->bufs[index].get();
 }
 
 static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor);
@@ -1748,9 +1816,16 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
 
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
+    // expert tensors are allocated on the expert buffer type of their device; they are the
+    // only tensors the expert store places. The flag comes from the loader and applies to the
+    // static weights, never to a compute tensor. A device without an expert buffer type (a
+    // capability branch for non-CUDA devices) keeps the default buffer type even for experts.
+    const bool tensor_is_expert = (tensor->flags & GGML_TENSOR_FLAG_EXPERT) != 0;
     for (size_t j = 0; j < n_simple_bufs; j++) {
-        ggml_context          * simple_ctx = stc.ctxs[j].get();
-        ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
+        const bool j_expert = tensor_is_expert && j < stc.expert_ctxs.size() &&
+            ggml_backend_meta_buft_simple_expert_buft(tensor->buffer->buft, j) != nullptr;
+        ggml_context          * simple_ctx = j_expert ? stc.expert_ctxs[j].get() : stc.ctxs[j].get();
+        ggml_backend_buffer_t   simple_buf = j_expert ? buf_ctx->expert_bufs[j].get() : buf_ctx->bufs[j].get();
 
         if (split_dim >= 0 && split_dim < GGML_MAX_DIMS) {
             // TODO: the following assert fails for llama-parallel even though the results are correct:
@@ -1815,6 +1890,29 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 }
                 ggml_mul_mat_id_set_expert_parallel(t_ij, true);
                 ggml_mul_mat_id_set_expert_offset(t_ij, (int32_t) expert_offset);
+            }
+        }
+        if (tensor_is_expert && split_state.axis == GGML_BACKEND_SPLIT_AXIS_2) {
+            // expert parallelism: the store places the local experts of this device, but the
+            // profile and the routing dump address global (layer, expert) entries. Hand the
+            // global index of this device's first expert to the expert buffer type before the
+            // tensor is allocated. Same prefix sum as the MUL_MAT_ID expert_offset above.
+            int64_t expert_base = 0;
+            for (size_t jj = 0; jj < j; jj++) {
+                for (size_t s = 0; s < split_state.n_segments; s++) {
+                    expert_base += split_state.ne[s*n_simple_bufs + jj] * split_state.nr[s];
+                }
+            }
+            ggml_backend_buffer_type_t expert_buft = ggml_backend_meta_buft_simple_expert_buft(tensor->buffer->buft, j);
+            ggml_backend_dev_t expert_dev = expert_buft != nullptr ? ggml_backend_buft_get_device(expert_buft) : nullptr;
+            ggml_backend_reg_t expert_reg = expert_dev != nullptr ? ggml_backend_dev_backend_reg(expert_dev) : nullptr;
+            if (expert_reg != nullptr) {
+                typedef void (*ggml_backend_expert_set_tensor_base_t)(ggml_backend_buffer_type_t, const ggml_tensor *, int64_t);
+                auto set_tensor_base = (ggml_backend_expert_set_tensor_base_t)
+                    ggml_backend_reg_get_proc_address(expert_reg, "ggml_backend_cuda_expert_set_tensor_base");
+                if (set_tensor_base != nullptr) {
+                    set_tensor_base(expert_buft, t_ij, expert_base);
+                }
             }
         }
         if (tensor->op == GGML_OP_FLASH_ATTN_EXT && ggml_get_op_params_i32(tensor, 5) < 0) {
@@ -2437,9 +2535,15 @@ static void ggml_backend_meta_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 }
 
 static void ggml_backend_meta_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
-    const size_t n_buffers = ggml_backend_meta_buffer_n_bufs(buffer);
-    for (size_t i = 0; i < n_buffers; i++) {
-        ggml_backend_buffer_clear(ggml_backend_meta_buffer_simple_buffer(buffer, i), value);
+    GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
+    ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
+    for (size_t i = 0; i < buf_ctx->bufs.size(); i++) {
+        ggml_backend_buffer_clear(buf_ctx->bufs[i].get(), value);
+    }
+    for (size_t i = 0; i < buf_ctx->expert_bufs.size(); i++) {
+        if (buf_ctx->expert_bufs[i]) {
+            ggml_backend_buffer_clear(buf_ctx->expert_bufs[i].get(), value);
+        }
     }
 }
 
@@ -2447,7 +2551,12 @@ static void ggml_backend_meta_buffer_reset(ggml_backend_buffer_t buffer) {
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer));
     ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buffer->context;
     for (size_t i = 0; i < buf_ctx->bufs.size(); i++) {
-        ggml_backend_buffer_reset(ggml_backend_meta_buffer_simple_buffer(buffer, i));
+        ggml_backend_buffer_reset(buf_ctx->bufs[i].get());
+    }
+    for (size_t i = 0; i < buf_ctx->expert_bufs.size(); i++) {
+        if (buf_ctx->expert_bufs[i]) {
+            ggml_backend_buffer_reset(buf_ctx->expert_bufs[i].get());
+        }
     }
 }
 
@@ -2695,6 +2804,11 @@ void ggml_backend_meta_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_
             ggml_backend_buffer_set_usage(buf_ctx->bufs[i].get(), usage);
         }
     }
+    for (size_t i = 0; i < buf_ctx->expert_bufs.size(); i++) {
+        if (buf_ctx->expert_bufs[i]) {
+            ggml_backend_buffer_set_usage(buf_ctx->expert_bufs[i].get(), usage);
+        }
+    }
 }
 
 static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
@@ -2713,13 +2827,14 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_bac
 
     size_t max_size = 0;
     std::vector<ggml_backend_buffer_t> bufs;
+    std::vector<ggml_backend_buffer_t> expert_bufs;
     bufs.reserve(n_simple_bufts);
     for (size_t i = 0; i < n_simple_bufts; i++) {
         bufs.push_back(ggml_backend_buft_alloc_buffer(ggml_backend_meta_buft_simple_buft(buft, i), size));
         GGML_ASSERT(bufs.back() != nullptr);
         max_size = std::max(max_size, ggml_backend_buffer_get_size(bufs.back()));
     }
-    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute, bufs);
+    ggml_backend_meta_buffer_context * buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute, bufs, expert_bufs);
 
     return ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, buf_ctx, max_size);
 }
@@ -2738,14 +2853,15 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
-    ggml_backend_meta_simple_tensor_container stc_static   (params_static,  n_simple_bufts);
+    ggml_backend_meta_simple_tensor_container stc_static (params_static,  n_simple_bufts, /*with_expert =*/ true);
     ggml_backend_meta_simple_tensor_container stc_compute[GGML_META_N_STC];
     for (int i = 0; i < GGML_META_N_STC; i++) {
         stc_compute[i] = ggml_backend_meta_simple_tensor_container(params_compute, n_simple_bufts);
     }
 
     std::vector<ggml_backend_buffer_t> bufs(n_simple_bufts, nullptr);
-    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute, bufs);
+    std::vector<ggml_backend_buffer_t> expert_bufs(n_simple_bufts, nullptr);
+    ggml_backend_meta_buffer_context * meta_buf_ctx = new ggml_backend_meta_buffer_context(stc_static, stc_compute, bufs, expert_bufs);
 
     ggml_backend_buffer_t meta_buf = ggml_backend_buffer_init(buft, ggml_backend_meta_buffer_iface, meta_buf_ctx, 0);
     for (int i = 0; i < n_tensors; i++) {
@@ -2755,28 +2871,42 @@ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer_n(ggml_b
         t->data = (void *) 0x2000000000000000; // FIXME
     }
     for (size_t i = 0; i < n_simple_bufts; i++) {
-        ggml_context * ctx = meta_buf_ctx->stc_static.ctxs[i].get();
         ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(buft, i);
 
-        // If a ggml_context only has zero-sized tensors, ggml_backend_alloc_ctx_tensors_from_buft returns NULL.
-        // For those edge cases, allocate a dummy buffer instead.
-        bool any_nonzero_slice = false;
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (ggml_nelements(t) != 0) {
-                any_nonzero_slice = true;
-                break;
-            }
-        }
-        if (any_nonzero_slice) {
-            meta_buf_ctx->bufs[i].reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, simple_buft));
-        } else {
-            meta_buf_ctx->bufs[i].reset(ggml_backend_buft_alloc_buffer(simple_buft, 0));
+        // Plain tensors and expert tensors of one device live in two contexts (and two buffer
+        // types). Each is allocated with the same zero-tensor rule.
+        auto alloc_container = [&](ggml_context * ctx, ggml_backend_buffer_type_t container_buft,
+                                   ggml_backend_buffer_ptr & out_buf) {
+            // If a ggml_context only has zero-sized tensors, ggml_backend_alloc_ctx_tensors_from_buft returns NULL.
+            // For those edge cases, allocate a dummy buffer instead.
+            bool any_nonzero_slice = false;
             for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-                t->buffer = meta_buf_ctx->bufs[i].get();
+                if (ggml_nelements(t) != 0) {
+                    any_nonzero_slice = true;
+                    break;
+                }
             }
+            if (any_nonzero_slice) {
+                out_buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx, container_buft));
+            } else {
+                out_buf.reset(ggml_backend_buft_alloc_buffer(container_buft, 0));
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    t->buffer = out_buf.get();
+                }
+            }
+            GGML_ASSERT(out_buf);
+            meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(out_buf.get()));
+        };
+
+        alloc_container(meta_buf_ctx->stc_static.ctxs[i].get(), simple_buft, meta_buf_ctx->bufs[i]);
+
+        // the expert buffer type of the device: only when the device has one and the model
+        // actually placed an expert tensor on it. A device with an empty expert context keeps
+        // a null expert buffer, so a dense model allocates none.
+        ggml_backend_buffer_type_t simple_expert_buft = ggml_backend_meta_buft_simple_expert_buft(buft, i);
+        if (simple_expert_buft != nullptr && ggml_get_first_tensor(meta_buf_ctx->stc_static.expert_ctxs[i].get()) != nullptr) {
+            alloc_container(meta_buf_ctx->stc_static.expert_ctxs[i].get(), simple_expert_buft, meta_buf_ctx->expert_bufs[i]);
         }
-        GGML_ASSERT(meta_buf_ctx->bufs[i]);
-        meta_buf->size = std::max(meta_buf->size, ggml_backend_buffer_get_size(meta_buf_ctx->bufs[i].get()));
     }
     return meta_buf;
 }

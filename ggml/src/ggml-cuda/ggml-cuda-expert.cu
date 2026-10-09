@@ -472,6 +472,31 @@ static size_t ggml_cuda_expert_get_stage_budget(int device) {
     return g_expert_stage_budget[device];
 }
 
+// global index of local expert 0 of every expert tensor registered by the meta backend. The
+// base belongs to the simple tensor of one device and is consumed by the allocation of that
+// tensor; no base is kept after the allocation. Layer-split tensors are never registered.
+static std::mutex g_expert_base_mutex;
+static std::map<const ggml_tensor *, int64_t> g_expert_base;
+
+void ggml_cuda_expert_set_tensor_base(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor, int64_t expert_base) {
+    if (tensor == nullptr || !ggml_cuda_expert_buft_is_expert(buft)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_expert_base_mutex);
+    g_expert_base[tensor] = expert_base;
+}
+
+static int64_t ggml_cuda_expert_get_tensor_base(const ggml_tensor * tensor) {
+    std::lock_guard<std::mutex> lock(g_expert_base_mutex);
+    const auto it = g_expert_base.find(tensor);
+    return it == g_expert_base.end() ? 0 : it->second;
+}
+
+static void ggml_cuda_expert_clear_tensor_base(const ggml_tensor * tensor) {
+    std::lock_guard<std::mutex> lock(g_expert_base_mutex);
+    g_expert_base.erase(tensor);
+}
+
 static void ggml_cuda_expert_set_allocation(int device, size_t slot_bytes, size_t host_bytes, size_t stage_bytes, size_t host_peak) {
     std::lock_guard<std::mutex> lock(g_expert_budget_mutex);
     g_expert_alloc_slot [device] = slot_bytes;
@@ -1088,8 +1113,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
     std::vector<ggml_expert_store_plan_tensor> plan_in;
     plan_in.reserve(expert_tensors.size());
     for (const ggml_tensor * t : expert_tensors) {
-        plan_in.push_back({ ggml_cuda_expert_tensor_layer(t), t->ne[2], (size_t) t->nb[2],
-            ggml_cuda_expert_blob_pad(t->type, t->ne[0]) });
+        plan_in.push_back({ ggml_cuda_expert_tensor_layer(t), t->ne[2], ggml_cuda_expert_get_tensor_base(t),
+            (size_t) t->nb[2], ggml_cuda_expert_blob_pad(t->type, t->ne[0]) });
     }
     ggml_expert_store_placement plan;
     ggml_expert_store_plan(plan_in.data(), plan_in.size(), (int64_t) slot_budget, ctx->store->profile_path.c_str(), &plan);
@@ -1144,9 +1169,11 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
 
         const int tensor_id = ggml_expert_store_add_tensor(ctx->store,
             ggml_cuda_expert_tensor_layer(t), ggml_cuda_expert_tensor_kind(t),
+            ggml_cuda_expert_get_tensor_base(t),
             n_expert, blob_bytes, blob_pad,
             plan.slot_experts[k].data(), plan.n_slot[k],
             -1); // the complement must always fit in host memory
+        ggml_cuda_expert_clear_tensor_base(t);
         if (tensor_id < 0) {
             GGML_LOG_ERROR("%s: cannot place expert tensor %s\n", __func__, t->name);
             delete ctx;
@@ -1346,7 +1373,7 @@ void ggml_backend_cuda_expert_verify_all(void) {
 // code checks their NUMA placement against the nodes).
 void ggml_cuda_expert_plan(
         ggml_backend_buffer_type_t buft,
-        const int * layer, const int64_t * n_expert, const size_t * blob_bytes,
+        const int * layer, const int64_t * expert_base, const int64_t * n_expert, const size_t * blob_bytes,
         const int * type, const int64_t * ne0, size_t n_tensors,
         size_t slot_budget,
         size_t * slot_bytes, size_t * host_bytes, size_t * host_peak, size_t * host_bytes_each) {
@@ -1360,7 +1387,7 @@ void ggml_cuda_expert_plan(
         // the fit plan must use the same per-expert stride the real allocation uses, so the
         // row padding is derived here from the tensor type exactly like alloc_buffer_n does
         const size_t blob_pad = ggml_cuda_expert_blob_pad((ggml_type) type[i], ne0[i]);
-        tensors.push_back({ layer[i], n_expert[i], blob_bytes[i], blob_pad });
+        tensors.push_back({ layer[i], n_expert[i], expert_base != nullptr ? expert_base[i] : 0, blob_bytes[i], blob_pad });
     }
 
     ggml_expert_store_placement plan;
@@ -1523,14 +1550,14 @@ void ggml_cuda_expert_stats_tick(const ggml_tensor * src0, cudaStream_t stream) 
 
 void ggml_cuda_expert_plan(
         ggml_backend_buffer_type_t buft,
-        const int * layer, const int64_t * n_expert, const size_t * blob_bytes,
+        const int * layer, const int64_t * expert_base, const int64_t * n_expert, const size_t * blob_bytes,
         const int * type, const int64_t * ne0, size_t n_tensors,
         size_t slot_budget,
         size_t * slot_bytes, size_t * host_bytes, size_t * host_peak, size_t * host_bytes_each) {
     GGML_UNUSED(buft);
     GGML_UNUSED(layer);
-    GGML_UNUSED(n_expert);
-    GGML_UNUSED(blob_bytes);
+    GGML_UNUSED(expert_base);
+    GGML_UNUSED(n_expert);    GGML_UNUSED(blob_bytes);
     GGML_UNUSED(type);
     GGML_UNUSED(ne0);
     GGML_UNUSED(n_tensors);
@@ -1545,6 +1572,12 @@ void ggml_cuda_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_by
     GGML_UNUSED(buft);
     GGML_UNUSED(slot_bytes);
     GGML_UNUSED(stage_bytes);
+}
+
+void ggml_cuda_expert_set_tensor_base(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor, int64_t expert_base) {
+    GGML_UNUSED(buft);
+    GGML_UNUSED(tensor);
+    GGML_UNUSED(expert_base);
 }
 
 void ggml_cuda_expert_record_plan(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t host_bytes) {
