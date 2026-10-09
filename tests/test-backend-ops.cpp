@@ -15013,6 +15013,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // qwen4exp decode/verify shapes at 16K and 200K context: 16384 and 204800 cells, kpool 4 so 4096 and 51200
+    // pools, indexer_top_k 2048 cells = 512 pools, so n_sel = 4*512 + 3 = 2051 cells. nb covers the decode (1) and
+    // the MTP verify (2/4/8) token counts.
+    for (int64_t nb : { 1, 2, 4, 8 }) {
+        // qsa_select over the pooled keys, 8 padded pools at the end
+        for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            test_cases.emplace_back(new test_qsa_select(4104,  8, nb, 4, 512, type_K)); // 16K context
+            test_cases.emplace_back(new test_qsa_select(51208, 8, nb, 4, 512, type_K)); // 200K context
+        }
+        // qsa_attn over the 2051 selected cells, both cache types of the production run
+        for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+            test_cases.emplace_back(new test_qsa_attn(2, 16384,  nb, 1, 2051, 2051, type_KV)); // 16K context
+            test_cases.emplace_back(new test_qsa_attn(2, 204800, nb, 1, 2051, 2051, type_KV)); // 200K context
+        }
+    }
+
     // launch-overhead isolation: single L2_NORM launch vs batched siblings at the GDN
     // production shape (strided qkv views) -- perf-mode only, the eval list has its own
     // 2/4-wide coverage
