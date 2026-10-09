@@ -4384,7 +4384,13 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
-    if ((src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) || dst->type != GGML_TYPE_F32) {
+    // The SwiGLU epilogue (op_params[4]) writes an F16 dst, which the F32-only check below
+    // rejects; it is a plain fused-expert launch like the F32 one, so it is decided by the same
+    // predicate further down and has no host-side part of its own.
+    const bool mmid_swiglu = ggml_get_op_params_i32(dst, 4) == 1;
+
+    if ((src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) ||
+        (!mmid_swiglu && dst->type != GGML_TYPE_F32)) {
         return true;
     }
 
@@ -4401,6 +4407,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const bool is_expert_store = ggml_cuda_expert_table_get(src0, &ex_table);
     if (is_expert_store && ggml_cuda_expert_stage_used(dst, ex_table, cc)) {
         return true;
+    }
+
+    if (mmid_swiglu) {
+        return !ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc);
     }
 
     // the fused-expert and grouped kernels are plain launches that build their tables on the
@@ -4443,11 +4453,28 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * ids  = dst->src[2];
 
     GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16);
-    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32 || dst->type == GGML_TYPE_F16);
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    // The SwiGLU epilogue flag (op_params[4]) makes this node the fused-expert kernel's own output
+    // layout: the F16 H of silu(gate) * up built from the row interleaved weights. No other path can
+    // produce it, so report the shape and stop when the kernel does not cover this node instead of
+    // falling through to a path that would write something else. ggml_cuda_supports_op returns false
+    // for the same shapes, so the scheduler normally runs such a node on the CPU.
+    const bool mmid_swiglu = ggml_get_op_params_i32(dst, 4) == 1;
+    if (mmid_swiglu && !ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc)) {
+        GGML_ABORT("%s: MUL_MAT_ID with the SwiGLU epilogue (op_params[4]) is not covered by the "
+                   "fused-expert kernel: src0 %s ne [%lld, %lld, %lld], src1 %s ne [%lld, %lld], "
+                   "ids ne [%lld], dst %s ne [%lld, %lld, %lld], cc 0x%x",
+                   __func__, ggml_type_name(src0->type),
+                   (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2],
+                   ggml_type_name(src1->type), (long long) src1->ne[1], (long long) src1->ne[2],
+                   (long long) ids->ne[0], ggml_type_name(dst->type),
+                   (long long) dst->ne[0], (long long) dst->ne[1], (long long) dst->ne[2], cc);
+    }
 
     // expert store: the weights are read through a device pointer table, the per-layer
     // placement is slot or host arena. The byte check runs when the loader finished the
@@ -4464,19 +4491,20 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     // An F16 activation belongs to the fused-expert kernel: its shared-memory X tile is F16, so
-    // the kernel converts an F32 activation itself (once per launch) and only it reads F16. The
+    // the kernel converts an F32 src1 itself (once per launch) and only it reads F16. The
     // predicate is the single gate, so such a node always returns from the fused-expert branch
-    // below and never reaches the vector or MMQ paths, which take the F32 src1.
-    if (dst->type == GGML_TYPE_F32 &&
+    // below and never reaches the vector or MMQ paths, which take the F32 src1. An F16 dst is
+    // the same node: only the fused-expert SwiGLU epilogue produces it (checked above).
+    if ((dst->type == GGML_TYPE_F32 || mmid_swiglu) &&
         (src1->type == GGML_TYPE_F32 || ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc))) {
-        if (src1->type == GGML_TYPE_F32 && ggml_is_quantized(src0->type)) {
+        if (!mmid_swiglu && src1->type == GGML_TYPE_F32 && ggml_is_quantized(src0->type)) {
             // The MMVQ mmid kernel is a separate kernel whose block width is the token count,
             // so on Volta it can go past MMVQ_MAX_BATCH_SIZE.
             if (ne2 <= get_mmvq_mmid_max_batch(src0->type, cc)) {
                 ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                 return;
             }
-        } else if (src1->type == GGML_TYPE_F32 && ne2 <= MMVF_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
+        } else if (!mmid_swiglu && src1->type == GGML_TYPE_F32 && ne2 <= MMVF_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
             ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
             return;
         }
@@ -4496,6 +4524,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         if (ggml_cuda_fused_expert_mul_mat_id(ctx, dst, expert_ptrs)) {
             return;
         }
+
+        // the SwiGLU epilogue has no other implementation. The predicate holds here (checked
+        // above), so fused_expert returned false only if the device changed under us: stop
+        // instead of writing a wrong result into the F16 H.
+        GGML_ASSERT(!mmid_swiglu);
 
         // Prefill (T > 8) also takes the grouped kernel: it stages the entries of one expert
         // and reads the weight row once per staged group, instead of the MMQ MUL_MAT_ID path
@@ -9228,6 +9261,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 struct ggml_tensor * b = op->src[1];
                 if (a->nb[0] != ggml_element_size(a) || b->nb[0] != ggml_element_size(b)) {
                     return false; // TODO this could in principle be implemented though currently there is no use case.
+                }
+                if (op->op == GGML_OP_MUL_MAT_ID && ggml_get_op_params_i32(op, 4) == 1) {
+                    // the SwiGLU epilogue is the fused-expert kernel's own output layout (the F16 H
+                    // of silu(gate) * up from the row interleaved weights); with a type or shape it
+                    // does not cover there is no implementation here, so the scheduler has to run
+                    // the node on a backend that has one
+                    return ggml_cuda_fused_expert_mul_mat_id_supported(op, ggml_cuda_info().devices[dev_ctx->device].cc);
                 }
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 && !ggml_cuda_op_mul_mat_use_fwht(op)) {
                     // the fused-expert kernel is the only path that reads an F16 activation: its

@@ -37,6 +37,10 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
 
+        // the rows of the tensor are rewritten from the concatenated gate/up order of the file
+        // into the interleaved order read by ggml_mul_mat_id_swiglu, see TENSOR_GATE_UP_INTERLEAVE
+        bool interleave_gate_up = false;
+
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {
@@ -70,6 +74,10 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    // the tensor holds the rows of a gate and an up projection concatenated (n_ff gate rows followed
+    // by n_ff up rows per expert) and is rewritten into the interleaved order (row 2r = gate row r,
+    // row 2r+1 = up row r) that ggml_mul_mat_id_swiglu reads; see llama_interleave_gate_up_rows
+    static const int TENSOR_GATE_UP_INTERLEAVE = 1 << 6;
 
     int n_kv      = 0;
     int n_tensors = 0;

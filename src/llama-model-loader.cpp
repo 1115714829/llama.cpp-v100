@@ -13,6 +13,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <vector>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1577,6 +1578,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_set_name(tensor, ggml_get_name(&t_meta));
     mark_expert_tensor(tensor);
 
+    if (flags & TENSOR_GATE_UP_INTERLEAVE) {
+        // the rows are reordered while loading, so load_all_data() reads them from the file into a
+        // private buffer instead of pointing the tensor into the mapping
+        auto it = weights_map.find(tn.str());
+        GGML_ASSERT(it != weights_map.end());
+        it->second.interleave_gate_up = true;
+    }
+
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
     } else {
@@ -1685,6 +1694,38 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
     }
 
     return data;
+}
+
+// The file stores the merged gate/up expert weight per expert as the n_ff rows of gate followed by
+// the n_ff rows of up. ggml_mul_mat_id_swiglu reads them as pairs, row 2r = gate row r and
+// row 2r+1 = up row r, so the rows are reordered here while the weight is loaded, which keeps the
+// reordering out of the run time entirely.
+//
+// data holds the tensor as it is in the file: n_expert experts of 2*n_ff contiguous rows of
+// ggml_row_size(type, ne0) bytes each. The rows are copied into a scratch buffer of the same size
+// and then moved back in the interleaved order, so the source is never read and written at once.
+// data must be writable and must not alias the file mapping.
+static void llama_interleave_gate_up_rows(uint8_t * data, ggml_type type, int64_t ne0, int64_t n_ff, int64_t n_expert) {
+    GGML_ASSERT(n_ff > 0 && n_expert > 0);
+
+    const size_t row_size = ggml_row_size(type, ne0);
+    const size_t expert_size = 2*n_ff*row_size;
+
+    std::vector<uint8_t> scratch(expert_size);
+
+    for (int64_t e = 0; e < n_expert; e++) {
+        uint8_t * dst_expert = data + e*expert_size;
+
+        // gate rows into the even positions of the scratch buffer
+        for (int64_t r = 0; r < n_ff; r++) {
+            memcpy(scratch.data() + (2*r)*row_size, dst_expert + r*row_size, row_size);
+        }
+        // up rows into the odd positions, then move the whole expert over
+        for (int64_t r = 0; r < n_ff; r++) {
+            memcpy(scratch.data() + (2*r + 1)*row_size, dst_expert + (n_ff + r)*row_size, row_size);
+        }
+        memcpy(dst_expert, scratch.data(), expert_size);
+    }
 }
 
 bool llama_model_loader::load_all_data(
@@ -1859,6 +1900,28 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // a gate/up weight is rewritten into the interleaved row order while loading: its rows come
+        // from the file into a private buffer, because neither the file mapping nor the destination
+        // buffer may be read and written in place
+        if (weight->interleave_gate_up) {
+            const auto & file = files.at(weight->idx);
+
+            std::vector<no_init<uint8_t>> read_buf(n_size);
+            file->seek(weight->offs, SEEK_SET);
+            file->read_raw(read_buf.data(), n_size);
+
+            llama_interleave_gate_up_rows((uint8_t *) read_buf.data(), cur->type, cur->ne[0], cur->ne[1]/2, cur->ne[2]);
+
+            if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+
+            ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+
+            size_done += n_size;
+            continue;
+        }
 
         // BF16 weights loaded as F16 are converted here: the file holds BF16 but the tensor that
         // was created is F16 and the model expects F16 from this point on

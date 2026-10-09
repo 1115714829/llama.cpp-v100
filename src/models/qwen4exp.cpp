@@ -183,6 +183,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
     const int  mtp_flags   = ml.load_mtp ? 0 : TENSOR_SKIP;
 
+    // the graph reads the merged gate/up expert weight with the fused SwiGLU matmul, which needs the
+    // rows interleaved while loading. the merged path never applies the swiglu clamp (that branch
+    // needs a separate gate weight), so it matches ggml_swiglu_split() one to one
+    gate_up_fused_swiglu = true;
+
     // an MTP-only file that shares the target's embeddings leaves tok_embd out too; then the
     // loader borrows it from the target (see llama_model_loader::borrow_shared_tensor)
     // from unsloth PR #240
@@ -281,7 +286,8 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
-        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags);
+        create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags,
+            gate_up_fused_swiglu ? TENSOR_GATE_UP_INTERLEAVE : 0);
 
         layer.ffn_gate_inp_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP_SHEXP, "weight", il), { n_embd }, flags);
         layer.ffn_gate_shexp     = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP,     "weight", il), { n_embd, n_ff_shexp }, flags);
@@ -1153,7 +1159,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
             nullptr, model.layers[il].ffn_gate_up_exps,
             model.layers[il].ffn_up_exps_s,
             model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
+            model.layers[il].ffn_down_exps_s,
+            nullptr,
+            model.gate_up_fused_swiglu);
     cb(moe_out, "ffn_moe_out", il);
 
     // shared experts, as in the Qwen3Next reference

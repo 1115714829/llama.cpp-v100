@@ -132,9 +132,11 @@ static __global__ void mm_ids_helper(
 
 // Expert parallelism: the MMQ and grouped kernels only write the (token, slot) entries whose
 // expert is local, so the entries routed to other devices must be zeroed here. One block per
-// (token, slot) pair, the threads of the block cover the output row.
+// (token, slot) pair, the threads of the block cover the output row. T is the output element
+// type: the fused-expert SwiGLU epilogue produces F16 rows, every other path F32.
+template <typename T>
 __global__ void mmid_zero_nonlocal_kernel(
-        float * __restrict__ dst, const int32_t * __restrict__ ids,
+        T * __restrict__ dst, const int32_t * __restrict__ ids,
         const int expert_offset, const int n_experts, const int n_expert_used,
         const int64_t ne0, const int64_t ids_stride,
         const int64_t stride_slot, const int64_t stride_token) {
@@ -147,24 +149,30 @@ __global__ void mmid_zero_nonlocal_kernel(
         return;
     }
 
-    float * dst_slot = dst + token*stride_token + slot*stride_slot;
+    T * dst_slot = dst + token*stride_token + slot*stride_slot;
     for (int64_t r = threadIdx.x; r < ne0; r += blockDim.x) {
-        dst_slot[r] = 0.0f;
+        dst_slot[r] = (T) 0.0f;
     }
 }
 
 void ggml_cuda_mmid_zero_nonlocal(
-        float * dst, const int32_t * ids, const int expert_offset, const int n_experts,
+        void * dst, const int32_t * ids, const int expert_offset, const int n_experts,
         const int64_t n_tokens, const int n_expert_used, const int64_t ne0,
-        const int64_t ids_stride, const int64_t stride_slot, const int64_t stride_token, cudaStream_t stream) {
+        const int64_t ids_stride, const int64_t stride_slot, const int64_t stride_token,
+        cudaStream_t stream, const bool dst_f16) {
     const int n_pairs = (int) (n_tokens * n_expert_used);
     if (n_pairs == 0) {
         return;
     }
     const dim3 num_blocks(n_pairs, 1, 1);
     const dim3 block_size(256, 1, 1);
-    mmid_zero_nonlocal_kernel<<<num_blocks, block_size, 0, stream>>>(
-        dst, ids, expert_offset, n_experts, n_expert_used, ne0, ids_stride, stride_slot, stride_token);
+    if (dst_f16) {
+        mmid_zero_nonlocal_kernel<half><<<num_blocks, block_size, 0, stream>>>(
+            (half *) dst, ids, expert_offset, n_experts, n_expert_used, ne0, ids_stride, stride_slot, stride_token);
+    } else {
+        mmid_zero_nonlocal_kernel<float><<<num_blocks, block_size, 0, stream>>>(
+            (float *) dst, ids, expert_offset, n_experts, n_expert_used, ne0, ids_stride, stride_slot, stride_token);
+    }
 }
 
 template <int n_expert_used_template>

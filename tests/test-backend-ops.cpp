@@ -6246,6 +6246,43 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// The fused SwiGLU expert matmul: the rows of src0 come in gate/up pairs (row 2r = gate row r,
+// row 2r+1 = up row r, the order the model loader writes them) and the epilogue applies
+// silu(gate)*up in FP32 and writes it as F16, which is what the down projection reads. Same
+// routing, shapes and tolerance as test_mul_mat_id, with src0 twice as tall.
+struct test_mul_mat_id_swiglu : public test_mul_mat_id {
+    test_mul_mat_id_swiglu(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 512, int n_used = 10, bool b = false,
+            int64_t m = 1280, int64_t n = 32, int64_t k = 2560)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_SWIGLU";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // the result is F16, so the src1 precision hint of the plain case does not apply
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id_swiglu(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // Skewed routing: a few hot experts take most of the slots. At n=2048 the average expert
 // receives 40 columns, but a hot expert receives hundreds, far more than the grouped kernel's
 // staged-entry capacity, so this exercises the per-expert column loop.
@@ -13257,6 +13294,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, 2048, 2560)); // gate/up
     }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, 2048, 2560)); // merged gate_up
+
+    // the same merged gate_up tensor read with the fused SwiGLU epilogue: one MUL_MAT_ID over the
+    // (k, 2*n_ff) interleaved weight, F16 activation for the down projection instead of a separate
+    // swiglu_split pass. The real UD-Q4_K_XL expert shapes (512 experts, top-10, n_ff = 640,
+    // k = 2560) with the K-quant types the model uses there, F32 and F16 activations, and the
+    // decode/verify, the grouped-tile edge and the prefill widths.
+    for (int n : {16, 64, 512, 2048}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
+            for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+                test_cases.emplace_back(new test_mul_mat_id_swiglu(type_a, type_b, 512, 10, false, 1280, n, 2560));
+            }
+        }
+    }
     for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, 2048, 640)); // down
     }
@@ -15161,6 +15211,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, 2048, 2560));
     test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q4_K, 512, 10, 640, 2048, 2560, 8));
     test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q4_K, 512, 10, 1280, 2048, 2560, 8));
+
+    // the fused SwiGLU gate_up at the prefill width, the same shapes as the merged gate_up line
+    // above: the epilogue saves the swiglu_split pass and halves the activation traffic
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
+        for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+            test_cases.emplace_back(new test_mul_mat_id_swiglu(type_a, type_b, 512, 10, false, 1280, 2048, 2560));
+        }
+    }
 
     // prefill blocks wider than -ub 2048: how the per-expert column count (n*10/512 = 40 at
     // n = 2048) drives the efficiency of the grouped expert kernels (TM = 64 token tiles)

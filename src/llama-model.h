@@ -648,6 +648,12 @@ struct llama_model {
     // the h sink is not usable without it
     bool h_nextn_sink_ok = false;
 
+    // the merged gate_up expert weight of every layer is loaded with its rows interleaved, so the
+    // graph reads it with the fused SwiGLU matmul instead of the split gate and up views.
+    // Set by the model loader of the architectures that load it that way, see
+    // TENSOR_GATE_UP_INTERLEAVE and ggml_mul_mat_id_swiglu
+    bool gate_up_fused_swiglu = false;
+
     llama_hparams hparams = {};
     llama_vocab   vocab;
 
@@ -843,6 +849,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
     const int TENSOR_READ_LAZY;
+    const int TENSOR_GATE_UP_INTERLEAVE;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;
@@ -854,7 +861,7 @@ struct llama_model_base : public llama_model {
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
-                int64_t n_ff_, int64_t n_expert_, int flags);
+                int64_t n_ff_, int64_t n_expert_, int flags, int flags_extra = 0);
 
     // helper: try to load merged qkv first, fall back to separate q, k, v
     void create_tensor_qkv(llama_layer & layer, int bid,

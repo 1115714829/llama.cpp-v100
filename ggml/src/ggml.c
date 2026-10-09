@@ -3421,11 +3421,12 @@ void ggml_mul_mat_set_hint(
 
     c ~= as[:,:,i] @ b[:,i%r,t], i = ids[e,t] for all e,t in ids
 */
-struct ggml_tensor * ggml_mul_mat_id(
+static struct ggml_tensor * ggml_mul_mat_id_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,
         struct ggml_tensor  * b,
-        struct ggml_tensor  * ids) {
+        struct ggml_tensor  * ids,
+        enum ggml_mul_mat_id_epilogue epilogue) {
     GGML_ASSERT(!ggml_is_transposed(as));
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
 
@@ -3436,15 +3437,49 @@ struct ggml_tensor * ggml_mul_mat_id(
     GGML_ASSERT(as->ne[0] == b->ne[0]); // can_mul_mat
     GGML_ASSERT(ids->ne[0] % b->ne[1] == 0); // can broadcast
 
-    const int64_t ne[4] = { as->ne[1], ids->ne[0], b->ne[2], 1 };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    // the SwiGLU epilogue consumes the rows of as in pairs and writes one F16 row per pair
+    const bool swiglu = epilogue == GGML_MUL_MAT_ID_EPILOGUE_SWIGLU;
+    GGML_ASSERT(!swiglu || as->ne[1] % 2 == 0);
+
+    const int64_t ne[4] = { swiglu ? as->ne[1]/2 : as->ne[1], ids->ne[0], b->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, swiglu ? GGML_TYPE_F16 : GGML_TYPE_F32, 4, ne);
 
     result->op     = GGML_OP_MUL_MAT_ID;
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
 
+    if (swiglu) {
+        // op_params[3] is the src1 precision, [4] the expert offset, [5] the expert parallel flag
+        // and [6] the global expert count, so the epilogue takes the next free slot
+        ggml_set_op_params_i32(result, 7, (int32_t) epilogue);
+    }
+
     return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids) {
+    return ggml_mul_mat_id_impl(ctx, as, b, ids, GGML_MUL_MAT_ID_EPILOGUE_NONE);
+}
+
+struct ggml_tensor * ggml_mul_mat_id_swiglu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids) {
+    return ggml_mul_mat_id_impl(ctx, as, b, ids, GGML_MUL_MAT_ID_EPILOGUE_SWIGLU);
+}
+
+int32_t ggml_mul_mat_id_get_epilogue(const struct ggml_tensor * a) {
+    // the fused kernels read the epilogue from a downstream node, which has none
+    if (a->op != GGML_OP_MUL_MAT_ID) {
+        return GGML_MUL_MAT_ID_EPILOGUE_NONE;
+    }
+    return ggml_get_op_params_i32(a, 7);
 }
 
 void ggml_mul_mat_id_set_expert_parallel(struct ggml_tensor * a, bool enabled) {

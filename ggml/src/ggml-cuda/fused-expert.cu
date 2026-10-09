@@ -4,6 +4,7 @@
 #include "ggml-cuda-expert.cuh"
 #include "mmid.cuh"
 #include "moe-grouped.cuh"
+#include "unary.cuh"
 
 #include <cuda_fp16.h>
 #include <cstdint>
@@ -12,8 +13,13 @@
 // src/kernels/cuda/fused_expert.cu (MIT, Copyright (c) 2026 Niko1221 and the Strata
 // contributors, see licenses/LICENSE-strata). The tile shape, the XOR swizzle, the per-step
 // independent accumulators and the Q4_K/Q5_K/Q5_1/Q8_0 dequantizers are theirs; the expert
-// addressing uses our grouped tables (expert_bounds / ids_src1 / ids_dst) and the output is
-// plain F32, so the SwiGLU epilogue stays in the graph.
+// addressing uses our grouped tables (expert_bounds / ids_src1 / ids_dst).
+//
+// Two output layouts, one per SWIGLU instantiation of the 256 kernel: plain F32 (the SwiGLU
+// epilogue stays in the graph) or, when the MUL_MAT_ID carries the SwiGLU epilogue flag
+// (op_params[4]), the F16 H written by the paired-row epilogue below, as in Strata's gu_kernel.
+// The weights are read row interleaved in that case: row 2c of the tile is the gate row of pair
+// c, row 2c+1 its up row, so one BN-row weight tile is exactly BN/2 (gate, up) pairs.
 
 namespace {
 
@@ -168,10 +174,11 @@ __device__ __forceinline__ void store_acc(float (*E)[LDE], Acc (&acc)[2][2]) {
 // generic W4A16 GEMM over one expert: D[ne][nrows] += X[ne][K] * W[nrows][K]^T, where X rows are
 // the compact columns of the expert (ids_src1) and D columns are the destination slots (ids_dst).
 // GT: Q4_K (12) or Q5_K (13, the fifth bit of each value in qh[32]: bit 2 jj + hi of qh[l] adds 16)
-template<int GT>
+// SWIGLU: D is the F16 H of the row pairs (2c gate, 2c+1 up), not the plain F32 rows
+template<int GT, bool SWIGLU>
 __device__ __forceinline__ void fused_expert_256_tile(
         unsigned char* sm, const char* __restrict__ wbase, const __half* __restrict__ X, const int32_t* __restrict__ ids_dst,
-        float* __restrict__ D, const int32_t* __restrict__ rows, int ne, int rt, int col_start,
+        void* __restrict__ D, const int32_t* __restrict__ rows, int ne, int rt, int col_start,
         int64_t K, int64_t nb01, int64_t Xld, int64_t dst_stride_col) {
     constexpr int BB = GT == 12 ? 144 : 176, QS = GT == 12 ? 16 : 48;   // block bytes, quants offset
     __half* Xs = (__half*) sm;
@@ -241,9 +248,23 @@ __device__ __forceinline__ void fused_expert_256_tile(
     float (*E)[LDE] = (float (*)[LDE]) sm;
     store_acc(E, acc);
     __syncthreads();
-    for (int i = threadIdx.x; i < TM * BN; i += NT) {
-        const int r = i / BN, c = i % BN;
-        if (r < ne) D[(size_t) ids_dst[col_start + r] * dst_stride_col + rt * BN + c] = E[r][c];
+    if constexpr (SWIGLU) {
+        // a BN-row weight tile holds BN/2 (gate, up) pairs, so the tile produces BN/2 columns of H.
+        // silu() is the FP32 ggml formula, the same one the CPU reference and the CUDA swiglu
+        // kernel use, and the product is rounded to F16 once here
+        __half * H = (__half *) D;
+        for (int i = threadIdx.x; i < TM * (BN / 2); i += NT) {
+            const int r = i / (BN / 2), c = i % (BN / 2);
+            if (r < ne) {
+                const float h = ggml_cuda_op_silu_single(E[r][2 * c]) * E[r][2 * c + 1];
+                H[(size_t) ids_dst[col_start + r] * dst_stride_col + rt * (BN / 2) + c] = __float2half(h);
+            }
+        }
+    } else {
+        for (int i = threadIdx.x; i < TM * BN; i += NT) {
+            const int r = i / BN, c = i % BN;
+            if (r < ne) ((float *) D)[(size_t) ids_dst[col_start + r] * dst_stride_col + rt * BN + c] = E[r][c];
+        }
     }
 }
 
@@ -332,11 +353,11 @@ __device__ __forceinline__ void fused_expert_32_tile(
 // One block serves one (expert, n-tile) pair and loops over the expert's token tiles. This keeps
 // the grid independent of the per-expert column count (unlike a tile-per-block layout, which
 // needs a prefix sum over experts) and needs no locate().
-template<int GT>
+template<int GT, bool SWIGLU>
 __global__ void __launch_bounds__(NT) fused_expert_256_kernel(
         const char* __restrict__ vx, const int32_t* __restrict__ expert_bounds,
         const int32_t* __restrict__ ids_src1, const int32_t* __restrict__ ids_dst,
-        const __half* __restrict__ X, float* __restrict__ D,
+        const __half* __restrict__ X, void* __restrict__ D,
         const int64_t K, const int64_t nb01, const int64_t nb02, const int64_t Xld, const int64_t dst_stride_col,
         const char* const* __restrict__ expert_ptrs) {
     const int e = blockIdx.y;
@@ -351,7 +372,7 @@ __global__ void __launch_bounds__(NT) fused_expert_256_kernel(
     for (int tt = 0; tt * TM < ne_total; ++tt) {
         const int ne = min(TM, ne_total - tt * TM);
         const int32_t* rows = ids_src1 + col_start + tt * TM;
-        fused_expert_256_tile<GT>(sm, wbase, X, ids_dst, D, rows, ne, rt, col_start + tt * TM,
+        fused_expert_256_tile<GT, SWIGLU>(sm, wbase, X, ids_dst, D, rows, ne, rt, col_start + tt * TM,
             K, nb01, Xld, dst_stride_col);
         __syncthreads();   // the next tile's commit_x overwrites the shared memory just read
     }
@@ -386,14 +407,16 @@ __global__ void __launch_bounds__(NT) fused_expert_32_kernel(
 
 static void fused_expert_launch(const ggml_tensor * dst, const char * const * expert_ptrs,
         const int32_t * expert_bounds, const int32_t * ids_src1, const int32_t * ids_dst,
-        const __half * X, const int64_t Xld, cudaStream_t stream) {
+        const __half * X, const int64_t Xld, const bool swiglu, cudaStream_t stream) {
     const ggml_tensor * src0 = dst->src[0];
 
 #if !defined(GGML_USE_HIP)
     // SMEM is a compile-time constant, so the opt-in limit is raised once
     static const bool smem_set = [] {
-        cudaFuncSetAttribute(fused_expert_256_kernel<12>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
-        cudaFuncSetAttribute(fused_expert_256_kernel<13>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        cudaFuncSetAttribute(fused_expert_256_kernel<12, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        cudaFuncSetAttribute(fused_expert_256_kernel<13, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        cudaFuncSetAttribute(fused_expert_256_kernel<12, true >, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
+        cudaFuncSetAttribute(fused_expert_256_kernel<13, true >, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
         cudaFuncSetAttribute(fused_expert_32_kernel<7>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
         cudaFuncSetAttribute(fused_expert_32_kernel<8>, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM);
         return true;
@@ -407,28 +430,45 @@ static void fused_expert_launch(const ggml_tensor * dst, const char * const * ex
     const int64_t K = src0->ne[0];
     const int64_t nb01 = src0->nb[1];
     const int64_t nb02 = src0->nb[2];
-    float * D = (float *) dst->data;
-    const int64_t dst_stride_col = dst->nb[1] / sizeof(float);
+    void * D = dst->data;
+    // the output stride is in elements of the output type: F32 rows, or F16 H columns of half width
+    const int64_t dst_stride_col = dst->nb[1] / (swiglu ? sizeof(__half) : sizeof(float));
 
-    switch (src0->type) {
-        case GGML_TYPE_Q4_K:
-            fused_expert_256_kernel<12><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
-                ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
-            break;
-        case GGML_TYPE_Q5_K:
-            fused_expert_256_kernel<13><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
-                ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
-            break;
-        case GGML_TYPE_Q5_1:
-            fused_expert_32_kernel<7><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
-                ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
-            break;
-        case GGML_TYPE_Q8_0:
-            fused_expert_32_kernel<8><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
-                ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
-            break;
-        default:
-            GGML_ABORT("fatal error");
+    if (swiglu) {
+        // the epilogue consumes the (gate, up) row pairs, so only the 256-block K-quants have one
+        switch (src0->type) {
+            case GGML_TYPE_Q4_K:
+                fused_expert_256_kernel<12, true><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
+                    ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
+                break;
+            case GGML_TYPE_Q5_K:
+                fused_expert_256_kernel<13, true><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
+                    ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
+                break;
+            default:
+                GGML_ABORT("fatal error: no SwiGLU epilogue for %s", ggml_type_name(src0->type));
+        }
+    } else {
+        switch (src0->type) {
+            case GGML_TYPE_Q4_K:
+                fused_expert_256_kernel<12, false><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
+                    ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
+                break;
+            case GGML_TYPE_Q5_K:
+                fused_expert_256_kernel<13, false><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
+                    ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
+                break;
+            case GGML_TYPE_Q5_1:
+                fused_expert_32_kernel<7><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
+                    ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
+                break;
+            case GGML_TYPE_Q8_0:
+                fused_expert_32_kernel<8><<<grid, block, SMEM, stream>>>((const char *) src0->data, expert_bounds,
+                    ids_src1, ids_dst, X, D, K, nb01, nb02, Xld, dst_stride_col, expert_ptrs);
+                break;
+            default:
+                GGML_ABORT("fatal error");
+        }
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -437,6 +477,12 @@ bool ggml_cuda_fused_expert_mul_mat_id_supported(const ggml_tensor * dst, const 
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
+
+    // the MUL_MAT_ID epilogue flag (op_params[4], GGML_MUL_MAT_ID_EPILOGUE_SWIGLU in ggml.h)
+    // selects the paired-row epilogue: the dst is the F16 H of silu(gate) * up built from the row
+    // interleaved weights. The op task adds the named constant, the test here is the value it maps
+    // to, so the kernel does not depend on the macro being visible here.
+    const bool swiglu = ggml_get_op_params_i32(dst, 4) == 1;
 
     // Capability branch: Volta's only tensor core instruction is mma.sync.m8n8k4, so the int8
     // tensor cores of sm_80+ are unavailable and only these four quant types have a dequantizer
@@ -447,12 +493,19 @@ bool ggml_cuda_fused_expert_mul_mat_id_supported(const ggml_tensor * dst, const 
     if (src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) {
         return false;
     }
-    if (dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
+    if (dst->type != (swiglu ? GGML_TYPE_F16 : GGML_TYPE_F32) || ids->type != GGML_TYPE_I32) {
         return false;
     }
     // decode and verify (T <= 8) keep the grouped dp4a kernel: the TM = 64 token tile of this
-    // kernel would be mostly empty at that batch
-    if (dst->ne[2] <= MOE_GROUPED_MAX_TOKENS) {
+    // kernel would be mostly empty at that batch. The SwiGLU epilogue has no such smaller-batch
+    // counterpart (the paired rows only exist inside this kernel), so it runs at every batch: the
+    // tile costs 64 rows to use T of them, which is slower than MMVQ but is the only correct path.
+    if (!swiglu && dst->ne[2] <= MOE_GROUPED_MAX_TOKENS) {
+        return false;
+    }
+    // the epilogue pairs weight rows (2c gate, 2c+1 up), so it needs the 256-block K-quants;
+    // Q5_1/Q8_0 are the down projections, they have no gate/up split
+    if (swiglu && src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K) {
         return false;
     }
     // the dequantizers read whole GGUF blocks: a K-quant block holds 256 values, a Q5_1/Q8_0
@@ -501,15 +554,15 @@ bool ggml_cuda_fused_expert_mul_mat_id_supported(const ggml_tensor * dst, const 
     if (src1->nb[2] % src1->nb[1] != 0) {
         return false;
     }
-    // dst is [ne01 rows, n_expert_used slots, n_tokens tokens]; src1 may broadcast the slot
-    // dimension (ne11 == 1) or carry one activation row per slot
-    if (dst->ne[0] != src0->ne[1] || dst->ne[1] != ids->ne[0] || dst->ne[2] != src1->ne[2]) {
+    // dst is [ne01 rows (half of them with the SwiGLU epilogue), n_expert_used slots, n_tokens
+    // tokens]; src1 may broadcast the slot dimension (ne11 == 1) or carry one activation row per slot
+    if (dst->ne[0] != (swiglu ? src0->ne[1] / 2 : src0->ne[1]) || dst->ne[1] != ids->ne[0] || dst->ne[2] != src1->ne[2]) {
         return false;
     }
     if (src1->ne[1] != 1 && src1->ne[1] != ids->ne[0]) {
         return false;
     }
-    if (!ggml_is_contiguous(dst) || dst->nb[1] % sizeof(float) != 0) {
+    if (!ggml_is_contiguous(dst) || dst->nb[1] % ggml_type_size(dst->type) != 0) {
         return false;
     }
     return true;
@@ -527,6 +580,10 @@ bool ggml_cuda_fused_expert_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_ten
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
+    // the SwiGLU epilogue writes the F16 H instead of the plain F32 rows, the kernel takes the
+    // layout from this flag and the supported predicate has already checked the shapes for it
+    const bool swiglu = ggml_get_op_params_i32(dst, 4) == 1;
+
     cudaStream_t stream = ctx.stream();
 
     const int64_t n_expert_used = ids->ne[0];
@@ -542,10 +599,12 @@ bool ggml_cuda_fused_expert_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_ten
     const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
 
     if (ggml_mul_mat_id_is_expert_parallel(dst)) {
-        // the fused kernel only writes the local entries, zero the others
-        ggml_cuda_mmid_zero_nonlocal((float *) dst->data, (const int32_t *) ids->data, expert_offset, (int) ne02,
+        // the fused kernel only writes the local entries, zero the others. With the SwiGLU
+        // epilogue the slots are the F16 H columns, so the element size of the strides halves
+        const size_t ts = swiglu ? sizeof(__half) : sizeof(float);
+        ggml_cuda_mmid_zero_nonlocal(dst->data, (const int32_t *) ids->data, expert_offset, (int) ne02,
             ne12, (int) n_expert_used, dst->ne[0], ids->nb[1] / (int64_t) sizeof(int32_t),
-            dst->nb[1] / sizeof(float), dst->nb[2] / sizeof(float), stream);
+            dst->nb[1] / ts, dst->nb[2] / ts, stream, swiglu);
     }
 
     {
@@ -566,7 +625,7 @@ bool ggml_cuda_fused_expert_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_ten
     // __float2half_rn and the old fetch_x with __float22half2_rn, both round to nearest even.
     if (src1->type == GGML_TYPE_F16) {
         fused_expert_launch(dst, expert_ptrs, expert_bounds.get(), ids_src1.get(), ids_dst.get(),
-            (const __half *) src1->data, nb11 / (int64_t) sizeof(__half), stream);
+            (const __half *) src1->data, nb11 / (int64_t) sizeof(__half), swiglu, stream);
     } else {
         ggml_cuda_pool_alloc<__half> X16(ctx.pool(), ggml_nelements(src1));
         if (ggml_is_contiguous(src1)) {
@@ -577,7 +636,7 @@ bool ggml_cuda_fused_expert_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_ten
         }
         CUDA_CHECK(cudaGetLastError());
         // the rows are packed, so the row stride is K
-        fused_expert_launch(dst, expert_ptrs, expert_bounds.get(), ids_src1.get(), ids_dst.get(), X16.get(), ne00, stream);
+        fused_expert_launch(dst, expert_ptrs, expert_bounds.get(), ids_src1.get(), ids_dst.get(), X16.get(), ne00, swiglu, stream);
     }
 
     return true;

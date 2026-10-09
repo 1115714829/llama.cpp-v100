@@ -1514,6 +1514,30 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // epilogue fused into MUL_MAT_ID, computed on the result before it is written out
+    enum ggml_mul_mat_id_epilogue {
+        GGML_MUL_MAT_ID_EPILOGUE_NONE   = 0,
+        GGML_MUL_MAT_ID_EPILOGUE_SWIGLU = 1,
+    };
+
+    // indirect matrix multiplication with a fused SwiGLU epilogue.
+    //
+    // as  -> [K, 2*n_ff, n_expert], rows interleaved: row 2r is gate row r, row 2r+1 is up row r
+    // b   -> [K, n_expert_used or 1, n_tokens], F32 or F16
+    // ids -> [n_expert_used, n_tokens] (i32)
+    // c   -> [n_ff, n_expert_used, n_tokens] (F16), c[r] = silu(gate[r]) * up[r]
+    //
+    // the rows of as must be interleaved when the weight is loaded, see llama.cpp; the plain
+    // ggml_mul_mat_id keeps the [K, n_ff, n_expert] layout of gate and up concatenated
+    GGML_API struct ggml_tensor * ggml_mul_mat_id_swiglu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * as,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids);
+
+    // the epilogue fused into a MUL_MAT_ID node, GGML_MUL_MAT_ID_EPILOGUE_NONE when there is none
+    GGML_API int32_t ggml_mul_mat_id_get_epilogue(const struct ggml_tensor * a);
+
     // expert parallelism: global index of the first expert held by this device.
     // MUL_MAT_ID entries whose id lies outside [expert_offset, expert_offset + as->ne[2]) are skipped
     // (the output for them is zero), so the per-device weight slices need no renumbering of the ids.

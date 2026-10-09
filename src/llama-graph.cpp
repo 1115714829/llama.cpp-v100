@@ -2048,7 +2048,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         bool gate_up_swiglu) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2069,7 +2070,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        gate_up_swiglu
     );
 }
 
@@ -2097,7 +2099,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         bool gate_up_swiglu) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2249,7 +2252,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
-    if (gate_up_exps) {
+    // the merged gate_up weight is loaded with its rows interleaved when the model asks for the
+    // fused SwiGLU matmul, see TENSOR_GATE_UP_INTERLEAVE. the matmul then reads the gate and up row
+    // of a pair out of one matmul and applies the activation, so no split views and no separate
+    // SwiGLU node are needed
+    const bool gate_up_fused = gate_up_exps != nullptr && gate_up_swiglu;
+
+    if (gate_up_fused) {
+        GGML_ASSERT(type_op == LLM_FFN_SILU);
+        GGML_ASSERT(gate_up_exps_b == nullptr && up_exps_s == nullptr);
+
+        // the epilogue replaces the split views the LoRA factors and the scale and bias multiply
+        // into, a weight with an adapter cannot be read this way
+        for (const auto & lora : *loras) {
+            if (lora.first->get_weight(gate_up_exps) != nullptr) {
+                GGML_ABORT("fused SwiGLU gate_up expert weight has a LoRA adapter");
+            }
+        }
+
+        cur = ggml_mul_mat_id_swiglu(ctx0, gate_up_exps, cur, selected_experts);
+        cb(cur, "ffn_moe_gate_up_swiglu", il);
+    } else if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
@@ -2323,6 +2346,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         break;
                     }
                 }
+            }
+
+            if (gate_up_fused) {
+                // the SwiGLU epilogue is already applied by the matmul above
+                break;
             }
 
             if (has_gate) {
