@@ -4354,6 +4354,29 @@ static int64_t ggml_cuda_mul_mat_id_ncols_typ(const ggml_tensor * dst, const ggm
     return (src1->ne[2]*n_expert_used + n_experts - 1) / n_experts;
 }
 
+// The MUL_MAT_ID batch boundary, shared by the expert staging, the dispatch, needs_sync and
+// supports_op: at most this many tokens per launch go to the MMVQ mmid kernel, larger batches go to
+// the kernels above it. The boundary does not look at the epilogue, so a node with the SwiGLU
+// epilogue switches at the same token count as one without it.
+static bool ggml_cuda_mul_mat_id_use_mmvq(const ggml_tensor * dst, const int cc) {
+    return dst->ne[2] <= get_mmvq_mmid_max_batch(dst->src[0]->type, cc);
+}
+
+// A MUL_MAT_ID node with the SwiGLU epilogue goes to the MMVQ mmid kernel while these hold: its
+// kernel fuses the (gate, up) row pair and writes the F16 H, so the same conditions as the MMVQ
+// branch of the dispatch decide it. An F16 activation is converted into an F32 pool buffer on the
+// way there (see ggml_cuda_mul_mat_id), so it counts as an F32 one here.
+static bool ggml_cuda_mul_mat_id_swiglu_mmvq(const ggml_tensor * dst, const int cc) {
+    if (ggml_mul_mat_id_get_epilogue(dst) != GGML_MUL_MAT_ID_EPILOGUE_SWIGLU) {
+        return false;
+    }
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    return ggml_is_quantized(src0->type) &&
+           (src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16) &&
+           ggml_cuda_mul_mat_id_use_mmvq(dst, cc);
+}
+
 // Prefill batches (above the MMVQ batch) stage the routed host experts into VRAM
 // (the grouped kernel and MMQ both read the staged copies; decode, up to the MMVQ batch, reads
 // the host arena in place). Uses the same conditions as the dispatch so that needs_sync and
@@ -4363,7 +4386,7 @@ static bool ggml_cuda_expert_stage_used(const ggml_tensor * dst, const ggml_cuda
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
-    if (!ex_table.has_stage || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+    if (!ex_table.has_stage || ggml_cuda_mul_mat_id_use_mmvq(dst, cc)) {
         return false;
     }
     // prefill reads every routed expert row at least once per column group: copy the routed host
@@ -4385,8 +4408,8 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     const ggml_tensor * ids  = dst->src[2];
 
     // The SwiGLU epilogue writes an F16 dst, which the F32-only check below
-    // rejects; it is a plain fused-expert launch like the F32 one, so it is decided by the same
-    // predicate further down and has no host-side part of its own.
+    // rejects; it is a plain launch on either path like the F32 one, so it is decided by the same
+    // two predicates further down and has no host-side part of its own.
     const bool mmid_swiglu = ggml_mul_mat_id_get_epilogue(dst) == GGML_MUL_MAT_ID_EPILOGUE_SWIGLU;
 
     // F16 and F32 src1 are treated the same: an F16 activation is either read by the fused-expert
@@ -4413,7 +4436,10 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     }
 
     if (mmid_swiglu) {
-        return !ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc);
+        // MMVQ covers the small batches with its own epilogue, the fused-expert kernel the rest.
+        // Both are plain launches, so only shapes neither of them covers need a host sync.
+        return !ggml_cuda_mul_mat_id_swiglu_mmvq(dst, cc) &&
+               !ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc);
     }
 
     // the fused-expert and grouped kernels are plain launches that build their tables on the
@@ -4427,7 +4453,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     }
 
     if (ggml_is_quantized(src0->type)) {
-        if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+        if (ggml_cuda_mul_mat_id_use_mmvq(dst, cc)) {
             return false;
         }
     } else if (dst->ne[2] <= MMVF_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
@@ -4461,16 +4487,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // The SwiGLU epilogue (ggml_mul_mat_id_get_epilogue(dst), op_params[7]) makes this node the
-    // fused-expert kernel's own output layout: the F16 H of silu(gate) * up built from the row
-    // interleaved weights. No other path can produce it, so report the shape and stop when the
-    // kernel does not cover this node instead of falling through to a path that would write
-    // something else. ggml_cuda_supports_op returns false for the same shapes, so the scheduler
-    // normally runs such a node on the CPU.
+    // F16 H of silu(gate) * up built from the row interleaved weights, with one dst row per weight
+    // row pair. Two kernels produce that layout: MMVQ (its MoE kernel fuses the pair, small batches,
+    // the same boundary as a node without the epilogue) and the fused-expert kernel (larger batches).
+    // With a type or shape neither of them covers there is no path here, so report the shape and
+    // stop instead of falling through to a path that would write something else.
+    // ggml_cuda_supports_op returns false for the same shapes, so the scheduler normally runs such a
+    // node on the CPU.
     const bool mmid_swiglu = ggml_mul_mat_id_get_epilogue(dst) == GGML_MUL_MAT_ID_EPILOGUE_SWIGLU;
-    if (mmid_swiglu && !ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc)) {
-        GGML_ABORT("%s: MUL_MAT_ID with the SwiGLU epilogue is not covered by the fused-expert "
-                   "kernel: src0 %s ne [%lld, %lld, %lld], src1 %s ne [%lld, %lld], "
-                   "ids ne [%lld], dst %s ne [%lld, %lld, %lld], cc 0x%x",
+    if (mmid_swiglu && !ggml_cuda_mul_mat_id_swiglu_mmvq(dst, cc) &&
+        !ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc)) {
+        GGML_ABORT("%s: MUL_MAT_ID with the SwiGLU epilogue is covered by neither the MMVQ mmid "
+                   "kernel nor the fused-expert kernel: src0 %s ne [%lld, %lld, %lld], src1 %s ne "
+                   "[%lld, %lld], ids ne [%lld], dst %s ne [%lld, %lld, %lld], cc 0x%x",
                    __func__, ggml_type_name(src0->type),
                    (long long) src0->ne[0], (long long) src0->ne[1], (long long) src0->ne[2],
                    ggml_type_name(src1->type), (long long) src1->ne[1], (long long) src1->ne[2],
@@ -4480,9 +4509,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     // F16 -> F32 activation view: the F16 H written by the epilogue above is read natively by the
     // fused-expert kernel only (its shared-memory X tile is F16). When this launch does not go
-    // there - the down projection at decode/verify batch, where the fused kernel would pay a 64
-    // row token tile for T of them - convert the activation once per launch into an F32 pool
-    // buffer and run the ordinary F32 paths on it, instead of there being no path at all. This is
+    // there - decode/verify batches, where the MMVQ mmid kernel or the grouped dp4a kernel would
+    // run instead of its 64 row token tile, and a node with the epilogue goes to MMVQ while its
+    // batch fits the mmid limit - convert the activation once per launch into an F32 pool buffer
+    // and run the ordinary F32 paths on it, instead of there being no path at all. This is
     // the mirror of the F32 -> F16 X tile fused_expert builds (fused-expert.cu): one pass per
     // launch instead of one per (expert, n-tile) block, which would be ne01/BN passes over the
     // same rows. The conversion is exact, so the q8_1 quantization in MMVQ sees exactly the values
@@ -4504,7 +4534,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         ~src1_f32_scope() { dst->src[1] = src1_orig; }
     } src1_f32_scope(dst);
 
-    if (src1->type == GGML_TYPE_F16 && !ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc)) {
+    // The F32 paths need an F32 activation; the fused-expert kernel reads F16 as it is. A node with
+    // the SwiGLU epilogue goes to MMVQ for a small batch even when the fused predicate holds (the
+    // dispatch below takes MMVQ first), so it is converted there as well.
+    const bool mmid_to_fused = ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc) &&
+        !ggml_cuda_mul_mat_id_swiglu_mmvq(dst, cc);
+    if (src1->type == GGML_TYPE_F16 && !mmid_to_fused) {
         src1_f32_buf.alloc(ggml_nelements(src1));
         if (ggml_is_contiguous(src1)) {
             ggml_get_to_fp32_cuda(GGML_TYPE_F16)(src1->data, src1_f32_buf.get(), ggml_nelements(src1), ctx.stream());
@@ -4548,16 +4583,15 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // holds and this node goes there, or the activation was converted into the F32 pool buffer
     // above, so from here on src1 is an F32 tensor and the vector and MMQ paths are reached with
     // the same layout an F32 activation would give them. An F16 dst is the epilogue node itself:
-    // only the fused-expert SwiGLU epilogue produces it (checked above).
+    // MMVQ writes it below and the fused-expert kernel above (checked at the top of this function).
     if ((dst->type == GGML_TYPE_F32 || mmid_swiglu) &&
         (src1->type == GGML_TYPE_F32 || ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc))) {
-        if (!mmid_swiglu && src1->type == GGML_TYPE_F32 && ggml_is_quantized(src0->type)) {
+        if (src1->type == GGML_TYPE_F32 && ggml_is_quantized(src0->type) && ggml_cuda_mul_mat_id_use_mmvq(dst, cc)) {
             // The MMVQ mmid kernel is a separate kernel whose block width is the token count,
-            // so on Volta it can go past MMVQ_MAX_BATCH_SIZE.
-            if (ne2 <= get_mmvq_mmid_max_batch(src0->type, cc)) {
-                ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
-                return;
-            }
+            // so on Volta it can go past MMVQ_MAX_BATCH_SIZE. Its MoE kernel also carries the
+            // SwiGLU epilogue, so a node with one is written here, not by the fused-expert kernel.
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+            return;
         } else if (!mmid_swiglu && src1->type == GGML_TYPE_F32 && ne2 <= MMVF_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
             ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
             return;
@@ -4579,9 +4613,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             return;
         }
 
-        // the SwiGLU epilogue has no other implementation. The predicate holds here (checked
-        // above), so fused_expert returned false only if the device changed under us: stop
-        // instead of writing a wrong result into the F16 H.
+        // The SwiGLU epilogue has no other implementation. The predicate holds here (checked
+        // at the top of this function), so fused_expert returned false only if the device
+        // changed under us: stop instead of writing a wrong result into the F16 H.
         GGML_ASSERT(!mmid_swiglu);
 
         // Prefill (T > 8) also takes the grouped kernel: it stages the entries of one expert
@@ -9317,11 +9351,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false; // TODO this could in principle be implemented though currently there is no use case.
                 }
                 if (op->op == GGML_OP_MUL_MAT_ID && ggml_mul_mat_id_get_epilogue(op) == GGML_MUL_MAT_ID_EPILOGUE_SWIGLU) {
-                    // the SwiGLU epilogue is the fused-expert kernel's own output layout (the F16 H
-                    // of silu(gate) * up from the row interleaved weights); with a type or shape it
-                    // does not cover there is no implementation here, so the scheduler has to run
-                    // the node on a backend that has one
-                    return ggml_cuda_fused_expert_mul_mat_id_supported(op, ggml_cuda_info().devices[dev_ctx->device].cc);
+                    // the SwiGLU epilogue is the F16 H of silu(gate) * up from the row interleaved
+                    // weights. MMVQ writes it for a small batch, the fused-expert kernel for the
+                    // rest, at the same boundary as a node without the epilogue; with a type or
+                    // shape neither covers there is no implementation here, so the scheduler has to
+                    // run the node on a backend that has one
+                    const int cc_epilogue = ggml_cuda_info().devices[dev_ctx->device].cc;
+                    return ggml_cuda_mul_mat_id_swiglu_mmvq(op, cc_epilogue) ||
+                           ggml_cuda_fused_expert_mul_mat_id_supported(op, cc_epilogue);
                 }
                 if (b->type == GGML_TYPE_F16 && a->type != GGML_TYPE_F16 && !ggml_cuda_op_mul_mat_use_fwht(op)) {
                     // MUL_MAT_ID covers an F16 activation: the fused-expert kernel reads it as it

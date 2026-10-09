@@ -13299,12 +13299,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // (k, 2*n_ff) interleaved weight, F16 activation for the down projection instead of a separate
     // swiglu_split pass. The real UD-Q4_K_XL expert shapes (512 experts, top-10, n_ff = 640,
     // k = 2560) with the K-quant types the model uses there, F32 and F16 activations, and the
-    // decode/verify, the grouped-tile edge and the prefill widths.
-    for (int n : {16, 64, 512, 2048}) {
+    // decode/verify windows (T = 1..8, the MMVQ mmid kernel), the grouped-tile edge (n = 16, which
+    // is still inside the mmid batch on Volta) and the prefill widths (the fused-expert kernel).
+    for (int n : {1, 2, 4, 8, 16, 64, 512, 2048}) {
         for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
             for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
                 test_cases.emplace_back(new test_mul_mat_id_swiglu(type_a, type_b, 512, 10, false, 1280, n, 2560));
             }
+        }
+    }
+    // the down projection reads the F16 H the SwiGLU epilogue writes: a plain MUL_MAT_ID with an F16
+    // activation, which the decode/verify widths take on the MMVQ mmid kernel after one conversion
+    for (int n : {1, 8, 16, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F16, 512, 10, false, 2560, n, 640));
         }
     }
     for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
@@ -15218,6 +15226,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             test_cases.emplace_back(new test_mul_mat_id_swiglu(type_a, type_b, 512, 10, false, 1280, 2048, 2560));
         }
+    }
+
+    // the decode windows of the epilogue against the same shapes without it: both run on MMVQ
+    // there, so the difference is the fused pair plus the halved activation traffic
+    for (int64_t n : {1, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id_swiglu(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560));
     }
 
     // prefill blocks wider than -ub 2048: how the per-expert column count (n*10/512 = 40 at

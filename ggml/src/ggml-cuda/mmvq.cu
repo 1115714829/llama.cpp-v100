@@ -907,11 +907,14 @@ static __global__ void mul_mat_vec_q(
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
+// swiglu: MUL_MAT_ID epilogue, the weight rows are interleaved (2r gate, 2r+1 up) and dst is the
+// F16 H of silu(gate) * up, one row per pair. c_rows_per_block must be even so that a pair is never
+// split across two blocks; the launch builds the grid from the same c_rows_per_block.
+template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool swiglu = false>
 __launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
-        float * dst_ptr,
+        void * dst_ptr,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
         const uint32_t stride_row_x, const uint32_t stride_col_y, uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
@@ -920,7 +923,10 @@ static __global__ void mul_mat_vec_q_moe(
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
-    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
+    float         * GGML_CUDA_RESTRICT dst = (float *) dst_ptr;
+    // the SwiGLU epilogue writes the F16 H through the same pointer, all dst strides below are in
+    // elements of the output type. Not GGML_CUDA_RESTRICT: it aliases dst on purpose.
+    __half * dst_h = (__half *) dst_ptr;
 
     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
@@ -976,7 +982,13 @@ static __global__ void mul_mat_vec_q_moe(
 
     // expert parallelism: this slot is routed to an expert held by another device, write zeros
     if (!shared_expert && (channel_x < (uint32_t) expert_offset || channel_x >= (uint32_t) (expert_offset + n_experts))) {
-        if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+        if constexpr (swiglu) {
+            // silu(0) * 0 is 0, so the whole H row of the pair is zero; it is half as wide and
+            // half as many rows as the weight block
+            if (threadIdx.x < c_rows_per_block/2 && uint32_t(row0 + threadIdx.x) < nrows_x) {
+                dst_h[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0/2 + threadIdx.x] = __float2half(0.0f);
+            }
+        } else if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
             dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = 0.0f;
         }
         return;
@@ -1032,7 +1044,15 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     // Write results
-    if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
+    if constexpr (swiglu) {
+        // The warp reduced every row of the block, so the gate/up pair of row t is tmp[2t] and
+        // tmp[2t+1] of the same thread - no exchange needed to fuse them. Weight row 2t and 2t+1
+        // are H row (row0 + t) / 2, written as one F16 element.
+        if (threadIdx.x < c_rows_per_block/2 && uint32_t(row0 + threadIdx.x) < nrows_x) {
+            const float h = ggml_cuda_op_silu_single(tmp[2*threadIdx.x]) * tmp[2*threadIdx.x + 1];
+            dst_h[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0/2 + threadIdx.x] = __float2half(h);
+        }
+    } else if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
         float result = tmp[threadIdx.x];
         if constexpr (has_fusion) {
             const uint32_t bias_idx = channel_x_local*stride_channel_dst + row0 + threadIdx.x;
@@ -1081,6 +1101,11 @@ static __global__ void mul_mat_vec_q_moe(
         GGML_UNUSED_VARS(use_gate, tmp_gate, vgate, x_bias, gate_bias, active_glu, glu_limit, x_scale, gate_scale);
     } else if constexpr (type != GGML_TYPE_NVFP4) {
         GGML_UNUSED_VARS(x_scale, gate_scale);
+    }
+    if constexpr (swiglu) {
+        GGML_UNUSED_VARS(dst);
+    } else {
+        GGML_UNUSED_VARS(dst_h);
     }
 }
 
@@ -1132,12 +1157,17 @@ template <ggml_type type>
 static void mul_mat_vec_q_moe_launch(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t nrows_x,
-        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
+        const uint32_t stride_row_x, const uint32_t stride_col_y, uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride,
-        const int warp_size, const int nchannels_dst, const int expert_offset, const int n_experts, cudaStream_t stream) {
+        const int warp_size, const int nchannels_dst, const int expert_offset, const int n_experts,
+        const bool swiglu, cudaStream_t stream) {
 
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
+    // the SwiGLU epilogue pairs weight rows 2r and 2r+1, so a pair has to sit in one block:
+    // rows_per_block must be even (the grid below starts every block at a multiple of it) and
+    // nrows_x must be even, which ggml_cuda_mul_mat_vec_q checks before it gets here
+    static_assert(rows_per_block % 2 == 0);
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
     const dim3 block_nums(nblocks_rows, nchannels_dst + (fusion.shared_up != nullptr));
     const dim3 block_dims(warp_size, ncols_dst);
@@ -1146,7 +1176,15 @@ static void mul_mat_vec_q_moe_launch(
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
 
-    if (has_fusion) {
+    if (swiglu) {
+        // the epilogue consumes the (gate, up) row pair itself and writes the F16 H, so it replaces
+        // the fusion args instead of running next to them
+        ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false, true>, launch_params,
+            vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+            stride_row_x, stride_col_y, stride_col_dst,
+            stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, ids_stride, expert_offset, n_experts);
+    } else if (has_fusion) {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
@@ -1169,7 +1207,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, const int expert_offset, const int n_experts, cudaStream_t stream) {
+        const int ids_stride, const int expert_offset, const int n_experts, const bool swiglu, cudaStream_t stream) {
 
     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
     GGML_ASSERT(ids ? (ncols_dst <= MMVQ_MMID_MAX_BATCH_SIZE) : (ncols_dst <= MMVQ_MAX_BATCH_SIZE));
@@ -1251,13 +1289,16 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return idle * 8 <= iters_wide * 2;
     };
 
-    if (has_ids && ncols_dst > 1) {
+    // The SwiGLU epilogue is a MUL_MAT_ID layout, so its node also belongs to the dedicated MoE
+    // kernel. That kernel handles ncols_dst == 1 (the block is one warp wide) and the epilogue
+    // needs the row pairs, which only this kernel's even row block gives.
+    if (has_ids && (ncols_dst > 1 || swiglu)) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, warp_size, nchannels_dst, expert_offset, n_experts, stream);
+            ncols_dst, ids_stride, warp_size, nchannels_dst, expert_offset, n_experts, swiglu, stream);
         return;
     }
 
@@ -1361,145 +1402,145 @@ static void mul_mat_vec_q_switch_type(
         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
-        const int ids_stride, const int expert_offset, const int n_experts, cudaStream_t stream) {
+        const int ids_stride, const int expert_offset, const int n_experts, const bool swiglu, cudaStream_t stream) {
     switch (type_x) {
         case GGML_TYPE_Q1_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_Q2_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_Q4_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_Q4_1:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_1>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_Q5_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q5_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_Q5_1:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q5_1>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_Q8_0:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_MXFP4:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP4>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_NVFP4:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_NVFP4>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_Q2_K:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_K>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_Q3_K:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q3_K>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_Q4_K:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_K>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_Q5_K:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q5_K>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_Q6_K:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q6_K>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_IQ2_XXS:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ2_XXS>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_IQ2_XS:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ2_XS>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_IQ2_S:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ2_S>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_IQ3_XXS:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ3_XXS>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_IQ1_S:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_S>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_IQ1_M:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_M>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_IQ4_NL:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ4_NL>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_IQ4_XS:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ4_XS>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         case GGML_TYPE_IQ3_S:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ3_S>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, swiglu, stream);
             break;
         default:
             GGML_ABORT("fatal error");
@@ -1510,11 +1551,24 @@ static void mul_mat_vec_q_switch_type(
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
+    // MUL_MAT_ID epilogue: the weight rows are interleaved (2r gate, 2r+1 up) and the dst is the F16
+    // H of silu(gate) * up. The MoE kernel fuses the pair and writes it, the dst strides below are
+    // in elements of the output type, so the F16 H needs no separate path. Only MUL_MAT_ID has an
+    // epilogue, a plain MUL_MAT never sets it.
+    const bool swiglu = ids != nullptr &&
+        ggml_mul_mat_id_get_epilogue(dst) == GGML_MUL_MAT_ID_EPILOGUE_SWIGLU;
+
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
-    GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(        dst->type  == GGML_TYPE_F32 || (swiglu && dst->type == GGML_TYPE_F16));
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+    // the epilogue has no fusion args of its own, it consumes the gate/up pair itself
+    GGML_ASSERT(!swiglu || fusion == nullptr);
 
     GGML_TENSOR_BINARY_OP_LOCALS;
+
+    // a gate/up pair must be inside one row block of the MoE kernel (its rows_per_block is even),
+    // and one pair is one dst row
+    GGML_ASSERT(!swiglu || (ne01 % 2 == 0 && ne0 == ne01/2));
 
     cudaStream_t stream = ctx.stream();
 
@@ -1682,7 +1736,7 @@ void ggml_cuda_mul_mat_vec_q(
         vx_weights, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
-        ne03,              ne3,           s03, s13,              s3,               ids_stride, expert_offset, n_experts, stream);
+        ne03,              ne3,           s03, s13,              s3,               ids_stride, expert_offset, n_experts, swiglu, stream);
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
@@ -1709,9 +1763,10 @@ void ggml_cuda_op_mul_mat_vec_q(
     const int stride_col_y = src1_padded_row_size / QK8_1;
 
     ggml_cuda_mm_fusion_args_device fusion_local{};
+    // a plain MUL_MAT has no MUL_MAT_ID epilogue
     mul_mat_vec_q_switch_type(
         src0_dd_i, src0->type, src1_ddq_i, nullptr, fusion_local, dst_dd_i, ne00, row_diff, src1_ncols, stride_row_x, stride_col_y, nrows_dst,
-        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, stream);
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, /*swiglu=*/false, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }

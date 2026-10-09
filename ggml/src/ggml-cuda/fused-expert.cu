@@ -497,11 +497,11 @@ bool ggml_cuda_fused_expert_mul_mat_id_supported(const ggml_tensor * dst, const 
     if (dst->type != (swiglu ? GGML_TYPE_F16 : GGML_TYPE_F32) || ids->type != GGML_TYPE_I32) {
         return false;
     }
-    // decode and verify (T <= 8) keep the grouped dp4a kernel: the TM = 64 token tile of this
-    // kernel would be mostly empty at that batch. The SwiGLU epilogue has no such smaller-batch
-    // counterpart (the paired rows only exist inside this kernel), so it runs at every batch: the
-    // tile costs 64 rows to use T of them, which is slower than MMVQ but is the only correct path.
-    if (!swiglu && dst->ne[2] <= MOE_GROUPED_MAX_TOKENS) {
+    // decode and verify (T <= 8) keep the MMVQ mmid kernel with the SwiGLU epilogue, or the grouped
+    // dp4a kernel without it: the TM = 64 token tile of this kernel would be mostly empty at that
+    // batch. Both boundaries are the same as they are without the epilogue, see the dispatch in
+    // ggml_cuda_mul_mat_id.
+    if (dst->ne[2] <= MOE_GROUPED_MAX_TOKENS) {
         return false;
     }
     // the epilogue pairs weight rows (2c gate, 2c+1 up), so it needs the 256-block K-quants;
