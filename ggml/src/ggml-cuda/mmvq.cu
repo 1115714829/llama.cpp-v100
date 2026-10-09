@@ -1601,7 +1601,7 @@ void ggml_cuda_mul_mat_vec_q(
     // keeps the tables.
     ggml_cuda_expert_table ex_table;
     bool is_expert_store = false;
-    const char * vx_weights = src0->data;
+    const char * vx_weights = (const char *) src0->data;
     int64_t s02_weights    = 0; // 0: take the expert pitch from src0->nb[2]
     if (ids != nullptr && ggml_cuda_expert_table_get(src0, &ex_table)) {
         is_expert_store = true;
@@ -1618,7 +1618,7 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ABORT("%s: cannot look up the gate weight table\n", __func__);
         }
         if (is_expert_store && s02_weights > 0) {
-            vx_weights            = src0->data;
+            vx_weights            = (const char *) src0->data;
             s02_weights           = 0;
             fusion_local.expert_ptrs = ex_table.main;
         }
