@@ -8647,10 +8647,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 1;
     }
 
-    // CONT -> UNARY(SIGMOID) -> MUL: the attention gate reads a strided view, so the CONT is elided
+    // CONT -> UNARY(SIGMOID) -> MUL: the attention gate reads a strided view, so the CONT is elided;
+    // with an F16 copy for the output projection that reads it next
     if (node->op == GGML_OP_CONT) {
         ggml_cuda_cont_sigmoid_mul_match match;
         if (ggml_cuda_match_cont_sigmoid_mul(cgraph, i, match)) {
+            const int j = ggml_cuda_skinny_f16_consumer(cgraph, match.last, match.mul);
+            if (j >= 0) {
+                const int idxs[] = { i, ggml_cuda_next_real_node(cgraph, i), match.last, j };
+                const enum ggml_op ops[] = { GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_MUL_MAT };
+                const int outs[] = { match.last, j };
+                if (ggml_can_fuse_subgraph_ext(cgraph, idxs, 4, ops, outs, 2)) {
+                    ggml_tensor * mm = cgraph->nodes[j];
+                    ggml_cuda_pool_alloc<half> x_f16(cuda_ctx->pool(), ggml_nelements(match.mul));
+                    ggml_cuda_op_cont_sigmoid_mul(*cuda_ctx, match.cont, match.sigmoid, match.mul, x_f16.get());
+                    const bool ok = ggml_cuda_q8_skinny_mul_mat(*cuda_ctx, mm->src[0], mm->src[1], mm, x_f16.get());
+                    GGML_ASSERT(ok);
+                    return j - i;
+                }
+            }
             ggml_cuda_op_cont_sigmoid_mul(*cuda_ctx, match.cont, match.sigmoid, match.mul);
             return match.last - i;
         }

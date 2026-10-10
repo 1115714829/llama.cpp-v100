@@ -760,9 +760,10 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 /* fused cont + unary + mul with a strided input view */
 
 // like unary_gated_op_kernel, but g is an F32 view with its own strides and the layout of dst
-template <float (*op)(float)>
+// write_f16: also store dst rounded to F16 (as the F32 -> F16 conversion does) into dst_f16
+template <float (*op)(float), bool write_f16>
 static __global__ void unary_gated_view_kernel(
-        const float * x, const float * g, float * dst,
+        const float * x, const float * g, float * dst, half * dst_f16,
         const int64_t k, const int64_t nc, const int64_t ne0, const int64_t ne2,
         const int64_t nb1, const int64_t nb2, const int64_t nb3) {
     ggml_cuda_pdl_lc();
@@ -782,20 +783,26 @@ static __global__ void unary_gated_view_kernel(
     const int64_t j = g0 + g1*nb1 + g2*nb2 + (row / ne2)*nb3;
 
     ggml_cuda_pdl_sync();
-    dst[i] = op(g[j]) * x[i];
+    const float value = op(g[j]) * x[i];
+    dst[i] = value;
+    if constexpr (write_f16) {
+        dst_f16[i] = __float2half(value);
+    }
 }
 
 static void unary_gated_view_cuda(
-        const float * x, const float * g, float * dst,
+        const float * x, const float * g, float * dst, half * dst_f16,
         const int64_t k, const int64_t nc, const int64_t ne0, const int64_t ne2,
         const int64_t nb1, const int64_t nb2, const int64_t nb3, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
-    ggml_cuda_kernel_launch(unary_gated_view_kernel<op_sigmoid>, launch_params, x, g, dst, k, nc, ne0, ne2, nb1, nb2, nb3);
+    auto kernel = dst_f16 != nullptr ? unary_gated_view_kernel<op_sigmoid, true> : unary_gated_view_kernel<op_sigmoid, false>;
+    ggml_cuda_kernel_launch(kernel, launch_params, x, g, dst, dst_f16, k, nc, ne0, ne2, nb1, nb2, nb3);
 }
 
 // CONT -> UNARY(SIGMOID) -> MUL: the attention gate is a strided view whose CONT is elided
-void ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * sigmoid, ggml_tensor * mul) {
+void ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * sigmoid, ggml_tensor * mul,
+                                   half * dst_f16) {
     const ggml_tensor * gate = cont->src[0];
     const ggml_tensor * attn = mul->src[0] == sigmoid ? mul->src[1] : mul->src[0];
 
@@ -808,7 +815,7 @@ void ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int64_t k  = ggml_nelements(mul);
     const int64_t nc = cont->ne[0];
 
-    unary_gated_view_cuda((const float *) attn->data, (const float *) gate->data, (float *) mul->data,
+    unary_gated_view_cuda((const float *) attn->data, (const float *) gate->data, (float *) mul->data, dst_f16,
         k, nc, gate->ne[0], gate->ne[2],
         gate->nb[1] / sizeof(float), gate->nb[2] / sizeof(float), gate->nb[3] / sizeof(float), stream);
 }

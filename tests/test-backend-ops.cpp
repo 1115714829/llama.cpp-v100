@@ -5291,6 +5291,53 @@ struct test_gated_norm_q8 : public test_case {
     }
 };
 
+// CONT -> UNARY(SIGMOID) -> MUL, the attention output gate (a strided view of the Q projection), read
+// by the Q8_0 output projection (qwen4exp wo). sm_70 hands the gated output to the projection as F16;
+// the F32 gated output is kept and checked too.
+struct test_attn_gate_q8 : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ATTN_GATE_Q8";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(head_dim, n_head, n_embd, n_tokens);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_attn_gate_q8(int64_t head_dim = 256, int64_t n_head = 4, int64_t n_embd = 2560, int64_t n_tokens = 4)
+        : head_dim(head_dim), n_head(n_head), n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim*2*n_head, n_tokens);
+        ggml_set_name(q_full, "q_full");
+        ggml_tensor * attn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim*n_head, n_tokens);
+        ggml_set_name(attn, "attn");
+        ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, head_dim*n_head, n_embd);
+        ggml_set_name(wo, "wo");
+
+        ggml_tensor * gate = ggml_view_3d(ctx, q_full, head_dim, n_head, n_tokens,
+                ggml_element_size(q_full)*head_dim*2, ggml_element_size(q_full)*head_dim*2*n_head,
+                ggml_element_size(q_full)*head_dim);
+        gate = ggml_cont_2d(ctx, gate, head_dim*n_head, n_tokens);
+        ggml_tensor * y   = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+        ggml_tensor * o   = ggml_mul_mat(ctx, wo, y);
+        ggml_tensor * out = ggml_concat(ctx, o, y, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // A gated Q8_0 FFN, down(swiglu(gate(x), up(x))), as the qwen4exp shared expert (sm_70 repacks the
 // weights; a narrow pair hands silu(gate) * up to the down projection as F16)
 struct test_ffn_q8 : public test_case {
@@ -12149,6 +12196,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_norm_q8(128, 6, 2560, 4, true));
     test_cases.emplace_back(new test_gated_norm_q8(128, 8, 2560, 4, false));
     test_cases.emplace_back(new test_gated_norm_q8(64, 4, 1024, 3, true));
+    // the attention output gate handed to wo as F16 (M <= 16)
+    for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
+        test_cases.emplace_back(new test_attn_gate_q8(256, 4, 2560, n_tokens));
+    }
+    test_cases.emplace_back(new test_attn_gate_q8(128, 3, 1024, 4));
 
     // scale + unary(silu): decode and prefill shapes of the hyper-connection mixer activation
     test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 320, 1, 1, 1 }));
