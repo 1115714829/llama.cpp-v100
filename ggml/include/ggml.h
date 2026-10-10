@@ -3054,6 +3054,33 @@ extern "C" {
     // only when the model unloads.
     GGML_API void ggml_expert_store_set_trace_path(const char * path, int size_mib);
 
+    // Expert assignment (which device holds which expert when the routed experts are split over
+    // the devices). The backend computes it from the profile while it plans the expert buffers
+    // (one table for the process, before the weights are loaded); the loader lays the experts
+    // out by it and the queries below read it.
+    //
+    // sizes of the assignment; false when none has been computed (no expert buffer was planned)
+    GGML_API bool    ggml_expert_store_assignment_dims(int * n_dev, int * n_layer, int * n_expert);
+    // experts device dev holds per layer (the quota of the split), -1 when there is no assignment
+    GGML_API int     ggml_expert_store_assignment_cap(int dev);
+    // position of expert `expert` of layer `layer` in the host buffer of a tensor that is split
+    // over the devices: the buffer is the concatenation of the device segments in device order,
+    // segment j holds the cap(j) experts of device j in local order, so the position is
+    // sum(cap(0..owner)) + local. The loader writes expert `expert` there. -1 without an assignment.
+    GGML_API int64_t ggml_expert_store_load_position(int layer, int expert);
+    // make the assignment the active one (the layout the kernels address): called once by the
+    // loader after every expert tensor was written in that layout. Increments the version.
+    GGML_API void    ggml_expert_store_activate_assignment(void);
+    GGML_API int     ggml_expert_store_assignment_version(void);
+
+    // Placement check: the loader registers, per tensor name, the hash of the bytes of every
+    // global expert it placed (ggml_expert_store_hash_expert); the backend compares them after the
+    // load against the bytes every local expert received, mapped through the active assignment.
+    GGML_API uint64_t ggml_expert_store_hash_expert(const void * data, size_t size);
+    GGML_API void     ggml_expert_store_set_source_hash(const char * tensor_name, int64_t expert, uint64_t hash);
+    // drop the registered hashes once the backends checked the placement
+    GGML_API void     ggml_expert_store_clear_source_hashes(void);
+
     GGML_API struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor);
 
     //

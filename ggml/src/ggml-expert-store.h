@@ -178,6 +178,14 @@ struct ggml_expert_store_tensor {
     bool    sample_ready[2] = { false, false };
     bool    sample_skip[2]  = { false, false };
 
+    // placement check: hash of the bytes every local expert received through
+    // ggml_expert_store_write() (see ggml_expert_store_hash_expert), compared by
+    // ggml_expert_store_verify_placement() against the hash the loader registered for the
+    // global expert the active table maps the local one to. state: 0 nothing written, 1 the
+    // expert arrived whole in one write (hash valid), 2 written in pieces (no hash)
+    std::vector<uint64_t> write_hash;
+    std::vector<uint8_t>  write_hash_state;
+
     // statistics (filled at runtime by the kernels' dispatch code)
     int64_t stat_hits_vram = 0;
     int64_t stat_hits_host = 0;
@@ -330,6 +338,51 @@ GGML_API int ggml_expert_store_global_of(int dev, int layer, int local);
 
 // state of the cached assignment, for logging and tests
 GGML_API bool ggml_expert_store_assignment_info_get(ggml_expert_store_assignment_info * info);
+
+// Two tables. The table above is the proposal: computed from the profile, it says where the
+// loader puts every expert. The active table is the one the kernels, the routing dump and the
+// profile row lookups use: it describes the layout that is in memory right now. It starts as
+// the contiguous split (that is the layout before any loader placed experts by the proposal) and
+// becomes the proposal when ggml_expert_store_activate_assignment() runs, after the loader
+// wrote every expert tensor. Every activation increments the version.
+GGML_API void          ggml_expert_store_activate_assignment(void);
+GGML_API int           ggml_expert_store_assignment_version(void);
+GGML_API int           ggml_expert_store_active_owner(int layer, int expert);
+GGML_API const int16_t * ggml_expert_store_active_local_of(int dev, int layer);
+GGML_API int           ggml_expert_store_active_global_of(int dev, int layer, int local);
+
+// the device whose segment of the expert dim is exactly [expert_base, expert_base + n_expert):
+// >= 0 that device, -1 when the range is the whole expert dim (a tensor that is not split over
+// the devices holds every expert, so its local numbers are the global ones), -2 when the range
+// matches no segment of the assignment (or there is no assignment)
+GGML_API int ggml_expert_store_slice_device(int64_t expert_base, int64_t n_expert);
+
+// global expert of local expert `local` of the tensor slice [expert_base, expert_base + n_expert)
+// according to the active table (-1 for the whole dim is the identity); -1 when the slice
+// matches no segment or local is out of range
+GGML_API int64_t ggml_expert_store_active_global_of_slice(int64_t expert_base, int64_t n_expert, int layer, int64_t local);
+
+// hash of the bytes of one expert as the placement check uses it on both sides (loader and store):
+// for a small expert all bytes, otherwise three windows (head, middle, tail) of
+// GGML_EXPERT_STORE_HASH_WINDOW bytes each, so the check costs a fixed small fraction of the load.
+// Two different experts of one tensor never share a hash in practice; the full-byte integrity of
+// the stored copies is covered separately by ggml_expert_store_verify().
+#define GGML_EXPERT_STORE_HASH_WINDOW (16*1024)
+GGML_API uint64_t ggml_expert_store_hash_expert(const void * data, size_t size);
+
+// Placement check of the loader's layout (the second half of ggml_expert_store_set_source_hash in
+// ggml.h): the loader registered the hash of every global expert of a tensor by tensor name, the
+// store hashed the bytes it received for every local expert. The check maps every local expert
+// of this store's slice to its global expert through the active table and compares the two
+// hashes. A tensor the loader did not register is counted as skipped (not a failure: the store
+// can be filled by other code), a registered expert whose hash differs is a failure. n_checked and
+// n_skipped (optional) receive the counts.
+GGML_API bool ggml_expert_store_verify_placement(
+        ggml_expert_store * store, int tensor_id, const char * tensor_name,
+        int64_t * n_checked, int64_t * n_skipped);
+
+// drop every registered source hash (after all stores verified their placement)
+GGML_API void ggml_expert_store_clear_source_hashes(void);
 
 // register one expert tensor at the placement computed by ggml_expert_store_plan:
 // slot_experts[0..n_slot) are the experts that get slots 0..n_slot-1, the others are packed
