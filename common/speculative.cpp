@@ -2176,29 +2176,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // the catch-up is the only draft graph that reads group columns, so only it records
             // the group as read (the draft steps below set -1)
             llama_set_h_src_group(ctx_dft, h_sink_group);
-            llama_set_h_source(ctx_dft, true, h_cols.data(), h_cols.size());
 
             auto * mem_dft = llama_get_memory(ctx_dft);
 
-            bool ok = true;
-            for (int head = 0; head < n_mtp_layers; ++head) {
-                if (chain_heads) {
-                    // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
-                    for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                        if (i_need_beg[seq_id] < 0) {
-                            continue;
-                        }
-                        llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_need_beg[seq_id]].pos[0], -1);
-                    }
-                    llama_set_nextn_layer_offset(ctx_dft, head);
-                }
+            // the draft context can have a smaller physical batch than the target, so the catch-up
+            // is fed to it in chunks of its own n_ubatch, each chunk with the h columns of its tokens
+            const int32_t n_ub_dft = (int32_t) llama_n_ubatch(ctx_dft);
+            const int32_t n_chunk  = (batch.size() + n_ub_dft - 1) / n_ub_dft;
 
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
-                if (rc != 0) {
-                    SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
-                            head, (int) rc, (int) batch_in.tokens[0].pos[0]);
-                    ok = false;
-                    break;
+            bool ok = true;
+            for (int head = 0; head < n_mtp_layers && ok; ++head) {
+                for (int32_t ic = 0; ic < n_chunk; ++ic) {
+                    const int32_t beg = ic * n_ub_dft;
+                    const int32_t n   = std::min(n_ub_dft, batch.size() - beg);
+
+                    if (chain_heads) {
+                        // only the first chunk clears the KV: the chunks of one head are consecutive
+                        // positions, and the later ones read what the earlier ones wrote
+                        if (ic == 0) {
+                            // ref: https://github.com/ggml-org/llama.cpp/pull/24340/changes#r3413498544
+                            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                                if (i_need_beg[seq_id] < 0) {
+                                    continue;
+                                }
+                                llama_memory_seq_rm(mem_dft, seq_id, batch_in.tokens[i_need_beg[seq_id]].pos[0], -1);
+                            }
+                        }
+                        llama_set_nextn_layer_offset(ctx_dft, head);
+                    }
+
+                    llama_set_h_source(ctx_dft, true, h_cols.data() + beg, (size_t) n);
+
+                    const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get_sub_batch(beg, n));
+                    if (rc != 0) {
+                        SPC_ERR("llama_process(ctx_dft) head=%d chunk=%d failed rc=%d (pos=%d)\n",
+                                head, (int) ic, (int) rc, (int) batch_in.tokens[0].pos[0]);
+                        ok = false;
+                        break;
+                    }
                 }
             }
 
@@ -3284,6 +3299,14 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_v  = params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
+
+    // the draft never needs the target physical batch: it replays the end of the window in ubatches
+    // during catch-up and decodes n_max+1 tokens per step. The draft compute buffer is sized by
+    // n_ubatch, so a smaller one keeps it small. n_batch keeps the target value: the h sink of an MTP
+    // draft holds two target batch column groups, and the pending columns start behind them.
+    // n_ubatch == 0 keeps the target value (llama_context does the same for the main context)
+    result.n_ubatch = std::min<int32_t>(params_spec.n_ubatch, result.n_batch);
+    result.n_batch  = std::max<int32_t>(result.n_batch, result.n_ubatch);
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types
