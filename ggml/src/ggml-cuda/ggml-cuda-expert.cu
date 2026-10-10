@@ -888,12 +888,21 @@ ggml_cuda_expert_stream_state & ggml_backend_cuda_expert_buffer_context::get_str
 
     ggml_cuda_set_device(device);
 
+    // The state belongs to the stream, so its clearing is queued on that stream: the kernels of
+    // the first launch follow it there in order. A clear through the synchronous cudaMemset would
+    // run on the legacy default stream, which has no ordering with the non-blocking streams of
+    // the backend (common.cuh, cudaStreamNonBlocking): it could run while the plan kernel of the
+    // first launch has already counted the routed host experts and the copy kernel is filling the
+    // area, and zero the count or the staged bytes behind them - the consumer then reads zeroed
+    // slots and the rows of every routed host expert come out as zero. Observed in
+    // test-backend-ops on x86 (every test case is a first launch there), where the result of a
+    // case lost all host experts about once in a hundred first launches.
     ggml_cuda_expert_stream_state ss;
     if (stage_budget > 0) {
         CUDA_CHECK(cudaMalloc((void **) &ss.stage_dev, stage_budget));
         // the copy kernel writes only the data bytes of a staged expert; the row padding
         // after them is never touched again, so clearing the area once keeps it at zero
-        CUDA_CHECK(cudaMemset(ss.stage_dev, 0, stage_budget));
+        CUDA_CHECK(cudaMemsetAsync(ss.stage_dev, 0, stage_budget, stream));
         ss.stage_bytes = stage_budget;
     }
 
@@ -903,7 +912,7 @@ ggml_cuda_expert_stream_state & ggml_backend_cuda_expert_buffer_context::get_str
     if (ss.hit_cap > 0) {
         CUDA_CHECK(cudaMalloc((void **) &ss.hit_list, ss.hit_cap * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc((void **) &ss.plan_state, 5 * sizeof(int)));
-        CUDA_CHECK(cudaMemset(ss.plan_state, 0, 5 * sizeof(int)));
+        CUDA_CHECK(cudaMemsetAsync(ss.plan_state, 0, 5 * sizeof(int), stream));
         CUDA_CHECK(cudaHostAlloc((void **) &ss.plan_pinned, 5 * sizeof(int), cudaHostAllocDefault));
         memset(ss.plan_pinned, 0, 5 * sizeof(int));
         CUDA_CHECK(cudaEventCreateWithFlags(&ss.plan_event, cudaEventDisableTiming));
@@ -920,9 +929,13 @@ ggml_cuda_expert_stream_state & ggml_backend_cuda_expert_buffer_context::get_str
             continue;
         }
         CUDA_CHECK(cudaMalloc((void **) &ss.tables[i], (size_t) s.n_expert * sizeof(char *)));
+        // every launch rewrites the whole table (see expert_stage_plan_kernel); the clear only
+        // takes the uninitialized bytes of the allocation out of the state space, so an entry
+        // that a launch did not write is a null pointer, not the pointer of an earlier tensor
+        CUDA_CHECK(cudaMemsetAsync(ss.tables[i], 0, (size_t) s.n_expert * sizeof(char *), stream));
         const size_t n_words = ((size_t) s.n_expert + 31) / 32 * sizeof(uint32_t);
         CUDA_CHECK(cudaMalloc((void **) &ss.bitmaps[i], n_words));
-        CUDA_CHECK(cudaMemset(ss.bitmaps[i], 0, n_words));
+        CUDA_CHECK(cudaMemsetAsync(ss.bitmaps[i], 0, n_words, stream));
         CUDA_CHECK(cudaHostAlloc((void **) &ss.bitmaps_pinned[i], n_words, cudaHostAllocDefault));
         memset(ss.bitmaps_pinned[i], 0, n_words);
     }
