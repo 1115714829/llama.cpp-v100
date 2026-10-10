@@ -103,6 +103,11 @@ public:
     // over the cache as it is now, empty if none. Call it after a decode, before the next sequence edit.
     std::string kpool_layout_diff() const;
 
+    // For tests: picks the cells of padded new-pool entries over the current layout as set_input_kpool does, for
+    // counts up to every cell that is no rep, and returns the first pick that is out of range, a pool's rep, taken
+    // twice or short of the count, empty if none. Call it where kpool_layout_diff is called.
+    std::string kpool_pad_check() const;
+
     // The pooled keys persist in the idx cache across batches. A sequence edit can regroup the pools
     // from some position on, which stales every pooled key at or after it. POS_CLEAN means none.
     using stale_pos_t = std::array<llama_pos, LLAMA_MAX_SEQ>;

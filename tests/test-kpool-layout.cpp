@@ -9,8 +9,12 @@
 //  - clearing a sequence and filling it again
 //  - two sequences in their own streams, rolled back in turn and in one batch
 //  - two sequences sharing cells after seq_cp, the copy rolled back and then dropped
+//  - many sequences whose first tokens share one ubatch, which pads more new-pool entries than the layout has cells
+//    that are no rep; then they grow a token each, and half of them decode two and roll back the second, per ubatch
 // The layout is compared after every decode. After the speculative rounds the next token's logits must also match a
 // context that decoded the accepted tokens straight.
+// After every decode the cells for padded new-pool entries are also picked over the layout, for counts up to every cell
+// that is no pool's rep: each must be in range, no rep and taken once.
 //
 // Models without a k-pool indexer are skipped. The dummy models of test-llama-archs (-o DIR) cover both pool kinds:
 // qwen4exp groups cells in sequence order, glm5-next groups consecutive positions.
@@ -99,12 +103,17 @@ struct kpool_case {
         return true;
     }
 
-    // the layout as the decode left it against a rebuild over the cache
+    // the layout as the decode left it against a rebuild over the cache, and the padding cells picked over it
     bool check(const char * what, int step) {
         ++n_checks;
         const std::string diff = mem->kpool_layout_diff();
         if (!diff.empty()) {
             LOG_ERR("%s: %s: %s step %d: kept layout differs from a rebuild: %s\n", __func__, name, what, step, diff.c_str());
+            return false;
+        }
+        const std::string pads = mem->kpool_pad_check();
+        if (!pads.empty()) {
+            LOG_ERR("%s: %s: %s step %d: bad padding cells: %s\n", __func__, name, what, step, pads.c_str());
             return false;
         }
         return true;
@@ -377,10 +386,67 @@ static test_status test_shared(const common_params & params, llama_model * model
     return test_status::PASS;
 }
 
+// Many sequences: the first tokens of all but one in one ubatch pad more new-pool entries than the layout has cells that
+// are no rep, so the pick runs on into the cells no sequence holds. Then every sequence grows a token per ubatch, and
+// half of them decode two in one ubatch and roll back the second, which spreads the pads over many sequences.
+static test_status test_many(const common_params & params, llama_model * model) {
+    constexpr uint32_t n_seq = 32; // a token each fills the ubatch of 32
+
+    kpool_case tc;
+    test_status res = test_status::SKIP;
+    if (!make_case(tc, params, model, "many", n_seq, true, res)) {
+        return res;
+    }
+
+    // one pool in sequence 0, so the pick has a rep to step over
+    const llama_pos kpool = (llama_pos) tc.mem->get_kpool();
+    if (!tc.decode_check({ { 0, 0, kpool } }, "first pool", 0)) {
+        return test_status::FAIL;
+    }
+
+    std::vector<span> firsts;
+    for (llama_seq_id s = 1; s < (llama_seq_id) n_seq; ++s) {
+        firsts.push_back({ s, 0, 1 });
+    }
+    if (!tc.decode_check(firsts, "first tokens", 0)) {
+        return test_status::FAIL;
+    }
+
+    for (int r = 0; r < 12; ++r) {
+        std::vector<span> grow;
+        for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+            const llama_pos pos = tc.pos_next(s);
+            grow.push_back({ s, pos, pos + 1 });
+        }
+        if (!tc.decode_check(grow, "grow", r)) {
+            return test_status::FAIL;
+        }
+
+        std::vector<span> drafts;
+        for (llama_seq_id s = r % 2; s < (llama_seq_id) n_seq; s += 2) {
+            const llama_pos pos = tc.pos_next(s);
+            drafts.push_back({ s, pos, pos + 2, pos + 1 });
+        }
+        if (!tc.decode_check(drafts, "drafts", r)) {
+            return test_status::FAIL;
+        }
+        for (const auto & sp : drafts) {
+            if (!llama_memory_seq_rm(tc.mem_i(), sp.s, sp.p_bad, -1)) {
+                LOG_ERR("%s: drafts step %d: rolling back seq %d was refused\n", __func__, r, sp.s);
+                return test_status::FAIL;
+            }
+        }
+    }
+
+    LOG_INF("%s: %d layout checks\n", __func__, tc.n_checks);
+    return test_status::PASS;
+}
+
 struct test_results {
     test_status single  = test_status::SKIP;
     test_status streams = test_status::SKIP;
     test_status shared  = test_status::SKIP;
+    test_status many    = test_status::SKIP;
 };
 
 static test_results run_tests_for_model(const std::string & model_path, const common_params & base_params) {
@@ -391,7 +457,7 @@ static test_results run_tests_for_model(const std::string & model_path, const co
     auto * model = llama_init->model();
     if (model == nullptr) {
         LOG_ERR("%s: failed to init model '%s'\n", __func__, model_path.c_str());
-        return { test_status::FAIL, test_status::FAIL, test_status::FAIL };
+        return { test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL };
     }
 
     test_results res;
@@ -401,6 +467,7 @@ static test_results run_tests_for_model(const std::string & model_path, const co
     }
     res.streams = test_streams(params, model);
     res.shared  = test_shared(params, model);
+    res.many    = test_many(params, model);
     return res;
 }
 
@@ -474,7 +541,7 @@ int main(int argc, char ** argv) {
         name_width = std::max(name_width, std::filesystem::path(model_path).filename().string().size());
     }
 
-    LOG("%-*s  %-6s  %-7s  %s\n", (int) name_width, "Model", "single", "streams", "shared");
+    LOG("%-*s  %-6s  %-7s  %-6s  %s\n", (int) name_width, "Model", "single", "streams", "shared", "many");
     common_log_flush(common_log_main());
 
     size_t n_pass = 0;
@@ -482,11 +549,11 @@ int main(int argc, char ** argv) {
     for (const auto & model_path : models) {
         const test_results res = run_tests_for_model(model_path, params);
 
-        LOG("%-*s  %s    %s     %s\n", (int) name_width, std::filesystem::path(model_path).filename().string().c_str(),
-                test_status_str(res.single), test_status_str(res.streams), test_status_str(res.shared));
+        LOG("%-*s  %s    %s     %s    %s\n", (int) name_width, std::filesystem::path(model_path).filename().string().c_str(),
+                test_status_str(res.single), test_status_str(res.streams), test_status_str(res.shared), test_status_str(res.many));
         common_log_flush(common_log_main());
 
-        const test_status all = merge_status(merge_status(res.single, res.streams), res.shared);
+        const test_status all = merge_status(merge_status(merge_status(res.single, res.streams), res.shared), res.many);
         if (all == test_status::PASS) {
             n_pass++;
         } else if (all == test_status::FAIL) {

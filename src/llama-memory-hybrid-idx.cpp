@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
 #include <iterator>
 #include <stdexcept>
@@ -496,6 +497,68 @@ void kpool_seq_update(llama_memory_hybrid_idx::kpool_layout::seq & sq, const lla
     sq.j_next = j;
 }
 
+// The cells for the n_pad padded entries of the new pool list, handed to take() one at a time.
+// A padded entry pools kpool copies of one cell's key | gate into that cell's pooled slot, so the cell must not be a rep:
+// pool_cells reads the reps' slots, the ones the real entries write this ubatch and the cached ones alike. The entries
+// must not share a cell either, the scatter would write it from several threads. Beyond that the pick has no effect on
+// the result: pool_cells reads no other slot but the first ubatch cell's, for the padded pools, which lie outside every
+// token's visible pools (pool_rng) or under its -inf mask (pool_mask), where a finite key scores -inf all the same; and
+// a cell that comes to end a pool later is re-pooled by the ubatch that forms that pool, before anything reads its slot
+// (see kpool_build_state).
+// So no global order is needed. Pools are disjoint runs of kpool cells, so a sequence's cells taken in order, skipping
+// each pool's last one, are no rep. Sequences never share a cell here: a layout that shares cells re-pools every pool
+// and pads only while it has none, when every cell qualifies. Fewer such cells than pads takes a nearly empty cache
+// (many sequences at their first tokens), and then the cells no sequence holds follow. O(n_pad) whatever the context.
+template <typename F>
+void kpool_pick_pads(const llama_memory_hybrid_idx::kpool_layout & lay, const llama_kv_cache & idx, uint32_t kpool,
+        uint32_t n_pad, F && take) {
+    if (n_pad == 0) {
+        return;
+    }
+
+    const uint32_t kv_size  = idx.get_size();
+    const uint32_t n_stream = idx.get_n_stream();
+
+    if (lay.n_pool_real == 0) {
+        GGML_ASSERT((uint64_t) n_pad <= (uint64_t) kv_size*n_stream);
+        for (uint32_t c = 0; c < n_pad; ++c) {
+            take((int64_t) c);
+        }
+        return;
+    }
+
+    GGML_ASSERT(lay.cache_safe && "a layout sharing cells pads only while it has no pool");
+
+    uint32_t n_left = n_pad;
+    for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ && n_left > 0; ++s) {
+        const auto & sq = lay.seqs[s];
+
+        size_t pi = 0; // the next pool to end at or after rank r
+        for (size_t r = 0; r < sq.cells.size() && n_left > 0; ++r) {
+            if (pi < sq.pools.size() && sq.pools[pi] + kpool - 1 == r) {
+                ++pi;
+                continue;
+            }
+            take((int64_t) sq.strm*kv_size + sq.cells[r].second);
+            --n_left;
+        }
+    }
+
+    // a non unified cache keeps one stream per sequence, see kpool_layout_build
+    for (uint32_t s = 0; s < n_stream && n_left > 0; ++s) {
+        const auto & cells = idx.get_cells((llama_seq_id) s);
+        const int64_t base = (int64_t) lay.seqs[s].strm*kv_size;
+        for (uint32_t c = 0; c < cells.size() && n_left > 0; ++c) {
+            if (cells.is_empty(c)) {
+                take(base + c);
+                --n_left;
+            }
+        }
+    }
+
+    GGML_ASSERT(n_left == 0 && "more padded entries than cells that are no rep");
+}
+
 }
 
 llama_memory_hybrid_idx::~llama_memory_hybrid_idx() = default;
@@ -592,6 +655,71 @@ std::string llama_memory_hybrid_idx::kpool_layout_diff() const {
     if (lay.n_pool_real != ref->n_pool_real || lay.cache_safe != ref->cache_safe) {
         return format("n_pool_real %u cache_safe %d, rebuilt %u %d",
                 lay.n_pool_real, (int) lay.cache_safe, ref->n_pool_real, (int) ref->cache_safe);
+    }
+
+    return "";
+}
+
+std::string llama_memory_hybrid_idx::kpool_pad_check() const {
+    GGML_ASSERT(mem_idx != nullptr);
+
+    if (!kpool_lay) {
+        return "no layout yet";
+    }
+
+    const auto & lay = *kpool_lay;
+
+    // set_input_kpool pads a layout that shares cells only while it has no pool, see kpool_build_state
+    if (!lay.cache_safe && lay.n_pool_real > 0) {
+        return "";
+    }
+
+    const uint32_t kpool   = get_kpool();
+    const uint32_t kv_size = mem_idx->get_size();
+    const int64_t  n_cells = (int64_t) kv_size*mem_idx->get_n_stream();
+
+    std::vector<uint8_t> is_rep((size_t) n_cells, 0);
+    int64_t n_free = n_cells; // the cells that are no rep
+    int64_t n_lay  = 0;       // the layout's cells that are no rep, taken before any cell no sequence holds
+    for (const auto & sq : lay.seqs) {
+        for (const uint32_t j : sq.pools) {
+            const int64_t c = (int64_t) sq.strm*kv_size + sq.cells[j + kpool - 1].second;
+            n_free -= is_rep[c] ? 0 : 1;
+            is_rep[c] = 1;
+        }
+        n_lay += (int64_t) (sq.cells.size() - sq.pools.size());
+    }
+
+    // a few counts inside the layout, the ones around running out of it, and every cell that is no rep
+    const int64_t counts[] = { 1, 2, 3, kpool + 1, n_lay - 1, n_lay, n_lay + 1, n_free };
+    for (const int64_t n_pad : counts) {
+        if (n_pad < 1 || n_pad > n_free) {
+            continue;
+        }
+
+        std::vector<uint8_t> taken((size_t) n_cells, 0);
+        int64_t     n_taken = 0;
+        std::string err;
+        kpool_pick_pads(lay, *mem_idx, kpool, (uint32_t) n_pad, [&](int64_t c) {
+            if (err.empty()) {
+                if (c < 0 || c >= n_cells) {
+                    err = format("%" PRId64 " pads: pad %" PRId64 " takes cell %" PRId64 " of %" PRId64, n_pad, n_taken, c, n_cells);
+                } else if (is_rep[c]) {
+                    err = format("%" PRId64 " pads: pad %" PRId64 " takes cell %" PRId64 ", a pool's rep", n_pad, n_taken, c);
+                } else if (taken[c]) {
+                    err = format("%" PRId64 " pads: pad %" PRId64 " takes cell %" PRId64 " again", n_pad, n_taken, c);
+                } else {
+                    taken[c] = 1;
+                }
+            }
+            ++n_taken;
+        });
+        if (!err.empty()) {
+            return err;
+        }
+        if (n_taken != n_pad) {
+            return format("%" PRId64 " pads: %" PRId64 " taken", n_pad, n_taken);
+        }
     }
 
     return "";
@@ -1025,23 +1153,16 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     }
     GGML_ASSERT(i_new == n_new);
 
-    // Padded entries re-pool cells whose pooled slot is never read: only the reps of complete pools are read.
-    // Each entry takes its own cell, entries sharing one would write it from several threads in the scatter.
-    if (n_new_g > n_new) {
-        std::vector<int64_t> reps(pcell, pcell + pool_end.size());
-        std::sort(reps.begin(), reps.end());
-
-        int64_t pad_cell = 0;
-        for (uint32_t i = n_new; i < n_new_g; ++i, ++pad_cell) {
-            while (std::binary_search(reps.begin(), reps.end(), pad_cell)) {
-                ++pad_cell;
-            }
-            GGML_ASSERT(pad_cell < (int64_t) kv_size*n_stream_kv);
+    // Padded entries re-pool cells whose pooled slot is never read, each its own cell, see kpool_pick_pads.
+    {
+        uint32_t i = n_new;
+        kpool_pick_pads(lay, *mem->get_mem_idx(), kpool, n_new_g - n_new, [&](int64_t cell) {
             for (uint32_t k = 0; k < kpool; ++k) {
-                nidx[(size_t) i*kpool + k] = (int32_t) pad_cell;
+                nidx[(size_t) i*kpool + k] = (int32_t) cell;
             }
-            nrep[i] = pad_cell;
-        }
+            nrep[i++] = cell;
+        });
+        GGML_ASSERT(i == n_new_g);
     }
 
     const uint32_t n_pool_real = (uint32_t) pool_end.size();
