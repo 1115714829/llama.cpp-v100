@@ -1084,7 +1084,53 @@ static __device__ __forceinline__ void q8_skinny_warp_loop_ahead(
         }
     }
 
-    for (int base = group_begin; base < group_end; base += Depth) {
+    // full chunks of Depth groups: one basic block per chunk, so that the decode of a group can be
+    // scheduled into the mma latency of the previous one; then the remaining groups
+    int base = group_begin;
+    for (; base + Depth <= group_end; base += Depth) {
+#pragma unroll
+        for (int slot = 0; slot < Depth; ++slot) {
+            const int group = base + slot;
+            // base - group_begin is a multiple of Depth, hence of InDepth: the input fragments
+            // of this group sit in slot % InDepth
+            const int in_slot     = slot % InDepth;
+            const int group_code  = min(group + Depth, group_last);
+            const int group_input = min(group + InDepth, group_last);
+
+            half2 weights[8];
+            s8x8_to_half2x4(make_uint2(codes[slot].x, codes[slot].y), weights);
+            s8x8_to_half2x4(make_uint2(codes[slot].z, codes[slot].w), weights + 4);
+            const half  scale  = __ushort_as_half((unsigned short) scales[slot]);
+            const half2 scale2 = __halves2half2(scale, scale);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                weights[i] = __hmul2(weights[i], scale2);
+            }
+            codes[slot]  = __ldcs(code_ptr + (size_t) group_code * 32);
+            scales[slot] = __ldg(scale_bits + (size_t) (group_code >> 1) * n);
+
+            const unsigned * b = reinterpret_cast<const unsigned *>(weights);
+#pragma unroll
+            for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+                const unsigned * a0 = reinterpret_cast<const unsigned *>(&in01[in_slot][row_tile]);
+                const unsigned * a1 = reinterpret_cast<const unsigned *>(&in23[in_slot][row_tile]);
+                Q8_SKINNY_MMA_8N8K4(accum[row_tile][0], a0[0], a0[1], b[0], b[1]);
+                Q8_SKINNY_MMA_8N8K4(accum[row_tile][1 % NAcc], a0[2], a0[3], b[2], b[3]);
+                Q8_SKINNY_MMA_8N8K4(accum[row_tile][2 % NAcc], a1[0], a1[1], b[4], b[5]);
+                Q8_SKINNY_MMA_8N8K4(accum[row_tile][3 % NAcc], a1[2], a1[3], b[6], b[7]);
+            }
+#pragma unroll
+            for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
+                const int input_row_idx = row_tile * 8 + row;
+                if (input_row_idx < m) {
+                    const half * input_row = input + (size_t) input_row_idx * k;
+                    in01[in_slot][row_tile] = *reinterpret_cast<const uint4 *>(input_row + group_input * 16);
+                    in23[in_slot][row_tile] = *reinterpret_cast<const uint4 *>(input_row + group_input * 16 + 8);
+                }
+            }
+        }
+    }
+    if (base < group_end) {
 #pragma unroll
         for (int slot = 0; slot < Depth; ++slot) {
             const int group = base + slot;
@@ -1332,13 +1378,10 @@ struct q8_skinny_split_out {
     int     epilogue;
 };
 
-template <int SplitK, int NAcc, int Parts, bool Gated, bool M1Only, int RowTiles>
-static void q8_skinny_split_launch_one(const uint8_t * codes0, const half * scales0, const uint8_t * codes1,
+template <int SplitK, int NAcc, int Parts, bool Gated, bool M1Only, int RowTiles, int depth, int in_depth>
+static void q8_skinny_split_launch_one_d(const uint8_t * codes0, const half * scales0, const uint8_t * codes1,
                                        const half * scales1, const half * input, const q8_skinny_split_out & out,
                                        float * scratch, unsigned int * counters, int n, int k, int m, cudaStream_t stream) {
-    constexpr bool deep    = !Gated && RowTiles == 1;
-    constexpr int  depth    = deep ? 9 : 4;
-    constexpr int  in_depth = deep ? 3 : 2;
     const dim3 grid((n / 32) * Parts);
     const dim3 block((Gated ? 64 : 32) * (SplitK / Parts));
     if (out.epilogue == Q8_SKINNY_EPI_SCALE_SILU_F16) {
@@ -1361,6 +1404,19 @@ static void q8_skinny_split_launch_one(const uint8_t * codes0, const half * scal
         q8_skinny_split_kernel<SplitK, NAcc, Parts, depth, in_depth, Gated, M1Only, RowTiles>
             <<<grid, block, 0, stream>>>(codes0, scales0, codes1, scales1, input, out.output, scratch, counters, n, k, m);
     }
+}
+
+// Load depths from the cold-weight benchmark (tests/bench-q8-skinny-cold.cpp, chunked ring): code
+// words 8 groups ahead and input fragments 4 ahead for one row tile, 4 and 4 for the gated pair
+// (two projections per CTA), 4 and 2 for two row tiles.
+template <int SplitK, int NAcc, int Parts, bool Gated, bool M1Only, int RowTiles>
+static void q8_skinny_split_launch_one(const uint8_t * codes0, const half * scales0, const uint8_t * codes1,
+                                       const half * scales1, const half * input, const q8_skinny_split_out & out,
+                                       float * scratch, unsigned int * counters, int n, int k, int m, cudaStream_t stream) {
+    constexpr int depth    = RowTiles == 1 && !Gated ? 8 : 4;
+    constexpr int in_depth = RowTiles == 1 ? 4 : 2;
+    q8_skinny_split_launch_one_d<SplitK, NAcc, Parts, Gated, M1Only, RowTiles, depth, in_depth>(
+        codes0, scales0, codes1, scales1, input, out, scratch, counters, n, k, m, stream);
 }
 
 template <int SplitK, int NAcc, bool Gated, bool M1Only, int RowTiles>
