@@ -12,13 +12,16 @@ inline constexpr size_t COMMON_FIT_TARGET_DEFAULT = 1024ull*1024*1024;
 // Margin per device of the expert parallel fit when the user sets none (--fit-target). The fit
 // budgets the communication contexts and the page tables itself; the margin holds what it cannot
 // measure before the load: the CUDA graph executables of the split graphs (0-2 MiB each, about
-// 130-230 MiB per card after a 16K and a 200K request), the operator pools of the CUDA backend
-// (they keep their peak), the cuBLAS handle, lazily loaded module code, and the connection
-// buffers NCCL >= 2.22 allocates at the first large collective (78-116 MiB per card; NCCL 2.21
-// allocates them at the init, where the fit measures them). Measured on 6 x V100 (AC922, short
-// prompt + 16K + 200K requests, with and without MTP): at most 476 MiB per card, plus about
-// 125 MiB of headroom (mimo-runs/margin-report.md).
-inline constexpr size_t COMMON_FIT_EP_MARGIN_DEFAULT = 600ull*1024*1024;
+// 270 MiB per card once every request shape has run; evicted graphs give their memory to new
+// ones, so the total stops growing), the operator pools of the CUDA backend (they keep their
+// peak, about 90 MiB), the cuBLAS handle, lazily loaded module code, and the connection buffers
+// NCCL >= 2.22 allocates at the first large collective (78-116 MiB per card; NCCL 2.21 allocates
+// them at the init, where the fit measures them). Measured on 6 x V100 (AC922, MTP, 30-37 minute
+// runs of 75 requests of 15 shapes: short to 200K prompts, outputs up to 2048, prefix reuse):
+// at most 521 MiB per card with NCCL 2.27 and 443 MiB with NCCL 2.21, flat from the third round
+// on; NCCL 2.29 projects to at most 540 MiB. The default keeps at least 250 MiB free above each
+// of them (mimo-runs/margin-report.md, section 7).
+inline constexpr size_t COMMON_FIT_EP_MARGIN_DEFAULT = 800ull*1024*1024;
 
 enum common_params_fit_status {
     COMMON_PARAMS_FIT_STATUS_SUCCESS = 0, // found allocations that are projected to fit
