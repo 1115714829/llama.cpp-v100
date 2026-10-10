@@ -2355,6 +2355,7 @@ int llama_bench(int argc, char ** argv) {
                 fit_tensor_split.data(),
                 fit_overrides.data(),
                 margins.data(),
+                /*margins_set =*/ true,
                 inst.fit_min_ctx,
                 nullptr,
                 params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);

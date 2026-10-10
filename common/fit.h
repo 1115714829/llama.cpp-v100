@@ -3,7 +3,22 @@
 #include "ggml.h"
 #include "llama.h"
 
+#include <cstddef>
 #include <vector>
+
+// default margin per device of the parameter fit (--fit-target), in bytes
+inline constexpr size_t COMMON_FIT_TARGET_DEFAULT = 1024ull*1024*1024;
+
+// Margin per device of the expert parallel fit when the user sets none (--fit-target). The fit
+// budgets the communication contexts and the page tables itself; the margin holds what it cannot
+// measure before the load: the CUDA graph executables of the split graphs (0-2 MiB each, about
+// 130-230 MiB per card after a 16K and a 200K request), the operator pools of the CUDA backend
+// (they keep their peak), the cuBLAS handle, lazily loaded module code, and the connection
+// buffers NCCL >= 2.22 allocates at the first large collective (78-116 MiB per card; NCCL 2.21
+// allocates them at the init, where the fit measures them). Measured on 6 x V100 (AC922, short
+// prompt + 16K + 200K requests, with and without MTP): at most 476 MiB per card, plus about
+// 125 MiB of headroom (mimo-runs/margin-report.md).
+inline constexpr size_t COMMON_FIT_EP_MARGIN_DEFAULT = 600ull*1024*1024;
 
 enum common_params_fit_status {
     COMMON_PARAMS_FIT_STATUS_SUCCESS = 0, // found allocations that are projected to fit
@@ -38,7 +53,12 @@ common_params_fit_status common_fit_params(
                llama_context_params * cparams,
                               float * tensor_split,          // writable buffer for tensor split, needs at least llama_max_devices elements
    llama_model_tensor_buft_override * tensor_buft_overrides, // writable buffer for overrides, needs at least llama_max_tensor_buft_overrides elements
-                             size_t * margins,               // margins of memory to leave per device in bytes
+                             size_t * margins,               // margins of memory to leave per device in bytes, see margins_set
+                               bool   margins_set,           // true: the margins are the user's and every fit mode leaves exactly them;
+                                                             // false: they are only what other loads reserve on the device (e.g. a
+                                                             // multimodal projector) and each fit mode adds its default margin
+                                                             // (COMMON_FIT_TARGET_DEFAULT; the expert parallel fit budgets the
+                                                             // runtime growth itself and adds a smaller one)
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log

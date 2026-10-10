@@ -1491,6 +1491,15 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ggml_backend_cuda_comm_init_internal(ret);
 }
 
+// Device memory the communication contexts created since the last reset took at their creation,
+// per device: the NCCL communicator (its device structures; NCCL >= 2.22 allocates the
+// connection buffers later, at the first collective that needs them) and the push all-reduce
+// buffers. Every context of a tensor split creates one, after the fit sampled the free memory of
+// the devices, so it is device memory the expert slot budget has to leave room for. fit creates
+// the contexts of its measurement, reads what they took here and budgets the same for the real
+// contexts.
+static std::atomic<int64_t> ggml_cuda_comm_device_bytes[GGML_CUDA_MAX_DEVICES];
+
 // Top-level init.  Picks one of the three init paths based on
 // GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
 // any fallback.  Unrecognised env values warn and fall through to the
@@ -1552,8 +1561,10 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         size_t total = 0;
         ggml_cuda_set_device(ret->dev_ids[i]);
         CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
+        const int64_t taken = (int64_t) free_before[i] - (int64_t) free_after;
+        ggml_cuda_comm_device_bytes[ret->dev_ids[i]] += taken;
         GGML_LOG_DEBUG("%s: device %d: communication context takes %.2f MiB of device memory\n",
-            __func__, ret->dev_ids[i], ((double) free_before[i] - (double) free_after)/1024.0/1024.0);
+            __func__, ret->dev_ids[i], taken/1024.0/1024.0);
     }
 
     return ret;
@@ -9341,6 +9352,20 @@ struct ggml_backend_cuda_device_context {
     int op_offload_min_batch_size;
 };
 
+// reset / read the device memory of the communication contexts created since the last reset
+// (see ggml_cuda_comm_device_bytes); fit brackets the contexts of its measurement with them
+static void ggml_backend_cuda_comm_memory_reset(void) {
+    for (std::atomic<int64_t> & bytes : ggml_cuda_comm_device_bytes) {
+        bytes.store(0);
+    }
+}
+
+static size_t ggml_backend_cuda_comm_memory(ggml_backend_dev_t dev) {
+    const ggml_backend_cuda_device_context * ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    const int64_t bytes = ggml_cuda_comm_device_bytes[ctx->device].load();
+    return bytes > 0 ? (size_t) bytes : 0;
+}
+
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
     return ctx->name.c_str();
@@ -10318,6 +10343,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_free") == 0) {
         return (void *)ggml_backend_cuda_comm_free;
+    }
+    if (strcmp(name, "ggml_backend_comm_memory_reset") == 0) {
+        return (void *)ggml_backend_cuda_comm_memory_reset;
+    }
+    if (strcmp(name, "ggml_backend_comm_memory") == 0) {
+        return (void *)ggml_backend_cuda_comm_memory;
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;

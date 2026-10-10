@@ -1269,10 +1269,20 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             /*.h_sink_rows  =*/ h_sink_rows,
         };
 
+        // without -fitt the target holds the default margin plus what other loads reserve on the
+        // devices (mmproj); the fit gets only the latter and applies the default of its mode
+        std::vector<size_t> fit_margins = params.fit_params_target;
+        if (!params.fit_params_target_set) {
+            for (size_t & m : fit_margins) {
+                m -= std::min(m, COMMON_FIT_TARGET_DEFAULT);
+            }
+        }
+
         if (common_fit_params(params.model.path.c_str(), &mparams, &cparams,
                 params.tensor_split,
                 params.tensor_buft_overrides.data(),
-                params.fit_params_target.data(),
+                fit_margins.data(),
+                params.fit_params_target_set,
                 params.fit_params_min_ctx,
                 has_draft || spec_mtp ? &extra : nullptr,
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR)

@@ -29,6 +29,14 @@ class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+// Page table of the host memory a GPU reads in place: with unified addressing every portable
+// pinned allocation (the mapped weights, the expert host arenas, the pinned host buffers of the
+// contexts) is mapped into the page table of every device, 8 bytes per 4 KiB page. Measured on
+// 6 x V100 (AC922): mapping the 26.82 GiB PLE table took 52 MiB on every card.
+static constexpr int64_t COMMON_FIT_GPU_PAGE = 4096;
+static constexpr int64_t COMMON_FIT_GPU_PTE  = 8;
+
+
 // buffer type whose bytes are host memory: a host buffer, or a device-readable host buffer (e.g.
 // the CUDA mapped host buffer) that the device reads in place. The meta buffer types ask the meta
 // backend, every other type its own backend. no_alloc gives every weight and cache tensor a
@@ -118,6 +126,32 @@ static void common_expert_reset_allocation(ggml_backend_buffer_type_t buft) {
     if (reset != nullptr) {
         reset(buft);
     }
+}
+
+// device memory of the communication contexts (collective communicators with their buffers)
+// the backend of this device created since the last reset. The contexts of a tensor split are
+// created with the llama contexts, after fit sampled the free memory; fit measures what the
+// contexts of its own measurement took and budgets the same for the real ones.
+static void common_comm_memory_reset(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return;
+    }
+    typedef void (*ggml_backend_comm_memory_reset_t)(void);
+    auto reset = (ggml_backend_comm_memory_reset_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_memory_reset");
+    if (reset != nullptr) {
+        reset();
+    }
+}
+
+static int64_t common_comm_memory(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return 0;
+    }
+    typedef size_t (*ggml_backend_comm_memory_t)(ggml_backend_dev_t);
+    auto mem = (ggml_backend_comm_memory_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_memory");
+    return mem != nullptr ? (int64_t) mem(dev) : 0;
 }
 
 // build the CUDA context of the device behind this buffer type (through the backend proc),
@@ -674,7 +708,9 @@ void common_fit_log_memory_stage_devs(struct ggml_backend_device ** devs, int nd
         sum_growth = 0;
         return;
     }
-    if (nd <= 0) {
+    // the samples only feed the trace lines below: no device queries when they are not printed
+    // (request_done samples after every request)
+    if (nd <= 0 || common_log_get_verbosity_thold() < LOG_LEVEL_TRACE) {
         return;
     }
 
@@ -714,7 +750,7 @@ void common_fit_log_memory_stage_devs(struct ggml_backend_device ** devs, int nd
 // cache, the compute buffers and the margin to the expert slots of that device.
 static void common_fit_ep(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
-        size_t * margins_s, enum ggml_log_level log_level, const common_fit_extra_model * extra) {
+        const size_t * margins_raw, bool margins_set, enum ggml_log_level log_level, const common_fit_extra_model * extra) {
     constexpr int64_t MiB = 1024*1024;
 
     llama_model_params mparams_copy = *mparams;
@@ -724,11 +760,6 @@ static void common_fit_ep(
     llama_model * model = llama_model_load_from_file(path_model, mparams_copy);
     if (model == nullptr) {
         throw common_params_fit_exception("failed to load model");
-    }
-    llama_context * ctx = llama_init_from_model(model, *cparams);
-    if (ctx == nullptr) {
-        llama_model_free(model);
-        throw common_params_fit_exception("failed to create llama_context from model");
     }
 
     // the model device is the meta device; its simple devices are the cards
@@ -742,9 +773,18 @@ static void common_fit_ep(
     }
     const size_t nd = simple_devs.size();
     if (nd < 1) {
-        llama_free(ctx);
         llama_model_free(model);
         throw common_params_fit_exception("expert parallel fit needs a meta device with at least one simple device, abort");
+    }
+
+    // the contexts below create the communication contexts of their meta backends (one for the
+    // target, one for the draft), exactly like the real load: count what they take from here on
+    common_comm_memory_reset(simple_devs[0]);
+
+    llama_context * ctx = llama_init_from_model(model, *cparams);
+    if (ctx == nullptr) {
+        llama_model_free(model);
+        throw common_params_fit_exception("failed to create llama_context from model");
     }
 
     // every simple device must offer an expert buffer type: the store is the only expert
@@ -769,12 +809,20 @@ static void common_fit_ep(
     // no-alloc load gives every weight tensor a zero-size dummy buffer of its real buffer type,
     // so its placement is readable here.
     std::vector<int64_t> dev_model(nd, 0);
+    // host memory the GPUs read in place (the mapped weights: the PLE table and the token
+    // embedding table, one shared allocation for all cards): every card maps it into its page
+    // table, see COMMON_FIT_GPU_PTE
+    int64_t mapped_host = 0;
     for (const auto & kv : llama_internal_get_tensor_map(model)) {
         const ggml_tensor * t = kv.second;
         if (t == nullptr || t->view_src != nullptr || ggml_nelements(t) == 0) {
             continue;
         }
         if ((t->flags & GGML_TENSOR_FLAG_EXPERT) != 0) {
+            continue;
+        }
+        if (t->buffer != nullptr && ggml_backend_buft_is_device_mapped(ggml_backend_buffer_get_type(t->buffer))) {
+            mapped_host += (int64_t) ggml_nbytes(t);
             continue;
         }
         if (t->buffer == nullptr || common_buft_is_host_memory(ggml_backend_buffer_get_type(t->buffer))) {
@@ -883,13 +931,20 @@ static void common_fit_ep(
         }
     }
 
-    // compute bytes: the meta device reports one number per buffer type for the whole model
+    // compute bytes: the meta device reports one number per buffer type for the whole model.
+    // The pinned host buffers of the context (compute, output) take no VRAM, but with unified
+    // addressing every card maps them into its page table, like the mapped weights.
+    ggml_backend_buffer_type_t pinned_buft = ggml_backend_dev_host_buffer_type(simple_devs[0]);
     int64_t compute_total = 0;
+    int64_t pinned_host   = 0;
     {
         const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx);
         for (const auto & [buft, data] : mb) {
             if (common_buft_is_host_memory(buft)) {
                 // host memory, no device VRAM
+                if (buft == pinned_buft) {
+                    pinned_host += (int64_t) (data.context + data.compute);
+                }
                 continue;
             }
             compute_total += (int64_t) data.compute;
@@ -1018,6 +1073,9 @@ static void common_fit_ep(
             const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx_extra);
             for (const auto & [buft, data] : mb) {
                 if (common_buft_is_host_memory(buft)) {
+                    if (buft == pinned_buft) {
+                        pinned_host += (int64_t) (data.context + data.compute);
+                    }
                     continue;
                 }
                 draft_compute_total  += (int64_t) data.compute;
@@ -1050,6 +1108,13 @@ static void common_fit_ep(
         llama_free(ctx_extra);
         llama_model_free(model_extra);
         extra->cparams->ctx_other = nullptr;
+    }
+
+    // what the communication contexts of the measured contexts took on every card: the real
+    // target and draft contexts create the same ones after the free sample below
+    std::vector<int64_t> comm_dev(nd, 0);
+    for (size_t j = 0; j < nd; j++) {
+        comm_dev[j] = common_comm_memory(simple_devs[j]);
     }
 
     llama_free(ctx);
@@ -1093,34 +1158,43 @@ static void common_fit_ep(
             __func__, draft_compute_total/(1024.0*1024.0), sinks_total/(1024.0*1024.0));
     }
 
+    // Device memory the runtime adds after the free sample below, budgeted explicitly instead of
+    // being left to the margin (measured growth on 6 x V100, see mimo-runs/margin-report.md):
+    //  - comm: the communication contexts of the target and the draft context, measured above;
+    //  - page tables: every card maps all device-readable host memory into its page table, 8 bytes
+    //    per 4 KiB page: the mapped weights, the pinned host buffers of the contexts and the host
+    //    complement of the expert store of every card (all cards map every arena);
+    //  - the margin: what the fit cannot see (the connection buffers NCCL allocates at the first
+    //    large collective, the operator pools, CUDA graphs, module code), the user's -fitt or the
+    //    expert parallel default.
+    std::vector<int64_t> margin_dev(nd, 0);
     for (size_t j = 0; j < nd; j++) {
-        const int64_t context_j = ctx_dev[j];
-        const int64_t compute_j = compute_total;
-        const int64_t draft_context_j = draft_ctx_dev[j];
-        const int64_t draft_compute_j  = draft_compute_total;
-        const int64_t margin_j  = margins_s[j];
-        const int64_t surplus   = free_mem[j] - dev_model[j] - context_j - compute_j
-                                 - dev_draft[j] - draft_context_j - draft_compute_j - sinks_total - margin_j;
+        margin_dev[j] = (int64_t) (margins_raw[j] + (margins_set ? 0 : COMMON_FIT_EP_MARGIN_DEFAULT));
+    }
+    const auto page_table = [](int64_t host_bytes) -> int64_t {
+        return (host_bytes + COMMON_FIT_GPU_PAGE - 1) / COMMON_FIT_GPU_PAGE * COMMON_FIT_GPU_PTE;
+    };
 
-        LOG_INF("%s: device %zu: free %.0f MiB, dense %.0f MiB, context %.0f MiB, compute %.0f MiB,"
-                " draft %.0f MiB, draft context %.0f MiB, draft compute %.0f MiB, sinks %.0f MiB,"
-                " margin %.0f MiB -> surplus %.0f MiB\n",
-            __func__, j, (double) free_mem[j]/MiB, (double) dev_model[j]/MiB, (double) context_j/MiB,
-            (double) compute_j/MiB, (double) dev_draft[j]/MiB, (double) draft_context_j/MiB,
-            (double) draft_compute_j/MiB, (double) sinks_total/MiB, (double) margin_j/MiB,
-            (double) surplus/MiB);
-
+    for (size_t j = 0; j < nd; j++) {
         for (const ep_tensor & t : expert_tensors) {
             dev_tensors[j].push_back({ t.layer, t.expert_base[j], t.n_expert[j], t.blob_bytes, t.type, t.ne0 });
         }
+    }
 
-        if (surplus <= 0) {
+    // the budget of one card for a given runtime reserve: slots, staging (fixed point of the
+    // staging that the host complement of the slot plan needs) and the host complement
+    struct ep_plan { int64_t surplus; size_t slot_budget; size_t stage_bytes; size_t slot_used; size_t host_bytes; size_t stage_peak; };
+    const auto plan_device = [&](size_t j, int64_t reserve, std::vector<size_t> * host_each_j) -> ep_plan {
+        ep_plan pl = {};
+        pl.surplus = free_mem[j] - dev_model[j] - ctx_dev[j] - compute_total
+                   - dev_draft[j] - draft_ctx_dev[j] - draft_compute_total - sinks_total - reserve;
+        if (pl.surplus <= 0) {
             // no VRAM for slots: the prefill staging of the host complement could not exist
             size_t slot_used_none = 0;
             size_t host_bytes_none = 0;
             size_t host_peak_none = 0;
             if (!common_expert_plan(expert_bufts[j], dev_tensors[j], 0, &slot_used_none, &host_bytes_none,
-                    &host_peak_none, &host_each[j])) {
+                    &host_peak_none, host_each_j)) {
                 throw common_params_fit_exception("expert store: the buffer type of device " + std::to_string(j) +
                     " has no placement plan, abort");
             }
@@ -1130,50 +1204,77 @@ static void common_fit_ep(
                 " MiB staging of one prefill batch cannot be allocated; reduce the context size,"
                 " use more devices or a lower quantization");
         }
-
-        size_t stage_bytes = 0;
-        size_t stage_peak  = 0;
-        size_t slot_budget = (size_t) surplus;
-        size_t slot_used   = 0;
-        size_t host_bytes  = 0;
+        pl.slot_budget = (size_t) pl.surplus;
         for (int round = 0; round < 64; ++round) {
-            if (!common_expert_plan(expert_bufts[j], dev_tensors[j], slot_budget, &slot_used, &host_bytes, &stage_peak)) {
+            if (!common_expert_plan(expert_bufts[j], dev_tensors[j], pl.slot_budget, &pl.slot_used, &pl.host_bytes, &pl.stage_peak)) {
                 throw common_params_fit_exception("expert store: the buffer type of device " + std::to_string(j) +
                     " has no placement plan, abort");
             }
-            const size_t next = std::min(stage_peak, (size_t) surplus);
-            if (next == stage_bytes) {
+            const size_t next = std::min(pl.stage_peak, (size_t) pl.surplus);
+            if (next == pl.stage_bytes) {
                 break;
             }
-            stage_bytes = next;
-            slot_budget = (size_t) surplus - stage_bytes;
+            pl.stage_bytes = next;
+            pl.slot_budget = (size_t) pl.surplus - pl.stage_bytes;
         }
-        if (!common_expert_plan(expert_bufts[j], dev_tensors[j], slot_budget, &slot_used, &host_bytes, &stage_peak, &host_each[j])) {
+        if (!common_expert_plan(expert_bufts[j], dev_tensors[j], pl.slot_budget, &pl.slot_used, &pl.host_bytes, &pl.stage_peak, host_each_j)) {
             throw common_params_fit_exception("expert store: the buffer type of device " + std::to_string(j) +
                 " has no placement plan, abort");
         }
-        if (stage_peak > stage_bytes) {
+        if (pl.stage_peak > pl.stage_bytes) {
             throw common_params_fit_exception(
                 "expert store: device " + std::to_string(j) + " needs " +
-                std::to_string((stage_peak + MiB - 1)/MiB) + " MiB of staging for the host experts of one prefill batch, but only " +
-                std::to_string(stage_bytes/MiB) + " MiB fit (short by " +
-                std::to_string((stage_peak - stage_bytes + MiB - 1)/MiB) +
+                std::to_string((pl.stage_peak + MiB - 1)/MiB) + " MiB of staging for the host experts of one prefill batch, but only " +
+                std::to_string(pl.stage_bytes/MiB) + " MiB fit (short by " +
+                std::to_string((pl.stage_peak - pl.stage_bytes + MiB - 1)/MiB) +
                 " MiB); reduce the context size, use more devices or a lower quantization");
         }
-        common_expert_set_budget(expert_bufts[j], slot_budget, stage_bytes);
-        common_expert_record_plan(expert_bufts[j], slot_used, host_bytes);
+        return pl;
+    };
 
-        const double hit = slot_used + host_bytes > 0
-            ? 100.0 * (double) slot_used / (double) (slot_used + host_bytes) : 0.0;
+    // The page tables of the host complements depend on the complements of all cards, which
+    // depend on the budgets: plan once without them, then budget the page tables of that
+    // complement. Shrinking the slots by that amount moves at most as many bytes to the host on
+    // every card, whose page tables are budgeted on top (closed form of the second round).
+    const int64_t pt_fixed = page_table(mapped_host + pinned_host);
+    int64_t host_first = 0;
+    for (size_t j = 0; j < nd; j++) {
+        host_first += (int64_t) plan_device(j, comm_dev[j] + pt_fixed + margin_dev[j], nullptr).host_bytes;
+    }
+    int64_t pt_hc = page_table(host_first);
+    pt_hc += page_table((int64_t) nd * pt_hc);
+
+    for (size_t j = 0; j < nd; j++) {
+        const int64_t pt_j    = pt_fixed + pt_hc;
+        const int64_t reserve = comm_dev[j] + pt_j + margin_dev[j];
+        const ep_plan pl      = plan_device(j, reserve, &host_each[j]);
+
+        LOG_INF("%s: device %zu: free %.0f MiB, dense %.0f MiB, context %.0f MiB, compute %.0f MiB,"
+                " draft %.0f MiB, draft context %.0f MiB, draft compute %.0f MiB, sinks %.0f MiB,"
+                " comm %.0f MiB, page tables %.0f MiB, margin %.0f MiB -> surplus %.0f MiB\n",
+            __func__, j, (double) free_mem[j]/MiB, (double) dev_model[j]/MiB, (double) ctx_dev[j]/MiB,
+            (double) compute_total/MiB, (double) dev_draft[j]/MiB, (double) draft_ctx_dev[j]/MiB,
+            (double) draft_compute_total/MiB, (double) sinks_total/MiB, (double) comm_dev[j]/MiB,
+            (double) pt_j/MiB, (double) margin_dev[j]/MiB, (double) pl.surplus/MiB);
+
+        common_expert_set_budget(expert_bufts[j], pl.slot_budget, pl.stage_bytes);
+        common_expert_record_plan(expert_bufts[j], pl.slot_used, pl.host_bytes);
+
+        const double hit = pl.slot_used + pl.host_bytes > 0
+            ? 100.0 * (double) pl.slot_used / (double) (pl.slot_used + pl.host_bytes) : 0.0;
         LOG_INF("%s: device %zu: dense %.0f MiB, context %.0f MiB, compute %.0f MiB, expert slots %.0f MiB (budget %.0f MiB), staging %.0f MiB, host complement %.0f MiB, decode hit %.0f%% (uniform)\n",
             __func__, j,
-            (double) dev_model[j]/MiB, (double) context_j/MiB, (double) compute_j/MiB,
-            slot_used/1024.0/1024.0, slot_budget/1024.0/1024.0, stage_bytes/1024.0/1024.0,
-            host_bytes/1024.0/1024.0, hit);
-        slot_budgets[j] = slot_budget;
-        host_complement += (int64_t) host_bytes;
+            (double) dev_model[j]/MiB, (double) ctx_dev[j]/MiB, (double) compute_total/MiB,
+            pl.slot_used/1024.0/1024.0, pl.slot_budget/1024.0/1024.0, pl.stage_bytes/1024.0/1024.0,
+            pl.host_bytes/1024.0/1024.0, hit);
+        slot_budgets[j] = pl.slot_budget;
+        host_complement += (int64_t) pl.host_bytes;
         has_experts = true;
     }
+    LOG_INF("%s: runtime reserve per device: page tables %.0f MiB (%.0f MiB mapped weights, %.0f MiB pinned host buffers,"
+            " %.0f MiB host complement of all devices), margin %s\n",
+        __func__, (double) (pt_fixed + pt_hc)/MiB, (double) mapped_host/MiB, (double) pinned_host/MiB,
+        (double) host_complement/MiB, margins_set ? "from --fit-target" : "expert parallel default");
 
     if (has_experts) {
         size_t min_slot = SIZE_MAX;
@@ -1247,7 +1348,8 @@ static void common_fit_ep(
 static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
-        size_t * margins_s, uint32_t n_ctx_min, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        size_t * margins_s, const size_t * margins_raw, bool margins_set, uint32_t n_ctx_min,
+        const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
     const llama_model_params default_mparams = llama_model_default_params();
@@ -1375,7 +1477,7 @@ static void common_params_fit_impl(
         if (hp_nex == 0) {
             throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
         }
-        common_fit_ep(path_model, mparams, cparams, margins_s, log_level, extra);
+        common_fit_ep(path_model, mparams, cparams, margins_raw, margins_set, log_level, extra);
         return;
     }
 
@@ -2762,6 +2864,7 @@ enum common_params_fit_status common_fit_params(
         float * tensor_split,
         llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins,
+        bool margins_set,
         uint32_t n_ctx_min,
         const common_fit_extra_model * extra,
         ggml_log_level log_level) {
@@ -2771,9 +2874,18 @@ enum common_params_fit_status common_fit_params(
     // logged relative to this fit measurement
     common_fit_log_memory_stage(nullptr, nullptr);
 
+    // the margins of the layer split (and of the host entry after the devices): the user's, or the
+    // default on top of what other loads reserve. The expert parallel fit applies its own default
+    // to the raw margins (common_fit_ep budgets the runtime growth itself).
+    std::vector<size_t> margins_layer(llama_max_devices());
+    for (size_t i = 0; i < margins_layer.size(); i++) {
+        margins_layer[i] = margins[i] + (margins_set ? 0 : COMMON_FIT_TARGET_DEFAULT);
+    }
+
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
-        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins, n_ctx_min, extra, log_level);
+        common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_layer.data(),
+            margins, margins_set, n_ctx_min, extra, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());
