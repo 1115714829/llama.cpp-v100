@@ -187,8 +187,8 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 
 #define GGML_CUDA_MAX_STREAMS 8
 
-// tile counters per stream of the split-K q8 skinny kernels (see q8-skinny.cu): a weight takes
-// the split path only up to this many 32-column tiles
+// tile counters per stream of the split-K kernels (q8-skinny.cu, mmvf.cu): a weight takes a
+// split path only up to this many tiles or rows
 #define GGML_CUDA_MAX_SPLIT_TILES 64
 
 [[noreturn]]
@@ -1487,9 +1487,9 @@ struct ggml_backend_cuda_context {
     // see ggml_cuda_q8_skinny_prepass()
     int q8_skinny_idle_scans = 0;
 
-    // GGML_CUDA_MAX_STREAMS x GGML_CUDA_MAX_SPLIT_TILES tile counters of the split-K q8
-    // skinny kernels, zero between launches (the last CTA of a tile resets its counter);
-    // allocated with the context on Volta, the only architecture that runs those kernels
+    // GGML_CUDA_MAX_STREAMS x GGML_CUDA_MAX_SPLIT_TILES tile counters of the split-K kernels
+    // (q8 skinny, narrow mmvf), zero between launches (the last CTA of a tile or row resets its
+    // counter); allocated with the context on Volta, the only architecture that runs those kernels
     unsigned int * tile_counters = nullptr;
 
     // an outer capture records everything enqueued on the main stream, graphs are evaluated directly

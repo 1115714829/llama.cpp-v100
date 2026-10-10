@@ -12924,6 +12924,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, n_tokens, 640, {1, 1}, {1, 1}));
     }
 
+    // narrow F32/BF16 GEMV of the Qwen3.8-Flash-Next decode graph: few long rows (the
+    // hyper-connection inject [10240, 4], a GDN beta/alpha slice [2560, 8], the shared expert
+    // gate [2560, 1]) split each row over 8 CTAs; many rows at M > 1 (the router [2560, 512], the
+    // indexer projection, BF16) run 4 rows per block
+    for (int64_t n_tokens : {1, 2, 4, 7, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 4,   n_tokens, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 8,   n_tokens, 2560,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 1,   n_tokens, 2560,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 512, n_tokens, 2560,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 512, n_tokens, 2560,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 128, n_tokens, 2560,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  n_tokens, 2048,  {1, 1}, {1, 1}));
+    }
+
     // Q2_K/Q3_K/Q4_K/Q5_K/Q6_K skinny GEMM (repacked codes + raw super-block meta, sm_70):
     // M <= 16 runs the single-stage kernel, M = 17..64 the two-phase M=32 kernel (split-16
     // shapes), M > 64 expands the repacked weights to F16 and uses the regular dense path. The

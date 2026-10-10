@@ -10406,8 +10406,8 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         return nullptr;
     }
 
-    // the split-K q8 skinny kernels count CTAs per tile in these (see q8-skinny.cu); they are
-    // allocated here because a skinny kernel may first run inside a CUDA graph capture
+    // the split-K kernels (q8-skinny.cu, mmvf.cu) count CTAs per tile or row in these; they are
+    // allocated here because such a kernel may first run inside a CUDA graph capture
     if (ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_VOLTA) {
         const size_t bytes = sizeof(unsigned int) * GGML_CUDA_MAX_STREAMS * GGML_CUDA_MAX_SPLIT_TILES;
         ggml_cuda_set_device(device);

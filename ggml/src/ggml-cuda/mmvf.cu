@@ -660,6 +660,278 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, expert_offset, n_experts, stream);
 }
 
+// ---- narrow F32/BF16 GEMV: few rows with a long K, or many rows at M > 1 ----
+//
+// mul_mat_vec_f runs one block per output row. For a few long rows (the Qwen3.8-Flash-Next
+// decode graph has the hyper-connection inject [10240, 4], the GDN beta/alpha slices [2560, 8]
+// and the shared expert gate [2560, 1]) that is 1 to 8 SMs, each pulling its row and the whole
+// input through one SM at the per-SM load limit. For many rows at M > 1 (the router [2560, 512]
+// at M = 4) every block reads the whole input again, 20 MiB of L2 reads for 5 MiB of weights.
+// The two kernels below keep the arithmetic of mul_mat_vec_f with its 256-thread block (thread
+// t adds columns t, t + 256, ... with the same multiply-adds, then the same warp and block
+// reductions), so the results are bitwise the same:
+//  - mul_mat_vec_f_split runs each of the 8 warps of a row as its own CTA; a warp stores its
+//    warp-reduced sums, the last CTA of the row (one atomic counter per row) reduces the 8 sums
+//    with the same 32-lane butterfly (lanes 8..31 add zero, as the zeroed shared buffer does)
+//    and resets the counter, so the counters are zero between launches;
+//  - mul_mat_vec_f_rows runs Rows rows per 256-thread block and loads each input value once.
+// Only taken when mul_mat_vec_f would use a 256-thread block (K a multiple of 512).
+
+static constexpr int mmvf_narrow_block_size = 256;
+
+template <typename T, int ncols_dst>
+static __device__ __forceinline__ void mul_mat_vec_f_narrow_accumulate(
+        const T * __restrict__ x, const float2 * __restrict__ y2, const int ncols2, const int stride_col_y2,
+        const int tid, float (&sumf)[ncols_dst]) {
+    if constexpr (std::is_same_v<T, float>) {
+        const float2 * x2 = (const float2 *) x;
+#pragma unroll 4
+        for (int col2 = tid; col2 < ncols2; col2 += mmvf_narrow_block_size) {
+            const float2 tmpx = x2[col2];
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const float2 tmpy = y2[j*stride_col_y2 + col2];
+                ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
+                ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
+            }
+        }
+    } else {
+        static_assert(std::is_same_v<T, nv_bfloat16>, "unsupported type");
+        const nv_bfloat162 * x2 = (const nv_bfloat162 *) x;
+#pragma unroll 4
+        for (int col2 = tid; col2 < ncols2; col2 += mmvf_narrow_block_size) {
+            const nv_bfloat162 tmpx = x2[col2];
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const float2 tmpy = y2[j*stride_col_y2 + col2];
+                ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
+                ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
+            }
+        }
+    }
+}
+
+template <typename T, int ncols_dst>
+static __global__ void __launch_bounds__(WARP_SIZE) mul_mat_vec_f_split(
+        const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+        const int ncols2, const int64_t stride_row, const int stride_col_y2, const int stride_col_dst,
+        float * __restrict__ scratch, unsigned int * __restrict__ counters) {
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    constexpr int n_warps = mmvf_narrow_block_size / WARP_SIZE;
+    const int row  = blockIdx.x / n_warps;
+    const int warp = blockIdx.x % n_warps;
+    const int lane = threadIdx.x;
+    __shared__ bool last_cta;
+
+    float sumf[ncols_dst];
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        sumf[j] = 0.0f;
+    }
+    mul_mat_vec_f_narrow_accumulate<T, ncols_dst>(x + row*stride_row, (const float2 *) y, ncols2, stride_col_y2,
+                                                  warp*WARP_SIZE + lane, sumf);
+
+    // [row][warp][column]
+    float * warp_sums = scratch + ((int64_t) row*n_warps + warp)*ncols_dst;
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        sumf[j] = warp_reduce_sum<WARP_SIZE>(sumf[j]);
+        if (lane == 0) {
+            warp_sums[j] = sumf[j];
+        }
+    }
+    __threadfence();
+    __syncwarp();
+    if (lane == 0) {
+        last_cta = atomicAdd(counters + row, 1u) == (unsigned int) (n_warps - 1);
+    }
+    __syncwarp();
+    if (!last_cta) {
+        return;
+    }
+    __threadfence();
+
+    const float * row_sums = scratch + (int64_t) row*n_warps*ncols_dst;
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        float v = lane < n_warps ? __ldcg(row_sums + lane*ncols_dst + j) : 0.0f;
+        v = warp_reduce_sum<WARP_SIZE>(v);
+        if (lane == j) {
+            dst[j*stride_col_dst + row] = v;
+        }
+    }
+    if (lane == 0) {
+        counters[row] = 0;
+    }
+#else
+    NO_DEVICE_CODE;
+    GGML_UNUSED_VARS(x, y, dst, ncols2, stride_row, stride_col_y2, stride_col_dst, scratch, counters);
+#endif
+}
+
+template <typename T, int ncols_dst, int rows>
+static __global__ void __launch_bounds__(mmvf_narrow_block_size) mul_mat_vec_f_rows(
+        const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+        const int ncols2, const int64_t stride_row, const int stride_col_y2, const int stride_col_dst) {
+    constexpr int n_warps = mmvf_narrow_block_size / WARP_SIZE;
+    const int row0 = blockIdx.x * rows;
+    const int tid  = threadIdx.x;
+    __shared__ float buf_iw[rows][WARP_SIZE];
+
+    if (tid < WARP_SIZE) {
+#pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            buf_iw[r][tid] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    float sumf[rows][ncols_dst];
+#pragma unroll
+    for (int r = 0; r < rows; ++r) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            sumf[r][j] = 0.0f;
+        }
+    }
+
+    const float2 * y2 = (const float2 *) y;
+    if constexpr (std::is_same_v<T, float>) {
+#pragma unroll 2
+        for (int col2 = tid; col2 < ncols2; col2 += mmvf_narrow_block_size) {
+            float2 tmpy[ncols_dst];
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                tmpy[j] = y2[j*stride_col_y2 + col2];
+            }
+#pragma unroll
+            for (int r = 0; r < rows; ++r) {
+                const float2 tmpx = ((const float2 *) (x + (row0 + r)*stride_row))[col2];
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    ggml_cuda_mad(sumf[r][j], tmpx.x, tmpy[j].x);
+                    ggml_cuda_mad(sumf[r][j], tmpx.y, tmpy[j].y);
+                }
+            }
+        }
+    } else {
+        static_assert(std::is_same_v<T, nv_bfloat16>, "unsupported type");
+#pragma unroll 2
+        for (int col2 = tid; col2 < ncols2; col2 += mmvf_narrow_block_size) {
+            float2 tmpy[ncols_dst];
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                tmpy[j] = y2[j*stride_col_y2 + col2];
+            }
+#pragma unroll
+            for (int r = 0; r < rows; ++r) {
+                const nv_bfloat162 tmpx = ((const nv_bfloat162 *) (x + (row0 + r)*stride_row))[col2];
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    ggml_cuda_mad(sumf[r][j], tmpx.x, tmpy[j].x);
+                    ggml_cuda_mad(sumf[r][j], tmpx.y, tmpy[j].y);
+                }
+            }
+        }
+    }
+
+    // the reductions of mul_mat_vec_f, per row
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+        for (int r = 0; r < rows; ++r) {
+            sumf[r][j] = warp_reduce_sum<WARP_SIZE>(sumf[r][j]);
+            buf_iw[r][tid/WARP_SIZE] = sumf[r][j];
+        }
+        __syncthreads();
+        if (tid < WARP_SIZE) {
+#pragma unroll
+            for (int r = 0; r < rows; ++r) {
+                sumf[r][j] = warp_reduce_sum<WARP_SIZE>(buf_iw[r][tid]);
+            }
+        }
+        __syncthreads();
+    }
+    GGML_UNUSED(n_warps);
+
+    if (tid < ncols_dst) {
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            if (tid == j) {
+#pragma unroll
+                for (int r = 0; r < rows; ++r) {
+                    dst[j*stride_col_dst + row0 + r] = sumf[r][j];
+                }
+            }
+        }
+    }
+}
+
+template <typename T, int ncols_dst>
+static void mul_mat_vec_f_narrow_launch(ggml_backend_cuda_context & ctx, const T * x, const float * y, float * dst,
+                                        int64_t ncols, int64_t nrows, int64_t stride_row, int64_t stride_col_y,
+                                        int64_t stride_col_dst) {
+    const int ncols2 = (int) (ncols / 2);
+    if (nrows <= 16) {
+        constexpr int n_warps = mmvf_narrow_block_size / WARP_SIZE;
+        GGML_ASSERT(ctx.tile_counters != nullptr && nrows <= GGML_CUDA_MAX_SPLIT_TILES);
+        ggml_cuda_pool_alloc<float> scratch(ctx.pool(), nrows * n_warps * ncols_dst);
+        mul_mat_vec_f_split<T, ncols_dst><<<nrows * n_warps, WARP_SIZE, 0, ctx.stream()>>>(
+            x, y, dst, ncols2, stride_row, (int) (stride_col_y / 2), (int) stride_col_dst, scratch.get(),
+            ctx.tile_counters + ctx.curr_stream_no * GGML_CUDA_MAX_SPLIT_TILES);
+    } else {
+        constexpr int rows = 4;
+        mul_mat_vec_f_rows<T, ncols_dst, rows><<<nrows / rows, mmvf_narrow_block_size, 0, ctx.stream()>>>(
+            x, y, dst, ncols2, stride_row, (int) (stride_col_y / 2), (int) stride_col_dst);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// Returns false if the shape is not one of the two narrow cases; the caller runs mul_mat_vec_f.
+static bool ggml_cuda_mul_mat_vec_f_narrow(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                           const ggml_tensor * src1, ggml_tensor * dst) {
+    const int64_t ncols     = src0->ne[0];
+    const int64_t nrows     = src0->ne[1];
+    const int64_t ncols_dst = src1->ne[1];
+    if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_BF16) ||
+            ggml_cuda_info().devices[ctx.device].cc != GGML_CUDA_CC_VOLTA ||
+            !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            ncols % (2*mmvf_narrow_block_size) != 0 || ncols_dst < 1 || ncols_dst > MMVF_MAX_BATCH_SIZE) {
+        return false;
+    }
+    const bool few_rows  = nrows <= 16 && ncols / (2*mmvf_narrow_block_size) >= 4;
+    const bool many_rows = nrows > 16 && ncols_dst >= 2 && nrows % 4 == 0;
+    if (!few_rows && !many_rows) {
+        return false;
+    }
+
+    const int64_t stride_row     = src0->nb[1] / ggml_type_size(src0->type);
+    const int64_t stride_col_y   = src1->nb[1] / sizeof(float);
+    const int64_t stride_col_dst = dst->nb[1] / sizeof(float);
+    const float * y = (const float *) src1->data;
+    float * d = (float *) dst->data;
+
+#define MMVF_NARROW_CASE(N)                                                                                  \
+        case N:                                                                                              \
+            if (src0->type == GGML_TYPE_F32) {                                                               \
+                mul_mat_vec_f_narrow_launch<float, N>(ctx, (const float *) src0->data, y, d, ncols, nrows,   \
+                                                      stride_row, stride_col_y, stride_col_dst);             \
+            } else {                                                                                         \
+                mul_mat_vec_f_narrow_launch<nv_bfloat16, N>(ctx, (const nv_bfloat16 *) src0->data, y, d,     \
+                                                            ncols, nrows, stride_row, stride_col_y,          \
+                                                            stride_col_dst);                                 \
+            }                                                                                                \
+            break
+    switch (ncols_dst) {
+        MMVF_NARROW_CASE(1); MMVF_NARROW_CASE(2); MMVF_NARROW_CASE(3); MMVF_NARROW_CASE(4);
+        MMVF_NARROW_CASE(5); MMVF_NARROW_CASE(6); MMVF_NARROW_CASE(7); MMVF_NARROW_CASE(8);
+        default: GGML_ABORT("fatal error");
+    }
+#undef MMVF_NARROW_CASE
+    return true;
+}
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -679,6 +951,10 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     GGML_ASSERT(        nb10       == ts_src1);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
     GGML_ASSERT(        nb0        == ts_dst);
+
+    if (ids == nullptr && fusion == nullptr && ggml_cuda_mul_mat_vec_f_narrow(ctx, src0, src1, dst)) {
+        return;
+    }
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst->op_params[0]) : GGML_PREC_F32;
