@@ -4,6 +4,7 @@
 
 #include "ggml-expert-store.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -224,6 +225,101 @@ int main() {
     check_eq(ggml_expert_store_owner(99, 0),      -1, "owner of an unknown layer");
     check_eq(ggml_expert_store_owner(0, 999),     -1, "owner of an unknown expert");
     check(ggml_expert_store_local_of(n_dev, 0) == nullptr, "local_of of an unknown device");
+
+    // ---- the active table: the contiguous split until the loader activates the proposal, the
+    // proposal after that, the contiguous split again after a reset. The expert maps of the nodes
+    // (ggml_expert_store_node_lut) follow it.
+    plan_of(n_dev, "test-expert-assign-profile.txt", 0); // proposal: the profile LPT, 4 layers x 32 experts
+    {
+        check(!ggml_expert_store_active_is_permuted(), "contiguous until activated");
+        const uint64_t v0 = ggml_expert_store_assignment_version();
+        check(v0 > 0, "the active table has a version");
+        int a_dev = 0;
+        int a_layer = 0;
+        int a_expert = 0;
+        check(ggml_expert_store_active_dims(&a_dev, &a_layer, &a_expert), "active dims");
+        check_eq(a_dev, n_dev, "active n_dev");
+        check_eq(a_layer, n_layer, "active n_layer");
+        check_eq(a_expert, n_expert, "active n_expert");
+
+        // contiguous rows: device j holds [j*cap, (j+1)*cap)
+        for (int j = 0; j < n_dev; ++j) {
+            for (int l = 0; l < n_layer; ++l) {
+                const int16_t * row = ggml_expert_store_active_local_of(j, l);
+                check(row != nullptr, "active row");
+                for (int e = 0; e < n_expert && row != nullptr; ++e) {
+                    const bool local = e >= j * cap && e < (j + 1) * cap;
+                    check_eq(row[e], local ? e - j * cap : -1, "active contiguous local number");
+                    check_eq(ggml_expert_store_active_owner(l, e) == j ? 1 : 0, local ? 1 : 0, "active contiguous owner");
+                }
+                for (int kk = 0; kk < cap; ++kk) {
+                    check_eq(ggml_expert_store_active_global_of(j, l, kk), j * cap + kk, "active contiguous global_of");
+                }
+            }
+        }
+
+        // the map of a node while contiguous: its segment, the same row on every call; the map
+        // of a node without expert parallelism is the identity
+        const int16_t * seg = ggml_expert_store_node_lut(true, 1, 0, cap, cap, n_expert);
+        check(seg != nullptr, "segment row");
+        for (int e = 0; e < n_expert && seg != nullptr; ++e) {
+            check_eq(seg[e], e >= cap && e < 2 * cap ? e - cap : -1, "segment row entry");
+        }
+        check(ggml_expert_store_node_lut(true, 1, 0, cap, cap, n_expert) == seg, "the segment row is kept");
+        const int16_t * idn = ggml_expert_store_node_lut(false, 0, 0, 0, n_expert, n_expert);
+        check(idn != nullptr, "identity row");
+        for (int e = 0; e < n_expert && idn != nullptr; ++e) {
+            check_eq(idn[e], e, "identity row entry");
+        }
+
+        // activate: the active rows are the proposal, the maps of the expert parallel nodes are them
+        ggml_expert_store_activate_assignment();
+        check(ggml_expert_store_active_is_permuted(), "permuted after activation");
+        check(ggml_expert_store_assignment_version() > v0, "activation bumps the version");
+        bool differs = false;
+        for (int j = 0; j < n_dev; ++j) {
+            for (int l = 0; l < n_layer; ++l) {
+                const int16_t * act = ggml_expert_store_active_local_of(j, l);
+                const int16_t * pro = ggml_expert_store_local_of(j, l);
+                check(act != nullptr && pro != nullptr, "active and proposal rows");
+                for (int e = 0; e < n_expert && act != nullptr && pro != nullptr; ++e) {
+                    check_eq(act[e], pro[e], "active row == proposal row");
+                    check_eq(ggml_expert_store_active_owner(l, e), ggml_expert_store_owner(l, e), "active owner == proposal owner");
+                    differs = differs || act[e] != (e >= j * cap && e < (j + 1) * cap ? e - j * cap : -1);
+                }
+                for (int kk = 0; kk < cap; ++kk) {
+                    check_eq(ggml_expert_store_active_global_of(j, l, kk), ggml_expert_store_global_of(j, l, kk), "active global_of == proposal");
+                }
+                check(ggml_expert_store_node_lut(true, j, l, j * cap, cap, n_expert) == act, "node map is the active row");
+            }
+        }
+        check(differs, "the profile permutes the experts");
+        // a node without expert parallelism keeps the identity whatever the active table
+        check(ggml_expert_store_node_lut(false, 0, 0, 0, n_expert, n_expert) == idn, "identity row unchanged");
+
+        // a plan without a profile (another device allocating) leaves the active table alone
+        {
+            ggml_expert_store_plan_tensor t = device_tensor(0);
+            ggml_expert_store_placement plan;
+            ggml_expert_store_plan(&t, 1, n_dev, -1, nullptr, &plan);
+        }
+        check(ggml_expert_store_active_is_permuted(), "a later plan keeps the activated table");
+        check(ggml_expert_store_active_dims(&a_dev, &a_layer, &a_expert) && a_layer == n_layer, "a later plan keeps the dims");
+
+        // reset: back to the contiguous split, the segment rows again
+        const uint64_t v1 = ggml_expert_store_assignment_version();
+        ggml_expert_store_reset_assignment();
+        check(!ggml_expert_store_active_is_permuted(), "contiguous after reset");
+        check(ggml_expert_store_assignment_version() > v1, "reset bumps the version");
+        for (int j = 0; j < n_dev; ++j) {
+            const int16_t * row = ggml_expert_store_active_local_of(j, 0);
+            for (int e = 0; e < n_expert && row != nullptr; ++e) {
+                const bool local = e >= j * cap && e < (j + 1) * cap;
+                check_eq(row[e], local ? e - j * cap : -1, "contiguous again after reset");
+            }
+        }
+        check(ggml_expert_store_node_lut(true, 1, 0, cap, cap, n_expert) == seg, "the segment row again after reset");
+    }
 
     if (g_fail == 0) {
         printf("expert assignment tests passed\n");

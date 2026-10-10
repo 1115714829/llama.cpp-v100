@@ -22,6 +22,7 @@
 // in-place / copy-to-VRAM choices of docs/design/r200-x86-worklist.md 4.1 can reuse it.
 
 #include "ggml.h"
+#include "ggml-impl.h" // ggml_expert_store_node_lut, ggml_expert_store_assignment_version (C linkage)
 
 #include <cstddef>
 #include <cstdint>
@@ -330,6 +331,28 @@ GGML_API int ggml_expert_store_global_of(int dev, int layer, int local);
 
 // state of the cached assignment, for logging and tests
 GGML_API bool ggml_expert_store_assignment_info_get(ggml_expert_store_assignment_info * info);
+
+// The assignment the loaded expert data follows (the "active" table), as opposed to the proposal
+// above. It starts as the contiguous split of the proposal's dimensions - device j holds its
+// segment of the expert numbering, which is how the meta backend slices the weights - whether or
+// not a profile is set. Only the loader changes it: once it has written the experts of every
+// device in the order of the proposal (local k of device j holds global_of(j, layer, k)) it calls
+// ggml_expert_store_activate_assignment(), and from then on the expert maps of the MUL_MAT_ID
+// nodes (ggml_expert_store_node_lut, ggml-impl.h) are the rows of this table. Every change bumps
+// ggml_expert_store_assignment_version(), which the device copies of the maps are keyed by.
+GGML_API void ggml_expert_store_activate_assignment(void);
+
+// back to the contiguous split of the current dimensions (a test that activated a permuted table
+// restores the state for the cases after it)
+GGML_API void ggml_expert_store_reset_assignment(void);
+
+// the same three lookups as ggml_expert_store_owner / _local_of / _global_of on the active table
+GGML_API int ggml_expert_store_active_owner(int layer, int expert);
+GGML_API const int16_t * ggml_expert_store_active_local_of(int dev, int layer);
+GGML_API int ggml_expert_store_active_global_of(int dev, int layer, int local);
+
+// dimensions of the active table; false when no assignment was computed yet
+GGML_API bool ggml_expert_store_active_dims(int * n_dev, int * n_layer, int * n_expert);
 
 // register one expert tensor at the placement computed by ggml_expert_store_plan:
 // slot_experts[0..n_slot) are the experts that get slots 0..n_slot-1, the others are packed
