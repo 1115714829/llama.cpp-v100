@@ -1550,7 +1550,7 @@ static void mul_mat_vec_q_switch_type(
 
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_cuda_mm_fusion_args_host * fusion) {
+        const ggml_cuda_mm_fusion_args_host * fusion, const char * const * expert_ptrs) {
     // MUL_MAT_ID epilogue: the weight rows are interleaved (2r gate, 2r+1 up) and the dst is the F16
     // H of silu(gate) * up. The MoE kernel fuses the pair and writes it, the dst strides below are
     // in elements of the output type, so the F16 H needs no separate path. Only MUL_MAT_ID has an
@@ -1663,7 +1663,9 @@ void ggml_cuda_mul_mat_vec_q(
             vx_weights  = ex_table.plain_base;
             s02_weights = (int64_t) ex_table.plain_pitch / ts_src0;
         } else {
-            fusion_local.expert_ptrs = ex_table.main;
+            // expert_ptrs is the staging table of the launch when the decode batch routed to
+            // host experts, the main table otherwise (null)
+            fusion_local.expert_ptrs = expert_ptrs != nullptr ? expert_ptrs : ex_table.main;
         }
     }
     if (ids != nullptr && fusion != nullptr && fusion->gate != nullptr && ggml_cuda_expert_is_store(fusion->gate)) {

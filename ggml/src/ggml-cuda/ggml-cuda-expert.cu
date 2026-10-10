@@ -356,22 +356,51 @@ static __global__ void expert_stage_plan_kernel(
     }
 }
 
+// bytes one block of the staging copy moves. The copy reads the host arena through UVA, so it
+// is latency bound and the bandwidth comes from the number of concurrent requests: one block
+// per expert moved 8 bytes per thread, which is what made a copy as slow as reading the same
+// expert in place. The chunk is a multiple of 16, so the 16-byte vector addresses stay aligned.
+#define EXPERT_STAGE_COPY_CHUNK 65536
+
+// Moves n bytes of one expert blob, four 16-byte vectors per thread per round so the block
+// keeps 64 bytes per thread in flight. src and dst are both 16-byte aligned (the arena offsets
+// and the slot pitch are 256-byte aligned, the chunk is a multiple of 16).
+static __device__ __forceinline__ void expert_stage_copy_bytes(
+        const char * __restrict__ src, char * __restrict__ dst, const size_t n) {
+    const uint4 * src16 = (const uint4 *) src;
+    uint4 * dst16 = (uint4 *) dst;
+
+    const size_t n16      = n / 16;
+    const size_t n16_full = (n16 / (4 * blockDim.x)) * (4 * blockDim.x);
+    for (size_t i = threadIdx.x; i < n16_full; i += 4 * blockDim.x) {
+        const uint4 v0 = src16[i];
+        const uint4 v1 = src16[i + blockDim.x];
+        const uint4 v2 = src16[i + 2 * blockDim.x];
+        const uint4 v3 = src16[i + 3 * blockDim.x];
+        dst16[i]                  = v0;
+        dst16[i + blockDim.x]     = v1;
+        dst16[i + 2 * blockDim.x] = v2;
+        dst16[i + 3 * blockDim.x] = v3;
+    }
+    for (size_t i = n16_full + threadIdx.x; i < n16; i += blockDim.x) {
+        dst16[i] = src16[i];
+    }
+    for (size_t i = n16 * 16 + threadIdx.x; i < n; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
 // Copies the routed host experts from the mapped host arena into their staging slots and
-// clears the row padding after each copy. One block per hit entry, grid covers n_local
-// (blocks beyond n_hit return at once).
-//
-// The block checks that the entry it copies is the one the plan put into the pointer table at
-// the slot address it writes: a mismatch means the copy and the table disagree, so the kernel
-// would leave the bytes of one expert where the mul_mat_id kernel reads another one. That can
-// only come from the plan and the copy being computed from different states, which the counter
-// reports instead of producing a wrong result.
+// clears the row padding after each copy. grid = (chunks of one expert, hit entries): every
+// block moves EXPERT_STAGE_COPY_CHUNK bytes of one expert, so a 3.0 MiB expert is 48 blocks
+// instead of one. Blocks of a hit slot that the plan did not fill return at once.
 static __global__ void expert_stage_copy_kernel(
         const int32_t * __restrict__ hit_list, const int * __restrict__ n_hit,
         const char * __restrict__ host_dev, const int64_t * __restrict__ host_offset,
         char * __restrict__ stage_dev, const size_t blob_stride, const size_t blob_bytes,
         const int expert_lo, const int expert_hi, const char * const * __restrict__ table_stage,
         int * __restrict__ fault) {
-    const int slot = blockIdx.x;
+    const int slot = blockIdx.y;
     if (slot >= *n_hit) {
         return;
     }
@@ -380,24 +409,143 @@ static __global__ void expert_stage_copy_kernel(
         atomicExch(fault, 2);
         return;
     }
-    // the arena offsets and the slot pitch are 256-byte aligned
-    const uint64_t * src64 = (const uint64_t *) (host_dev + host_offset[expert]);
-    uint64_t * dst64 = (uint64_t *) (stage_dev + (size_t) slot * blob_stride);
+    char * dst = stage_dev + (size_t) slot * blob_stride;
 
-    const size_t n64 = blob_bytes / 8;
-    for (size_t i = threadIdx.x; i < n64; i += blockDim.x) {
-        dst64[i] = src64[i];
-    }
-    const char * src = (const char *) src64;
-    char * dst = (char *) dst64;
-    for (size_t i = n64 * 8 + threadIdx.x; i < blob_bytes; i += blockDim.x) {
-        dst[i] = src[i];
+    const size_t begin = (size_t) blockIdx.x * EXPERT_STAGE_COPY_CHUNK;
+    if (begin < blob_bytes) {
+        const size_t left = blob_bytes - begin;
+        expert_stage_copy_bytes(host_dev + host_offset[expert] + begin, dst + begin,
+            left < EXPERT_STAGE_COPY_CHUNK ? left : EXPERT_STAGE_COPY_CHUNK);
     }
     // The staging area is shared by tensors with different strides, so the bytes past the
     // data can still hold the weights of an earlier launch. Clear them: the MMQ loaders
-    // read that far and must see zeros, not a previous tensor's bytes.
-    for (size_t i = blob_bytes + threadIdx.x; i < blob_stride; i += blockDim.x) {
-        dst[i] = 0;
+    // read that far and must see zeros, not a previous tensor's bytes. Only the last chunk
+    // of an expert reaches them.
+    if (blockIdx.x == gridDim.x - 1) {
+        for (size_t i = blob_bytes + threadIdx.x; i < blob_stride; i += blockDim.x) {
+            dst[i] = 0;
+        }
+    }
+}
+
+// Staging for a decode batch (the MMVQ mmid path, at most MMVQ_MMID_MAX_BATCH_SIZE tokens):
+// the routed host experts are copied into VRAM slots and the staging pointer table is
+// rewritten, all in one kernel. grid = (chunks of one expert, local experts): block (c, y)
+// owns expert e = blockIdx.y and the slice [c * CHUNK, ...) of its blob. A decode batch has a
+// few hundred ids at most, so one block reads them from shared memory and derives everything
+// from them: whether e is routed, which slot it gets, and whether it is copied. That is why
+// there is no bitmap, no memset and no atomic on the slot numbers here, and why the host side
+// of a decode launch is a single launch with nothing to wait for.
+//
+// The slot number is the number of routed host experts with a smaller expert number, so every
+// expert computes the same number without talking to the other blocks. The staging table is a
+// reused buffer: every entry is written on every launch and the entries outside the view of
+// this launch take the main table (same contract as expert_stage_plan_kernel).
+static __global__ void expert_stage_decode_kernel(
+        const int32_t * __restrict__ ids, const int n_entries, const int n_expert_used, const int64_t ids_stride,
+        const int expert_offset, const int expert_base,
+        const int expert_lo, const int expert_hi,
+        const int32_t * __restrict__ residency, const char * __restrict__ host_dev,
+        const int64_t * __restrict__ host_offset,
+        const char * const * __restrict__ table_main, const char ** __restrict__ table_stage,
+        char * __restrict__ stage_dev, const size_t blob_stride, const size_t blob_bytes, const size_t stage_bytes,
+        const int seq, int * __restrict__ fault, unsigned long long * __restrict__ counters) {
+    const int e = (int) blockIdx.y;
+
+    if (e < expert_lo || e >= expert_hi) {
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            table_stage[e] = table_main[e];
+        }
+        return;
+    }
+
+    extern __shared__ int32_t s_ids[];
+    for (int i = threadIdx.x; i < n_entries; i += blockDim.x) {
+        const int token = i / n_expert_used;
+        s_ids[i] = ids[(int64_t) token * ids_stride + (i - token * n_expert_used)];
+    }
+    __syncthreads();
+
+    // is expert e routed by this batch?
+    int found = 0;
+    for (int i = threadIdx.x; i < n_entries; i += blockDim.x) {
+        found |= s_ids[i] + expert_base - expert_offset == e;
+    }
+    unsigned int any = (unsigned int) found;
+    for (int off = 16; off > 0; off >>= 1) {
+        any |= __shfl_down_sync(0xffffffffu, any, off);
+    }
+    __shared__ int s_any;
+    if (threadIdx.x == 0) {
+        s_any = 0;
+    }
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0 && any) {
+        atomicOr(&s_any, 1);
+    }
+    __syncthreads();
+
+    const bool hit = s_any && residency[e] < 0;
+    if (!hit) {
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            table_stage[e] = table_main[e];
+        }
+        return;
+    }
+
+    // slot: how many routed host experts have a smaller expert number than e. Only a hit
+    // block needs it, so the second pass over the ids runs for the few experts of the batch
+    // that are actually in the host arena.
+    int cnt = 0;
+    for (int f = expert_lo + (int) threadIdx.x; f < e; f += blockDim.x) {
+        int f_found = 0;
+        for (int i = 0; i < n_entries; ++i) {
+            f_found |= s_ids[i] + expert_base - expert_offset == f;
+        }
+        cnt += f_found && residency[f] < 0;
+    }
+    unsigned int sum = (unsigned int) cnt;
+    for (int off = 16; off > 0; off >>= 1) {
+        sum += __shfl_down_sync(0xffffffffu, sum, off);
+    }
+    __shared__ int s_slot;
+    if (threadIdx.x == 0) {
+        s_slot = 0;
+    }
+    __syncthreads();
+    if ((threadIdx.x & 31) == 0 && sum) {
+        atomicAdd(&s_slot, (int) sum);
+    }
+    __syncthreads();
+    const size_t slot = (size_t) s_slot;
+
+    // The host side sizes the area for the host complement of this tensor (its stride
+    // included), so a routed host expert always has a slot. A launch number in the fault
+    // counter reports the case where it does not; the entry stays at the main table, which is
+    // where the bytes of this expert are, and the host turns the counter into an abort.
+    if ((slot + 1) * blob_stride > stage_bytes) {
+        atomicMax(fault, seq);
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            table_stage[e] = table_main[e];
+        }
+        return;
+    }
+
+    char * dst = stage_dev + slot * blob_stride;
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        table_stage[e] = dst;
+        atomicAdd(&counters[3], (unsigned long long) blob_bytes);
+    }
+    const size_t begin = (size_t) blockIdx.x * EXPERT_STAGE_COPY_CHUNK;
+    if (begin < blob_bytes) {
+        const size_t left = blob_bytes - begin;
+        expert_stage_copy_bytes(host_dev + host_offset[e] + begin, dst + begin,
+            left < EXPERT_STAGE_COPY_CHUNK ? left : EXPERT_STAGE_COPY_CHUNK);
+    }
+    if (blockIdx.x == gridDim.x - 1) {
+        for (size_t i = blob_bytes + threadIdx.x; i < blob_stride; i += blockDim.x) {
+            dst[i] = 0;
+        }
     }
 }
 
@@ -430,13 +578,16 @@ struct ggml_cuda_expert_stream_state {
     // per tensor: device pointer table through the staging area, and the copy plan buffers
     std::vector<const char **> tables;
     int32_t *              hit_list   = nullptr;
-    // [n_hit, slot_counter, fault_plan, fault_copy]. The two counters are cleared before every
-    // launch, the two faults are not: a fault of one launch is reported by the next launch whose
-    // readback has landed, so an asynchronous check cannot miss it.
+    // [n_hit, slot_counter, fault_plan, fault_copy, fault_decode]. The two counters are cleared
+    // before every prefill launch, the faults are not: a fault of one launch is reported by the
+    // next launch whose readback has landed, so an asynchronous check cannot miss it. The decode
+    // staging writes the launch number of the launch that did not fit, which makes the counter
+    // monotonic and frees it from a clear before every launch.
     int *                  plan_state  = nullptr;
     int *                  plan_pinned = nullptr; // async readback of the last plan, logs and fault check
     cudaEvent_t            plan_event  = nullptr; // marks the readback into plan_pinned
     size_t                 hit_cap    = 0;        // == largest n_local of the tensors
+    int                    stage_seq  = 0;        // launch counter of the decode staging, for its fault
 };
 
 struct ggml_backend_cuda_expert_buffer_context {
@@ -744,10 +895,10 @@ ggml_cuda_expert_stream_state & ggml_backend_cuda_expert_buffer_context::get_str
     }
     if (ss.hit_cap > 0) {
         CUDA_CHECK(cudaMalloc((void **) &ss.hit_list, ss.hit_cap * sizeof(int32_t)));
-        CUDA_CHECK(cudaMalloc((void **) &ss.plan_state, 4 * sizeof(int)));
-        CUDA_CHECK(cudaMemset(ss.plan_state, 0, 4 * sizeof(int)));
-        CUDA_CHECK(cudaHostAlloc((void **) &ss.plan_pinned, 4 * sizeof(int), cudaHostAllocDefault));
-        memset(ss.plan_pinned, 0, 4 * sizeof(int));
+        CUDA_CHECK(cudaMalloc((void **) &ss.plan_state, 5 * sizeof(int)));
+        CUDA_CHECK(cudaMemset(ss.plan_state, 0, 5 * sizeof(int)));
+        CUDA_CHECK(cudaHostAlloc((void **) &ss.plan_pinned, 5 * sizeof(int), cudaHostAllocDefault));
+        memset(ss.plan_pinned, 0, 5 * sizeof(int));
         CUDA_CHECK(cudaEventCreateWithFlags(&ss.plan_event, cudaEventDisableTiming));
     }
     ss.tables.assign(tensors.size(), nullptr);
@@ -1016,41 +1167,106 @@ const char * const * ggml_cuda_expert_stage_prepare(
         ss.hit_list, ss.hit_cap, ss.plan_state, ss.plan_state + 1, ss.plan_state + 2, ctx->usage_dev);
     CUDA_CHECK(cudaGetLastError());
 
-    expert_stage_copy_kernel<<<expert_hi - expert_lo, nthreads, 0, stream>>>(
+    const int copy_chunks = (int) ((s.blob_bytes + EXPERT_STAGE_COPY_CHUNK - 1) / EXPERT_STAGE_COPY_CHUNK);
+    expert_stage_copy_kernel<<<dim3(copy_chunks, expert_hi - expert_lo), nthreads, 0, stream>>>(
         ss.hit_list, ss.plan_state, st->host_dev, s.host_offset_dev,
         block_dev, s.blob_stride, s.blob_bytes,
         expert_lo, expert_hi, table_stage, ss.plan_state + 3);
     CUDA_CHECK(cudaGetLastError());
 
     // read the bitmap and the copy plan back without waiting: the log shows how many experts
-    // the last batches staged, and a launch whose plan and copy disagree is reported here
+    // the last batches staged, and a launch whose plan and copy disagree is reported here.
+    // The decode staging fault rides in the same readback: a decode launch records nothing
+    // itself, so the next prefill launch is the one that reports it.
     CUDA_CHECK(cudaMemcpyAsync(s.bitmap_pinned, s.bitmap_dev, (size_t) n_words * sizeof(uint32_t),
         cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaMemcpyAsync(ss.plan_pinned, ss.plan_state, 4 * sizeof(int),
+    CUDA_CHECK(cudaMemcpyAsync(ss.plan_pinned, ss.plan_state, 5 * sizeof(int),
         cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaEventRecord(ss.plan_event, stream));
 
-    // the two fault counters are sticky, so a launch that could not be checked here (its
-    // readback has not landed) is still reported by the next launch that can. Neither can fire
-    // on a correct staging: the area holds every routed host expert by the budget invariant
-    // above, and the copy reads the plan of the same launch on the same stream.
+    // the fault counters are sticky, so a launch that could not be checked here (its
+    // readback has not landed) is still reported by the next launch that can. None of them can
+    // fire on a correct staging: the area holds every routed host expert by the budget
+    // invariant above, and the copy reads the plan of the same launch on the same stream.
     if (cudaEventQuery(ss.plan_event) == cudaSuccess) {
         const int fault_plan  = ss.plan_pinned[2];
         const int fault_copy  = ss.plan_pinned[3];
-        if (fault_plan != 0 || fault_copy != 0) {
+        const int fault_decode = ss.plan_pinned[4];
+        if (fault_plan != 0 || fault_copy != 0 || fault_decode != 0) {
             const size_t slot_cap = ss.stage_bytes / s.blob_stride;
-            GGML_ABORT("%s: tensor '%s' on stream %p: staging plan does not fit (fault %d/%d): "
+            GGML_ABORT("%s: tensor '%s' on stream %p: staging plan does not fit (fault %d/%d/%d): "
                 "staging area %.2f MiB holds %zu experts of %.2f MiB, the host complement of the tensor "
                 "is %" PRId64 " experts; fault 1 is the plan (too many routed host experts), "
-                "fault 2 is the copy (hit list and pointer table disagree)\n",
+                "fault 2 is the copy (hit list and pointer table disagree), fault 3 is the decode "
+                "staging (launch number %d did not fit)\n",
                 __func__, s.tensor != nullptr ? s.tensor->name : "?", (void *) stream,
-                fault_plan, fault_copy,
+                fault_plan, fault_copy, fault_decode,
                 (double) ss.stage_bytes / 1024.0 / 1024.0, slot_cap,
-                (double) s.blob_stride / 1024.0 / 1024.0, st->n_host);
+                (double) s.blob_stride / 1024.0 / 1024.0, st->n_host, fault_decode);
         }
     } else {
         (void) cudaGetLastError();
     }
+
+    return table_stage + ex_table.expert_start;
+}
+
+// Staging for one decode launch: the experts this batch routes to that live in the host arena
+// are copied into VRAM slots by one fused kernel, and the staging pointer table is rewritten
+// for the MMVQ mmid kernel that follows. Nothing is read back and nothing is waited for, so a
+// decode launch can be recorded into a CUDA graph; the kernel recomputes the routing of the ids
+// it is given when the graph is replayed.
+const char * const * ggml_cuda_expert_stage_prepare_decode(
+        const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream) {
+    ggml_backend_cuda_expert_buffer_context * ctx = ggml_cuda_expert_buffer_ctx(src0);
+
+    ggml_cuda_expert_table ex_table;
+    GGML_ASSERT(ggml_cuda_expert_table_get(src0, &ex_table));
+    ggml_cuda_expert_tensor_state & s = ctx->tensors[(size_t) ex_table.tensor_id];
+    const ggml_expert_store_tensor * st = ggml_expert_store_tensor_at(ctx->store, ex_table.tensor_id);
+
+    // without a host tier there is nothing to stage: the main table is complete (every
+    // entry is a VRAM slot) and is used as-is.
+    if (!s.has_host) {
+        return s.table_main_dev + ex_table.expert_start;
+    }
+
+    // Configuration invariants, not a fallback path: the area holds the host complement of
+    // this tensor with the stride of a slot, and a decode batch routes to at most one expert
+    // per id entry, so every routed host expert has a slot.
+    GGML_ASSERT(ids != nullptr && ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ex_table.has_stage);
+    GGML_ASSERT(ctx->stage_budget > 0 && ctx->stage_budget >= (size_t) st->host_used);
+
+    ggml_cuda_expert_stream_state & ss = ctx->get_stream(stream);
+    GGML_ASSERT(ss.stage_dev != nullptr && ss.stage_bytes >= s.blob_stride);
+
+    const int n_entries = (int) ggml_nelements(ids);
+    const int n_expert_used = (int) ids->ne[0];
+    GGML_ASSERT(n_entries > 0 && n_entries <= (int) (32 * 1024 / sizeof(int32_t)));
+    GGML_ASSERT((size_t) std::min<int64_t>(n_entries, st->n_host) * s.blob_stride <= ss.stage_bytes);
+
+    const char ** table_stage = ss.tables[(size_t) ex_table.tensor_id];
+    if (table_stage == nullptr) {
+        CUDA_CHECK(cudaMalloc((void **) &table_stage, (size_t) s.n_expert * sizeof(char *)));
+        ss.tables[(size_t) ex_table.tensor_id] = table_stage;
+    }
+
+    ggml_cuda_set_device(ctx->device);
+
+    const int nthreads = 256;
+    const int expert_lo = (int) ex_table.expert_start;
+    const int expert_hi = expert_lo + (int) ex_table.n_expert;
+    const int n_chunks = (int) ((s.blob_bytes + EXPERT_STAGE_COPY_CHUNK - 1) / EXPERT_STAGE_COPY_CHUNK);
+
+    expert_stage_decode_kernel<<<dim3(n_chunks, (unsigned int) s.n_expert), nthreads,
+        n_entries * sizeof(int32_t), stream>>>(
+        (const int32_t *) ids->data, n_entries, n_expert_used, ids->nb[1] / sizeof(int32_t),
+        expert_offset, (int) ex_table.expert_start, expert_lo, expert_hi,
+        s.residency_dev, st->host_dev, s.host_offset_dev, s.table_main_dev, table_stage,
+        ss.stage_dev, s.blob_stride, s.blob_bytes, ss.stage_bytes,
+        ++ss.stage_seq, ss.plan_state + 4, ctx->usage_dev);
+    CUDA_CHECK(cudaGetLastError());
 
     return table_stage + ex_table.expert_start;
 }
@@ -1762,6 +1978,15 @@ bool ggml_cuda_expert_table_get(const ggml_tensor * src0, ggml_cuda_expert_table
 }
 
 const char * const * ggml_cuda_expert_stage_prepare(
+        const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream) {
+    GGML_UNUSED(src0);
+    GGML_UNUSED(ids);
+    GGML_UNUSED(expert_offset);
+    GGML_UNUSED(stream);
+    return nullptr;
+}
+
+const char * const * ggml_cuda_expert_stage_prepare_decode(
         const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream) {
     GGML_UNUSED(src0);
     GGML_UNUSED(ids);

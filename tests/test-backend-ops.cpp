@@ -13185,7 +13185,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 32, 4, 640, n, 2560));
         }
         // expert parallelism: each shard is a separate expert tensor with its own offset
-        for (int n : {1, 8, 64, 512}) {
+        for (int n : {1, 4, 8, 64, 512}) {
             test_cases.emplace_back(new test_mul_mat_id_expert_ep(type_a, GGML_TYPE_F32, 48, 4, 3, 640, n, 2560, true));
         }
     }

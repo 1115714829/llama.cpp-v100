@@ -91,6 +91,12 @@ bool ggml_cuda_expert_table_get(const ggml_tensor * src0, ggml_cuda_expert_table
 const char * const * ggml_cuda_expert_stage_prepare(
         const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream);
 
+// Same for a decode batch (the MMVQ mmid path): one fused kernel stages the routed host experts
+// and rewrites the staging pointer table, with no host side state, so the launch can be recorded
+// into a CUDA graph. The pointer table that the kernels must use is returned.
+const char * const * ggml_cuda_expert_stage_prepare_decode(
+        const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream);
+
 // record hits of one mul_mat_id launch: every (token, expert) entry is counted in the
 // per-expert statistics, vram/host tier hits are accumulated separately. Runs on the same
 // stream, no synchronization.

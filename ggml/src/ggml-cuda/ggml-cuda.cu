@@ -4378,9 +4378,10 @@ static bool ggml_cuda_mul_mat_id_swiglu_mmvq(const ggml_tensor * dst, const int 
 }
 
 // Prefill batches (above the MMVQ batch) stage the routed host experts into VRAM
-// (the grouped kernel and MMQ both read the staged copies; decode, up to the MMVQ batch, reads
-// the host arena in place). Uses the same conditions as the dispatch so that needs_sync and
-// the dispatch never disagree.
+// (the grouped kernel and MMQ both read the staged copies). Decode batches (up to the MMVQ
+// batch) take the MMVQ mmid branch of ggml_cuda_mul_mat_id, which stages them with
+// ggml_cuda_expert_stage_prepare_decode instead. Uses the same conditions as the dispatch so
+// that needs_sync and the dispatch never disagree.
 static bool ggml_cuda_expert_stage_used(const ggml_tensor * dst, const ggml_cuda_expert_table & ex_table, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -4428,7 +4429,9 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     }
 
     // expert store: the prefill staging has a host-side part (the stream state), so launches
-    // that stage cannot be recorded into a CUDA graph
+    // that stage cannot be recorded into a CUDA graph. The decode staging (the MMVQ mmid
+    // branch of ggml_cuda_mul_mat_id) is one kernel without a host-side part, so it stays
+    // graph recordable and is not covered by this test.
     ggml_cuda_expert_table ex_table;
     const bool is_expert_store = ggml_cuda_expert_table_get(src0, &ex_table);
     if (is_expert_store && ggml_cuda_expert_stage_used(dst, ex_table, cc)) {
@@ -4590,7 +4593,16 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             // The MMVQ mmid kernel is a separate kernel whose block width is the token count,
             // so on Volta it can go past MMVQ_MAX_BATCH_SIZE. Its MoE kernel also carries the
             // SwiGLU epilogue, so a node with one is written here, not by the fused-expert kernel.
-            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+            // A decode batch reads the weight of every expert it routes to once, so a host
+            // expert it hits costs the whole UVA read inside the kernel: stage the routed host
+            // experts into VRAM first and read them from there. The staging is one kernel with
+            // no host side state, so the launch stays graph recordable.
+            const char * const * expert_ptrs = nullptr;
+            if (is_expert_store && ids != nullptr && ex_table.has_stage) {
+                expert_ptrs = ggml_cuda_expert_stage_prepare_decode(src0, ids,
+                    ggml_mul_mat_id_get_expert_offset(dst), ctx.stream());
+            }
+            ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst, nullptr, expert_ptrs);
             return;
         } else if (!mmid_swiglu && src1->type == GGML_TYPE_F32 && ne2 <= MMVF_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
             ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
