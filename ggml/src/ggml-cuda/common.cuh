@@ -27,6 +27,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdio>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -1491,6 +1492,19 @@ struct ggml_backend_cuda_context {
     // nullptr leaves every existing path unchanged
     const struct ggml_backend_meta_assist_rank * assist = nullptr;
 
+    // device copies of the expert maps of the MUL_MAT_ID launches (ggml_cuda_mul_mat_id_lut), one
+    // per distinct map, keyed by (expert parallel, device, layer, expert_offset, n_local, n_total).
+    // An entry lives as long as the context: a captured graph keeps the device pointer of its
+    // launches, so a map is only ever rewritten in place (when the active assignment changes, see
+    // ggml_expert_store_assignment_version), never moved or freed before the context goes.
+    struct expert_lut_entry {
+        int16_t *       dev     = nullptr;
+        const int16_t * host    = nullptr;
+        int             n       = 0;
+        uint64_t        version = 0;
+    };
+    std::map<std::array<int, 6>, expert_lut_entry> expert_luts;
+
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
@@ -1599,6 +1613,26 @@ struct ggml_backend_cuda_context {
     }
 };
 
+// Expert map of one MUL_MAT_ID launch: which id of the routing is which local expert of the weight
+// this device holds. map has n entries, map[id] is the local expert number (the index into the
+// weight slice and into the expert store tables) or -1 for an expert held by another device; ids
+// outside [0, n) are not local either. The row is a device copy of ggml_expert_store_node_lut()
+// (ggml-impl.h) made by ggml_cuda_mul_mat_id_lut(): the identity for a node without expert
+// parallelism, the contiguous segment of the device while the experts are the contiguous split,
+// and the row of the permuted assignment once the loader activated one. The kernels never test an
+// id against a range: this map is the one place that knows which expert is local.
+struct ggml_cuda_expert_lut {
+    const int16_t * map  = nullptr; // device memory
+    const int16_t * host = nullptr; // the same row in host memory, for the host side sorted path
+    int             n    = 0;
+};
+
+// local expert number of an id, -1 when it is not an expert of this launch. The row of a layer is
+// 1 KiB for 512 experts, so it stays in L1 across the lanes of a block.
+static __device__ __forceinline__ int ggml_cuda_expert_local(const ggml_cuda_expert_lut & lut, const int id) {
+    return (unsigned int) id < (unsigned int) lut.n ? (int) __ldg(lut.map + id) : -1;
+}
+
 struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * x_bias = nullptr;
     const ggml_tensor * gate = nullptr;
@@ -1610,11 +1644,10 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
-    // expert parallelism: the fused output node (GLU or ADD) has no expert state of its own,
-    // so it is copied from the MUL_MAT_ID node that carries it
-    bool expert_parallel = false;
-    int  expert_offset = 0;
-    int  n_experts = 0;
+    // expert parallelism: the fused output node (GLU or ADD) has no expert state of its own, so
+    // the MUL_MAT_ID node that carries it (expert parallel flag, offset, global count, layer and
+    // device: the inputs of ggml_cuda_mul_mat_id_lut) is passed along. nullptr when dst is that node.
+    const ggml_tensor * mm_id = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;

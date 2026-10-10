@@ -83,24 +83,34 @@ bool ggml_cuda_expert_supported(void);
 // view but cannot be traced back, because then no kernel could know where the weights are.
 bool ggml_cuda_expert_table_get(const ggml_tensor * src0, ggml_cuda_expert_table * table);
 
+// The expert map of a MUL_MAT_ID node (see ggml_cuda_expert_lut in common.cuh): the device copy of
+// ggml_expert_store_node_lut() for the node, held by the context and keyed by the inputs of that
+// row (expert parallel flag, device, layer, expert offset, local and global expert count of the
+// node). The copy is made on the first launch that needs it and remade when the active assignment
+// changed (ggml_expert_store_assignment_version); both happen outside of a graph capture, a capture
+// in flight at that moment aborts instead of recording a stale table. dst is the MUL_MAT_ID node
+// itself; a fused launch passes the MUL_MAT_ID node that carries the expert state.
+ggml_cuda_expert_lut ggml_cuda_mul_mat_id_lut(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+
 // prepare the staging area for one prefill launch: the routed host experts of this batch
 // are copied into VRAM slots and the staging pointer table is updated. All work is queued
 // on the given stream, so the launch that follows reads the staged bytes. The pointer
 // table that the kernels must use is returned. Requires the tensor to be an expert store
-// tensor and the batch to be a prefill batch (see ggml_cuda_mul_mat_id).
+// tensor and the batch to be a prefill batch (see ggml_cuda_mul_mat_id). lut is the expert
+// map of the node: the routed ids are turned into local expert numbers through it.
 const char * const * ggml_cuda_expert_stage_prepare(
-        const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream);
+        const ggml_tensor * src0, const ggml_tensor * ids, const ggml_cuda_expert_lut & lut, cudaStream_t stream);
 
 // Same for a decode batch (the MMVQ mmid path): one fused kernel stages the routed host experts
 // and rewrites the staging pointer table, with no host side state, so the launch can be recorded
 // into a CUDA graph. The pointer table that the kernels must use is returned.
 const char * const * ggml_cuda_expert_stage_prepare_decode(
-        const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream);
+        const ggml_tensor * src0, const ggml_tensor * ids, const ggml_cuda_expert_lut & lut, cudaStream_t stream);
 
 // record hits of one mul_mat_id launch: every (token, expert) entry is counted in the
 // per-expert statistics, vram/host tier hits are accumulated separately. Runs on the same
 // stream, no synchronization.
-void ggml_cuda_expert_record_usage(const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream);
+void ggml_cuda_expert_record_usage(const ggml_tensor * src0, const ggml_tensor * ids, const ggml_cuda_expert_lut & lut, cudaStream_t stream);
 
 // run the startup byte check of all tensors once. Called by the llama loader through the
 // "ggml_backend_expert_store_model_loaded" backend proc after all tensor data was written,

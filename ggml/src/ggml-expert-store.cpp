@@ -9,6 +9,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <tuple>
 
 static bool ggml_expert_store_read_profile(const char * path, ggml_expert_store_profile & profile) {
@@ -118,8 +119,8 @@ void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_device) {
     }
 
     // tensors of the same layer (gate/up/down) share one profile row: sum their counts.
-    // With expert parallelism a store holds a contiguous slice of the experts, so the local
-    // expert numbers are shifted by the tensor's global expert base.
+    // With expert parallelism a store holds one device's segment of the experts; which global
+    // expert a local one is comes from the active assignment (the layout the kernels counted on).
     int64_t n_layer = 0;
     for (const ggml_expert_store_tensor & t : store->tensors) {
         if (!t.stat_experts.empty() && t.layer >= 0) {
@@ -136,10 +137,17 @@ void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_device) {
         if (t.stat_experts.empty() || t.layer < 0) {
             continue;
         }
+        if (ggml_expert_store_slice_device(t.expert_base, t.n_expert) == -2) {
+            GGML_LOG_ERROR("%s: device %d: layer %d: experts [%" PRId64 ", %" PRId64 ") are no segment of the expert assignment, the counts of this tensor are not written\n",
+                __func__, store->device, t.layer, t.expert_base, t.expert_base + t.n_expert);
+            continue;
+        }
         std::vector<int64_t> & row = counts[(size_t) t.layer];
-        row.resize(std::max<size_t>(row.size(), (size_t) t.expert_base + t.stat_experts.size()), 0);
         for (size_t e = 0; e < t.stat_experts.size(); ++e) {
-            row[(size_t) t.expert_base + e] += t.stat_experts[e];
+            const int64_t g = ggml_expert_store_active_global_of_slice(t.expert_base, t.n_expert, t.layer, (int64_t) e);
+            GGML_ASSERT(g >= 0);
+            row.resize(std::max<size_t>(row.size(), (size_t) g + 1), 0);
+            row[(size_t) g] += t.stat_experts[e];
             any = any || t.stat_experts[e] > 0;
         }
     }
@@ -212,8 +220,534 @@ void ggml_expert_store_free(ggml_expert_store * store) {
     delete store;
 }
 
+// assignment of the experts to the devices, one table for the whole process. The proposal is
+// computed once from the routing profile and read through ggml_expert_store_owner() and friends;
+// the active table (ggml_expert_store_active_*) is the one the loaded expert data follows.
+struct ggml_expert_store_assignment {
+    std::string          profile_path;
+    std::vector<int64_t> profile_count; // counts the table was computed from
+    bool     has_profile = false;
+    int      n_dev       = 0;
+    int      n_layer     = 0;
+    int      n_expert    = 0;
+    int      cap_max     = 0;
+    std::vector<int>     cap;   // [n_dev] experts per device, same numbers as the contiguous split
+    std::vector<int64_t> cap_prefix; // [n_dev + 1] experts of the devices before j: start of segment j
+    std::vector<int32_t> owner; // [n_layer * n_expert] device of an expert
+    std::vector<int16_t> local; // [n_dev * n_layer * n_expert] local number, -1 when not local
+    std::vector<int32_t> rev;   // [n_dev * n_layer * cap_max] global number of a local expert
+    double   imbalance_contiguous = 0.0;
+    double   imbalance_permuted    = 0.0;
+    int      worst_layer           = -1;
+    double   worst_layer_imbalance = 0.0;
+};
+
+static std::mutex g_assign_mutex;
+static ggml_expert_store_assignment g_assign; // the proposal
+static bool g_assign_valid = false;
+// most experts of any slice the plans have seen so far. Without a profile it is the only source
+// of the global expert count: every device plans its own slice, the whole count is known once
+// the last one did. A profile names the whole count itself.
+static int64_t g_assign_n_expert_seen = 0;
+
+// the active table (see ggml_expert_store_activate_assignment). The per-launch dispatch reads the
+// flag and the version without the mutex, so they are atomics written under it.
+static ggml_expert_store_assignment g_active;
+static bool                  g_active_valid = false;
+static std::atomic<bool>     g_active_permuted{false};
+static std::atomic<uint64_t> g_active_version{0};
+// per (device, layer): the local expert count a node of that row was checked against since the
+// last change of the active table (0 = not yet). The check walks the row, so it runs once per
+// row and version instead of once per launch.
+static std::vector<int32_t> g_active_checked;
+
+// contiguous segment rows of ggml_expert_store_node_lut, one per distinct
+// (expert_offset, n_local, n_total); a row never changes, so the pointers stay valid for the process
+static std::mutex g_segment_mutex;
+static std::map<std::tuple<int, int, int>, std::vector<int16_t>> g_segment_rows;
+
+// the table depends on nothing but the counts, the device count and the sizes, so an unchanged
+// input reuses the table of the first computation
+static bool ggml_expert_store_assignment_matches(
+        const char * path, const ggml_expert_store_profile * profile,
+        int n_dev, int n_layer, int n_expert) {
+    if (g_assign.n_dev != n_dev || g_assign.n_layer != n_layer || g_assign.n_expert != n_expert) {
+        return false;
+    }
+    const bool has = profile != nullptr && !profile->count.empty();
+    if (g_assign.has_profile != has) {
+        return false;
+    }
+    return !has || (g_assign.profile_count == profile->count &&
+                    g_assign.profile_path == std::string(path != nullptr ? path : ""));
+}
+
+// mean over the layers of max(device load) / mean(device load); 0 for a layer without traffic
+static double ggml_expert_store_imbalance(const std::vector<int64_t> & load, int n_dev) {
+    int64_t total = 0;
+    int64_t peak  = 0;
+    for (const int64_t v : load) {
+        total += v;
+        peak = std::max(peak, v);
+    }
+    if (total <= 0 || n_dev <= 0) {
+        return 0.0;
+    }
+    return (double) peak * n_dev / (double) total;
+}
+
+// sizes, quotas and empty tables of an assignment of n_expert experts over n_dev devices. The
+// quota of device j is the integer slice of the weight split in llama-model.cpp, so the per-device
+// byte counts of the contiguous split are kept whatever the owners are (512 experts over 6
+// devices: 85/85/86/85/85/86).
+static void ggml_expert_store_assignment_init(ggml_expert_store_assignment & a, int n_dev, int n_layer, int n_expert) {
+    GGML_ASSERT(n_dev > 0 && n_layer > 0 && n_expert > 0);
+    a.n_dev    = n_dev;
+    a.n_layer  = n_layer;
+    a.n_expert = n_expert;
+    a.cap_max  = 0;
+    a.cap.assign((size_t) n_dev, 0);
+    a.cap_prefix.assign((size_t) n_dev + 1, 0);
+    for (int j = 0; j < n_dev; ++j) {
+        const int64_t hi = (int64_t) n_expert * (j + 1) / n_dev;
+        const int64_t lo = (int64_t) n_expert * j         / n_dev;
+        a.cap[(size_t) j] = (int) (hi - lo);
+        a.cap_max = std::max(a.cap_max, a.cap[(size_t) j]);
+        a.cap_prefix[(size_t) j + 1] = a.cap_prefix[(size_t) j] + a.cap[(size_t) j];
+    }
+    const size_t n_pair = (size_t) n_layer * n_expert;
+    a.owner.assign(n_pair, 0);
+    a.local.assign(n_pair * (size_t) n_dev, -1);
+    a.rev.assign((size_t) n_dev * (size_t) n_layer * (size_t) a.cap_max, -1);
+}
+
+// owners of layer l of the contiguous split: device jj holds the experts of its own segment of the
+// numbering, which is how the meta backend slices the weights
+static void ggml_expert_store_assignment_contiguous_layer(ggml_expert_store_assignment & a, int l) {
+    int base = 0;
+    for (int jj = 0; jj < a.n_dev; ++jj) {
+        for (int e = 0; e < a.cap[(size_t) jj]; ++e) {
+            GGML_ASSERT(base + e < a.n_expert);
+            a.owner[(size_t) l * a.n_expert + (size_t) (base + e)] = jj;
+        }
+        base += a.cap[(size_t) jj];
+    }
+}
+
+// local numbers of layer l from its owners: the experts of one device in ascending global order,
+// so a device that holds all of them keeps slot number == local number
+static void ggml_expert_store_assignment_number_layer(ggml_expert_store_assignment & a, int l) {
+    std::vector<int> nxt((size_t) a.n_dev, 0);
+    for (int e = 0; e < a.n_expert; ++e) {
+        const int j = a.owner[(size_t) l * a.n_expert + e];
+        const int k = nxt[(size_t) j]++;
+        GGML_ASSERT(k < a.cap[(size_t) j]);
+        a.local[((size_t) j * a.n_layer + l) * a.n_expert + e] = (int16_t) k;
+        a.rev [((size_t) j * a.n_layer + l) * a.cap_max + k] = e;
+    }
+}
+
+static void ggml_expert_store_assignment_contiguous(ggml_expert_store_assignment & a, int n_dev, int n_layer, int n_expert) {
+    ggml_expert_store_assignment_init(a, n_dev, n_layer, n_expert);
+    for (int l = 0; l < n_layer; ++l) {
+        ggml_expert_store_assignment_contiguous_layer(a, l);
+        ggml_expert_store_assignment_number_layer(a, l);
+    }
+}
+
+static uint64_t ggml_expert_store_hash_range(uint64_t h, const uint8_t * p, size_t n);
+
+// fingerprint of a whole table (every owner and local number), so two starts can be compared
+// by one log line
+static uint64_t ggml_expert_store_assignment_fingerprint(const ggml_expert_store_assignment & a) {
+    uint64_t h = 0x243F6A8885A308D3ULL ^ ((uint64_t) a.n_dev << 40) ^ ((uint64_t) a.n_layer << 20) ^ (uint64_t) a.n_expert;
+    h = ggml_expert_store_hash_range(h, (const uint8_t *) a.owner.data(), a.owner.size() * sizeof(int32_t));
+    h = ggml_expert_store_hash_range(h, (const uint8_t *) a.local.data(), a.local.size() * sizeof(int16_t));
+    return h;
+}
+
+// install a table as the active one; the caller holds g_assign_mutex
+static void ggml_expert_store_set_active(ggml_expert_store_assignment a, bool permuted, const char * what) {
+    g_active       = std::move(a);
+    g_active_valid = true;
+    g_active_checked.assign((size_t) g_active.n_dev * (size_t) g_active.n_layer, 0);
+    g_active_permuted.store(permuted, std::memory_order_release);
+    const uint64_t version = g_active_version.fetch_add(1, std::memory_order_acq_rel) + 1;
+    GGML_LOG_INFO("%s: expert assignment version %" PRIu64 " active: %s (profile=%s devs=%d layers=%d experts=%d) max/avg %.3f table %016" PRIx64 "\n",
+        __func__, version, what, g_active.has_profile ? g_active.profile_path.c_str() : "none",
+        g_active.n_dev, g_active.n_layer, g_active.n_expert, g_active.imbalance_permuted,
+        ggml_expert_store_assignment_fingerprint(g_active));
+}
+
+// replace the contiguous split by a per-layer LPT split: the experts of a layer go to the least
+// loaded device, the hottest first. The number of experts per device stays the one of the
+// contiguous split (see cap above), so the bytes per device do not change. Without a profile
+// the split stays contiguous: the routing counts are unknown then, and the contiguous split is
+// the only placement that can be correct - a capability branch, not a fallback.
+// The result is the proposal; the active table (what the kernels read) is only moved to it by
+// ggml_expert_store_activate_assignment(), after the loader placed the data accordingly.
+void ggml_expert_store_compute_assignment(
+        const char * path, const ggml_expert_store_profile * profile,
+        int n_dev, int n_layer, int n_expert) {
+    GGML_ASSERT(n_dev > 0 && n_layer > 0 && n_expert > 0);
+
+    std::lock_guard<std::mutex> lock(g_assign_mutex);
+
+    const bool has_profile = profile != nullptr && !profile->count.empty();
+
+    // a plan covers the slice of one device: without a profile the global expert count is the
+    // largest global index any of them has seen; a profile names the whole count itself
+    if (has_profile) {
+        g_assign_n_expert_seen = n_expert;
+    } else {
+        g_assign_n_expert_seen = std::max(g_assign_n_expert_seen, (int64_t) n_expert);
+        n_expert = (int) g_assign_n_expert_seen;
+    }
+
+    if (g_assign_valid &&
+        ggml_expert_store_assignment_matches(path, profile, n_dev, n_layer, n_expert)) {
+        return;
+    }
+
+    // the tables grow with n_dev * n_layer * n_expert entries, so a caller that passes sizes of
+    // a different model must be caught here instead of taking the process down with them
+    if ((int64_t) n_layer * n_expert > (int64_t) 1 << 22 || n_expert > INT16_MAX) {
+        GGML_LOG_ERROR("%s: %d layers x %d experts is too large for an expert assignment\n",
+            __func__, n_layer, n_expert);
+        return;
+    }
+
+    ggml_expert_store_assignment a;
+    ggml_expert_store_assignment_init(a, n_dev, n_layer, n_expert);
+    a.has_profile   = has_profile;
+    a.profile_path  = a.has_profile ? (path != nullptr ? path : "") : "";
+    a.profile_count = a.has_profile ? profile->count : std::vector<int64_t>();
+
+    const auto count_of = [&](int l, int e) -> int64_t {
+        if (!a.has_profile || l >= profile->n_layer || e >= profile->n_expert) {
+            return 0;
+        }
+        return profile->at(l, e);
+    };
+
+    std::vector<int>      order((size_t) n_expert);
+    std::vector<int64_t>  load((size_t) n_dev, 0);
+    std::vector<int>      used((size_t) n_dev, 0);
+    std::vector<int64_t>  load_split((size_t) n_dev, 0);
+    std::vector<int64_t>  load_perm ((size_t) n_dev, 0);
+
+    double sum_split = 0.0;
+    double sum_perm  = 0.0;
+    double worst     = 0.0;
+
+    for (int l = 0; l < n_layer; ++l) {
+        if (a.has_profile) {
+            // hottest expert first, expert number breaks the ties: same profile, same table
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(), [&](int x, int y) {
+                return count_of(l, x) > count_of(l, y);
+            });
+            std::fill(load.begin(), load.end(), 0);
+            std::fill(used.begin(), used.end(), 0);
+            for (const int e : order) {
+                int best = -1;
+                for (int j = 0; j < n_dev; ++j) {
+                    if (used[(size_t) j] >= a.cap[(size_t) j]) {
+                        continue; // this device already holds its quota of experts
+                    }
+                    if (best < 0 || load[(size_t) j] < load[(size_t) best]) {
+                        best = j; // tie: the lowest device number stays
+                    }
+                }
+                GGML_ASSERT(best >= 0);
+                a.owner[(size_t) l * n_expert + e] = best;
+                load  [(size_t) best] += count_of(l, e);
+                used  [(size_t) best]++;
+            }
+        } else {
+            ggml_expert_store_assignment_contiguous_layer(a, l);
+        }
+        ggml_expert_store_assignment_number_layer(a, l);
+
+        std::fill(load_split.begin(), load_split.end(), 0);
+        std::fill(load_perm.begin(),  load_perm.end(),  0);
+        int base = 0;
+        for (int jj = 0; jj < n_dev; ++jj) {
+            for (int e = 0; e < a.cap[(size_t) jj]; ++e) {
+                load_split[(size_t) jj] += count_of(l, base + e);
+            }
+            base += a.cap[(size_t) jj];
+        }
+        for (int e = 0; e < n_expert; ++e) {
+            load_perm[(size_t) a.owner[(size_t) l * n_expert + e]] += count_of(l, e);
+        }
+
+        const double imb_split = ggml_expert_store_imbalance(load_split, n_dev);
+        const double imb_perm  = ggml_expert_store_imbalance(load_perm,  n_dev);
+        sum_split += imb_split;
+        sum_perm  += imb_perm;
+        if (a.worst_layer < 0 || imb_perm > worst) {
+            a.worst_layer           = l;
+            a.worst_layer_imbalance = imb_perm;
+            worst = imb_perm;
+        }
+        GGML_LOG_DEBUG("%s: expert assignment: layer %d: max/avg %.3f -> %.3f\n",
+            __func__, l, imb_split, imb_perm);
+    }
+
+    a.imbalance_contiguous = sum_split / n_layer;
+    a.imbalance_permuted    = sum_perm  / n_layer;
+
+    g_assign      = std::move(a);
+    g_assign_valid = true;
+
+    GGML_LOG_INFO("%s: expert assignment: profile=%s layers=%d experts=%d devs=%d max/avg %.3f -> %.3f (worst layer %d: %.3f)\n",
+        __func__, g_assign.has_profile ? g_assign.profile_path.c_str() : "none",
+        g_assign.n_layer, g_assign.n_expert, g_assign.n_dev,
+        g_assign.imbalance_contiguous, g_assign.imbalance_permuted,
+        g_assign.worst_layer, worst);
+
+    // the active table follows the dimensions of the proposal while no permutation is in effect:
+    // the loaded data is the contiguous split until the loader says otherwise. A permuted table
+    // describes data that was already placed, so a later plan (another device, a fit trial) must
+    // not touch it.
+    if (!g_active_permuted.load(std::memory_order_acquire) &&
+        (!g_active_valid || g_active.n_dev != n_dev || g_active.n_layer != n_layer || g_active.n_expert != n_expert)) {
+        ggml_expert_store_assignment c;
+        ggml_expert_store_assignment_contiguous(c, n_dev, n_layer, n_expert);
+        ggml_expert_store_set_active(std::move(c), false, "contiguous split");
+    }
+}
+
+void ggml_expert_store_activate_assignment(void) {
+    std::lock_guard<std::mutex> lock(g_assign_mutex);
+    if (!g_assign_valid) {
+        GGML_ABORT("%s: no expert assignment was computed (ggml_expert_store_compute_assignment)\n", __func__);
+    }
+    ggml_expert_store_set_active(g_assign, true,
+        g_assign.has_profile ? "permuted by the routing profile" : "the proposal (contiguous, no profile)");
+}
+
+void ggml_expert_store_reset_assignment(void) {
+    std::lock_guard<std::mutex> lock(g_assign_mutex);
+    if (!g_active_valid) {
+        return;
+    }
+    ggml_expert_store_assignment c;
+    ggml_expert_store_assignment_contiguous(c, g_active.n_dev, g_active.n_layer, g_active.n_expert);
+    ggml_expert_store_set_active(std::move(c), false, "contiguous split (reset)");
+}
+
+uint64_t ggml_expert_store_assignment_version(void) {
+    return g_active_version.load(std::memory_order_acquire);
+}
+
+bool ggml_expert_store_active_is_permuted(void) {
+    return g_active_permuted.load(std::memory_order_acquire);
+}
+
+static int ggml_expert_store_table_owner(const ggml_expert_store_assignment & a, bool valid, int layer, int expert) {
+    if (!valid || layer < 0 || layer >= a.n_layer || expert < 0 || expert >= a.n_expert) {
+        return -1;
+    }
+    return a.owner[(size_t) layer * a.n_expert + expert];
+}
+
+static const int16_t * ggml_expert_store_table_local_of(const ggml_expert_store_assignment & a, bool valid, int dev, int layer) {
+    if (!valid || dev < 0 || dev >= a.n_dev || layer < 0 || layer >= a.n_layer) {
+        return nullptr;
+    }
+    return a.local.data() + ((size_t) dev * a.n_layer + layer) * a.n_expert;
+}
+
+static int ggml_expert_store_table_global_of(const ggml_expert_store_assignment & a, bool valid, int dev, int layer, int local) {
+    if (!valid || dev < 0 || dev >= a.n_dev || layer < 0 || layer >= a.n_layer) {
+        return -1;
+    }
+    if (local < 0 || local >= a.cap[(size_t) dev]) {
+        return -1;
+    }
+    return a.rev[((size_t) dev * a.n_layer + layer) * a.cap_max + local];
+}
+
+int ggml_expert_store_owner(int layer, int expert) {
+    return ggml_expert_store_table_owner(g_assign, g_assign_valid, layer, expert);
+}
+
+const int16_t * ggml_expert_store_local_of(int dev, int layer) {
+    return ggml_expert_store_table_local_of(g_assign, g_assign_valid, dev, layer);
+}
+
+int ggml_expert_store_global_of(int dev, int layer, int local) {
+    return ggml_expert_store_table_global_of(g_assign, g_assign_valid, dev, layer, local);
+}
+
+int ggml_expert_store_active_owner(int layer, int expert) {
+    return ggml_expert_store_table_owner(g_active, g_active_valid, layer, expert);
+}
+
+const int16_t * ggml_expert_store_active_local_of(int dev, int layer) {
+    return ggml_expert_store_table_local_of(g_active, g_active_valid, dev, layer);
+}
+
+int ggml_expert_store_active_global_of(int dev, int layer, int local) {
+    return ggml_expert_store_table_global_of(g_active, g_active_valid, dev, layer, local);
+}
+
+bool ggml_expert_store_active_dims(int * n_dev, int * n_layer, int * n_expert) {
+    std::lock_guard<std::mutex> lock(g_assign_mutex);
+    if (!g_active_valid) {
+        return false;
+    }
+    if (n_dev    != nullptr) { *n_dev    = g_active.n_dev; }
+    if (n_layer  != nullptr) { *n_layer  = g_active.n_layer; }
+    if (n_expert != nullptr) { *n_expert = g_active.n_expert; }
+    return true;
+}
+
+bool ggml_expert_store_assignment_dims(int * n_dev, int * n_layer, int * n_expert) {
+    if (!g_assign_valid) {
+        return false;
+    }
+    if (n_dev    != nullptr) { *n_dev    = g_assign.n_dev;    }
+    if (n_layer  != nullptr) { *n_layer  = g_assign.n_layer;  }
+    if (n_expert != nullptr) { *n_expert = g_assign.n_expert; }
+    return true;
+}
+
+int ggml_expert_store_assignment_cap(int dev) {
+    if (!g_assign_valid || dev < 0 || dev >= g_assign.n_dev) {
+        return -1;
+    }
+    return g_assign.cap[(size_t) dev];
+}
+
+// where the loader puts expert `expert`: the segments of the devices follow each other in device
+// order and segment j holds the cap[j] experts of device j in local order
+int64_t ggml_expert_store_load_position(int layer, int expert) {
+    const int dev = ggml_expert_store_owner(layer, expert);
+    if (dev < 0) {
+        return -1;
+    }
+    const int16_t local = g_assign.local[((size_t) dev * g_assign.n_layer + layer) * g_assign.n_expert + expert];
+    GGML_ASSERT(local >= 0);
+    return g_assign.cap_prefix[(size_t) dev] + local;
+}
+
+int ggml_expert_store_slice_device(int64_t expert_base, int64_t n_expert) {
+    if (!g_assign_valid) {
+        return -2;
+    }
+    if (expert_base == 0 && n_expert == g_assign.n_expert) {
+        return -1; // the whole expert dim: the tensor is not split over the devices
+    }
+    for (int j = 0; j < g_assign.n_dev; ++j) {
+        if (g_assign.cap_prefix[(size_t) j] == expert_base && g_assign.cap[(size_t) j] == n_expert) {
+            return j;
+        }
+    }
+    return -2;
+}
+
+int64_t ggml_expert_store_active_global_of_slice(int64_t expert_base, int64_t n_expert, int layer, int64_t local) {
+    if (local < 0 || local >= n_expert) {
+        return -1;
+    }
+    const int dev = ggml_expert_store_slice_device(expert_base, n_expert);
+    if (dev == -1) {
+        return local; // the whole dim: local numbers are the global ones
+    }
+    if (dev < 0) {
+        return -1;
+    }
+    return ggml_expert_store_active_global_of(dev, layer, (int) local);
+}
+
+bool ggml_expert_store_assignment_info_get(ggml_expert_store_assignment_info * info) {
+    if (info == nullptr) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(g_assign_mutex);
+    if (!g_assign_valid) {
+        return false;
+    }
+    info->n_dev       = g_assign.n_dev;
+    info->n_layer     = g_assign.n_layer;
+    info->n_expert    = g_assign.n_expert;
+    info->cap_max     = g_assign.cap_max;
+    info->has_profile = g_assign.has_profile;
+    info->imbalance_contiguous = g_assign.imbalance_contiguous;
+    info->imbalance_permuted    = g_assign.imbalance_permuted;
+    info->worst_layer           = g_assign.worst_layer;
+    info->worst_layer_imbalance = g_assign.worst_layer_imbalance;
+    return true;
+}
+
+// the expert map of one MUL_MAT_ID node, see ggml-impl.h for the contract
+const int16_t * ggml_expert_store_node_lut(
+        bool expert_parallel, int device, int layer, int expert_offset, int n_local, int n_total) {
+    GGML_ASSERT(n_local > 0 && n_total >= n_local && n_total <= INT16_MAX);
+
+    if (expert_parallel && g_active_permuted.load(std::memory_order_acquire)) {
+        // the row of (device, layer) of the permuted assignment the loader placed the data by
+        std::lock_guard<std::mutex> lock(g_assign_mutex);
+        GGML_ASSERT(g_active_valid);
+        if (device < 0 || device >= g_active.n_dev || layer < 0 || layer >= g_active.n_layer || n_total != g_active.n_expert) {
+            GGML_ABORT("%s: node (device %d, layer %d, %d of %d experts) has no row in the active expert assignment "
+                "(devs=%d layers=%d experts=%d)\n", __func__, device, layer, n_local, n_total,
+                g_active.n_dev, g_active.n_layer, g_active.n_expert);
+        }
+        const size_t    ri  = (size_t) device * g_active.n_layer + layer;
+        const int16_t * row = g_active.local.data() + ri * g_active.n_expert;
+        if (g_active_checked[ri] != n_local) {
+            // the row has to name exactly the n_local experts of the node, each local number once:
+            // the kernels index the weight of the node by these numbers
+            std::vector<uint8_t> seen((size_t) n_local, 0);
+            int n = 0;
+            for (int e = 0; e < n_total; ++e) {
+                const int v = row[e];
+                if (v < 0) {
+                    continue;
+                }
+                if (v >= n_local || seen[(size_t) v] != 0) {
+                    GGML_ABORT("%s: active expert assignment row (device %d, layer %d) numbers expert %d as local %d, "
+                        "the node holds %d experts\n", __func__, device, layer, e, v, n_local);
+                }
+                seen[(size_t) v] = 1;
+                n++;
+            }
+            if (n != n_local) {
+                GGML_ABORT("%s: active expert assignment row (device %d, layer %d) holds %d experts, the node holds %d\n",
+                    __func__, device, layer, n, n_local);
+            }
+            g_active_checked[ri] = n_local;
+        }
+        return row;
+    }
+
+    // the contiguous split: the segment [expert_offset, expert_offset + n_local) of the node is
+    // local and numbered from 0; without expert parallelism that is the whole weight (identity)
+    if (expert_parallel) {
+        GGML_ASSERT(expert_offset >= 0 && expert_offset + n_local <= n_total);
+    } else {
+        GGML_ASSERT(expert_offset == 0 && n_total == n_local);
+    }
+    std::lock_guard<std::mutex> lock(g_segment_mutex);
+    const auto key = std::make_tuple(expert_offset, n_local, n_total);
+    auto it = g_segment_rows.find(key);
+    if (it == g_segment_rows.end()) {
+        std::vector<int16_t> row((size_t) n_total, (int16_t) -1);
+        for (int e = 0; e < n_local; ++e) {
+            row[(size_t) (expert_offset + e)] = (int16_t) e;
+        }
+        it = g_segment_rows.emplace(key, std::move(row)).first;
+    }
+    return it->second.data();
+}
+
 void ggml_expert_store_plan(
         const ggml_expert_store_plan_tensor * tensors, size_t n_tensors,
+        int n_device,
         int64_t slot_budget, const char * profile_path,
         ggml_expert_store_placement * placement) {
     GGML_ASSERT(placement != nullptr);
@@ -332,6 +866,25 @@ void ggml_expert_store_plan(
             __func__, path.c_str());
     }
 
+    // which device holds which expert: the same profile and the same layer/expert sizes as the
+    // plan above, computed once for the whole process and read through ggml_expert_store_owner()
+    if (n_device > 0) {
+        int64_t n_expert_total = 0;
+        int64_t n_layer_total  = 0;
+        for (size_t i = 0; i < n_tensors; ++i) {
+            n_expert_total = std::max(n_expert_total, tensors[i].expert_base + tensors[i].n_expert);
+            n_layer_total  = std::max(n_layer_total, tensors[i].layer >= 0 ? (int64_t) tensors[i].layer + 1 : (int64_t) 0);
+        }
+        if (have_profile) {
+            n_expert_total = std::max(n_expert_total, profile.n_expert);
+            n_layer_total  = std::max(n_layer_total,  profile.n_layer);
+        }
+        if (n_expert_total > 0 && n_layer_total > 0) {
+            ggml_expert_store_compute_assignment(path.c_str(), have_profile ? &profile : nullptr,
+                n_device, (int) n_layer_total, (int) n_expert_total);
+        }
+    }
+
     for (size_t i = 0; i < n_tensors; ++i) {
         const ggml_expert_store_plan_tensor & in = tensors[i];
         GGML_ASSERT(in.n_expert > 0 && in.blob_bytes > 0);
@@ -344,10 +897,28 @@ void ggml_expert_store_plan(
             order[(size_t) e] = e;
         }
         if (have_profile && in.layer >= 0 && profile.n_layer > in.layer && profile.n_expert > 0) {
+            // the profile row of a local expert is the one of the global expert the assignment
+            // puts there: the loader lays the slice out by the proposal computed above, so the
+            // proposal (not the active table of the layout still in memory) is the right map here
+            const int dev = ggml_expert_store_slice_device(in.expert_base, in.n_expert);
+            if (dev == -2) {
+                GGML_ABORT("%s: layer %d: experts [%" PRId64 ", %" PRId64 ") are no segment of the expert assignment\n",
+                    __func__, in.layer, in.expert_base, in.expert_base + in.n_expert);
+            }
+            const auto global_of = [&](int64_t local) -> int64_t {
+                if (dev == -1) {
+                    return local; // the whole expert dim on one device
+                }
+                const int g = ggml_expert_store_global_of(dev, in.layer, (int) local);
+                GGML_ASSERT(g >= 0);
+                return g;
+            };
+            const auto count_of = [&](int64_t local) -> int64_t {
+                const int64_t g = global_of(local);
+                return g < profile.n_expert ? profile.at(in.layer, g) : 0;
+            };
             std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
-                const int64_t ca = a + in.expert_base < profile.n_expert ? profile.at(in.layer, a + in.expert_base) : 0;
-                const int64_t cb = b + in.expert_base < profile.n_expert ? profile.at(in.layer, b + in.expert_base) : 0;
-                return ca > cb;
+                return count_of(a) > count_of(b);
             });
         }
 
@@ -410,6 +981,8 @@ int ggml_expert_store_add_tensor(
     t.n_host     = n_host;
     t.residency.assign((size_t) n_expert, GGML_EXPERT_STORE_INVALID);
     t.host_offset.assign((size_t) n_expert, GGML_EXPERT_STORE_INVALID);
+    t.write_hash.assign((size_t) n_expert, 0);
+    t.write_hash_state.assign((size_t) n_expert, 0);
 
     // the placement comes from ggml_expert_store_plan: slot s holds expert slot_experts[s],
     // the rest is packed into the host arena in expert order
@@ -493,9 +1066,11 @@ static inline int64_t ggml_expert_store_expert_of(const ggml_expert_store_tensor
     return (int64_t) (offset / t.blob_bytes);
 }
 
-void ggml_expert_store_write(
+// record_hash: the bytes are weight data (a write by the loader) and their hash is kept for the
+// placement check; false for a memset, which carries no weight data
+static void ggml_expert_store_write_impl(
         ggml_expert_store * store, int tensor_id,
-        const void * data, size_t offset, size_t size) {
+        const void * data, size_t offset, size_t size, bool record_hash) {
     GGML_ASSERT(tensor_id >= 0 && tensor_id < (int) store->tensors.size());
     ggml_expert_store_tensor & t = store->tensors[(size_t) tensor_id];
 
@@ -529,9 +1104,25 @@ void ggml_expert_store_write(
                 }
             }
         }
+        // the hash of what this local expert holds, for the placement check: a whole expert in
+        // one write is hashed, an expert that arrives in pieces has no hash
+        if (record_hash) {
+            if (in_expert == 0 && n == t.blob_bytes) {
+                t.write_hash[(size_t) expert]       = ggml_expert_store_hash_expert(src + written, n);
+                t.write_hash_state[(size_t) expert] = 1;
+            } else {
+                t.write_hash_state[(size_t) expert] = 2;
+            }
+        }
         t.load_bytes += (int64_t) n;
         written += n;
     }
+}
+
+void ggml_expert_store_write(
+        ggml_expert_store * store, int tensor_id,
+        const void * data, size_t offset, size_t size) {
+    ggml_expert_store_write_impl(store, tensor_id, data, offset, size, /*record_hash =*/ true);
 }
 
 void ggml_expert_store_read(
@@ -578,7 +1169,7 @@ void ggml_expert_store_memset(
     size_t done = 0;
     while (done < size) {
         const size_t n = std::min(size - done, zeros.size());
-        ggml_expert_store_write(store, tensor_id, zeros.data(), offset + done, n);
+        ggml_expert_store_write_impl(store, tensor_id, zeros.data(), offset + done, n, /*record_hash =*/ false);
         done += n;
     }
 
@@ -625,6 +1216,135 @@ bool ggml_expert_store_verify(
 
     if (ok) {
         GGML_LOG_INFO("%s: layer %d kind %d: byte check passed\n", __func__, t.layer, t.kind);
+    }
+    return ok;
+}
+
+// 8 bytes per step, multiply and xor-shift mixing; the tail is zero padded and the length is
+// folded into the seed by the caller, so a shorter range never aliases a longer one
+static uint64_t ggml_expert_store_hash_range(uint64_t h, const uint8_t * p, size_t n) {
+    while (n >= 8) {
+        uint64_t w;
+        memcpy(&w, p, 8);
+        h = (h ^ w) * 0x9E3779B97F4A7C15ULL;
+        h ^= h >> 32;
+        p += 8;
+        n -= 8;
+    }
+    if (n > 0) {
+        uint64_t w = 0;
+        memcpy(&w, p, n);
+        h = (h ^ w) * 0x9E3779B97F4A7C15ULL;
+        h ^= h >> 32;
+    }
+    return h;
+}
+
+uint64_t ggml_expert_store_hash_expert(const void * data, size_t size) {
+    const size_t    W = GGML_EXPERT_STORE_HASH_WINDOW;
+    const uint8_t * p = (const uint8_t *) data;
+    uint64_t h = 0x243F6A8885A308D3ULL ^ ((uint64_t) size * 0x9E3779B97F4A7C15ULL);
+    if (size <= 3*W) {
+        return ggml_expert_store_hash_range(h, p, size);
+    }
+    h = ggml_expert_store_hash_range(h, p, W);
+    h = ggml_expert_store_hash_range(h, p + size/2 - W/2, W);
+    h = ggml_expert_store_hash_range(h, p + size - W, W);
+    return h;
+}
+
+// source hashes the loader registered, by tensor name: hash and presence of every global expert
+struct ggml_expert_store_source_hashes {
+    std::vector<uint64_t> hash;
+    std::vector<uint8_t>  present;
+};
+
+static std::mutex g_source_hash_mutex;
+static std::map<std::string, ggml_expert_store_source_hashes> g_source_hash;
+
+void ggml_expert_store_set_source_hash(const char * tensor_name, int64_t expert, uint64_t hash) {
+    GGML_ASSERT(tensor_name != nullptr && expert >= 0);
+    std::lock_guard<std::mutex> lock(g_source_hash_mutex);
+    ggml_expert_store_source_hashes & s = g_source_hash[tensor_name];
+    if ((size_t) expert >= s.hash.size()) {
+        s.hash.resize((size_t) expert + 1, 0);
+        s.present.resize((size_t) expert + 1, 0);
+    }
+    s.hash[(size_t) expert]    = hash;
+    s.present[(size_t) expert] = 1;
+}
+
+void ggml_expert_store_clear_source_hashes(void) {
+    std::lock_guard<std::mutex> lock(g_source_hash_mutex);
+    g_source_hash.clear();
+}
+
+bool ggml_expert_store_verify_placement(
+        ggml_expert_store * store, int tensor_id, const char * tensor_name,
+        int64_t * n_checked, int64_t * n_skipped) {
+    GGML_ASSERT(tensor_id >= 0 && tensor_id < (int) store->tensors.size());
+    const ggml_expert_store_tensor & t = store->tensors[(size_t) tensor_id];
+
+    int64_t checked = 0;
+    int64_t skipped = 0;
+    bool ok = true;
+
+    ggml_expert_store_source_hashes src;
+    bool have_src = false;
+    if (tensor_name != nullptr) {
+        std::lock_guard<std::mutex> lock(g_source_hash_mutex);
+        const auto it = g_source_hash.find(tensor_name);
+        if (it != g_source_hash.end()) {
+            src      = it->second;
+            have_src = true;
+        }
+    }
+
+    if (!have_src) {
+        // the bytes did not come from the loader (another writer filled the store): nothing
+        // to compare against, every expert is skipped and the summary says so
+        skipped = t.n_expert;
+    } else {
+        const int dev = ggml_expert_store_slice_device(t.expert_base, t.n_expert);
+        if (dev == -2) {
+            GGML_LOG_ERROR("%s: %s: experts [%" PRId64 ", %" PRId64 ") are no segment of the expert assignment\n",
+                __func__, tensor_name, t.expert_base, t.expert_base + t.n_expert);
+            ok = false;
+        }
+        for (int64_t k = 0; ok && k < t.n_expert; ++k) {
+            const int64_t g = ggml_expert_store_active_global_of_slice(t.expert_base, t.n_expert, t.layer, k);
+            if (g < 0) {
+                GGML_LOG_ERROR("%s: %s: local expert %" PRId64 " of device segment %d has no global expert in the active assignment\n",
+                    __func__, tensor_name, k, dev);
+                ok = false;
+                break;
+            }
+            if (t.write_hash_state[(size_t) k] != 1) {
+                // written in pieces or not at all: no hash to compare
+                skipped++;
+                continue;
+            }
+            if ((size_t) g >= src.present.size() || !src.present[(size_t) g]) {
+                GGML_LOG_ERROR("%s: %s: the loader registered no source hash for global expert %" PRId64 " (local %" PRId64 " of device segment %d)\n",
+                    __func__, tensor_name, g, k, dev);
+                ok = false;
+                break;
+            }
+            if (src.hash[(size_t) g] != t.write_hash[(size_t) k]) {
+                GGML_LOG_ERROR("%s: %s: local expert %" PRId64 " of device segment %d holds other bytes than global expert %" PRId64 " of the file (layer %d, %s tier)\n",
+                    __func__, tensor_name, k, dev, g, t.layer, t.residency[(size_t) k] >= 0 ? "slot" : "host");
+                ok = false;
+                break;
+            }
+            checked++;
+        }
+    }
+
+    if (n_checked != nullptr) {
+        *n_checked = checked;
+    }
+    if (n_skipped != nullptr) {
+        *n_skipped = skipped;
     }
     return ok;
 }

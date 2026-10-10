@@ -182,6 +182,50 @@ static void ggml_set_op_params_f32(struct ggml_tensor * tensor, uint32_t i, floa
     ((float *)(tensor->op_params))[i] = value;
 }
 
+// layer number of a model tensor from its name ("blk.N." -> N), -1 when the name has none. The
+// expert store keys its per-layer tables by this number, so every consumer of those tables (the
+// store plan, the meta backend writing ggml_mul_mat_id_set_layer, the kernels) derives it here.
+static inline int ggml_expert_layer_of_name(const char * name) {
+    const char * p = name != NULL ? strstr(name, "blk.") : NULL;
+    if (p == NULL) {
+        return -1;
+    }
+    p += 4;
+    if (*p < '0' || *p > '9') {
+        return -1;
+    }
+    int layer = 0;
+    while (*p >= '0' && *p <= '9') {
+        layer = layer * 10 + (*p - '0');
+        p++;
+    }
+    return layer;
+}
+
+// Expert map of one MUL_MAT_ID node (ggml-expert-store.cpp, ggml-base): the local expert number of
+// every expert id the node may see, -1 for the experts of the other devices; n_total entries, ids
+// outside [0, n_total) are not local either. The row is the one source the CUDA kernels (through
+// a device copy) and the CPU backend read, so both backends agree on which id is which expert.
+//   - expert_parallel == false: every id is a local expert and keeps its number (identity,
+//     n_total == n_local, expert_offset == 0);
+//   - expert_parallel, no permuted assignment in effect: the contiguous segment of the node,
+//     id - expert_offset for ids in [expert_offset, expert_offset + n_local);
+//   - expert_parallel with a permuted assignment (the loader reordered the experts of every
+//     device by the routing profile, see ggml_expert_store_activate_assignment): the row of
+//     (device, layer) of that assignment, which must hold exactly n_local local experts.
+// The pointer stays valid until the assignment changes (ggml_expert_store_assignment_version).
+GGML_API const int16_t * ggml_expert_store_node_lut(
+        bool expert_parallel, int device, int layer, int expert_offset, int n_local, int n_total);
+
+// changes whenever the active expert assignment changes (and so the rows of
+// ggml_expert_store_node_lut may); a device copy of a row is stale once the version it was made at
+// is not the current one. Starts at 0, which no table ever has.
+GGML_API uint64_t ggml_expert_store_assignment_version(void);
+
+// true while the active assignment is a permuted one (see ggml_expert_store_activate_assignment):
+// the maps of the expert parallel nodes then come from its rows, not from the segments
+GGML_API bool ggml_expert_store_active_is_permuted(void);
+
 struct ggml_map_custom1_op_params {
     ggml_custom1_op_t  fun;
     int                n_tasks;

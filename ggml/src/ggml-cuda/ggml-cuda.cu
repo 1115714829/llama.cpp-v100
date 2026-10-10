@@ -907,6 +907,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             }
         }
     }
+    // the expert maps of the MUL_MAT_ID launches (ggml_cuda_mul_mat_id_lut)
+    for (auto & kv : expert_luts) {
+        if (kv.second.dev != nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaFree(kv.second.dev));
+        }
+    }
 }
 
 
@@ -4738,13 +4745,18 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // the expert map of the node: which routed id is which local expert of the weight this device
+    // holds (identity without expert parallelism). Every path below takes its expert membership
+    // from this map, none tests the ids against a range.
+    const ggml_cuda_expert_lut lut = ggml_cuda_mul_mat_id_lut(ctx, dst);
+
     // expert store: the weights are read through a device pointer table, the per-layer
     // placement is slot or host arena. The byte check runs when the loader finished the
     // tensor data (see ggml_backend_cuda_expert_verify_all), not on the first dispatch.
     ggml_cuda_expert_table ex_table;
     const bool is_expert_store = ggml_cuda_expert_table_get(src0, &ex_table);
     if (is_expert_store) {
-        ggml_cuda_expert_record_usage(src0, ids, ggml_mul_mat_id_get_expert_offset(dst), ctx.stream());
+        ggml_cuda_expert_record_usage(src0, ids, lut, ctx.stream());
         ggml_cuda_expert_stats_tick(src0, ctx.stream());
     }
 
@@ -4770,8 +4782,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             // no host side state, so the launch stays graph recordable.
             const char * const * expert_ptrs = nullptr;
             if (is_expert_store && ids != nullptr && ex_table.has_stage) {
-                expert_ptrs = ggml_cuda_expert_stage_prepare_decode(src0, ids,
-                    ggml_mul_mat_id_get_expert_offset(dst), ctx.stream());
+                expert_ptrs = ggml_cuda_expert_stage_prepare_decode(src0, ids, lut, ctx.stream());
             }
             ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst, nullptr, expert_ptrs);
             return;
@@ -4789,7 +4800,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // host experts into the staging area once and read them from VRAM (Strata prefill ring)
         const char * const * expert_ptrs = is_expert_store ? ex_table.main : nullptr;
         if (ggml_cuda_expert_mmid_stages(dst, cc)) {
-            expert_ptrs = ggml_cuda_expert_stage_prepare(src0, ids, ggml_mul_mat_id_get_expert_offset(dst), ctx.stream());
+            expert_ptrs = ggml_cuda_expert_stage_prepare(src0, ids, lut, ctx.stream());
         }
 
         if (ggml_cuda_fused_expert_mul_mat_id(ctx, dst, expert_ptrs)) {
@@ -4867,11 +4878,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    // expert parallelism: ids outside the local expert range belong to other devices; they are
-    // not scheduled on this device and their output slots are overwritten with the zero row.
-    // An expert store view reads its weights from the view start (main_host is shifted there),
-    // so its ids stay view-local and expert_offset only carries the parallelism offset.
-    const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
+    // expert parallelism: the ids the expert map (lut) does not know belong to other devices; they
+    // are not scheduled on this device and their output slots are overwritten with the zero row.
+    // An expert store view reads its weights from the view start (main_host is shifted there), so
+    // its ids stay view-local, as the map numbers them.
 
     // non-local slots gather a dedicated zero row appended after the compact rows. The row is
     // also the target of the assert below when the compact rows end at ne_get_rows exactly.
@@ -4886,7 +4896,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 // an expert store view covers a sub range of the tensor, so its ids are view-local
                 assert(ggml_mul_mat_id_is_expert_parallel(dst) || is_expert_store ||
                        expert_to_use < ne02);
-                if (expert_to_use == i02 + expert_offset) {
+                // the host side of the same map the kernels read: local expert of the id, -1 = elsewhere
+                const int expert_local = expert_to_use >= 0 && expert_to_use < lut.n ? (int) lut.host[expert_to_use] : -1;
+                if (expert_local == i02) {
                     ids_from_sorted_host[i12*n_expert_used + iex] = ids_to_sorted_host.size();
                     ids_to_sorted_host.push_back(i12*ne11 + iex % ne11);
                     tokens_per_expert[i02]++;
@@ -7492,13 +7504,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // Expert parallelism: the fused kernels write the GLU or ADD node, which does not carry the
-    // expert state of the MUL_MAT_ID nodes, so it is copied into the fusion arguments here.
+    // expert state of the MUL_MAT_ID nodes, so the node that does is handed along in the fusion
+    // arguments (ggml_cuda_mul_mat_id_lut reads the state from it).
     auto fusion_args_ep = [](const ggml_tensor * mm_id) {
         ggml_cuda_mm_fusion_args_host fusion{};
         if (mm_id->op == GGML_OP_MUL_MAT_ID) {
-            fusion.expert_parallel = ggml_mul_mat_id_is_expert_parallel(mm_id);
-            fusion.expert_offset   = ggml_mul_mat_id_get_expert_offset(mm_id);
-            fusion.n_experts       = (int) mm_id->src[0]->ne[2];
+            fusion.mm_id = mm_id;
         }
         return fusion;
     };
