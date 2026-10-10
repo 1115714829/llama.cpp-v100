@@ -15,11 +15,14 @@
 //   multi   MUL_MAT(W_i, x) for 2..4 weights sharing one input     q8_skinny_multi_kernel
 //   hcpost  gated DSV4_HC_POST -> RMS_NORM -> MUL (the hyper-connection combine and next mixer norm)
 //   hcmix   hcpost followed by the Q8_0 down projection, SCALE -> SILU and the up projection
+//   hcpre   gated DSV4_HC_PRE followed by the Q8_0 projections of the block input (GDN qkv + z)
+//   gnorm   RMS_NORM -> MUL -> SIGMOID -> MUL (the GDN gated norm) followed by the Q8_0 ssm_out
+//   agate   CONT -> SIGMOID -> MUL (the attention output gate) followed by the Q8_0 wo
 // Not part of the CMake build. Build against a llama.cpp build tree:
 //   g++ -O2 -std=c++17 -I<src>/ggml/include tests/bench-q8-skinny-cold.cpp -o bench-q8-skinny-cold \
 //       -L<build>/bin -lggml -lggml-base -lggml-cuda -Wl,-rpath,<build>/bin
 // Usage:
-//   bench-q8-skinny-cold [--dev 0] [--iters 30] [--min-mib 256] [--set moe|27b|mmvf|hc|all] [--what <case>] [--m 1,4,8] [--dump <prefix>]
+//   bench-q8-skinny-cold [--dev 0] [--iters 30] [--min-mib 256] [--set moe|27b|mmvf|hc|hand|all] [--what <case>] [--m 1,4,8] [--dump <prefix>]
 // Output: one line per case: pattern, K, N list, M, R, us per copy, GB/s of weight bytes.
 // --dump writes the F32 results of the first copy per case to <prefix>-<case>-m<M>.bin, to
 // compare two kernel variants bit for bit (the weights and inputs are the same in every run).
@@ -67,6 +70,13 @@ static std::vector<bench_case> make_cases() {
         { "hc", "hcpost", "hc_post_norm",  2560, { 4 }, GGML_TYPE_F32 },
         // the whole mixer opening: the combine, the norm, the Q8_0 down/up projections (n = { hc, lr })
         { "hc", "hcmix",  "hc_mix",        2560, { 4, 320 }, GGML_TYPE_Q8_0 },
+        // a fused producer handing its result to the next Q8_0 projection: k = n_embd (hcpre, n = { hc,
+        // projection widths }) or the projection K (gnorm, agate: n = { head_dim, N })
+        { "hand", "hcpre", "hcpre_gdn_3h",   2560, { 4, 1920, 1152 } },
+        { "hand", "hcpre", "hcpre_gdn_2h",   2560, { 4, 1280, 768 } },
+        { "hand", "gnorm", "gnorm_out_3h",   1152, { 128, 2560 } },
+        { "hand", "gnorm", "gnorm_out_2h",    768, { 128, 2560 } },
+        { "hand", "agate", "agate_wo",       1024, { 256, 2560 } },
         // the F32/BF16 projections of the decode graph (mul_mat_vec_f)
         { "mmvf", "single", "hc_inject",     10240, { 4 },   GGML_TYPE_F32 },
         { "mmvf", "single", "gate_inp",       2560, { 512 }, GGML_TYPE_F32 },
@@ -208,6 +218,133 @@ static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m
     return us;
 }
 
+// A producer (hcpre, gnorm, agate) and the Q8_0 projection(s) that read its result next. The bytes are
+// those of the weights and of the producer inputs.
+static double run_handoff(ggml_backend_t backend, const bench_case & c, int64_t m, int iters, double min_mib,
+                          int * r_out, double * gb_out, const std::string & dump) {
+    const bool hcpre = strcmp(c.pattern, "hcpre") == 0;
+    const bool gnorm = strcmp(c.pattern, "gnorm") == 0;
+    std::vector<int64_t> proj_n;   // the projection widths
+    int64_t proj_k = c.k;
+    size_t  in_floats = 0;
+    if (hcpre) {
+        proj_n.assign(c.n.begin() + 1, c.n.end());
+        in_floats = (size_t) (2 * c.k * c.n[0] * m);
+    } else {
+        proj_n = { c.n[1] };
+        in_floats = (size_t) ((gnorm ? 2 : 3) * c.k * m);
+    }
+    size_t copy_bytes = sizeof(float) * in_floats;
+    for (int64_t n : proj_n) {
+        copy_bytes += ggml_row_size(GGML_TYPE_Q8_0, proj_k) * n;
+    }
+    int r = (int) std::ceil(min_mib * 1024.0 * 1024.0 / (double) copy_bytes);
+    r = std::max(4, std::min(r, 512));
+
+    ggml_init_params ip = { ggml_tensor_overhead() * (size_t) r * 24 + ggml_graph_overhead_custom(8192, false), nullptr, true };
+    ggml_context * ctx   = ggml_init(ip);
+    ggml_context * ctx_w = ggml_init(ip);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
+    std::vector<ggml_tensor *> inputs, weights, first_outs;
+    ggml_tensor * gamma = nullptr;
+    if (gnorm) {
+        gamma = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, c.n[0]);
+        inputs.push_back(gamma);
+    }
+    for (int i = 0; i < r; ++i) {
+        std::vector<ggml_tensor *> outs;
+        ggml_tensor * y = nullptr;
+        if (hcpre) {
+            const int64_t hc = c.n[0];
+            ggml_tensor * x    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.k, hc, m);
+            ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c.k, hc, m);
+            inputs.push_back(x);
+            inputs.push_back(gate);
+            y = ggml_dsv4_hc_pre_gated(ctx, x, gate, 1.0f / (float) hc);
+            ggml_build_forward_expand(gf, y);
+        } else if (gnorm) {
+            const int64_t hd = c.n[0];
+            ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, c.k / hd, m);
+            ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hd, c.k / hd, m);
+            inputs.push_back(x);
+            inputs.push_back(z);
+            y = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), gamma), ggml_sigmoid(ctx, z));
+            y = ggml_reshape_2d(ctx, y, c.k, m);
+        } else {
+            const int64_t hd = c.n[0];
+            const int64_t nh = c.k / hd;
+            ggml_tensor * q_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hd*2*nh, m);
+            ggml_tensor * attn   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.k, m);
+            inputs.push_back(q_full);
+            inputs.push_back(attn);
+            ggml_tensor * gate = ggml_view_3d(ctx, q_full, hd, nh, m, sizeof(float)*hd*2, sizeof(float)*hd*2*nh, sizeof(float)*hd);
+            gate = ggml_cont_2d(ctx, gate, c.k, m);
+            y = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+        }
+        outs.push_back(y);
+        for (int64_t n : proj_n) {
+            ggml_tensor * w = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q8_0, proj_k, n);
+            weights.push_back(w);
+            ggml_tensor * o = ggml_mul_mat(ctx, w, y);
+            ggml_build_forward_expand(gf, o);
+            outs.push_back(o);
+        }
+        if (i == 0) {
+            first_outs = outs;
+        }
+    }
+    ggml_backend_buffer_t buf   = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    ggml_backend_buffer_t buf_w = ggml_backend_alloc_ctx_tensors(ctx_w, backend);
+    if (buf == nullptr || buf_w == nullptr) {
+        fprintf(stderr, "allocation failed for %s m=%lld r=%d\n", c.what, (long long) m, r);
+        exit(1);
+    }
+    ggml_backend_buffer_set_usage(buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+    for (ggml_tensor * t : inputs) {
+        std::vector<float> v(ggml_nelements(t));
+        for (float & f : v) {
+            f = ud(rng);
+        }
+        ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+    }
+    std::vector<std::vector<uint8_t>> wb(proj_n.size());
+    for (size_t j = 0; j < proj_n.size(); ++j) {
+        fill_weight(wb[j], GGML_TYPE_Q8_0, proj_k, proj_n[j], rng);
+    }
+    for (size_t i = 0; i < weights.size(); ++i) {
+        const std::vector<uint8_t> & b = wb[i % proj_n.size()];
+        ggml_backend_tensor_set(weights[i], b.data(), 0, b.size());
+    }
+    for (int i = 0; i < 3; ++i) {
+        ggml_backend_graph_compute(backend, gf);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) {
+        ggml_backend_graph_compute(backend, gf);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / ((double) iters * r);
+    *r_out  = r;
+    *gb_out = (double) copy_bytes / (us * 1e3);
+    if (!dump.empty()) {
+        const std::string path = dump + "-" + c.what + "-m" + std::to_string(m) + ".bin";
+        FILE * f = fopen(path.c_str(), "wb");
+        for (ggml_tensor * o : first_outs) {
+            std::vector<float> v(ggml_nelements(o));
+            ggml_backend_tensor_get(o, v.data(), 0, ggml_nbytes(o));
+            fwrite(v.data(), sizeof(float), v.size(), f);
+        }
+        fclose(f);
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_backend_buffer_free(buf_w);
+    ggml_free(ctx);
+    ggml_free(ctx_w);
+    return us;
+}
+
 static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, int iters, double min_mib,
                        int * r_out, double * gb_out, const std::string & dump) {
     const bool ffn    = strcmp(c.pattern, "ffn") == 0;
@@ -216,6 +353,9 @@ static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, 
     const bool hcpost = strcmp(c.pattern, "hcpost") == 0;
     if (hcpost || strcmp(c.pattern, "hcmix") == 0) {
         return run_hcpost(backend, c, m, iters, min_mib, r_out, gb_out, dump);
+    }
+    if (strcmp(c.pattern, "hcpre") == 0 || strcmp(c.pattern, "gnorm") == 0 || strcmp(c.pattern, "agate") == 0) {
+        return run_handoff(backend, c, m, iters, min_mib, r_out, gb_out, dump);
     }
 
     // weights of one copy of the pattern
@@ -387,7 +527,7 @@ int main(int argc, char ** argv) {
                 p = q + 1;
             }
         } else {
-            fprintf(stderr, "usage: %s [--dev 0] [--iters 30] [--min-mib 256] [--set moe|27b|mmvf|hc|all] [--what <case>] [--m 1,4,8] [--dump <prefix>]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--dev 0] [--iters 30] [--min-mib 256] [--set moe|27b|mmvf|hc|hand|all] [--what <case>] [--m 1,4,8] [--dump <prefix>]\n", argv[0]);
             return 1;
         }
     }

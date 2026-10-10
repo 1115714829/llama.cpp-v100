@@ -102,7 +102,9 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
-template <bool gated>
+// write_f16: also store the result rounded to F16 (as the F32 -> F16 conversion does) into a
+// contiguous [n_embd, n_tokens] buffer, the input of the projections that follow the mixer.
+template <bool gated, bool write_f16 = false>
 static __global__ void dsv4_hc_pre_f32(
         const float * x,
         const float * weights,
@@ -118,7 +120,8 @@ static __global__ void dsv4_hc_pre_f32(
         int64_t sw2,
         int64_t sd0,
         int64_t sd1,
-        float   scale) {
+        float   scale,
+        half *  dst_f16) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * n_tokens;
@@ -144,7 +147,11 @@ static __global__ void dsv4_hc_pre_f32(
         sum += xv * wv;
     }
 
-    dst[i0*sd0 + it*sd1] = scale * sum;
+    const float value = scale * sum;
+    dst[i0*sd0 + it*sd1] = value;
+    if constexpr (write_f16) {
+        dst_f16[ir] = __float2half(value);
+    }
 }
 
 // gated_post: `post` is the raw inject tensor; qwen4exp builds 2*sigmoid(inject/hc), and
@@ -252,7 +259,7 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             eps, n_iter);
 }
 
-void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst, half * dst_f16) {
     const ggml_tensor * x       = dst->src[0];
     const ggml_tensor * weights = dst->src[1];
 
@@ -277,14 +284,15 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
+    auto kernel = dst_f16 != nullptr ? (gated ? dsv4_hc_pre_f32<true, true>  : dsv4_hc_pre_f32<false, true>)
+                                     : (gated ? dsv4_hc_pre_f32<true, false> : dsv4_hc_pre_f32<false, false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) weights->data, (float *) dst->data,
             n_embd, hc, n_tokens,
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
-            scale);
+            scale, dst_f16);
 }
 
 static void dsv4_hc_post_launch(

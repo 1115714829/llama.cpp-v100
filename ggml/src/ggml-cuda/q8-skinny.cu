@@ -1630,8 +1630,8 @@ void ggml_cuda_q8_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * 
     }
 }
 
-bool ggml_cuda_q8_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
-                                 const ggml_tensor * src1, ggml_tensor * dst) {
+// The shapes ggml_cuda_q8_skinny_mul_mat covers (src0 is a repacked weight).
+static bool q8_skinny_mul_mat_covers(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     const int64_t k = src0->ne[0];
     const int64_t n = src0->ne[1];
     const int64_t m = src1->ne[1];
@@ -1644,11 +1644,30 @@ bool ggml_cuda_q8_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_ten
     if (m > 16 && q8_skinny_config_for(n, k).split_k != 16) {
         return false;
     }
+    return true;
+}
 
-    ggml_cuda_pool_alloc<half> input(ctx.pool(), m * k);
-    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
-    GGML_ASSERT(to_fp16 != nullptr);
-    to_fp16(src1->data, input.get(), m * k, ctx.stream());
+bool ggml_cuda_q8_skinny_mul_mat_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    return ggml_cuda_q8_skinny_is_repacked(src0) && q8_skinny_mul_mat_covers(src0, src1, dst);
+}
+
+bool ggml_cuda_q8_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                 const ggml_tensor * src1, ggml_tensor * dst, const half * input_f16) {
+    if (!q8_skinny_mul_mat_covers(src0, src1, dst)) {
+        return false;
+    }
+    const int64_t k = src0->ne[0];
+    const int64_t n = src0->ne[1];
+    const int64_t m = src1->ne[1];
+
+    ggml_cuda_pool_alloc<half> input(ctx.pool());
+    if (input_f16 == nullptr) {
+        input.alloc(m * k);
+        const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+        GGML_ASSERT(to_fp16 != nullptr);
+        to_fp16(src1->data, input.get(), m * k, ctx.stream());
+        input_f16 = input.get();
+    }
 
     const uint8_t * data = (const uint8_t *) src0->data;
     if (m <= 16 && n / 32 <= q8_skinny_split_max_tiles) {
@@ -1656,12 +1675,12 @@ bool ggml_cuda_q8_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_ten
         const q8_skinny_config config = q8_skinny_config_for(n, k);
         ggml_cuda_pool_alloc<float> scratch(ctx.pool(), q8_skinny_split_scratch_floats((int) n, config.split_k, false, (int) m));
         const q8_skinny_split_out out = { (float *) dst->data, nullptr, 0.0f, Q8_SKINNY_EPI_F32 };
-        q8_skinny_split_launch_single(config, data, (const half *) (data + n * k), input.get(), out,
+        q8_skinny_split_launch_single(config, data, (const half *) (data + n * k), input_f16, out,
                                       scratch.get(), ctx.tile_counters + ctx.curr_stream_no * GGML_CUDA_MAX_SPLIT_TILES,
                                       (int) n, (int) k, (int) m, ctx.stream());
         return true;
     }
-    return q8_skinny_mul_mat_dispatch(data, (const half *) (data + n * k), input.get(),
+    return q8_skinny_mul_mat_dispatch(data, (const half *) (data + n * k), input_f16,
                                       (float *) dst->data, (int) n, (int) k, (int) m,
                                       ctx.stream());
 }
@@ -1822,9 +1841,9 @@ bool ggml_cuda_q8_skinny_gated_down(ggml_backend_cuda_context & ctx, const ggml_
     return true;
 }
 
-bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
-                                       const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4],
-                                       int n_nodes, const ggml_tensor * src1) {
+// Checks the nodes of a multi-weight group and fills the launch parameters except the input.
+static bool q8_skinny_multi_prepare(const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4],
+                                    int n_nodes, const ggml_tensor * src1, q8_skinny_multi_params & p) {
     if (n_nodes < 2 || n_nodes > 4) {
         return false;
     }
@@ -1839,7 +1858,6 @@ bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
         return false;
     }
 
-    q8_skinny_multi_params p = {};
     p.k = (int) k;
     p.m = (int) m;
     for (int i = 0; i < n_nodes; ++i) {
@@ -1885,12 +1903,34 @@ bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
         p.dot[s].first_row = p.n_dot_rows;
         p.n_dot_rows += p.dot[s].n_rows;
     }
+    return true;
+}
 
-    ggml_cuda_pool_alloc<half> input(ctx.pool(), m * k);
-    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
-    GGML_ASSERT(to_fp16 != nullptr);
-    to_fp16(src1->data, input.get(), m * k, ctx.stream());
-    p.input = input.get();
+bool ggml_cuda_q8_skinny_mul_mat_multi_supported(const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4],
+                                                 int n_nodes, const ggml_tensor * src1) {
+    q8_skinny_multi_params p = {};
+    return q8_skinny_multi_prepare(src0s, dsts, n_nodes, src1, p);
+}
+
+bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
+                                       const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4],
+                                       int n_nodes, const ggml_tensor * src1, const half * input_f16) {
+    q8_skinny_multi_params p = {};
+    if (!q8_skinny_multi_prepare(src0s, dsts, n_nodes, src1, p)) {
+        return false;
+    }
+    const int64_t k = src0s[0]->ne[0];
+    const int64_t m = src1->ne[1];
+
+    ggml_cuda_pool_alloc<half> input(ctx.pool());
+    if (input_f16 == nullptr) {
+        input.alloc(m * k);
+        const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+        GGML_ASSERT(to_fp16 != nullptr);
+        to_fp16(src1->data, input.get(), m * k, ctx.stream());
+        input_f16 = input.get();
+    }
+    p.input = input_f16;
 
     if (m <= 16) {
         q8_skinny_multi_mul_mat_launch(p, ctx.stream());
@@ -1930,12 +1970,14 @@ void ggml_cuda_q8_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * 
     GGML_UNUSED(cgraph);
 }
 
+bool ggml_cuda_q8_skinny_mul_mat_supported(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    GGML_UNUSED_VARS(src0, src1, dst);
+    return false;
+}
+
 bool ggml_cuda_q8_skinny_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
-                                 const ggml_tensor * src1, ggml_tensor * dst) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(src0);
-    GGML_UNUSED(src1);
-    GGML_UNUSED(dst);
+                                 const ggml_tensor * src1, ggml_tensor * dst, const half * input_f16) {
+    GGML_UNUSED_VARS(ctx, src0, src1, dst, input_f16);
     return false;
 }
 
@@ -1967,14 +2009,16 @@ void ggml_cuda_q8_skinny_hc_down_up(ggml_backend_cuda_context & ctx, const ggml_
     GGML_ABORT("Q8 skinny: not available");
 }
 
+bool ggml_cuda_q8_skinny_mul_mat_multi_supported(const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4],
+                                                 int n_nodes, const ggml_tensor * src1) {
+    GGML_UNUSED_VARS(src0s, dsts, n_nodes, src1);
+    return false;
+}
+
 bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
                                        const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4],
-                                       int n_nodes, const ggml_tensor * src1) {
-    GGML_UNUSED(ctx);
-    GGML_UNUSED(src0s);
-    GGML_UNUSED(dsts);
-    GGML_UNUSED(n_nodes);
-    GGML_UNUSED(src1);
+                                       int n_nodes, const ggml_tensor * src1, const half * input_f16) {
+    GGML_UNUSED_VARS(ctx, src0s, dsts, n_nodes, src1, input_f16);
     return false;
 }
 

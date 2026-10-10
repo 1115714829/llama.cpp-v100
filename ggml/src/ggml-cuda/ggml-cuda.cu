@@ -7613,6 +7613,64 @@ static int ggml_cuda_try_fuse_hc_mix(ggml_backend_cuda_context * cuda_ctx, ggml_
     return k + 3 - i;
 }
 
+// DSV4_HC_PRE -> MUL_MAT [-> MUL_MAT ...]: the mixed stream that a qwen4exp hyper-connection mixer
+// hands to its block is the input of the projections that open the block (build_qkvz expands the
+// GDN qkv and z right after the mixer, as do the q/k/v of an attention layer without the QSA
+// indexer, whose nodes come first otherwise). The mixer kernel also writes its result rounded to
+// F16 and the q8 skinny kernels read that copy instead of converting the F32 result again, so
+// the products are bitwise the same and one conversion kernel per block is gone. The F32 result
+// is still written: the GDN beta/alpha and the indexer read it.
+static int ggml_cuda_try_fuse_hc_pre_mm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * hc_pre = cgraph->nodes[i];
+    if (hc_pre->op != GGML_OP_DSV4_HC_PRE || hc_pre->type != GGML_TYPE_F32 || !ggml_is_contiguous(hc_pre) ||
+            hc_pre->ne[2] != 1 || hc_pre->ne[3] != 1 || hc_pre->ne[1] < 1 || hc_pre->ne[1] > 16) {
+        return 0;
+    }
+    const int j = ggml_cuda_next_real_node(cgraph, i);
+    if (j < 0 || cgraph->nodes[j]->op != GGML_OP_MUL_MAT || cgraph->nodes[j]->src[1] != hc_pre) {
+        return 0;
+    }
+
+    const ggml_tensor * src0s[4];
+    ggml_tensor * dsts[4];
+    int n_mm = ggml_cuda_match_mul_mat_multi(cgraph, j, src0s, dsts, /*q4k =*/ false);
+    if (n_mm > 0) {
+        int out_nodes[4] = { j, j + 1, j + 2, j + 3 };
+        if (!ggml_cuda_q8_skinny_mul_mat_multi_supported(src0s, dsts, n_mm, hc_pre) ||
+                !ggml_cuda_check_fusion_memory_ranges(cgraph, j, n_mm, out_nodes, n_mm)) {
+            return 0;
+        }
+    } else {
+        ggml_tensor * mm = cgraph->nodes[j];
+        if (!ggml_cuda_q8_skinny_mul_mat_supported(mm->src[0], hc_pre, mm)) {
+            return 0;
+        }
+        n_mm     = 1;
+        src0s[0] = mm->src[0];
+        dsts[0]  = mm;
+    }
+
+    // a gate/up pair that feeds a GLU keeps its fused gated kernel
+    const int after = ggml_cuda_next_real_node(cgraph, j + n_mm - 1);
+    if (after >= 0 && cgraph->nodes[after]->op == GGML_OP_GLU) {
+        return 0;
+    }
+
+    // every node is kept: the mixed stream has other readers further down
+    int idxs[5] = { i, j, j + 1, j + 2, j + 3 };
+    enum ggml_op ops[5] = { GGML_OP_DSV4_HC_PRE, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n_mm + 1, ops, idxs, n_mm + 1)) {
+        return 0;
+    }
+
+    ggml_cuda_pool_alloc<half> x_f16(cuda_ctx->pool(), ggml_nelements(hc_pre));
+    ggml_cuda_op_dsv4_hc_pre(*cuda_ctx, hc_pre, x_f16.get());
+    const bool ok = n_mm == 1 ? ggml_cuda_q8_skinny_mul_mat(*cuda_ctx, src0s[0], hc_pre, dsts[0], x_f16.get())
+                              : ggml_cuda_q8_skinny_mul_mat_multi(*cuda_ctx, src0s, dsts, n_mm, hc_pre, x_f16.get());
+    GGML_ASSERT(ok);
+    return j + n_mm - 1 - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -7642,6 +7700,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int n_hc_mix = ggml_cuda_try_fuse_hc_mix(cuda_ctx, cgraph, i);
         if (n_hc_mix > 0) {
             return n_hc_mix;
+        }
+    }
+
+    if (node->op == GGML_OP_DSV4_HC_PRE) {
+        const int n_hc_pre = ggml_cuda_try_fuse_hc_pre_mm(cuda_ctx, cgraph, i);
+        if (n_hc_pre > 0) {
+            return n_hc_pre;
         }
     }
 

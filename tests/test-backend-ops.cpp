@@ -5195,6 +5195,54 @@ struct test_hc_mix_q8 : public test_dsv4_hc {
     }
 };
 
+// The hyper-connection mixer output feeding the Q8_0 projections that open a block, expanded right
+// after it (qwen4exp build_qkvz: wqkv and wqkv_gate). sm_70 hands the mixer result to the multi-weight
+// kernel as F16; the F32 mixer result is kept and checked too.
+struct test_hc_pre_mm_q8 : public test_dsv4_hc {
+    const int64_t n_embd;
+    const std::array<int64_t, 3> n_out;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_PRE_MM_Q8";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_out, n_tokens);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_hc_pre_mm_q8(int64_t n_embd = 2560, std::array<int64_t, 3> n_out = { 1920, 1152, 0 }, int64_t n_tokens = 4)
+        : n_embd(n_embd), n_out(n_out), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * mixed = ggml_dsv4_hc_pre_gated(ctx, x, gate, 1.0f / (float) hc);
+
+        ggml_tensor * cat = nullptr;
+        for (int64_t n : n_out) {
+            if (n == 0) {
+                continue;
+            }
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, n);
+            ggml_tensor * y = ggml_mul_mat(ctx, w, mixed);
+            cat = cat == nullptr ? y : ggml_concat(ctx, cat, y, 0);
+        }
+        out = ggml_concat(ctx, cat, mixed, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // A gated Q8_0 FFN, down(swiglu(gate(x), up(x))), as the qwen4exp shared expert (sm_70 repacks the
 // weights; a narrow pair hands silu(gate) * up to the down projection as F16)
 struct test_ffn_q8 : public test_case {
@@ -12038,6 +12086,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_hc_mix_q8(2560, 320, 4, false));
     test_cases.emplace_back(new test_hc_mix_q8(1024, 128, 4, true));
+    // the mixer result handed to the projections that open the block as F16 (M <= 16; 17 unfused):
+    // GDN qkv + z on a 3-head and a 2-head card, QSA q/k/v, and a single projection
+    for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
+        test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {1920, 1152, 0}, n_tokens));
+    }
+    test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {1280, 768, 0}, 4));
+    test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {2048, 256, 256}, 4));
+    test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {1024, 0, 0}, 4));
 
     // scale + unary(silu): decode and prefill shapes of the hyper-connection mixer activation
     test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 320, 1, 1, 1 }));
