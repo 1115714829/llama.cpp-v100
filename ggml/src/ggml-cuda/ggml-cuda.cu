@@ -5523,7 +5523,10 @@ static int ggml_cuda_next_real_node(const ggml_cgraph * cgraph, int idx) {
 }
 
 // true if t is already computed when the node at node_idx runs, so a fused kernel placed there
-// can read it. Views resolve to their source; leaves (weights and inputs) are always ready.
+// can read it. Views resolve to their source; leaves (weights and inputs) are always ready. A
+// tensor is ready unless this graph computes it at or after node_idx: a graph that reaches the
+// backend in pieces (the meta backend's per-device subgraphs between two all-reduces) reads the
+// results of the earlier pieces, which are not nodes of this one.
 static bool ggml_cuda_tensor_ready_before(const ggml_cgraph * cgraph, const ggml_tensor * t, int node_idx) {
     while (t->view_src != nullptr) {
         t = t->view_src;
@@ -5531,13 +5534,13 @@ static bool ggml_cuda_tensor_ready_before(const ggml_cgraph * cgraph, const ggml
     if (t->op == GGML_OP_NONE) {
         return true;
     }
-    for (int i = 0; i < node_idx; ++i) {
+    for (int i = node_idx; i < cgraph->n_nodes; ++i) {
         if (cgraph->nodes[i] == t) {
-            return true;
+            return false;
         }
     }
 
-    return false;
+    return true;
 }
 
 #ifdef USE_CUDA_GRAPH
