@@ -5090,6 +5090,50 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
+// DSV4_HC_POST with the qwen4exp gate followed by the RMS_NORM -> MUL of the next mixer, which
+// backends can fuse; the output adds the normalized mixer input to the new residual so that both
+// fused outputs are checked
+struct test_dsv4_hc_post_norm : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_POST_NORM";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_dsv4_hc_post_norm(int64_t n_embd = 2560, int64_t n_tokens = 4)
+        : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(post, "post");
+        post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+
+        ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(gamma, "gamma");
+
+        ggml_tensor * res = ggml_dsv4_hc_post(ctx, x, residual, post, nullptr);
+        ggml_tensor * xn  = ggml_mul(ctx, ggml_rms_norm(ctx, res, 1e-6f), gamma);
+
+        out = ggml_add(ctx, xn, res);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -11881,6 +11925,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // into the post kernel; identity comb, as qwen4exp builds the hyper-connection combine
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 2048, true, true));
+    // the post followed by the next mixer's RMS_NORM -> MUL: fused at the decode and verify widths,
+    // unfused below 1024 columns
+    for (int64_t n_tokens : {1, 4, 8, 17}) {
+        test_cases.emplace_back(new test_dsv4_hc_post_norm(2560, n_tokens));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_post_norm(1280, 4));
+    test_cases.emplace_back(new test_dsv4_hc_post_norm(512, 4));
 
     // scale + unary(silu): decode and prefill shapes of the hyper-connection mixer activation
     test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 320, 1, 1, 1 }));

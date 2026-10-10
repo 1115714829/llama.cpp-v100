@@ -8406,6 +8406,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return 2;
     }
 
+    // SCALE -> UNARY(SIGMOID) -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL: the combine gate and
+    // post as below, followed by the grouped RMSNorm that opens the next mixer (qwen4exp
+    // build_hc_mix), in one kernel. Strata likewise reads the pending block output into its next
+    // mixer instead of writing the residual first (refs/strata/src/kernels/cuda/fused_gr.cu:62-66).
+    if (node->op == GGML_OP_SCALE && i + 5 < cgraph->n_nodes &&
+            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST,
+                                                GGML_OP_RMS_NORM, GGML_OP_MUL }, { i + 3, i + 5 }) &&
+            ggml_check_edges(cgraph, i, {{1, 0, 0}, {2, 0, 1}, {3, 2, 2}, {4, 0, 3}}) &&
+            ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SIGMOID &&
+            (cgraph->nodes[i + 5]->src[0] == cgraph->nodes[i + 4] || cgraph->nodes[i + 5]->src[1] == cgraph->nodes[i + 4]) &&
+            node->src[0]->type == GGML_TYPE_F32 &&
+            node->type == GGML_TYPE_F32 &&
+            ggml_cuda_op_dsv4_hc_post_rms_norm_mul_fused(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2],
+                                                         cgraph->nodes[i + 4], cgraph->nodes[i + 5])) {
+        return 5;
+    }
+
     // SCALE -> UNARY(SIGMOID) -> SCALE -> DSV4_HC_POST: the hyper-connection combine gate,
     // post = 2*sigmoid(inject/hc), folded into the post kernel. qwen4exp builds the chain in
     // build_hc_combine. Strata folds the same gate into its up projection epilogue:

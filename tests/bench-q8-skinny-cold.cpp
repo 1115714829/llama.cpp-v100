@@ -12,11 +12,12 @@
 //   single  MUL_MAT(W[K,N], x[K,M])                                q8_skinny_kernel
 //   gated   SWIGLU(MUL_MAT(G, x), MUL_MAT(U, x))                    q8_skinny_gated_kernel
 //   multi   MUL_MAT(W_i, x) for 2..4 weights sharing one input     q8_skinny_multi_kernel
+//   hcpost  gated DSV4_HC_POST -> RMS_NORM -> MUL (the hyper-connection combine and next mixer norm)
 // Not part of the CMake build. Build against a llama.cpp build tree:
 //   g++ -O2 -std=c++17 -I<src>/ggml/include tests/bench-q8-skinny-cold.cpp -o bench-q8-skinny-cold \
 //       -L<build>/bin -lggml -lggml-base -lggml-cuda -Wl,-rpath,<build>/bin
 // Usage:
-//   bench-q8-skinny-cold [--dev 0] [--iters 30] [--min-mib 256] [--set moe|27b|mmvf|all] [--what <case>] [--m 1,4,8] [--dump <prefix>]
+//   bench-q8-skinny-cold [--dev 0] [--iters 30] [--min-mib 256] [--set moe|27b|mmvf|hc|all] [--what <case>] [--m 1,4,8] [--dump <prefix>]
 // Output: one line per case: pattern, K, N list, M, R, us per copy, GB/s of weight bytes.
 // --dump writes the F32 results of the first copy per case to <prefix>-<case>-m<M>.bin, to
 // compare two kernel variants bit for bit (the weights and inputs are the same in every run).
@@ -59,6 +60,8 @@ static std::vector<bench_case> make_cases() {
         { "moe", "multi",  "gdn_qkv_z_3h",   2560, { 1920, 1152 } },
         { "moe", "multi",  "gdn_qkv_z_2h",   2560, { 1280, 768 } },
         { "moe", "multi",  "qsa_q_k_v",      2560, { 2048, 256, 256 } },
+        // the hyper-connection combine (gated DSV4_HC_POST) and the next mixer's RMS_NORM -> MUL
+        { "hc", "hcpost", "hc_post_norm",  2560, { 4 }, GGML_TYPE_F32 },
         // the F32/BF16 projections of the decode graph (mul_mat_vec_f)
         { "mmvf", "single", "hc_inject",     10240, { 4 },   GGML_TYPE_F32 },
         { "mmvf", "single", "gate_inp",       2560, { 512 }, GGML_TYPE_F32 },
@@ -91,10 +94,88 @@ static void fill_weight(std::vector<uint8_t> & bytes, ggml_type type, int64_t k,
     }
 }
 
+// DSV4_HC_POST with the qwen4exp gate (post = 2*sigmoid(inject/hc)) followed by RMS_NORM -> MUL, as
+// the combine of one block and the start of the next mixer; k = n_embd, n = { hc }. The bytes are
+// those read and written by the unfused pair.
+static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m, int iters, double min_mib,
+                         int * r_out, double * gb_out, const std::string & dump) {
+    const int64_t n_embd = c.k;
+    const int64_t hc     = c.n[0];
+    const size_t copy_bytes = sizeof(float) * (size_t) (n_embd*m + 3*n_embd*hc*m + hc*m);
+    int r = (int) std::ceil(min_mib * 1024.0 * 1024.0 / (double) copy_bytes);
+    r = std::max(4, std::min(r, 1024));
+
+    ggml_init_params ip = { ggml_tensor_overhead() * (size_t) r * 12 + ggml_graph_overhead_custom(8192, false), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+    ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+    std::vector<ggml_tensor *> xs(r), res(r), posts(r), first_outs;
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
+    for (int i = 0; i < r; ++i) {
+        xs[i]    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, m);
+        res[i]   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, m);
+        posts[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, m);
+        ggml_tensor * post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, posts[i], 1.0f / (float) hc)), 2.0f);
+        ggml_tensor * hp   = ggml_dsv4_hc_post(ctx, xs[i], res[i], post, nullptr);
+        ggml_tensor * xn   = ggml_mul(ctx, ggml_rms_norm(ctx, hp, 1e-6f), gamma);
+        ggml_build_forward_expand(gf, xn);
+        if (i == 0) {
+            first_outs = { hp, xn };
+        }
+    }
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    if (buf == nullptr) {
+        fprintf(stderr, "allocation failed for %s m=%lld r=%d\n", c.what, (long long) m, r);
+        exit(1);
+    }
+    std::mt19937 rng(1234);
+    std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
+    auto fill = [&](ggml_tensor * t) {
+        std::vector<float> v(ggml_nelements(t));
+        for (float & f : v) {
+            f = ud(rng);
+        }
+        ggml_backend_tensor_set(t, v.data(), 0, ggml_nbytes(t));
+    };
+    fill(gamma);
+    for (int i = 0; i < r; ++i) {
+        fill(xs[i]);
+        fill(res[i]);
+        fill(posts[i]);
+    }
+    for (int i = 0; i < 3; ++i) {
+        ggml_backend_graph_compute(backend, gf);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < iters; ++i) {
+        ggml_backend_graph_compute(backend, gf);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / ((double) iters * r);
+    *r_out  = r;
+    *gb_out = (double) copy_bytes / (us * 1e3);
+    if (!dump.empty()) {
+        const std::string path = dump + "-" + c.what + "-m" + std::to_string(m) + ".bin";
+        FILE * f = fopen(path.c_str(), "wb");
+        for (ggml_tensor * o : first_outs) {
+            std::vector<float> v(ggml_nelements(o));
+            ggml_backend_tensor_get(o, v.data(), 0, ggml_nbytes(o));
+            fwrite(v.data(), sizeof(float), v.size(), f);
+        }
+        fclose(f);
+    }
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx);
+    return us;
+}
+
 static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, int iters, double min_mib,
                        int * r_out, double * gb_out, const std::string & dump) {
-    const bool gated = strcmp(c.pattern, "gated") == 0;
-    const bool multi = strcmp(c.pattern, "multi") == 0;
+    const bool gated  = strcmp(c.pattern, "gated") == 0;
+    const bool multi  = strcmp(c.pattern, "multi") == 0;
+    const bool hcpost = strcmp(c.pattern, "hcpost") == 0;
+    if (hcpost) {
+        return run_hcpost(backend, c, m, iters, min_mib, r_out, gb_out, dump);
+    }
 
     // weights of one copy of the pattern
     std::vector<int64_t> ws;
@@ -253,7 +334,7 @@ int main(int argc, char ** argv) {
                 p = q + 1;
             }
         } else {
-            fprintf(stderr, "usage: %s [--dev 0] [--iters 30] [--min-mib 256] [--set moe|27b|mmvf|all] [--what <case>] [--m 1,4,8] [--dump <prefix>]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--dev 0] [--iters 30] [--min-mib 256] [--set moe|27b|mmvf|hc|all] [--what <case>] [--m 1,4,8] [--dump <prefix>]\n", argv[0]);
             return 1;
         }
     }

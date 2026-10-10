@@ -857,6 +857,132 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     rms_norm_f32_cuda<true>(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
 
+// SCALE -> UNARY(SIGMOID) -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL: the hyper-connection
+// combine that closes a block (qwen4exp build_hc_combine, post = 2*sigmoid(inject/hc), identity
+// comb) and the grouped RMSNorm that opens the next mixer (build_hc_mix). One block per row of the
+// new residual (row = stream, channel = token), the grid and block of rms_norm_f32<1024, true>.
+// Each thread computes its residual values with the expressions of dsv4_hc_post_f32<false, true>
+// and stores them (the DSV4_HC_POST output), adds their squares over the columns tid, tid + 1024,
+// ... and reduces them like rms_norm_f32; the normalized values times the gamma are the MUL
+// output. Both outputs are bitwise those of the two kernels it replaces.
+template <int block_size>
+static __global__ void dsv4_hc_post_rms_norm_mul_f32(
+        const float * __restrict__ x,
+        const float * __restrict__ residual,
+        const float * __restrict__ post,
+        float * __restrict__       dst_post,
+        float * __restrict__       dst,
+        const int     ncols,
+        const int64_t sx0,
+        const int64_t sx1,
+        const int64_t sr0,
+        const int64_t sr1,
+        const int64_t sr2,
+        const int64_t sp0,
+        const int64_t sp1,
+        const float   gate_inv_hc,
+        const float   gate_scale,
+        const float   eps,
+        const float * __restrict__ mul,
+        const int64_t mul_stride_row,
+        const int64_t mul_stride_channel,
+        const uint3   mul_ncols_packed,
+        const uint3   mul_nrows_packed,
+        const uint3   mul_nchannels_packed) {
+    const int nrows   = gridDim.x;
+    const int row     = blockIdx.x; // stream
+    const int channel = blockIdx.y; // token
+    const int tid     = threadIdx.x;
+
+    // dsv4_hc_post_f32<false, true>
+    const float v = gate_inv_hc * post[row*sp0 + channel*sp1];
+    const float p = gate_scale * (1.0f / (1.0f + expf(-v)));
+
+    float * row_post = dst_post + ((int64_t) channel*nrows + row)*ncols;
+    dst += ((int64_t) channel*nrows + row)*ncols;
+
+    const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+    const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+    mul += mul_channel*mul_stride_channel + mul_row*mul_stride_row;
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    for (int col = tid; col < ncols; col += block_size) {
+        float sum = x[col*sx0 + channel*sx1] * p;
+        sum += residual[col*sr0 + row*sr1 + channel*sr2];
+        row_post[col] = sum;
+        tmp += sum * sum;
+    }
+
+    // rms_norm_f32<block_size, true>
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const int mul_col = fastmodulo(col, mul_ncols_packed);
+        dst[col] = scale * row_post[col] * mul[mul_col];
+    }
+}
+
+// Returns false when the nodes are not the shapes the fused kernel covers; the caller then runs
+// them unfused. hc_post is the DSV4_HC_POST node, scale_inv_hc and scale_gate the SCALE nodes of
+// its gate, rms_norm/mul the two nodes after it.
+bool ggml_cuda_op_dsv4_hc_post_rms_norm_mul_fused(ggml_backend_cuda_context & ctx,
+                                                  ggml_tensor *               hc_post,
+                                                  ggml_tensor *               scale_inv_hc,
+                                                  ggml_tensor *               scale_gate,
+                                                  ggml_tensor *               rms_norm,
+                                                  ggml_tensor *               mul) {
+    const ggml_tensor * x        = hc_post->src[0];
+    const ggml_tensor * residual = hc_post->src[1];
+    const ggml_tensor * post     = scale_inv_hc->src[0];
+    const ggml_tensor * gamma    = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    if (hc_post->src[3] != nullptr || rms_norm->src[0] != hc_post ||
+            x->type != GGML_TYPE_F32 || residual->type != GGML_TYPE_F32 || post->type != GGML_TYPE_F32 ||
+            gamma->type != GGML_TYPE_F32 || hc_post->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(hc_post) || !ggml_is_contiguous(mul) || !ggml_are_same_shape(hc_post, mul) ||
+            x->nb[0] != sizeof(float) || residual->nb[0] != sizeof(float) || gamma->nb[0] != sizeof(float) ||
+            hc_post->ne[3] != 1 || gamma->ne[3] != 1) {
+        return false;
+    }
+
+    const int64_t ncols     = hc_post->ne[0];
+    const int64_t nrows     = hc_post->ne[1];
+    const int64_t nchannels = hc_post->ne[2];
+
+    // the unfused RMS_NORM+MUL takes rms_norm_f32<1024, true> for these shapes: at least 1024
+    // columns and a gamma that is not a single row (rms_norm_f32_rows_ok needs mul_nrows == 1)
+    if (ncols < 1024 || gamma->ne[0] != ncols || gamma->ne[1] == 1 || gamma->ne[2] != 1 ||
+            nrows % gamma->ne[1] != 0) {
+        return false;
+    }
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    const float inv_hc = ggml_get_op_params_f32(scale_inv_hc, 0);
+    const float factor = ggml_get_op_params_f32(scale_gate,   0);
+
+    const size_t ts = sizeof(float);
+    const dim3 blocks_num(nrows, nchannels, 1);
+    const dim3 block_dims(1024, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32 * sizeof(float), ctx.stream()};
+    ggml_cuda_kernel_launch(dsv4_hc_post_rms_norm_mul_f32<1024>, launch_params,
+        (const float *) x->data, (const float *) residual->data, (const float *) post->data,
+        (float *) hc_post->data, (float *) mul->data, (int) ncols,
+        (int64_t) (x->nb[0] / ts), (int64_t) (x->nb[1] / ts),
+        (int64_t) (residual->nb[0] / ts), (int64_t) (residual->nb[1] / ts), (int64_t) (residual->nb[2] / ts),
+        (int64_t) (post->nb[0] / ts), (int64_t) (post->nb[1] / ts),
+        inv_hc, factor, eps,
+        (const float *) gamma->data, (int64_t) (gamma->nb[1] / ts), (int64_t) (gamma->nb[2] / ts),
+        init_fastdiv_values((uint32_t) gamma->ne[0]), init_fastdiv_values((uint32_t) gamma->ne[1]),
+        init_fastdiv_values((uint32_t) gamma->ne[2]));
+    return true;
+}
+
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
