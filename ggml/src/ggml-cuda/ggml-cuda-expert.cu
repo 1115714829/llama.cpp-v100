@@ -943,6 +943,102 @@ ggml_cuda_expert_stream_state & ggml_backend_cuda_expert_buffer_context::get_str
     return streams.emplace(stream, std::move(ss)).first->second;
 }
 
+// release the allocations of one per-stream staging state; the caller guarantees that no launch
+// still reads them (the buffer is being freed, or the device was synchronized)
+static void ggml_cuda_expert_free_stream_state(ggml_cuda_expert_stream_state & ss) {
+    for (size_t i = 0; i < ss.tables.size(); ++i) {
+        if (ss.tables[i] != nullptr) {
+            CUDA_CHECK(cudaFree(ss.tables[i]));
+        }
+        if (ss.bitmaps[i] != nullptr) {
+            CUDA_CHECK(cudaFree(ss.bitmaps[i]));
+        }
+        if (ss.bitmaps_pinned[i] != nullptr) {
+            CUDA_CHECK(cudaFreeHost(ss.bitmaps_pinned[i]));
+        }
+    }
+    if (ss.stage_dev) {
+        CUDA_CHECK(cudaFree(ss.stage_dev));
+    }
+    if (ss.hit_list) {
+        CUDA_CHECK(cudaFree(ss.hit_list));
+    }
+    if (ss.plan_state) {
+        CUDA_CHECK(cudaFree(ss.plan_state));
+    }
+    if (ss.plan_pinned) {
+        CUDA_CHECK(cudaFreeHost(ss.plan_pinned));
+    }
+    if (ss.plan_event) {
+        CUDA_CHECK(cudaEventDestroy(ss.plan_event));
+    }
+}
+
+// test hook: release the per-stream staging state of every expert buffer of the device, so that the
+// next launch creates it again and runs the first-launch path of get_stream (allocation and clearing
+// of the staging area, the plan buffers and the pointer tables right before the first staging
+// kernels). The device is synchronized first, so no launch still reads the state that goes away.
+void ggml_cuda_expert_reset_streams(ggml_backend_buffer_type_t buft) {
+    if (buft == nullptr || buft->context == nullptr || !ggml_cuda_expert_buft_is_expert(buft)) {
+        return;
+    }
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+    std::vector<ggml_backend_cuda_expert_buffer_context *> list;
+    {
+        std::lock_guard<std::mutex> lock(g_expert_buffers_mutex);
+        list = g_expert_buffers;
+    }
+    for (ggml_backend_cuda_expert_buffer_context * ctx : list) {
+        if (ctx->device != buft_ctx->device) {
+            continue;
+        }
+        ggml_cuda_set_device(ctx->device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        for (auto & kv : ctx->streams) {
+            ggml_cuda_expert_free_stream_state(kv.second);
+        }
+        ctx->streams.clear();
+    }
+}
+
+// test hook: how many host experts the last prefill staging launch of the device copied into the
+// staging area (the n_hit of its plan), summed over the stream states of the expert buffers of the
+// device. The device is synchronized first. A test that knows the routing of the launch compares it
+// with the number of distinct routed host experts: a plan that counted fewer staged less than it
+// should have (the consumer then read the host arena in place, or a slot that was never filled).
+// Returns false when the device has no stream state yet (no staging launch ran).
+bool ggml_cuda_expert_last_stage_hits(ggml_backend_buffer_type_t buft, size_t * n_hit) {
+    if (buft == nullptr || buft->context == nullptr || !ggml_cuda_expert_buft_is_expert(buft) || n_hit == nullptr) {
+        return false;
+    }
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+    std::vector<ggml_backend_cuda_expert_buffer_context *> list;
+    {
+        std::lock_guard<std::mutex> lock(g_expert_buffers_mutex);
+        list = g_expert_buffers;
+    }
+    bool found = false;
+    *n_hit = 0;
+    for (ggml_backend_cuda_expert_buffer_context * ctx : list) {
+        if (ctx->device != buft_ctx->device) {
+            continue;
+        }
+        ggml_cuda_set_device(ctx->device);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        for (auto & kv : ctx->streams) {
+            const ggml_cuda_expert_stream_state & ss = kv.second;
+            if (ss.plan_state == nullptr) {
+                continue;
+            }
+            int plan[2] = { 0, 0 };
+            CUDA_CHECK(cudaMemcpy(plan, ss.plan_state, sizeof(plan), cudaMemcpyDeviceToHost));
+            *n_hit += (size_t) plan[0];
+            found = true;
+        }
+    }
+    return found;
+}
+
 ggml_backend_cuda_expert_buffer_context::~ggml_backend_cuda_expert_buffer_context() {
     ggml_cuda_set_device(device);
 
@@ -961,33 +1057,7 @@ ggml_backend_cuda_expert_buffer_context::~ggml_backend_cuda_expert_buffer_contex
     }
 
     for (auto & kv : streams) {
-        ggml_cuda_expert_stream_state & ss = kv.second;
-        for (size_t i = 0; i < ss.tables.size(); ++i) {
-            if (ss.tables[i] != nullptr) {
-                CUDA_CHECK(cudaFree(ss.tables[i]));
-            }
-            if (ss.bitmaps[i] != nullptr) {
-                CUDA_CHECK(cudaFree(ss.bitmaps[i]));
-            }
-            if (ss.bitmaps_pinned[i] != nullptr) {
-                CUDA_CHECK(cudaFreeHost(ss.bitmaps_pinned[i]));
-            }
-        }
-        if (ss.stage_dev) {
-            CUDA_CHECK(cudaFree(ss.stage_dev));
-        }
-        if (ss.hit_list) {
-            CUDA_CHECK(cudaFree(ss.hit_list));
-        }
-        if (ss.plan_state) {
-            CUDA_CHECK(cudaFree(ss.plan_state));
-        }
-        if (ss.plan_pinned) {
-            CUDA_CHECK(cudaFreeHost(ss.plan_pinned));
-        }
-        if (ss.plan_event) {
-            CUDA_CHECK(cudaEventDestroy(ss.plan_event));
-        }
+        ggml_cuda_expert_free_stream_state(kv.second);
     }
     for (ggml_cuda_expert_tensor_state & s : tensors) {
         if (s.table_main_dev) {
@@ -2080,6 +2150,16 @@ void ggml_cuda_expert_record_plan(ggml_backend_buffer_type_t buft, size_t slot_b
 void ggml_cuda_expert_set_slot_limit(ggml_backend_buffer_type_t buft, size_t bytes) {
     GGML_UNUSED(buft);
     GGML_UNUSED(bytes);
+}
+
+void ggml_cuda_expert_reset_streams(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+}
+
+bool ggml_cuda_expert_last_stage_hits(ggml_backend_buffer_type_t buft, size_t * n_hit) {
+    GGML_UNUSED(buft);
+    GGML_UNUSED(n_hit);
+    return false;
 }
 
 bool ggml_backend_cuda_expert_get_allocation(

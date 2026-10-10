@@ -10069,6 +10069,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_expert_set_slot_limit") == 0) {
         return (void *)ggml_cuda_expert_set_slot_limit;
     }
+    if (strcmp(name, "ggml_backend_cuda_expert_reset_streams") == 0) {
+        return (void *)ggml_cuda_expert_reset_streams;
+    }
+    if (strcmp(name, "ggml_backend_cuda_expert_last_stage_hits") == 0) {
+        return (void *)ggml_cuda_expert_last_stage_hits;
+    }
     if (strcmp(name, "ggml_backend_cuda_expert_set_budget") == 0) {
         return (void *)ggml_cuda_expert_set_budget;
     }
