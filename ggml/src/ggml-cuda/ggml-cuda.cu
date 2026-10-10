@@ -5807,6 +5807,41 @@ static bool ggml_cuda_fused_output_ranges_ok(const ggml_tensor * out, std::initi
     return true;
 }
 
+// Memory check for the fused hyper-connection norm (dsv4_hc_post_rms_norm_mul_f32): one block per
+// row reads the shared block output x and the gate input of every row, so the outputs must not
+// overlap them at all; the residual (and the norm input without the post) is read element by
+// element by the thread that writes the same element of the outputs, so an exact alias is fine.
+// ggml-alloc may give an output the memory of an input that is dead in the unfused node order.
+static bool ggml_cuda_hc_mix_norm_ranges_ok(const ggml_tensor * hc_post, const ggml_tensor * post,
+                                            const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+    auto disjoint = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t a0 = (uintptr_t) a->data;
+        const uintptr_t b0 = (uintptr_t) b->data;
+        return a0 >= b0 + ggml_nbytes(b) || b0 >= a0 + ggml_nbytes(a);
+    };
+    const ggml_tensor * gamma  = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    const ggml_tensor * rms_in = rms_norm->src[0];
+    if (hc_post != nullptr && !disjoint(hc_post, mul)) {
+        return false;
+    }
+    for (const ggml_tensor * out : { mul, hc_post }) {
+        if (out == nullptr) {
+            continue;
+        }
+        if (!disjoint(out, gamma) || (post != nullptr && !disjoint(out, post))) {
+            return false;
+        }
+        if (hc_post != nullptr) {
+            if (!disjoint(out, hc_post->src[0]) || !ggml_cuda_fused_output_ranges_ok(out, { hc_post->src[1] })) {
+                return false;
+            }
+        } else if (!ggml_cuda_fused_output_ranges_ok(out, { rms_in })) {
+            return false;
+        }
+    }
+    return true;
+}
+
 struct ggml_cuda_rms_norm_gated_match {
     ggml_tensor * rms_norm = nullptr;
     ggml_tensor * mul      = nullptr;
@@ -7536,7 +7571,8 @@ static int ggml_cuda_try_fuse_hc_mix(ggml_backend_cuda_context * cuda_ctx, ggml_
             mm_down->type != GGML_TYPE_F32 || mm_up->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm_up) ||
             mm_up->ne[1] != m || silu->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
             !ggml_cuda_q8_skinny_hc_down_up_supported(mm_down->src[0], mm_up->src[0], m) ||
-            !ggml_cuda_hc_mix_norm_supported(hc_post, scale_inv_hc, rms_norm, mul)) {
+            !ggml_cuda_hc_mix_norm_supported(hc_post, scale_inv_hc, rms_norm, mul) ||
+            !ggml_cuda_hc_mix_norm_ranges_ok(hc_post, scale_inv_hc ? scale_inv_hc->src[0] : nullptr, rms_norm, mul)) {
         return 0;
     }
 
@@ -8550,6 +8586,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             (cgraph->nodes[i + 5]->src[0] == cgraph->nodes[i + 4] || cgraph->nodes[i + 5]->src[1] == cgraph->nodes[i + 4]) &&
             node->src[0]->type == GGML_TYPE_F32 &&
             node->type == GGML_TYPE_F32 &&
+            ggml_cuda_hc_mix_norm_ranges_ok(cgraph->nodes[i + 3], node->src[0], cgraph->nodes[i + 4], cgraph->nodes[i + 5]) &&
             ggml_cuda_op_dsv4_hc_post_rms_norm_mul_fused(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2],
                                                          cgraph->nodes[i + 4], cgraph->nodes[i + 5])) {
         return 5;
