@@ -112,6 +112,17 @@ static void ggml_cuda_expert_free_device(void * user, void * ptr) {
 static std::mutex g_expert_host_mutex;
 static std::map<void *, std::pair<int, size_t>> g_expert_host_alloc;
 
+// NUMA node of the host arena that starts at host_ptr, GGML_CUDA_NUMA_NODE_ANY when the pointer
+// is not an arena of this backend (no host complement) or the arena got no node
+static int ggml_cuda_expert_host_node(const void * host_ptr) {
+    if (host_ptr == nullptr) {
+        return GGML_CUDA_NUMA_NODE_ANY;
+    }
+    std::lock_guard<std::mutex> lock(g_expert_host_mutex);
+    const auto it = g_expert_host_alloc.find(const_cast<void *>(host_ptr));
+    return it != g_expert_host_alloc.end() ? it->second.first : GGML_CUDA_NUMA_NODE_ANY;
+}
+
 static void * ggml_cuda_expert_alloc_host(void * user, size_t size, void ** dev_ptr) {
     const int device = (int) (intptr_t) user;
     ggml_cuda_set_device(device);
@@ -588,6 +599,15 @@ struct ggml_cuda_expert_stream_state {
     cudaEvent_t            plan_event  = nullptr; // marks the readback into plan_pinned
     size_t                 hit_cap    = 0;        // == largest n_local of the tensors
     int                    stage_seq  = 0;        // launch counter of the decode staging, for its fault
+
+    // timing of the stage copy kernel for the periodic staging log: a ring of event pairs is
+    // recorded around the copy of a launch and read once it has landed, so the host never
+    // waits for the GPU here (ggml_cuda_expert_stage_copy_timing_drain)
+    static constexpr int   COPY_TIMING_RING = 16;
+    cudaEvent_t            copy_ev[COPY_TIMING_RING][2] = {};
+    int                    copy_ring_head  = 0;   // next pair to record
+    int                    copy_ring_tail  = 0;   // oldest pair not yet read
+    int                    copy_ring_count = 0;   // pairs recorded and not yet read
 };
 
 struct ggml_backend_cuda_expert_buffer_context {
@@ -610,6 +630,12 @@ struct ggml_backend_cuda_expert_buffer_context {
     unsigned long long * usage_host = nullptr; // pinned
     cudaEvent_t usage_event = nullptr;          // marks the last async copy into usage_host
     int64_t launches = 0;
+
+    // stage copy kernel time of the prefill launches that were timed (see the stream state),
+    // for the periodic staging log
+    double  stage_copy_ms      = 0.0;
+    int64_t stage_copy_timed   = 0;
+    int64_t stage_copy_untimed = 0;
 
     ggml_cuda_expert_stream_state & get_stream(cudaStream_t stream);
     ~ggml_backend_cuda_expert_buffer_context();
@@ -900,6 +926,10 @@ ggml_cuda_expert_stream_state & ggml_backend_cuda_expert_buffer_context::get_str
         CUDA_CHECK(cudaHostAlloc((void **) &ss.plan_pinned, 5 * sizeof(int), cudaHostAllocDefault));
         memset(ss.plan_pinned, 0, 5 * sizeof(int));
         CUDA_CHECK(cudaEventCreateWithFlags(&ss.plan_event, cudaEventDisableTiming));
+        for (int i = 0; i < ggml_cuda_expert_stream_state::COPY_TIMING_RING; ++i) {
+            CUDA_CHECK(cudaEventCreate(&ss.copy_ev[i][0]));
+            CUDA_CHECK(cudaEventCreate(&ss.copy_ev[i][1]));
+        }
     }
     ss.tables.assign(tensors.size(), nullptr);
 
@@ -944,6 +974,13 @@ ggml_backend_cuda_expert_buffer_context::~ggml_backend_cuda_expert_buffer_contex
         }
         if (ss.plan_event) {
             CUDA_CHECK(cudaEventDestroy(ss.plan_event));
+        }
+        for (int i = 0; i < ggml_cuda_expert_stream_state::COPY_TIMING_RING; ++i) {
+            for (int j = 0; j < 2; ++j) {
+                if (ss.copy_ev[i][j]) {
+                    CUDA_CHECK(cudaEventDestroy(ss.copy_ev[i][j]));
+                }
+            }
         }
     }
     for (ggml_cuda_expert_tensor_state & s : tensors) {
@@ -1037,10 +1074,16 @@ static void ggml_cuda_expert_stats_readback(ggml_backend_cuda_expert_buffer_cont
         }
         const unsigned long long total = ctx->usage_host[0] + ctx->usage_host[1];
         if (total > 0) {
-            GGML_LOG_DEBUG("%s: device %d: expert hits vram %llu / host %llu (%.2f%% vram), host hit %.2f MiB, staged %.2f MiB\n",
+            // the stage copy rate takes the staged bytes of the timed share of the launches
+            const int64_t n_copy = ctx->stage_copy_timed + ctx->stage_copy_untimed;
+            const double  gbs    = ctx->stage_copy_ms > 0.0 && n_copy > 0
+                ? (double) ctx->usage_host[3] * ((double) ctx->stage_copy_timed / (double) n_copy) / (ctx->stage_copy_ms * 1e6)
+                : 0.0;
+            GGML_LOG_DEBUG("%s: device %d: expert hits vram %llu / host %llu (%.2f%% vram), host hit %.2f MiB, staged %.2f MiB, stage copy kernel %.1f ms over %" PRId64 " timed launches (%" PRId64 " untimed), %.1f GB/s\n",
                 __func__, ctx->device, ctx->usage_host[0], ctx->usage_host[1],
                 100.0 * ctx->usage_host[0] / total, ctx->usage_host[2] / 1024.0 / 1024.0,
-                ctx->usage_host[3] / 1024.0 / 1024.0);
+                ctx->usage_host[3] / 1024.0 / 1024.0,
+                ctx->stage_copy_ms, ctx->stage_copy_timed, ctx->stage_copy_untimed, gbs);
         }
     }
 }
@@ -1092,6 +1135,24 @@ void ggml_cuda_expert_stats_tick(const ggml_tensor * src0, cudaStream_t stream) 
     GGML_LOG_DEBUG("%s: device %d tensor %s: staging last batch: %d host experts staged (%.2f MiB)\n",
         __func__, ctx->device, s.tensor != nullptr ? s.tensor->name : "?",
         n_hit, (double) (n_hit * (int64_t) s.blob_bytes) / 1024.0 / 1024.0);
+}
+
+// read the landed stage copy timings of earlier launches of the stream into the device totals;
+// stops at the first pair whose copy has not finished, without waiting for it
+static void ggml_cuda_expert_stage_copy_timing_drain(ggml_backend_cuda_expert_buffer_context * ctx, ggml_cuda_expert_stream_state & ss) {
+    while (ss.copy_ring_count > 0) {
+        cudaEvent_t * pair = ss.copy_ev[ss.copy_ring_tail];
+        if (cudaEventQuery(pair[1]) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+        float ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&ms, pair[0], pair[1]));
+        ctx->stage_copy_ms += ms;
+        ctx->stage_copy_timed++;
+        ss.copy_ring_tail = (ss.copy_ring_tail + 1) % ggml_cuda_expert_stream_state::COPY_TIMING_RING;
+        ss.copy_ring_count--;
+    }
 }
 
 // prepare the staging area for one prefill launch: de-duplicate the routed experts of the
@@ -1167,12 +1228,32 @@ const char * const * ggml_cuda_expert_stage_prepare(
         ss.hit_list, ss.hit_cap, ss.plan_state, ss.plan_state + 1, ss.plan_state + 2, ctx->usage_dev);
     CUDA_CHECK(cudaGetLastError());
 
+    // time the copy when a pair of the ring is free and the stream is not being captured; the
+    // landed timings of earlier launches are read first, without waiting (logs only)
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    const bool timing = cudaStreamIsCapturing(stream, &capture) == cudaSuccess && capture == cudaStreamCaptureStatusNone;
+    if (timing) {
+        ggml_cuda_expert_stage_copy_timing_drain(ctx, ss);
+    }
+    const bool timed = timing && ss.copy_ring_count < ggml_cuda_expert_stream_state::COPY_TIMING_RING;
+    if (timed) {
+        CUDA_CHECK(cudaEventRecord(ss.copy_ev[ss.copy_ring_head][0], stream));
+    }
+
     const int copy_chunks = (int) ((s.blob_bytes + EXPERT_STAGE_COPY_CHUNK - 1) / EXPERT_STAGE_COPY_CHUNK);
     expert_stage_copy_kernel<<<dim3(copy_chunks, expert_hi - expert_lo), nthreads, 0, stream>>>(
         ss.hit_list, ss.plan_state, st->host_dev, s.host_offset_dev,
         block_dev, s.blob_stride, s.blob_bytes,
         expert_lo, expert_hi, table_stage, ss.plan_state + 3);
     CUDA_CHECK(cudaGetLastError());
+
+    if (timed) {
+        CUDA_CHECK(cudaEventRecord(ss.copy_ev[ss.copy_ring_head][1], stream));
+        ss.copy_ring_head = (ss.copy_ring_head + 1) % ggml_cuda_expert_stream_state::COPY_TIMING_RING;
+        ss.copy_ring_count++;
+    } else {
+        ctx->stage_copy_untimed++;
+    }
 
     // read the bitmap and the copy plan back without waiting: the log shows how many experts
     // the last batches staged, and a launch whose plan and copy disagree is reported here.
@@ -1345,7 +1426,14 @@ static void ggml_backend_cuda_expert_buffer_memset_tensor(ggml_backend_buffer_t 
         CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
         return;
     }
+    // the host complement is written by the CPUs of the node its arena is on (see
+    // ggml_cuda_numa_bind_cpus); the slot experts go through copy_h2d either way
+    const ggml_expert_store_tensor * st = ggml_expert_store_tensor_at(ctx->store, tensor_id);
+    const bool bound = ggml_cuda_numa_bind_cpus(ggml_cuda_expert_host_node(st != nullptr ? st->host_host : nullptr));
     ggml_expert_store_memset(ctx->store, tensor_id, value, store_offset + offset, size);
+    if (bound) {
+        ggml_cuda_numa_unbind_cpus();
+    }
 }
 
 static void ggml_backend_cuda_expert_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
@@ -1360,7 +1448,14 @@ static void ggml_backend_cuda_expert_buffer_set_tensor(ggml_backend_buffer_t buf
         return;
     }
     ggml_cuda_set_device(ctx->device);
+    // the host complement is written by the CPUs of the node its arena is on: a GPU reads pages
+    // the other socket wrote last at 17-30 GB/s instead of 44 (see ggml_cuda_numa_bind_cpus)
+    const ggml_expert_store_tensor * st = ggml_expert_store_tensor_at(ctx->store, tensor_id);
+    const bool bound = ggml_cuda_numa_bind_cpus(ggml_cuda_expert_host_node(st != nullptr ? st->host_host : nullptr));
     ggml_expert_store_write(ctx->store, tensor_id, data, store_offset + offset, size);
+    if (bound) {
+        ggml_cuda_numa_unbind_cpus();
+    }
 }
 
 static void ggml_backend_cuda_expert_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
