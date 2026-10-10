@@ -195,6 +195,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build(test-llama-archs.cpp)
 
+    # expert assignment table; ggml-expert-store.h lives in ggml/src, so the test includes it directly
+    llama_build_and_test(test-expert-assign.cpp)
+    target_include_directories(test-expert-assign PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 

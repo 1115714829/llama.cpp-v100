@@ -286,11 +286,50 @@ struct ggml_expert_store_placement {
 // totals. No allocation, repeatable. slot_budget < 0 gives every expert a slot. profile_path
 // is the routing profile that ranks the experts; nullptr means the process-wide profile
 // (ggml_expert_store_set_profile), which is the file that stores created afterwards use - so
-// fit and the real allocation plan with the same profile.
+// fit and the real allocation plan with the same profile. n_device is the number of devices
+// the experts are split over; it is needed for the per-device assignment (see
+// ggml_expert_store_owner) and must be the count of the whole run, not of one store.
 GGML_API void ggml_expert_store_plan(
         const ggml_expert_store_plan_tensor * tensors, size_t n_tensors,
+        int n_device,
         int64_t slot_budget, const char * profile_path,
         ggml_expert_store_placement * placement);
+
+// compute the expert assignment (the per-layer LPT split of the experts over the devices) and
+// cache it for the process. profile is the routing profile of the run, nullptr (or an empty one)
+// means the counts are unknown and the contiguous split is used. Called by
+// ggml_expert_store_plan(); the table it produces is read through ggml_expert_store_owner().
+GGML_API void ggml_expert_store_compute_assignment(
+        const char * path, const ggml_expert_store_profile * profile,
+        int n_device, int n_layer, int n_expert);
+
+// result of the expert assignment (the per-layer LPT split of the experts over the devices)
+struct ggml_expert_store_assignment_info {
+    int    n_dev    = 0;  // devices the experts are split over
+    int    n_layer  = 0;  // layers covered by the assignment
+    int    n_expert = 0;  // experts per layer
+    int    cap_max  = 0;  // most experts on one device
+    bool   has_profile = false; // the assignment was computed from a routing profile
+    // mean over the layers of max(dev load) / mean(dev load), before and after the assignment
+    double imbalance_contiguous = 0.0;
+    double imbalance_permuted    = 0.0;
+    int    worst_layer           = -1;  // layer with the largest imbalance_permuted
+    double worst_layer_imbalance = 0.0;
+};
+
+// device that holds one expert, or -1 when no assignment has been computed yet
+GGML_API int ggml_expert_store_owner(int layer, int expert);
+
+// local expert number of every expert of one layer on one device, -1 for the experts of the
+// other devices; the row has ggml_expert_store_assignment_info::n_expert entries and stays
+// valid until the next assignment is computed. nullptr when there is no assignment for dev.
+GGML_API const int16_t * ggml_expert_store_local_of(int dev, int layer);
+
+// global expert number of one local expert, or -1 when there is no such expert on dev
+GGML_API int ggml_expert_store_global_of(int dev, int layer, int local);
+
+// state of the cached assignment, for logging and tests
+GGML_API bool ggml_expert_store_assignment_info_get(ggml_expert_store_assignment_info * info);
 
 // register one expert tensor at the placement computed by ggml_expert_store_plan:
 // slot_experts[0..n_slot) are the experts that get slots 0..n_slot-1, the others are packed

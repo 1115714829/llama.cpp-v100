@@ -1555,7 +1555,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
             (size_t) t->nb[2], ggml_cuda_expert_blob_pad(t->type, t->ne[0]), ggml_type_size(t->type) });
     }
     ggml_expert_store_placement plan;
-    ggml_expert_store_plan(plan_in.data(), plan_in.size(), (int64_t) slot_budget, ctx->store->profile_path.c_str(), &plan);
+    ggml_expert_store_plan(plan_in.data(), plan_in.size(), ggml_backend_cuda_get_device_count(), (int64_t) slot_budget, ctx->store->profile_path.c_str(), &plan);
 
     // the staging area must hold the host complement of the largest tensor: fit sizes it that
     // way and reports a deficit, so a smaller budget is a configuration error
@@ -1844,7 +1844,7 @@ void ggml_cuda_expert_plan(
     }
 
     ggml_expert_store_placement plan;
-    ggml_expert_store_plan(tensors.data(), tensors.size(), (int64_t) slot_budget, nullptr, &plan);
+    ggml_expert_store_plan(tensors.data(), tensors.size(), ggml_backend_cuda_get_device_count(), (int64_t) slot_budget, nullptr, &plan);
 
     if (slot_bytes != nullptr) {
         *slot_bytes = (size_t) plan.slot_used;
