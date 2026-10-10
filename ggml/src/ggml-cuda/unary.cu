@@ -757,6 +757,43 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
+/* fused sigmoid of a per-row gate, broadcast mul and add */
+
+// dst = a + x * sigmoid(g[row]), g one value per row of x: the qwen4exp shared expert tail
+// (ffn_out = moe_out + ffn_shexp * sigmoid(shared_gate)). Each step is rounded to F32 as the unfused
+// SIGMOID, MUL and ADD kernels round it (no contraction into an FMA), so the result is bitwise the same.
+static __global__ void sigmoid_mul_add_rows_kernel(const float * x, const float * g, const float * a, float * dst,
+                                                   const int64_t ncols, const int64_t k) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    const float s = ggml_cuda_op_sigmoid_single(g[i / ncols]);
+    dst[i] = __fadd_rn(a[i], __fmul_rn(x[i], s));
+}
+
+void ggml_cuda_op_sigmoid_mul_add_rows(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid, ggml_tensor * mul, ggml_tensor * add) {
+    const ggml_tensor * g = sigmoid->src[0];
+    const ggml_tensor * x = mul->src[0] == sigmoid ? mul->src[1] : mul->src[0];
+    const ggml_tensor * a = add->src[0] == mul ? add->src[1] : add->src[0];
+
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && ggml_is_contiguous(g));
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && ggml_is_contiguous(x));
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_contiguous(a));
+    GGML_ASSERT(add->type == GGML_TYPE_F32 && ggml_is_contiguous(add));
+    GGML_ASSERT(ggml_nrows(g) == ggml_nrows(x) && g->ne[0] == 1);
+
+    const int64_t k = ggml_nelements(add);
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3) num_blocks, CUDA_GLU_BLOCK_SIZE, 0, ctx.stream());
+    ggml_cuda_kernel_launch(sigmoid_mul_add_rows_kernel, launch_params,
+        (const float *) x->data, (const float *) g->data, (const float *) a->data, (float *) add->data, x->ne[0], k);
+}
+
 /* fused cont + unary + mul with a strided input view */
 
 // like unary_gated_op_kernel, but g is an F32 view with its own strides and the layout of dst

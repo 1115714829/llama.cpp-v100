@@ -7702,6 +7702,58 @@ static int ggml_cuda_try_fuse_hc_pre_mm(ggml_backend_cuda_context * cuda_ctx, gg
     return j + n_mm - 1 - i;
 }
 
+// UNARY(SIGMOID) -> MUL -> ADD with the sigmoid on one value per row: the qwen4exp shared expert tail,
+// ffn_out = moe_out + ffn_shexp * sigmoid(shared_gate). One kernel at the position of the sigmoid
+// instead of the sigmoid, the broadcast mul and the add; bitwise the same.
+static int ggml_cuda_try_fuse_sigmoid_mul_add_rows(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * sig = cgraph->nodes[i];
+    if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID) {
+        return 0;
+    }
+    const int i1 = ggml_cuda_next_real_node(cgraph, i);
+    const int i2 = i1 < 0 ? -1 : ggml_cuda_next_real_node(cgraph, i1);
+    if (i2 < 0) {
+        return 0;
+    }
+    ggml_tensor * mul = cgraph->nodes[i1];
+    ggml_tensor * add = cgraph->nodes[i2];
+    if (mul->op != GGML_OP_MUL || add->op != GGML_OP_ADD ||
+            (mul->src[0] == sig) == (mul->src[1] == sig) || (add->src[0] == mul) == (add->src[1] == mul)) {
+        return 0;
+    }
+    const ggml_tensor * g = sig->src[0];
+    const ggml_tensor * x = mul->src[0] == sig ? mul->src[1] : mul->src[0];
+    const ggml_tensor * a = add->src[0] == mul ? add->src[1] : add->src[0];
+    for (const ggml_tensor * t : { g, (const ggml_tensor *) sig, x, (const ggml_tensor *) mul, a, (const ggml_tensor *) add }) {
+        if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) {
+            return 0;
+        }
+    }
+    if (g->ne[0] != 1 || ggml_nrows(g) != ggml_nrows(x) || g->ne[1] != x->ne[1] || g->ne[2] != x->ne[2] ||
+            g->ne[3] != x->ne[3] || !ggml_are_same_shape(x, mul) || !ggml_are_same_shape(x, a) ||
+            !ggml_are_same_shape(x, add)) {
+        return 0;
+    }
+    // the kernel runs at the position of the sigmoid
+    if (!ggml_cuda_tensor_ready_before(cgraph, x, i) || !ggml_cuda_tensor_ready_before(cgraph, a, i)) {
+        return 0;
+    }
+    const int idxs[] = { i, i1, i2 };
+    const enum ggml_op ops[] = { GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_ADD };
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, 3, ops, &i2, 1)) {
+        return 0;
+    }
+    // each thread reads its elements of x and a before writing that element; every thread reads g
+    const uintptr_t d0 = (uintptr_t) add->data;
+    const uintptr_t g0 = (uintptr_t) g->data;
+    if (!(d0 >= g0 + ggml_nbytes(g) || g0 >= d0 + ggml_nbytes(add)) ||
+            !ggml_cuda_fused_output_ranges_ok(add, { x, a })) {
+        return 0;
+    }
+    ggml_cuda_op_sigmoid_mul_add_rows(*cuda_ctx, sig, mul, add);
+    return i2 - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -7738,6 +7790,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int n_hc_pre = ggml_cuda_try_fuse_hc_pre_mm(cuda_ctx, cgraph, i);
         if (n_hc_pre > 0) {
             return n_hc_pre;
+        }
+    }
+
+    if (node->op == GGML_OP_UNARY) {
+        const int n_tail = ggml_cuda_try_fuse_sigmoid_mul_add_rows(cuda_ctx, cgraph, i);
+        if (n_tail > 0) {
+            return n_tail;
         }
     }
 

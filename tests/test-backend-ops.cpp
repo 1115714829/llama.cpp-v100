@@ -5338,6 +5338,39 @@ struct test_attn_gate_q8 : public test_case {
     }
 };
 
+// The qwen4exp shared expert tail: ffn_out = moe_out + ffn_shexp * sigmoid(shared_gate), the gate one
+// value per token (sm_70 fuses the sigmoid, the broadcast mul and the add)
+struct test_shexp_tail : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SHEXP_TAIL";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_shexp_tail(int64_t n_embd = 2560, int64_t n_tokens = 4)
+        : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * moe   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * gate  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
+        ggml_set_name(moe, "moe");
+        ggml_set_name(shexp, "shexp");
+        ggml_set_name(gate, "gate");
+        ggml_tensor * out = ggml_add(ctx, moe, ggml_mul(ctx, shexp, ggml_sigmoid(ctx, gate)));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // A gated Q8_0 FFN, down(swiglu(gate(x), up(x))), as the qwen4exp shared expert (sm_70 repacks the
 // weights; a narrow pair hands silu(gate) * up to the down projection as F16)
 struct test_ffn_q8 : public test_case {
@@ -13324,6 +13357,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n_tokens, 640, 2560,
             false, 1, 1, false, false, true, false, {1, 1}));
     }
+    // the shared expert tail, decode and prefill widths
+    for (int64_t n_tokens : {1, 4, 17, 512}) {
+        test_cases.emplace_back(new test_shexp_tail(2560, n_tokens));
+    }
+    test_cases.emplace_back(new test_shexp_tail(96, 3));
     // the shared expert with its down projection: the gated pair hands F16 activations to the
     // down projection (M <= 16), a wide pair keeps the F32 GLU output (N = 4352)
     for (int64_t n_tokens : {1, 4, 8, 16, 17}) {

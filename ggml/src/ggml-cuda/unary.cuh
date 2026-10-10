@@ -100,6 +100,10 @@ void ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor 
 
 void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * silu_node);
 
+// UNARY(SIGMOID) on a per-row gate [1, rows] -> MUL with x [ncols, rows] -> ADD with a [ncols, rows] in one
+// kernel, bitwise the unfused kernels (the qwen4exp shared expert tail)
+void ggml_cuda_op_sigmoid_mul_add_rows(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid, ggml_tensor * mul, ggml_tensor * add);
+
 void ggml_cuda_op_gdn_gating(ggml_backend_cuda_context & ctx,
         const ggml_tensor * beta_in, ggml_tensor * beta_out,
         const ggml_tensor * alpha_in, const ggml_tensor * dt, const ggml_tensor * a,
