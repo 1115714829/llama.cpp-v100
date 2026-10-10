@@ -2384,6 +2384,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // ring[slot] = id_last, queued on the draft streams behind the catch-up decode
         llama_draft_ring_begin(ctx_dft, ids_last.data(), ids_last.size());
 
+        // host time of every submission and of the final wait (trace only, see below)
+        std::vector<int64_t> t_submit_us;
+        t_submit_us.reserve(n_max);
+        const int64_t t_chain0_us = ggml_time_us();
+
         int n_steps = 0;
         for (int i = 0; i < n_max; ++i) {
             if (i > 0) {
@@ -2399,7 +2404,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             llama_set_h_source(ctx_dft, true, step_cols.data(), step_cols.size());
 
+            const int64_t t_step0_us = ggml_time_us();
             const int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            t_submit_us.push_back(ggml_time_us() - t_step0_us);
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
@@ -2408,7 +2415,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         // one wait for the whole chain: the readback rows of every step are complete
+        const int64_t t_wait0_us = ggml_time_us();
         llama_synchronize_outputs(ctx_dft);
+        const int64_t t_end_us = ggml_time_us();
+
+        if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+            std::string submits;
+            for (const int64_t t : t_submit_us) {
+                submits += (submits.empty() ? "" : ",") + std::to_string(t);
+            }
+            SPC_MTP("draft chain timing: steps=%d submit_us=[%s] wait_us=%" PRId64 " total_us=%" PRId64 "\n",
+                    n_steps, submits.c_str(), t_end_us - t_wait0_us, t_end_us - t_chain0_us);
+        }
 
         for (int32_t slot = 0; slot < n_slots; ++slot) {
             auto & dp = dparams[seqs[slot]];
@@ -2526,7 +2544,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const int64_t t_step0_us = ggml_time_us();
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            const int64_t t_step1_us = ggml_time_us();
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
@@ -2536,6 +2556,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // copies only (the device streams are not drained)
             if (topk_device) {
                 llama_synchronize_outputs(ctx_dft);
+            }
+            if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+                SPC_MTP("draft step timing: step=%d submit_us=%" PRId64 " wait_us=%" PRId64 "\n",
+                        i, t_step1_us - t_step0_us, ggml_time_us() - t_step1_us);
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
