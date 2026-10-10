@@ -191,6 +191,11 @@ struct ggml_backend_sched {
     // in that case, the caller must synchronize the scheduler before overwriting the inputs
     bool async_inputs;
 
+    // dchain: optional caller-owned event per backend, recorded on the backend stream right after
+    // the asynchronous user-input copies of a split (async_inputs, single copy). A caller that
+    // waits for it may overwrite the host inputs while the compute of that graph still runs
+    ggml_backend_event_t ev_inputs[GGML_SCHED_MAX_BACKENDS];
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]

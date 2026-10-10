@@ -26,6 +26,8 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     // r-mtpdev: graph_mtp reads the nextn h from the device sink
     h_nextn_sink_ok = true;
+    // dchain: graph_mtp keeps the draft token chain in the device ring
+    draft_ring_ok = true;
 
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -557,8 +559,20 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out());
 
-    inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    ggml_set_input(inp->tokens);
+    // dchain: a draft step (an output row per token, at most one per sequence) takes its input tokens
+    // from the device ring, where the previous step wrote its argmax; the catch-up decode (kv-only,
+    // real target tokens) keeps the host token input, and so does the worst-case reserve graph of the
+    // catch-up size (every row an output): it only sizes the buffers and has more rows than the ring
+    const bool draft_ring = t_draft_ring != nullptr && !mtp_kv_only && n_tokens <= t_draft_ring->ne[0];
+
+    if (draft_ring) {
+        GGML_ASSERT(t_draft_ring->type == GGML_TYPE_I32);
+        inp->tokens        = ggml_view_1d(ctx0, t_draft_ring, n_tokens, 0);
+        inp->tokens_device = true;
+    } else {
+        inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+        ggml_set_input(inp->tokens);
+    }
 
     // r-mtpdev device path: the h rows are gathered in place from the sink. The separate host
     // input branch is gone with the MTP host h path, so the linked sink is required
@@ -653,6 +667,41 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res->t_logits = cur;
 
     ggml_build_forward_expand(gf, cur);
+
+    // dchain: the argmax of every output row goes back into the ring as the input token of the next
+    // draft step. ggml_top_k over the vocab-sharded logits is a meta collective: every device selects
+    // the candidates of its own shard, the shards are merged with the deterministic (value desc, id
+    // asc) order and every device ends up with the same global ids, so each one writes its own copy
+    // of the ring. The same tensor is a graph output (the host reads the chain once at its end)
+    if (draft_ring) {
+        const int64_t n_rows = cur->ne[1]; // output rows of this step, one per drafting sequence
+        GGML_ASSERT(n_rows <= t_draft_ring->ne[0]);
+
+        ggml_tensor * top1 = nullptr;
+        if (draft_ring_ptop) {
+            // p_min gate: the probability of the argmax over the global top 10, the same candidate set
+            // the CPU chain (top_k(10) + dist) normalizes over
+            ggml_tensor * ids10 = ggml_top_k(ctx0, cur, 10);                                                  // I32 [10, n_rows]
+            ggml_tensor * vals  = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, cur, 1, cur->ne[0], n_rows), ids10); // F32 [1, 10, n_rows]
+            ggml_tensor * probs = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, vals, 10, n_rows));              // F32 [10, n_rows]
+            ggml_tensor * ptop  = ggml_cont(ctx0, ggml_view_2d(ctx0, probs, 1, n_rows, probs->nb[1], 0));     // F32 [1, n_rows]
+            cb(ptop, "draft_ptop", -1);
+            res->t_draft_ptop = ptop;
+            ggml_build_forward_expand(gf, ptop);
+
+            top1 = ggml_cont(ctx0, ggml_view_2d(ctx0, ids10, 1, n_rows, ids10->nb[1], 0));                    // I32 [1, n_rows]
+        } else {
+            top1 = ggml_top_k(ctx0, cur, 1);                                                                 // I32 [1, n_rows]
+        }
+        cb(top1, "draft_top1", -1);
+        res->t_draft_top1 = top1;
+        ggml_build_forward_expand(gf, top1);
+
+        ggml_tensor * ring_rows = ggml_view_1d(ctx0, t_draft_ring, n_rows, 0);
+        ggml_tensor * ring_cpy  = ggml_cpy(ctx0, ggml_reshape_1d(ctx0, top1, n_rows), ring_rows);
+        ggml_set_name(ring_cpy, "draft_ring_cpy");
+        ggml_build_forward_expand(gf, ring_cpy);
+    }
 }
 
 std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(

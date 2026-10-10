@@ -641,6 +641,13 @@ llama_context::~llama_context() {
         ggml_backend_event_free(ev_outputs);
         ev_outputs = nullptr;
     }
+    if (ev_inputs_dec != nullptr) {
+        if (sched_dec) {
+            ggml_backend_sched_set_inputs_event(sched_dec.get(), backend_draft_ring, nullptr);
+        }
+        ggml_backend_event_free(ev_inputs_dec);
+        ev_inputs_dec = nullptr;
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -849,6 +856,10 @@ void llama_context::sched_reserve() {
     if (!dflash_draft) {
         sched_dec.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
         ggml_backend_sched_set_async_inputs(sched_dec.get(), true);
+        // dchain: the draft chain overlaps its steps on this scheduler, see process_ubatch
+        if (ev_inputs_dec != nullptr) {
+            ggml_backend_sched_set_inputs_event(sched_dec.get(), backend_draft_ring, ev_inputs_dec);
+        }
     } else {
         sched_dec.reset();
     }
@@ -2198,6 +2209,143 @@ int32_t llama_context::h_nextn_sink_group() const {
     return embd_link->h_sink_group_last;
 }
 
+bool llama_context::enable_draft_ring(int32_t n_max, bool with_p) {
+    if (t_draft_ring != nullptr) {
+        // idempotent: the ring is sized once
+        return draft_ring_n_max >= n_max && draft_ring_ptop == with_p;
+    }
+
+    if (backends.empty() || n_max <= 0) {
+        return false;
+    }
+
+    // capability branch, not a fallback: only an MTP draft context of an architecture whose MTP graph
+    // reads and writes the ring can use it (t_draft_ring branch in graph_mtp, see draft_ring_ok)
+    if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || !model.draft_ring_ok) {
+        LLAMA_LOG_INFO("%s: this architecture keeps the draft token chain on the host\n", __func__);
+        return false;
+    }
+
+    // the ring lives where the draft graph runs: with a meta output device (tensor split) every device
+    // holds its own copy (MIRRORED), the argmax that every device computes from the merged top-k is the
+    // same on all of them, so each device writes and reads its own copy (same layout as the h sink)
+    ggml_backend_dev_t dev = model.dev_output();
+    if (dev == nullptr) {
+        LLAMA_LOG_ERROR("%s: the model has no output device\n", __func__);
+        return false;
+    }
+    const bool dev_meta = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_META;
+    ggml_backend_t backend_ring = dev_meta ? backends[0].get() : llm_backend_for_device(backends, dev);
+    if (backend_ring == nullptr) {
+        LLAMA_LOG_ERROR("%s: the output device is not one of the context backends\n", __func__);
+        return false;
+    }
+    ggml_backend_buffer_type_t buft = dev_meta ?
+        ggml_backend_get_default_buffer_type(backend_ring) : ggml_backend_dev_buffer_type(dev);
+
+    // pinned host memory for the staging write and the readback rows, so that the copies are truly
+    // asynchronous (a pageable source or destination would synchronize the stream); same choice as
+    // the output buffers (output_reserve)
+    ggml_backend_buffer_type_t buft_host = ggml_backend_dev_host_buffer_type(dev);
+    if (buft_host == nullptr) {
+        buft_host = ggml_backend_cpu_buffer_type();
+    }
+
+    const int64_t n_seq = cparams.n_seq_max;
+
+    const ggml_init_params params_dev = {
+        /*.mem_size   =*/ 2*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ctx_draft_ring.reset(ggml_init(params_dev));
+    ggml_tensor * ring = ggml_new_tensor_1d(ctx_draft_ring.get(), GGML_TYPE_I32, n_seq);
+    ggml_set_name(ring, "draft_ring");
+    buf_draft_ring.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_draft_ring.get(), buft));
+    if (!buf_draft_ring) {
+        LLAMA_LOG_ERROR("%s: draft ring allocation failed\n", __func__);
+        ctx_draft_ring.reset();
+        return false;
+    }
+
+    const ggml_init_params params_host = {
+        /*.mem_size   =*/ 4*ggml_tensor_overhead(),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ctx_draft_ring_host.reset(ggml_init(params_host));
+    ggml_tensor * stage = ggml_new_tensor_1d(ctx_draft_ring_host.get(), GGML_TYPE_I32, n_seq);
+    ggml_tensor * tok   = ggml_new_tensor_2d(ctx_draft_ring_host.get(), GGML_TYPE_I32, n_seq, n_max);
+    ggml_tensor * p     = with_p ? ggml_new_tensor_2d(ctx_draft_ring_host.get(), GGML_TYPE_F32, n_seq, n_max) : nullptr;
+    ggml_set_name(stage, "draft_ring_stage");
+    ggml_set_name(tok,   "draft_ring_tok");
+    if (p) {
+        ggml_set_name(p, "draft_ring_p");
+    }
+    buf_draft_ring_host.reset(ggml_backend_alloc_ctx_tensors_from_buft(ctx_draft_ring_host.get(), buft_host));
+    if (!buf_draft_ring_host) {
+        LLAMA_LOG_ERROR("%s: draft ring host buffers allocation failed\n", __func__);
+        buf_draft_ring.reset();
+        ctx_draft_ring.reset();
+        ctx_draft_ring_host.reset();
+        return false;
+    }
+
+    llama_clear_tensor_data(ring, 0, ggml_nbytes(ring));
+    ggml_backend_buffer_clear(buf_draft_ring_host.get(), 0);
+
+    t_draft_ring       = ring;
+    t_draft_ring_stage = stage;
+    t_draft_ring_tok   = tok;
+    t_draft_ring_p     = p;
+    backend_draft_ring = backend_ring;
+    draft_ring_ptop    = with_p;
+    draft_ring_n_max   = n_max;
+    draft_ring_i       = 0;
+
+    // the chain steps overlap on the decode scheduler: it records this event after the host input
+    // copies of every graph and process_ubatch waits for it instead of the whole scheduler
+    ev_inputs_dec = ggml_backend_event_new(ggml_backend_get_device(backend_ring));
+    if (ev_inputs_dec != nullptr && sched_dec) {
+        ggml_backend_sched_set_inputs_event(sched_dec.get(), backend_draft_ring, ev_inputs_dec);
+    }
+
+    // the graph reads/writes the ring, so its scheduler needs a fresh allocation
+    sched_need_reserve = true;
+
+    LLAMA_LOG_INFO("%s: draft token ring enabled: n_seq_max = %" PRId64 ", n_max = %d, ptop = %d\n", __func__, n_seq, n_max, (int) with_p);
+
+    return true;
+}
+
+void llama_context::draft_ring_begin(const llama_token * ids, size_t n) {
+    GGML_ASSERT(t_draft_ring != nullptr && "the draft ring is not enabled");
+    GGML_ASSERT(ids != nullptr && n > 0 && n <= (size_t) cparams.n_seq_max);
+
+    // the staging row was consumed by the previous chain: its upload preceded that chain's outputs on
+    // the draft streams, and the chain end waited for those (synchronize_outputs)
+    memcpy(t_draft_ring_stage->data, ids, n*sizeof(llama_token));
+
+    // queue the upload on the draft streams, behind the previous chain and the catch-up decode
+    wait_submitted(backend_draft_ring);
+    ggml_backend_tensor_set_async(backend_draft_ring, t_draft_ring, t_draft_ring_stage->data, 0, n*sizeof(llama_token));
+
+    draft_ring_i = 0;
+}
+
+const llama_token * llama_context::draft_ring_tokens(int32_t step) const {
+    GGML_ASSERT(t_draft_ring_tok != nullptr && step >= 0 && step < draft_ring_n_max);
+    return (const llama_token *) t_draft_ring_tok->data + (size_t) step * cparams.n_seq_max;
+}
+
+const float * llama_context::draft_ring_p(int32_t step) const {
+    if (t_draft_ring_p == nullptr) {
+        return nullptr;
+    }
+    GGML_ASSERT(step >= 0 && step < draft_ring_n_max);
+    return (const float *) t_draft_ring_p->data + (size_t) step * cparams.n_seq_max;
+}
+
 bool llama_context::h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols) {
     // runs on the draft context: the copies queue on the draft's output-device stream, after the
     // draft graph that reads the pending columns and before the next one. On the target stream
@@ -2604,7 +2752,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // for the previous user of the input slot and copy synchronously (see
         // ggml_backend_sched_compute_splits), so the backend must not be synchronized here
         if (ggml_backend_sched_get_n_copies(sched_cur) == 1) {
-            ggml_backend_sched_synchronize(sched_cur);
+            if (sched_cur == sched_dec.get() && ev_inputs_dec != nullptr) {
+                // dchain: the decode scheduler records this event right after it handed the host inputs
+                // of the previous graph to the device stream (ggml_backend_sched_set_inputs_event), so
+                // the inputs may be overwritten as soon as it fires while that graph still computes:
+                // the next draft step is prepared and submitted behind the running one
+                ggml_backend_event_synchronize(ev_inputs_dec);
+            } else {
+                ggml_backend_sched_synchronize(sched_cur);
+            }
         }
     }
 
@@ -3144,11 +3300,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -2;
     };
 
-    // with the top-k output only a single row still gets its full logits, unless the context declared
-    // that its host never reads them (logits_topk_only, the MTP draft steps)
-    const bool logits_topk_only = cparams.logits_topk > 0 && cparams.logits_topk_active &&
-        (n_outputs_all > 1 || cparams.logits_topk_only);
-    logits_full = !logits_topk_only;
+    // the host reads no raw logits of this decode when the context declared that it never does
+    // (logits_topk_only: the MTP draft reads its top-k rows or its device ring) or when a batch with
+    // several outputs has the top-k output on (only the top-k rows are copied, see llama_set_logits_topk)
+    const bool logits_host_off = cparams.logits_topk_only ||
+        (cparams.logits_topk > 0 && cparams.logits_topk_active && n_outputs_all > 1);
+    logits_full = !logits_host_off;
 
     // the output buffers of this decode are being refilled
     outputs_ready       = false;
@@ -3198,7 +3355,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers) && !logits_topk_only) {
+        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers) && !logits_host_off) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched_res, t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -3222,6 +3379,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             post_tensor_get_async(sched_res, backend_topk, res->t_logits_topk_ids, topk_ids.data    + n_outputs_prev*n, 0, n_outputs*n*sizeof(int32_t));
             // the output event of this decode is recorded on the stream that carries these copies
             ev_outputs_backend = backend_topk;
+        }
+
+        // dchain: the argmax tokens of a draft step land in the readback row of this step of the chain
+        // (llama_draft_ring_begin resets the row); the chain reads them once after its last step
+        if (res->t_draft_top1 && n_outputs > 0 && t_draft_ring_tok != nullptr) {
+            GGML_ASSERT(draft_ring_i < draft_ring_n_max && "more draft steps than the ring holds: llama_draft_ring_begin missing?");
+            GGML_ASSERT(n_outputs <= (int32_t) cparams.n_seq_max);
+            ggml_backend_t backend_ring = ggml_backend_sched_get_tensor_backend(sched_res, res->t_draft_top1);
+            const size_t row = (size_t) draft_ring_i * cparams.n_seq_max;
+            post_tensor_get_async(sched_res, backend_ring, res->t_draft_top1, (llama_token *) t_draft_ring_tok->data + row, 0, n_outputs*sizeof(llama_token));
+            if (res->t_draft_ptop && t_draft_ring_p != nullptr) {
+                post_tensor_get_async(sched_res, backend_ring, res->t_draft_ptop, (float *) t_draft_ring_p->data + row, 0, n_outputs*sizeof(float));
+            }
+            ev_outputs_backend = backend_ring;
+            draft_ring_i++;
         }
 
         // extract embeddings
@@ -4150,6 +4322,8 @@ llm_graph_params llama_context::graph_params(
         /*.h_sink_write          =*/ h_sink_write,
         /*.fa_assist             =*/ fa_assist,
         /*.mtp_kv_only           =*/ mtp_kv_only,
+        /*.t_draft_ring          =*/ t_draft_ring,
+        /*.draft_ring_ptop       =*/ draft_ring_ptop,
     };
 }
 
@@ -5741,6 +5915,22 @@ void llama_synchronize_outputs(struct llama_context * ctx) {
 
 void llama_set_logits_topk_only(struct llama_context * ctx, bool only) {
     ctx->set_logits_topk_only(only);
+}
+
+bool llama_draft_ring_enable(struct llama_context * ctx, int32_t n_max, bool with_p) {
+    return ctx->enable_draft_ring(n_max, with_p);
+}
+
+void llama_draft_ring_begin(struct llama_context * ctx, const llama_token * ids, size_t n) {
+    ctx->draft_ring_begin(ids, n);
+}
+
+const llama_token * llama_draft_ring_tokens(const struct llama_context * ctx, int32_t step) {
+    return ctx->draft_ring_tokens(step);
+}
+
+const float * llama_draft_ring_p(const struct llama_context * ctx, int32_t step) {
+    return ctx->draft_ring_p(step);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

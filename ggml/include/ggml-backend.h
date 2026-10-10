@@ -416,6 +416,13 @@ extern "C" {
     // can be copied asynchronously (see ggml_backend_sched_compute_splits)
     GGML_API void                 ggml_backend_sched_set_async_inputs(ggml_backend_sched_t sched, bool async_inputs);
 
+    // dchain: record event on the stream of backend right after the asynchronous user-input copies of
+    // every split that runs on it (async inputs, single input copy). Waiting for the event instead of
+    // synchronizing the scheduler lets the caller overwrite the host input tensors for the next graph
+    // while the compute of the previous one is still running. The event stays owned by the caller;
+    // NULL removes it.
+    GGML_API void                 ggml_backend_sched_set_inputs_event(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_event_t event);
+
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
