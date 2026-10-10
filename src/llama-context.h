@@ -87,6 +87,17 @@ struct llama_context {
 
     void synchronize();
 
+    // wait only for the host output buffers of the last decode (the device-to-host copies that
+    // extract_outputs posted), not for the whole context: the device streams keep running whatever
+    // was queued after them. Valid after a decode that did not go through the prefill pipeline
+    // (the pipeline posts its copies to the submission workers and records no single event); the
+    // perf counters are updated like synchronize() does
+    void synchronize_outputs();
+
+    // synchronize() unless the host output buffers of the last decode are already complete
+    // (synchronize_outputs() or synchronize() ran after it), see outputs_ready
+    void wait_outputs();
+
     // wait for all in-flight prefill pipeline ubatches without touching the scheduler copy index
     // or the perf counters. callers use it before mutating state the pipeline may still be writing
     void pipeline_drain();
@@ -116,6 +127,7 @@ struct llama_context {
     float * get_logits_ith(int32_t i);
 
     void    set_logits_topk(int32_t k);
+    void    set_logits_topk_only(bool only);
     void    reserve_if_needed();
     int32_t get_logits_topk_ith(int32_t i, const llama_token ** ids, const float ** logits);
 
@@ -394,6 +406,10 @@ private:
     // set the threadpool and thread counts for the given batch type
     void graph_set_threads(bool batched);
 
+    // account the queued tokens of the last decode to the perf counters and reset the queue
+    // (shared by synchronize() and synchronize_outputs())
+    void perf_eval_update();
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -513,6 +529,18 @@ private:
 
     // false when the last batch only copied its top-k logits
     bool logits_full = true;
+
+    // true once the host output buffers of the last decode are complete (synchronize() or
+    // synchronize_outputs() ran after it); decode()/encode() clear it. The top-k getter only
+    // synchronizes when it is false, so a caller that waited for the outputs pays no second wait
+    bool outputs_ready = true;
+
+    // event recorded on the output backend right after the device-to-host output copies of a
+    // non-pipelined decode (see synchronize_outputs). Created on first use, on the device of the
+    // backend that holds the outputs; ev_outputs_recorded is false after a pipelined decode
+    ggml_backend_event_t ev_outputs          = nullptr;
+    ggml_backend_t       ev_outputs_backend  = nullptr;
+    bool                 ev_outputs_recorded = false;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

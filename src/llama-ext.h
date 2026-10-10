@@ -239,6 +239,16 @@ LLAMA_API int32_t llama_h_nextn_sink_col(struct llama_context * ctx, llama_seq_i
 // not tracked by the pipeline (decode-sized batches).
 LLAMA_API bool llama_synchronize_ubatch(struct llama_context * ctx, int64_t ubatch_id);
 
+// dchain: wait only for the host output buffers of the last decode (its device-to-host copies), not
+// for everything queued on the device streams. Valid after a decode that did not use the prefill
+// pipeline (decode-sized batches). llama_get_logits_topk_ith then reads without another wait.
+LLAMA_API void llama_synchronize_outputs(struct llama_context * ctx);
+
+// dchain: with the top-k output on (llama_set_logits_topk), a batch with a single output normally
+// still copies its full logits to the host. A context whose host only ever reads the top-k rows
+// (the MTP draft steps) turns that copy off here; llama_get_logits_ith is then invalid for it.
+LLAMA_API void llama_set_logits_topk_only(struct llama_context * ctx, bool only);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //

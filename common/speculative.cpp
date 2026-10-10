@@ -1839,8 +1839,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<common_params_sampling> smpls_cfg;
 
-    // backend sampler chain per seq, attached to ctx_dft
-    std::vector<llama_sampler *> backend_chains;
+    // dchain: the greedy draft steps take their argmax from the device top-k rows of ctx_dft
+    // (llama_set_logits_topk): every vocab shard selects its candidates on its own device and only
+    // those come back to the host, no full-vocab logits and no CPU sort per step. The probabilistic
+    // draft keeps the CPU chain (smpls): it samples and reports q from the full row
+    bool topk_device = false;
 
     int32_t n_embd = 0;
 
@@ -1923,20 +1926,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
-        // offload draft sampling to the backend
-        backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling) {
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
-
-                if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
-                    SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
-                    llama_sampler_free(chain);
-                    chain = nullptr;
-                }
-                backend_chains[seq_id] = chain;
-            }
+        // dchain: the greedy draft argmax comes from the device top-k rows. The graph selects the
+        // candidates of every vocab shard (k = 1 takes the smallest bucket, 64 per shard), the host
+        // reads only those rows (no raw logits of the single output row either) and takes the best
+        // one. This replaces the backend sampler request, which a tensor-split context rejects
+        topk_device = this->params.backend_sampling && !this->params.probabilistic;
+        if (topk_device) {
+            llama_set_logits_topk(ctx_dft, 1);
+            llama_set_logits_topk_only(ctx_dft, true);
         }
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
@@ -2000,18 +1997,43 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         target_first.assign(n_seq, 0);
     }
 
-    ~common_speculative_impl_draft_mtp() override {
-        auto * ctx_dft = this->params.ctx_dft;
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
-            if (backend_chains[seq_id] == nullptr) {
-                continue;
+    // dchain: argmax of the device top-k row of output idx. The shards select their candidates
+    // independently, so the row is a superset of the global top k in no particular order; ties break
+    // like the host sort of the sparse rows, (logit desc, id asc). With p_top set, the probability of
+    // the argmax is normalized over the global top 10, the candidate set the CPU chain (top_k(10) +
+    // dist) normalizes over, so the p_min gate sees the same number as the CPU path
+    static llama_token draft_topk_argmax(llama_context * ctx, int idx, float * p_top) {
+        const llama_token * ids    = nullptr;
+        const float       * logits = nullptr;
+        const int32_t n = llama_get_logits_topk_ith(ctx, idx, &ids, &logits);
+        GGML_ASSERT(n > 0 && "the MTP draft context has no top-k output");
+
+        int32_t best = 0;
+        for (int32_t i = 1; i < n; ++i) {
+            if (logits[i] > logits[best] || (logits[i] == logits[best] && ids[i] < ids[best])) {
+                best = i;
             }
-            if (ctx_dft) {
-                llama_set_sampler(ctx_dft, seq_id, nullptr);
-            }
-            llama_sampler_free(backend_chains[seq_id]);
         }
-        backend_chains.clear();
+
+        if (p_top != nullptr) {
+            const int32_t k = std::min<int32_t>(10, n);
+            std::vector<llama_token_data> cand(n);
+            for (int32_t i = 0; i < n; ++i) {
+                cand[i] = llama_token_data{ids[i], logits[i], 0.0f};
+            }
+            std::partial_sort(cand.begin(), cand.begin() + k, cand.end(), [](const llama_token_data & a, const llama_token_data & b) {
+                return a.logit != b.logit ? a.logit > b.logit : a.id < b.id;
+            });
+            // the same arithmetic as llama_sampler_dist: float exp terms, double running sum
+            const float max_l = cand[0].logit;
+            double sum = 0.0;
+            for (int32_t i = 0; i < k; ++i) {
+                sum += expf(cand[i].logit - max_l);
+            }
+            *p_top = (float) (1.0 / sum);
+        }
+
+        return ids[best];
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -2372,6 +2394,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 break;
             }
 
+            // dchain: one wait per step for the top-k rows of every drafting sequence, on the output
+            // copies only (the device streams are not drained)
+            if (topk_device) {
+                llama_synchronize_outputs(ctx_dft);
+            }
+
             // rebuild the batch for the next step: the growing-KV paths re-add only the
             // new token (the KV already holds the prefix), while chained heads re-add the
             // whole prefix at the next head. dropped sequences are simply not re-added.
@@ -2384,43 +2412,64 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                auto * smpl = smpls[seq_id].get();
+                auto & dp = dparams.at(seq_id);
 
-                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                llama_token id    = LLAMA_TOKEN_NULL;
+                float       p_top = 1.0f; // probability of the argmax under the draft's top-k distribution
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                // the CPU candidates, only on the CPU chain path (probabilistic drafting reads them)
+                const llama_token_data_array * cur_p = nullptr;
 
-                if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
-                    SPC_MTP("draft step=%d seq=%d id_last=%d sampled=%d top1=%d p=%.4f\n",
-                            i, (int) seq_id, dparams[seq_id].id_last, id_sampled,
-                            cur_p->size > 0 ? cur_p->data[0].id : -1, cur_p->size > 0 ? cur_p->data[0].p : 0.0f);
+                if (topk_device) {
+                    // greedy: the argmax of the device top-k row. p_top is only needed by the p_min gate
+                    id = draft_topk_argmax(ctx_dft, i_last[seq_id], params.p_min > 0.0f ? &p_top : nullptr);
+
+                    if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+                        SPC_MTP("draft step=%d seq=%d id_last=%d top1=%d p=%.4f (device top-k)\n",
+                                i, (int) seq_id, dp.id_last, id, p_top);
+                    }
+                } else {
+                    auto * smpl = smpls[seq_id].get();
+
+                    const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+
+                    cur_p = common_sampler_get_candidates(smpl, true);
+
+                    if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+                        SPC_MTP("draft step=%d seq=%d id_last=%d sampled=%d top1=%d p=%.4f\n",
+                                i, (int) seq_id, dp.id_last, id_sampled,
+                                cur_p->size > 0 ? cur_p->data[0].id : -1, cur_p->size > 0 ? cur_p->data[0].p : 0.0f);
+                    }
+
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
+
+                    // add drafted token for each sequence
+                    id    = dp.result_q ? id_sampled : cur_p->data[0].id;
+                    p_top = cur_p->data[0].p;
                 }
-
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                }
-
-                // add drafted token for each sequence
-                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (p_top < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
                     continue;
                 }
 
-                common_sampler_accept(smpl, id, true);
+                if (!topk_device) {
+                    common_sampler_accept(smpls[seq_id].get(), id, true);
+                }
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
 
                 if (dp.result_q) {
+                    GGML_ASSERT(cur_p != nullptr);
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
@@ -2428,6 +2477,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // CPU chain dist filled .p with the top-k normalized proposal the draft sampled from
                 if (dp.use_rejection && params.probabilistic) {
                     GGML_ASSERT(dp.result_q_dflash);
+                    GGML_ASSERT(cur_p != nullptr);
 
                     common_sampler_draft_q q;
                     q.ids.reserve(cur_p->size);

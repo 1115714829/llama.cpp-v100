@@ -637,6 +637,11 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    if (ev_outputs != nullptr) {
+        ggml_backend_event_free(ev_outputs);
+        ev_outputs = nullptr;
+    }
+
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -1065,6 +1070,39 @@ void llama_context::synchronize() {
         ggml_backend_sched_synchronize(sched_dec.get());
     }
 
+    outputs_ready = true;
+
+    perf_eval_update();
+}
+
+void llama_context::synchronize_outputs() {
+    if (!sched) {
+        return;
+    }
+
+    // only a non-pipelined decode records the event; a pipelined prefill posts its output copies to
+    // the submission workers and has no single point to record after, so its callers synchronize().
+    // A decode without outputs (ev_outputs_backend == nullptr) has nothing to wait for, and a device
+    // without events (ev_outputs == nullptr, the CPU backend) computes and copies synchronously
+    GGML_ASSERT((ev_outputs_recorded || ev_outputs_backend == nullptr || ev_outputs == nullptr) &&
+            "synchronize_outputs() needs a preceding non-pipelined decode");
+
+    if (ev_outputs_recorded) {
+        ggml_backend_event_synchronize(ev_outputs);
+    }
+
+    outputs_ready = true;
+
+    perf_eval_update();
+}
+
+void llama_context::wait_outputs() {
+    if (!outputs_ready) {
+        synchronize();
+    }
+}
+
+void llama_context::perf_eval_update() {
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
     // this should only happen when using batch size 1 to evaluate a batch
@@ -1302,11 +1340,14 @@ void llama_context::set_logits_topk(int32_t k) {
     int32_t n_shards  = 1;
     int32_t shard_max = (int32_t) n_vocab;
     int32_t shard_off[LLAMA_MAX_DEVICES] = {0};
-    if (k > 0 && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.output != nullptr) {
+    // a draft head without an lm head of its own (the shared MTP head) multiplies with the target's
+    // output tensor (graph_mtp), so its logits are sharded like the target's: take the split from there
+    const llama_model & model_head = (model.output == nullptr && cparams.model_tgt != nullptr) ? *cparams.model_tgt : model;
+    if (k > 0 && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model_head.output != nullptr) {
         // the callback takes a non-const userdata but only reads it
-        const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(model.output,
-            const_cast<llama_meta_device_get_split_state_userdata *>(&model.get_split_state_ud));
-        const size_t n_devs = model.get_split_state_ud.n_devices;
+        const ggml_backend_meta_split_state ss = llama_meta_device_get_split_state(model_head.output,
+            const_cast<llama_meta_device_get_split_state_userdata *>(&model_head.get_split_state_ud));
+        const size_t n_devs = model_head.get_split_state_ud.n_devices;
 
         bool split = ss.axis == GGML_BACKEND_SPLIT_AXIS_1 && ss.n_segments == 1 && ss.nr[0] == 1 &&
             !ss.has_off && n_devs > 1;
@@ -1349,6 +1390,11 @@ void llama_context::set_logits_topk(int32_t k) {
     std::copy(shard_off, shard_off + LLAMA_MAX_DEVICES, cparams.logits_topk_shard_off);
 
     sched_need_reserve = true;
+}
+
+void llama_context::set_logits_topk_only(bool only) {
+    // no graph change: the same top-k nodes run, only the host copy of the raw logits is skipped
+    cparams.logits_topk_only = only;
 }
 
 void llama_context::reserve_if_needed() {
@@ -2745,6 +2791,11 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     cparams.causal_attn = causal_attn_org;
 
+    // the output buffers are refilled below; the encoder records no output event (its callers synchronize())
+    outputs_ready       = false;
+    ev_outputs_recorded = false;
+    ev_outputs_backend  = nullptr;
+
     if (!res) {
         switch (status) {
             case GGML_STATUS_ABORTED:      return  2;
@@ -3093,9 +3144,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -2;
     };
 
-    // with the top-k output only a single row still gets its full logits
-    const bool logits_topk_only = cparams.logits_topk > 0 && cparams.logits_topk_active && n_outputs_all > 1;
+    // with the top-k output only a single row still gets its full logits, unless the context declared
+    // that its host never reads them (logits_topk_only, the MTP draft steps)
+    const bool logits_topk_only = cparams.logits_topk > 0 && cparams.logits_topk_active &&
+        (n_outputs_all > 1 || cparams.logits_topk_only);
     logits_full = !logits_topk_only;
+
+    // the output buffers of this decode are being refilled
+    outputs_ready       = false;
+    ev_outputs_recorded = false;
+    ev_outputs_backend  = nullptr;
 
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
@@ -3151,6 +3209,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
                 post_tensor_get_async(sched_res, backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                ev_outputs_backend = backend_res;
             }
         }
 
@@ -3161,6 +3220,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             ggml_backend_t backend_topk = ggml_backend_sched_get_tensor_backend(sched_res, res->t_logits_topk);
             post_tensor_get_async(sched_res, backend_topk, res->t_logits_topk,     topk_logits.data + n_outputs_prev*n, 0, n_outputs*n*sizeof(float));
             post_tensor_get_async(sched_res, backend_topk, res->t_logits_topk_ids, topk_ids.data    + n_outputs_prev*n, 0, n_outputs*n*sizeof(int32_t));
+            // the output event of this decode is recorded on the stream that carries these copies
+            ev_outputs_backend = backend_topk;
         }
 
         // extract embeddings
@@ -3401,6 +3462,21 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // the prefill pipeline is intentionally left in flight: the server chunks one prompt across
     // multiple decode() calls and the next call keeps overlapping. it is drained only when a
     // caller needs the results or mutates shared state (synchronize, memory ops, state, encode)
+
+    // record the output event: a non-pipelined decode has enqueued its output copies on the device
+    // streams by now (the compute is submitted synchronously, the copies run inline), so an event
+    // recorded here completes when the host buffers are filled (see synchronize_outputs). A pipelined
+    // decode leaves its copies with the submission workers and records nothing
+    if (!use_pipeline && ev_outputs_backend != nullptr) {
+        if (ev_outputs == nullptr) {
+            ev_outputs = ggml_backend_event_new(ggml_backend_get_device(ev_outputs_backend));
+        }
+        if (ev_outputs != nullptr) {
+            wait_submitted(ev_outputs_backend);
+            ggml_backend_event_record(ev_outputs, ev_outputs_backend);
+            ev_outputs_recorded = true;
+        }
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -5536,7 +5612,8 @@ void llama_reserve(llama_context * ctx) {
 }
 
 int32_t llama_get_logits_topk_ith(llama_context * ctx, int32_t i, const llama_token ** ids, const float ** logits) {
-    ctx->synchronize();
+    // a caller that already waited for the outputs (llama_synchronize_outputs) pays no second wait
+    ctx->wait_outputs();
 
     return ctx->get_logits_topk_ith(i, ids, logits);
 }
@@ -5656,6 +5733,14 @@ int32_t llama_h_nextn_sink_col(struct llama_context * ctx, llama_seq_id seq_id, 
 
 bool llama_synchronize_ubatch(struct llama_context * ctx, int64_t ubatch_id) {
     return ctx->synchronize_ubatch(ubatch_id);
+}
+
+void llama_synchronize_outputs(struct llama_context * ctx) {
+    ctx->synchronize_outputs();
+}
+
+void llama_set_logits_topk_only(struct llama_context * ctx, bool only) {
+    ctx->set_logits_topk_only(only);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

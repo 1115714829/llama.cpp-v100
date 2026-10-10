@@ -68,6 +68,10 @@ struct llama_cparams {
     int32_t logits_topk_shard_off[LLAMA_MAX_DEVICES] = {0};
 
     bool    logits_topk_active = false; // the current request reads the top-k output (the graph may keep a top-k output while it is off)
+    // the host never reads the raw logits of this context while the top-k output is on: a batch with a
+    // single output then only copies its top-k rows back as well (the MTP draft steps, see
+    // llama_set_logits_topk_only). Off by default: a single-output batch keeps its full logits
+    bool    logits_topk_only   = false;
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
