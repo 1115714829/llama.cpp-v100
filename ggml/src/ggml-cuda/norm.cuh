@@ -25,11 +25,14 @@ bool ggml_cuda_hc_mix_norm_supported(const ggml_tensor * hc_post, const ggml_ten
 void ggml_cuda_op_hc_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * hc_post, ggml_tensor * scale_inv_hc,
                               ggml_tensor * scale_gate, ggml_tensor * rms_norm, ggml_tensor * mul, half * mul_f16);
 
+// RMS_NORM -> MUL -> UNARY(SILU or SIGMOID) -> MUL in one kernel. dst_f16, if not null, also
+// receives mul2 rounded to F16 (mul2 must be contiguous), bitwise the F32 -> F16 conversion of it.
 void ggml_cuda_op_rms_norm_mul_silu_mul_fused(ggml_backend_cuda_context & ctx,
                                               ggml_tensor *               rms_norm,
                                               ggml_tensor *               mul,
                                               ggml_tensor *               silu,
-                                              ggml_tensor *               mul2);
+                                              ggml_tensor *               mul2,
+                                              half *                      dst_f16 = nullptr);
 
 void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * scale_tensor);
 

@@ -5850,8 +5850,8 @@ struct ggml_cuda_rms_norm_gated_match {
     int           last     = 0;
 };
 
-// match RMS_NORM -> MUL -> UNARY(SILU) -> MUL, the gated norm at the output of the GDN layers.
-// Views may separate the nodes of the chain.
+// match RMS_NORM -> MUL -> UNARY(SILU or SIGMOID) -> MUL, the gated norm at the output of the GDN
+// layers (silu: Qwen3.5, sigmoid: qwen4exp). Views may separate the nodes of the chain.
 static bool ggml_cuda_match_rms_norm_mul_silu_mul(
         const ggml_cgraph * cgraph, int node_idx, ggml_cuda_rms_norm_gated_match & match) {
     const int i0 = node_idx;
@@ -5868,7 +5868,8 @@ static bool ggml_cuda_match_rms_norm_mul_silu_mul(
     const ggml_tensor * mul2     = cgraph->nodes[i3];
 
     if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL || silu->op != GGML_OP_UNARY ||
-        ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || mul2->op != GGML_OP_MUL) {
+        (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU && ggml_get_unary_op(silu) != GGML_UNARY_OP_SIGMOID) ||
+        mul2->op != GGML_OP_MUL) {
         return false;
     }
 
@@ -7613,6 +7614,36 @@ static int ggml_cuda_try_fuse_hc_mix(ggml_backend_cuda_context * cuda_ctx, ggml_
     return k + 3 - i;
 }
 
+// The q8 skinny projection that reads the result of a fused producer right after it (the GDN ssm_out
+// after the gated norm, the attention output after the attention gate): returns its node index, or
+// -1. Its src1 must be the producer output or a reshape of it, and it must be the only projection
+// of that input there (a group of them goes to the multi-weight kernel unfused). The producer then
+// also writes its result rounded to F16 and the projection reads that copy instead of converting
+// the F32 result again; bitwise the same.
+static int ggml_cuda_skinny_f16_consumer(const ggml_cgraph * cgraph, int last, const ggml_tensor * out) {
+    const int j = ggml_cuda_next_real_node(cgraph, last);
+    if (j < 0 || !ggml_is_contiguous(out) || out->type != GGML_TYPE_F32) {
+        return -1;
+    }
+    const ggml_tensor * mm = cgraph->nodes[j];
+    if (mm->op != GGML_OP_MUL_MAT) {
+        return -1;
+    }
+    const ggml_tensor * src1 = mm->src[1];
+    if (src1 != out && !(src1->view_src == out && src1->data == out->data && ggml_is_contiguous(src1) &&
+                         ggml_nelements(src1) == ggml_nelements(out))) {
+        return -1;
+    }
+    if (src1->ne[1] > 16 || !ggml_cuda_q8_skinny_mul_mat_supported(mm->src[0], src1, mm)) {
+        return -1;
+    }
+    const int next = ggml_cuda_next_real_node(cgraph, j);
+    if (next >= 0 && cgraph->nodes[next]->op == GGML_OP_MUL_MAT && cgraph->nodes[next]->src[1] == src1) {
+        return -1;
+    }
+    return j;
+}
+
 // DSV4_HC_PRE -> MUL_MAT [-> MUL_MAT ...]: the mixed stream that a qwen4exp hyper-connection mixer
 // hands to its block is the input of the projections that open the block (build_qkvz expands the
 // GDN qkv and z right after the mixer, as do the q/k/v of an attention layer without the QSA
@@ -8544,10 +8575,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return fused_node_count - 1;
     }
 
-    // RMS_NORM -> MUL -> UNARY(SILU) -> MUL: gated norm at the output of the GDN layers
+    // RMS_NORM -> MUL -> UNARY(SILU or SIGMOID) -> MUL: gated norm at the output of the GDN layers,
+    // and with an F16 copy for the output projection that reads it next
     if (node->op == GGML_OP_RMS_NORM) {
         ggml_cuda_rms_norm_gated_match match;
         if (ggml_cuda_match_rms_norm_mul_silu_mul(cgraph, i, match)) {
+            const int j = ggml_cuda_skinny_f16_consumer(cgraph, match.last, match.mul2);
+            if (j >= 0) {
+                const int i1 = ggml_cuda_next_real_node(cgraph, i);
+                const int i2 = ggml_cuda_next_real_node(cgraph, i1);
+                const int idxs[] = { i, i1, i2, match.last, j };
+                const enum ggml_op ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_MUL_MAT };
+                const int outs[] = { match.last, j };
+                if (ggml_can_fuse_subgraph_ext(cgraph, idxs, 5, ops, outs, 2)) {
+                    ggml_tensor * mm = cgraph->nodes[j];
+                    ggml_cuda_pool_alloc<half> x_f16(cuda_ctx->pool(), ggml_nelements(match.mul2));
+                    ggml_cuda_op_rms_norm_mul_silu_mul_fused(*cuda_ctx, match.rms_norm, match.mul, match.silu, match.mul2, x_f16.get());
+                    const bool ok = ggml_cuda_q8_skinny_mul_mat(*cuda_ctx, mm->src[0], mm->src[1], mm, x_f16.get());
+                    GGML_ASSERT(ok);
+                    return j - i;
+                }
+            }
             ggml_cuda_op_rms_norm_mul_silu_mul_fused(*cuda_ctx, match.rms_norm, match.mul, match.silu, match.mul2);
             return match.last - i;
         }

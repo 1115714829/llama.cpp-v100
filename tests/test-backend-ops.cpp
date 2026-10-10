@@ -5243,6 +5243,54 @@ struct test_hc_pre_mm_q8 : public test_dsv4_hc {
     }
 };
 
+// RMS_NORM -> MUL -> UNARY(SIGMOID or SILU) -> MUL, the gated norm of the GDN output, read by the Q8_0
+// output projection (qwen4exp ssm_out). sm_70 fuses the norm chain and hands it to the projection as F16;
+// the F32 gated norm is kept and checked too.
+struct test_gated_norm_q8 : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const bool    sigmoid;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_NORM_Q8";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(head_dim, n_head, n_embd, n_tokens, sigmoid);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_gated_norm_q8(int64_t head_dim = 128, int64_t n_head = 8, int64_t n_embd = 2560, int64_t n_tokens = 4, bool sigmoid = true)
+        : head_dim(head_dim), n_head(n_head), n_embd(n_embd), n_tokens(n_tokens), sigmoid(sigmoid) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_set_name(w, "w");
+        ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, n_tokens);
+        ggml_set_name(z, "z");
+        ggml_tensor * w_out = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, head_dim*n_head, n_embd);
+        ggml_set_name(w_out, "w_out");
+
+        ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        ggml_tensor * gated  = sigmoid ? ggml_sigmoid(ctx, z) : ggml_silu(ctx, z);
+        ggml_tensor * y      = ggml_reshape_2d(ctx, ggml_mul(ctx, normed, gated), head_dim*n_head, n_tokens);
+        ggml_tensor * o      = ggml_mul_mat(ctx, w_out, y);
+        ggml_tensor * out    = ggml_concat(ctx, o, y, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // A gated Q8_0 FFN, down(swiglu(gate(x), up(x))), as the qwen4exp shared expert (sm_70 repacks the
 // weights; a narrow pair hands silu(gate) * up to the down projection as F16)
 struct test_ffn_q8 : public test_case {
@@ -12094,6 +12142,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {1280, 768, 0}, 4));
     test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {2048, 256, 256}, 4));
     test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {1024, 0, 0}, 4));
+    // the GDN gated norm (sigmoid: qwen4exp, silu: Qwen3.5) handed to ssm_out as F16 (M <= 16)
+    for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
+        test_cases.emplace_back(new test_gated_norm_q8(128, 9, 2560, n_tokens, true));
+    }
+    test_cases.emplace_back(new test_gated_norm_q8(128, 6, 2560, 4, true));
+    test_cases.emplace_back(new test_gated_norm_q8(128, 8, 2560, 4, false));
+    test_cases.emplace_back(new test_gated_norm_q8(64, 4, 1024, 3, true));
 
     // scale + unary(silu): decode and prefill shapes of the hyper-connection mixer activation
     test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 320, 1, 1, 1 }));
