@@ -2205,19 +2205,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // The expert tensors that are split over the devices along the expert dim: hand the loader the
     // number of experts every device holds (the same split the meta buffer applies), it lays the
     // experts of these tensors out by the expert assignment (llama_expert_layout).
-    {
-        const size_t nd = llama_model_n_devices(model);
-        for (const auto & [name, t] : tensors_by_name) {
-            if (t == nullptr || (t->flags & GGML_TENSOR_FLAG_EXPERT) == 0 || t->ne[2] <= 1) {
-                continue;
-            }
-            if (t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
-                continue;
-            }
-            const ggml_backend_meta_split_state ss = llama_model_tensor_split_state(model, t);
-            if (ss.axis != GGML_BACKEND_SPLIT_AXIS_2) {
-                continue;
-            }
+    for (const auto & [name, t] : tensors_by_name) {
+        if (t == nullptr || (t->flags & GGML_TENSOR_FLAG_EXPERT) == 0 || t->ne[2] <= 1) {
+            continue;
+        }
+        if (t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
+            continue;
+        }
+        const ggml_backend_meta_split_state ss = llama_model_tensor_split_state(model, t);
+        if (ss.axis != GGML_BACKEND_SPLIT_AXIS_2) {
+            continue;
+        }
+        // the slices are per simple device of the meta device the buffer belongs to (the model's
+        // own device list holds the meta device as one entry)
+        ggml_backend_dev_t meta_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+        GGML_ASSERT(meta_dev != nullptr && ggml_backend_dev_is_meta(meta_dev));
+        const size_t nd = ggml_backend_meta_dev_n_devs(meta_dev);
+        {
             std::vector<int64_t> slices(nd, 0);
             for (size_t j = 0; j < nd; j++) {
                 for (size_t s = 0; s < ss.n_segments; s++) {

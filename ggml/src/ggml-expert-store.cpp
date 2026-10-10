@@ -427,6 +427,12 @@ void ggml_expert_store_compute_assignment(
 
     std::lock_guard<std::mutex> lock(g_assign_mutex);
 
+    // a plan covers the slice of one device: the global expert count is the largest global index
+    // any of them has seen, which is the profile when there is one. Taken before the cache check,
+    // so a plan of a smaller slice after the whole count is known reuses the table.
+    g_assign_n_expert_seen = std::max(g_assign_n_expert_seen, (int64_t) n_expert);
+    n_expert = (int) g_assign_n_expert_seen;
+
     if (g_assign_valid &&
         ggml_expert_store_assignment_matches(path, profile, n_dev, n_layer, n_expert)) {
         return;
@@ -439,11 +445,6 @@ void ggml_expert_store_compute_assignment(
             __func__, n_layer, n_expert);
         return;
     }
-
-    // a plan covers the slice of one device: the global expert count is the largest global index
-    // any of them has seen, which is the profile when there is one
-    g_assign_n_expert_seen = std::max(g_assign_n_expert_seen, (int64_t) n_expert);
-    n_expert = (int) g_assign_n_expert_seen;
 
     g_assign       = ggml_expert_store_build_assignment(path, profile, n_dev, n_layer, n_expert, /*log_layers =*/ true);
     g_assign_valid = true;
