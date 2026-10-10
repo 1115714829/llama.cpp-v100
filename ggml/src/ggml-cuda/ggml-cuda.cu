@@ -7580,8 +7580,9 @@ static int ggml_cuda_try_fuse_hc_mix(ggml_backend_cuda_context * cuda_ctx, ggml_
     // the down projection, the scale and the silu are only read inside the group; the post, the
     // MUL (read by the views, the inject projection and the hc_pre mixer) and the up projection
     // are outputs
-    int idxs[9];
-    ggml_op ops[9];
+    // the post chain (4 nodes) and the norm and mixer nodes (6)
+    int idxs[10];
+    ggml_op ops[10];
     int n = 0;
     if (hc_post != nullptr) {
         for (int t = 0; t < 4; ++t) {
