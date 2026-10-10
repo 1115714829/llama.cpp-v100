@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-expert-store.h" // the expert assignment the permuted expert store test plays the loader for
 
 #include <algorithm>
 #include <atomic>
@@ -1451,6 +1452,10 @@ struct test_case {
     // type can inspect the resulting allocation (e.g. the tier split of the expert store)
     virtual void check_weight_alloc(ggml_backend_t backend) { GGML_UNUSED(backend); }
 
+    // called when eval() / eval_perf() leave, on every exit after build_graph(): a test that
+    // changes process-wide state for its run (the active expert assignment) restores it here
+    virtual void after_eval(ggml_backend_t backend) { GGML_UNUSED(backend); }
+
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
 
@@ -1564,6 +1569,13 @@ struct test_case {
         ggml_tensor * out = build_graph(ctx.get(), ctx_weights.get());
         current_op_name   = op_desc(out);
         check_for_f16_tensor(ctx.get());
+
+        // after_eval() runs on every exit from here on
+        struct after_eval_guard {
+            test_case *    tc;
+            ggml_backend_t backend;
+            ~after_eval_guard() { tc->after_eval(backend); }
+        } after_eval_guard { this, backend1 };
 
         if (!matches_filter(out, op_names_filter)) {
             //printf("  %s: skipping\n", op_desc(out).c_str());
@@ -1759,6 +1771,11 @@ struct test_case {
 
         ggml_tensor * out             = build_graph(ctx.get(), ctx_weights.get());
         current_op_name               = op_desc(out);
+        struct after_eval_guard {
+            test_case *    tc;
+            ggml_backend_t backend;
+            ~after_eval_guard() { tc->after_eval(backend); }
+        } after_eval_guard { this, backend };
         if (!matches_filter(out, op_names_filter)) {
             //printf("  %s: skipping\n", op_desc(out).c_str());
             return true;
@@ -7170,6 +7187,363 @@ struct test_mul_mat_id_expert_ffn : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
+};
+
+// index of the device of a backend in its registry: the CUDA registry lists its devices in CUDA
+// device order, which is the device number the expert store and the expert maps are keyed by
+static int backend_device_index(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return -1;
+    }
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+// Expert store under a permuted expert assignment. The loader of a model places the experts of a
+// device by the LPT proposal computed from the routing profile (local expert k of device d holds
+// global expert global_of(d, layer, k), see ggml_expert_store_compute_assignment) and activates the
+// assignment; from then on every consumer of the routing ids goes through the row of (device,
+// layer) of that assignment (ggml_expert_store_node_lut) instead of a contiguous range test. This
+// test plays the loader: it computes an assignment from an artificial profile, activates it, writes
+// the experts of its device into the store tensors in that order and marks the MUL_MAT_ID nodes
+// with the layer and the device like the meta backend does. The ids are global ids over all
+// n_mats experts, one store tensor per layer.
+//   check_naive == false: the permuted node against the CPU reference, which reads the same row;
+//   check_naive == true:  the difference between the permuted node and the naive computation on the
+//                         full unpermuted weight (the slots of the other devices zeroed by a mask),
+//                         which has to be zero on both backends - a table error that both backends
+//                         share shows up here, the plain comparison would not see it.
+// The device of the test is the device of the backend; devices without a row in the n_dev
+// assignment skip the test. after_eval() restores the contiguous split for the cases after it.
+struct test_mul_mat_id_expert_permute : public test_case {
+    const ggml_type type_a;
+    const int n_mats;    // global experts
+    const int n_used;
+    const int n_dev;     // devices of the assignment, n_mats is a multiple so every device holds n_local
+    const int n_layer;   // rows of the assignment used, one store tensor each
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool all_slot;
+    const bool check_naive;
+
+    const int n_local;   // experts of the device of the test
+
+    int  dev       = -1;    // device of the backend, set in weight_buffer_type()
+    bool activated = false; // the permuted assignment is the active one
+
+    std::vector<ggml_tensor *> as_perm; // per layer: the store tensor of the device, n_local experts in local order
+    std::vector<ggml_tensor *> as_full; // per layer: the full unpermuted weight the store tensor is cut from
+    std::vector<ggml_tensor *> ids_l;   // per layer: global ids
+    std::vector<ggml_tensor *> mask_l;  // per layer: 1 for a slot of a local expert, 0 otherwise (check_naive)
+    std::vector<ggml_tensor *> mm_perm; // per layer: the MUL_MAT_ID node of the store tensor
+    ggml_tensor * out_diff = nullptr;
+    ggml_backend_buffer_type_t expert_buft = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR10(type_a, n_mats, n_used, n_dev, n_layer, m, n, k, all_slot, check_naive);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_PERMUTE";
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * n_used * n_layer;
+    }
+
+    // the naive comparison is an absolute check: the difference has to be zero on both backends,
+    // so the error is the largest value either backend produced
+    double err(const float * a, const float * b, size_t n) override {
+        if (!check_naive) {
+            return test_case::err(a, b, n);
+        }
+        double result = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            result = std::max(result, (double) std::max(fabsf(a[i]), fabsf(b[i])));
+        }
+        return result;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        if (!check_naive) {
+            return test_case::max_err(backend);
+        }
+        GGML_UNUSED(backend);
+        return 1e-2;
+    }
+
+    double max_nmse_err() override {
+        // Q4_K/Q8_0 weights against the CPU reference with the Q8_1 activation quantization
+        return 5e-4;
+    }
+
+    // with check_naive only the difference node is compared, the intermediate nodes carry the normal
+    // CPU/CUDA activation quantization difference
+    bool run_whole_graph() override { return check_naive; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return check_naive ? std::vector<ggml_tensor *>{ out_diff } : std::vector<ggml_tensor *>{};
+    }
+
+    test_mul_mat_id_expert_permute(ggml_type type_a = GGML_TYPE_Q4_K,
+            int n_mats = 48, int n_used = 4, int n_dev = 3, int n_layer = 2,
+            int64_t m = 640, int64_t n = 8, int64_t k = 2560, bool all_slot = false, bool check_naive = false)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), n_dev(n_dev), n_layer(n_layer),
+            m(m), n(n), k(k), all_slot(all_slot), check_naive(check_naive), n_local(n_mats / n_dev) {
+            GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(n_dev > 0 && n_mats % n_dev == 0 && n_local >= 2);
+            GGML_ASSERT(n_layer > 0);
+        }
+
+    bool use_weight_context() override { return true; }
+    bool requires_weight_buffer_type() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    // the routing counts the assignment is computed from: pseudo-random per (layer, expert), so the
+    // LPT split scatters the experts of a device over the whole numbering
+    static int64_t profile_count(int layer, int expert) {
+        return (int64_t) ((expert * 7919 + layer * 104729 + 17) % 101) + 1;
+    }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        ggml_backend_dev_t bdev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg  = ggml_backend_dev_backend_reg(bdev);
+        if (reg == nullptr) {
+            return nullptr;
+        }
+        auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra == nullptr) {
+            return nullptr;
+        }
+        dev = backend_device_index(backend);
+        if (dev < 0 || dev >= n_dev) {
+            // no row of the n_dev assignment belongs to this device
+            return nullptr;
+        }
+        for (ggml_backend_buffer_type_t * extra = get_extra(bdev); extra && *extra; ++extra) {
+            const std::string name = ggml_backend_buft_name(*extra);
+            if (name.size() < 8 || name.compare(name.size() - 8, 8, "_Experts") != 0) {
+                continue;
+            }
+
+            // the loader's part: the proposal from the profile, activated. The plan of the store
+            // allocation recomputes the proposal without a profile afterwards, which leaves the
+            // active table alone (it describes placed data).
+            ggml_expert_store_profile profile;
+            profile.n_layer  = n_layer;
+            profile.n_expert = n_mats;
+            profile.count.assign((size_t) n_layer * n_mats, 0);
+            for (int l = 0; l < n_layer; ++l) {
+                for (int e = 0; e < n_mats; ++e) {
+                    profile.count[(size_t) l * n_mats + e] = profile_count(l, e);
+                }
+            }
+            ggml_expert_store_compute_assignment("test-backend-ops permute", &profile, n_dev, n_layer, n_mats);
+            ggml_expert_store_activate_assignment();
+            activated = true;
+            GGML_ASSERT(ggml_expert_store_active_is_permuted());
+
+            // the permutation must be a real one for the test to mean anything: the row of the
+            // device differs from its contiguous segment
+            bool permuted = false;
+            for (int l = 0; l < n_layer && !permuted; ++l) {
+                const int16_t * row = ggml_expert_store_active_local_of(dev, l);
+                GGML_ASSERT(row != nullptr);
+                int held = 0;
+                for (int e = 0; e < n_mats; ++e) {
+                    const int seg = e >= dev * n_local && e < (dev + 1) * n_local ? e - dev * n_local : -1;
+                    permuted = permuted || row[e] != seg;
+                    held += row[e] >= 0;
+                }
+                GGML_ASSERT(held == n_local);
+            }
+            GGML_ASSERT(permuted);
+
+            // the meta backend marks every per-device MUL_MAT_ID node with its device and the
+            // (unused under a permutation) contiguous segment start; the layer was set at build
+            for (ggml_tensor * mm : mm_perm) {
+                ggml_mul_mat_id_set_device(mm, dev);
+                ggml_mul_mat_id_set_expert_offset(mm, dev * n_local);
+            }
+
+            // budgets: every expert in a slot, or two experts per tensor in the slots and the
+            // complement in the host arena with a staging area for the whole complement
+            const size_t blob_bytes   = expert_store_stride(type_a, k, m);
+            const size_t expert_bytes = blob_bytes * (size_t) n_local * (size_t) n_layer;
+            const size_t slot_bytes   = all_slot ? expert_bytes : 2 * blob_bytes * (size_t) n_layer;
+            const size_t stage_bytes  = all_slot ? 0 : blob_bytes * (size_t) n_local;
+            auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
+            if (set_budget != nullptr) {
+                set_budget(*extra, slot_bytes, stage_bytes);
+            }
+            for (ggml_tensor * t : as_perm) {
+                mark_expert_tensor(reg, *extra, t);
+            }
+            expert_buft = *extra;
+            return *extra;
+        }
+        return nullptr;
+    }
+
+    void check_weight_alloc(ggml_backend_t backend) override {
+        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, all_slot);
+    }
+
+    void after_eval(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        if (activated) {
+            ggml_expert_store_reset_assignment();
+            activated = false;
+        }
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        // gate/up broadcast one activation row per token
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out  = nullptr;
+        ggml_tensor * diff = nullptr;
+        for (int l = 0; l < n_layer; ++l) {
+            char name[64];
+
+            // the store tensor of the device: n_local experts, filled in local order by initialize_tensors
+            snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", l);
+            ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_local);
+            ggml_set_name(as, name);
+            as_perm.push_back(as);
+
+            // the full weight it is cut from, for the naive computation
+            snprintf(name, sizeof(name), "as_full_%d", l);
+            ggml_tensor * full = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+            ggml_set_name(full, name);
+            as_full.push_back(full);
+
+            snprintf(name, sizeof(name), "ids_%d", l);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+            ggml_set_name(ids, name);
+            ids_l.push_back(ids);
+
+            ggml_tensor * mm = ggml_mul_mat_id(ctx, as, b, ids);
+            ggml_mul_mat_id_set_expert_parallel(mm, true);
+            ggml_mul_mat_id_set_n_expert_total(mm, n_mats);
+            ggml_mul_mat_id_set_layer(mm, l);
+            // the device and the segment start follow in weight_buffer_type(), when the device is known
+            snprintf(name, sizeof(name), "out_perm_%d", l);
+            ggml_set_name(mm, name);
+            mm_perm.push_back(mm);
+
+            out = out == nullptr ? mm : ggml_concat(ctx, out, mm, 2);
+
+            if (check_naive) {
+                snprintf(name, sizeof(name), "mask_%d", l);
+                ggml_tensor * mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+                ggml_set_name(mask, name);
+                mask_l.push_back(mask);
+
+                ggml_tensor * naive = ggml_mul(ctx, ggml_mul_mat_id(ctx, full, b, ids), mask);
+                snprintf(name, sizeof(name), "naive_%d", l);
+                ggml_set_name(naive, name);
+
+                ggml_tensor * d = ggml_sub(ctx, mm, naive);
+                diff = diff == nullptr ? d : ggml_concat(ctx, diff, d, 2);
+            }
+        }
+        if (check_naive) {
+            ggml_set_name(diff, "out_diff");
+            out_diff = diff;
+            return diff;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = t->name;
+            if (name.compare(0, 4, "ids_") == 0) {
+                // the n_used experts of a token are drawn without replacement over all experts, like
+                // the top-k routing: every device, hence this one, gets matches and misses
+                std::vector<int32_t> data(n_mats);
+                for (int i = 0; i < n_mats; i++) {
+                    data[i] = i;
+                }
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    std::shuffle(data.begin(), data.end(), rng);
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else if (name.compare(0, 5, "mask_") == 0 || name.compare(0, 4, "blk.") == 0) {
+                // filled below from the ids / the full weight
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+
+        // the mask of a layer: 1 for the slots routed to an expert of this device
+        for (size_t l = 0; l < mask_l.size(); ++l) {
+            if (!in_context(ctx, mask_l[l])) {
+                continue;
+            }
+            const int16_t * row = activated ? ggml_expert_store_active_local_of(dev, (int) l) : nullptr;
+            std::vector<int32_t> ids((size_t) n_used * n);
+            ggml_backend_tensor_get(ids_l[l], ids.data(), 0, ids.size() * sizeof(int32_t));
+            std::vector<float> mask(ids.size());
+            for (size_t i = 0; i < ids.size(); ++i) {
+                // without an activated assignment (perf mode) the node is the contiguous segment [0, n_local)
+                const bool local = row != nullptr ? row[ids[i]] >= 0 : ids[i] < n_local;
+                mask[i] = local ? 1.0f : 0.0f;
+            }
+            ggml_backend_tensor_set(mask_l[l], mask.data(), 0, mask.size() * sizeof(float));
+        }
+
+        // the store tensor of a layer: local expert k is global expert global_of(dev, l, k) of the
+        // full weight, exactly what the loader writes under a permuted assignment. The compute
+        // context (the full weights) is initialized before the weight context, see test_case::eval.
+        for (size_t l = 0; l < as_perm.size(); ++l) {
+            if (!in_context(ctx, as_perm[l])) {
+                continue;
+            }
+            const size_t expert_bytes = as_full[l]->nb[2];
+            GGML_ASSERT(as_perm[l]->nb[2] == expert_bytes);
+            std::vector<uint8_t> full(ggml_nbytes(as_full[l]));
+            ggml_backend_tensor_get(as_full[l], full.data(), 0, full.size());
+            for (int kk = 0; kk < n_local; ++kk) {
+                // perf mode has no activated assignment: the tensor is the contiguous segment then
+                const int g = activated ? ggml_expert_store_active_global_of(dev, (int) l, kk) : kk;
+                GGML_ASSERT(g >= 0 && g < n_mats);
+                ggml_backend_tensor_set(as_perm[l], full.data() + (size_t) g * expert_bytes, (size_t) kk * expert_bytes, expert_bytes);
+            }
+        }
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+
+    static bool in_context(ggml_context * ctx, const ggml_tensor * t) {
+        for (ggml_tensor * c = ggml_get_first_tensor(ctx); c != NULL; c = ggml_get_next_tensor(ctx, c)) {
+            if (c == t) {
+                return true;
+            }
+        }
+        return false;
+    }
 };
 
 // expert parallelism with the gate/up GLU fusion: gate and up are each split along the expert
@@ -13239,6 +13613,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_id_expert_ffn(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 512, 10, 640, 2048, 2560));
     test_cases.emplace_back(new test_mul_mat_id_expert_ffn(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, 512, 10, 640, 2048, 2560));
     test_cases.emplace_back(new test_mul_mat_id_expert_ffn(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 512, 10, 640, 16,   2560));
+
+    // Expert store under a permuted expert assignment: the experts of the device are not a
+    // contiguous range of the numbering, every consumer of the ids goes through the row of the
+    // assignment (ggml_expert_store_node_lut). n covers the MMVQ paths (1, 8, 16), the grouped
+    // kernel (64), the fused-expert / MMQ prefill (128, with host experts staged) and the large
+    // batch (512). The naive variant checks the result against the full unpermuted weight in the
+    // same graph; the all-slot cases have no host tier. The device of the test is the device of
+    // the backend, so with 3 (2) devices in the assignment the test runs on CUDA0..2 (0..1).
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 8, 16, 64, 128, 512}) {
+            for (bool check_naive : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id_expert_permute(type_a, 48, 4, 3, 2, 640, n, 2560, /*all_slot=*/false, check_naive));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_id_expert_permute(type_a, 48, 4, 2, 1, 640, 16,  2560, /*all_slot=*/true, true));
+        test_cases.emplace_back(new test_mul_mat_id_expert_permute(type_a, 48, 4, 2, 1, 640, 512, 2560, /*all_slot=*/true, true));
+    }
 
     // the expert weights in a plain device weight buffer, exactly as model loading leaves them:
     // the skinny prepass repacks eligible 2D Q8_0 weights in that buffer, so the 3D expert
