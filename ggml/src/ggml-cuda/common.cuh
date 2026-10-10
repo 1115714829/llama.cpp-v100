@@ -1578,6 +1578,7 @@ struct ggml_backend_cuda_context {
             CUDA_CHECK(cudaMalloc(&cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
             CUBLAS_CHECK(cublasSetWorkspace(cublas_handles[device][curr_stream_no], cublas_workspaces[device][curr_stream_no], cublas_workspace_sizes[device]));
 #endif
+            GGML_LOG_DEBUG("%s: device %d stream %d: cuBLAS handle created\n", __func__, device, curr_stream_no);
         }
         return cublas_handles[device][curr_stream_no];
     }

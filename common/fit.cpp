@@ -647,19 +647,30 @@ void common_fit_log_memory_stage(const struct llama_model * model, const char * 
         return;
     }
 
-    std::vector<ggml_backend_dev_t> devs((size_t) nd);
+    // with a tensor split the model has one meta device whose memory is the sum of its cards;
+    // the growth that decides whether a card runs out is per card, so sample the cards
+    std::vector<ggml_backend_dev_t> devs;
     for (int i = 0; i < nd; i++) {
-        devs[(size_t) i] = llama_model_get_device(model, i);
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        if (ggml_backend_dev_is_meta(dev)) {
+            for (size_t j = 0; j < ggml_backend_meta_dev_n_devs(dev); j++) {
+                devs.push_back(ggml_backend_meta_dev_simple_dev(dev, j));
+            }
+        } else {
+            devs.push_back(dev);
+        }
     }
-    common_fit_log_memory_stage_devs(devs.data(), nd, stage);
+    common_fit_log_memory_stage_devs(devs.data(), (int) devs.size(), stage);
 }
 
 void common_fit_log_memory_stage_devs(struct ggml_backend_device ** devs, int nd, const char * stage) {
     static std::vector<size_t> prev_free;
+    static std::vector<size_t> ref_free;
     static int64_t             sum_growth = 0;
 
     if (devs == nullptr || stage == nullptr) {
         prev_free.clear();
+        ref_free.clear();
         sum_growth = 0;
         return;
     }
@@ -674,14 +685,19 @@ void common_fit_log_memory_stage_devs(struct ggml_backend_device ** devs, int nd
         ggml_backend_dev_memory(devs[i], &free, &total);
         cur_free[(size_t) i] = free;
     }
+    if (ref_free.size() != (size_t) nd) {
+        ref_free = cur_free;
+    }
 
     int64_t stage_growth = 0;
     for (int i = 0; i < nd; i++) {
         const int64_t growth = prev_free.size() == (size_t) nd ? (int64_t) prev_free[(size_t) i] - (int64_t) cur_free[(size_t) i] : 0;
+        const int64_t growth_ref = (int64_t) ref_free[(size_t) i] - (int64_t) cur_free[(size_t) i];
         stage_growth += growth;
-        LOG_TRC("%s: stage '%s' device %d (%s): free %.0f MiB, %+.0f MiB since the previous stage\n",
+        LOG_TRC("%s: stage '%s' device %d (%s): free %.0f MiB, %+.0f MiB since the previous stage, %+.0f MiB since the reference sample\n",
             __func__, stage, i, ggml_backend_dev_name(devs[i]),
-            (double) cur_free[(size_t) i] / 1024.0 / 1024.0, (double) growth / 1024.0 / 1024.0);
+            (double) cur_free[(size_t) i] / 1024.0 / 1024.0, (double) growth / 1024.0 / 1024.0,
+            (double) growth_ref / 1024.0 / 1024.0);
     }
     sum_growth += stage_growth;
     LOG_TRC("%s: stage '%s': device free memory changed by %+.0f MiB (%.0f MiB since the reference sample)\n",
@@ -1058,6 +1074,9 @@ static void common_fit_ep(
         ggml_backend_dev_memory(simple_devs[j], &free, &total);
         free_mem[j] = (int64_t) free;
     }
+    // the startup memory series of the cards starts at the sample the budgets are planned from
+    common_fit_log_memory_stage_devs(nullptr, 0, nullptr);
+    common_fit_log_memory_stage_devs(simple_devs.data(), (int) nd, "fit");
 
     // per-device expert tensors: the contiguous prefix split of every expert tensor
     std::vector<std::vector<common_expert_tensor>> dev_tensors(nd);

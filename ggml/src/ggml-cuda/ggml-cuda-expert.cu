@@ -970,6 +970,9 @@ ggml_cuda_expert_stream_state & ggml_backend_cuda_expert_buffer_context::get_str
         memset(ss.bitmaps_pinned[i], 0, n_words);
     }
 
+    GGML_LOG_DEBUG("%s: device %d: staging state of stream %zu: %.2f MiB staging, %zu tensors\n",
+        __func__, device, streams.size(), ss.stage_bytes/1024.0/1024.0, tensors.size());
+
     return streams.emplace(stream, std::move(ss)).first->second;
 }
 
