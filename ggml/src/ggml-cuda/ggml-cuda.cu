@@ -120,9 +120,6 @@
 #ifndef MPOL_DEFAULT
 #define MPOL_DEFAULT 0
 #endif
-#ifndef MPOL_MF_MOVE
-#define MPOL_MF_MOVE (1 << 1)
-#endif
 
 // on Linux the CUDA mapped host memory is allocated with cudaHostAlloc under a
 // set_mempolicy(MPOL_BIND) policy on the allocating thread, which pins the pages to the
@@ -2135,14 +2132,15 @@ void ggml_cuda_numa_unbind_cpus(void) {
     }
 }
 
-static bool ggml_cuda_mbind_node(void * ptr, size_t size, int node);
-
 // cudaHostAlloc of `size` bytes of mapped host memory placed on NUMA node `node`: the
 // allocation runs on a thread bound to the CPUs of the node under a memory policy bound to it,
-// so the pages belong to the node and the driver's clearing of them was done by its CPUs, then
-// the pages are bound with mbind(MPOL_MF_MOVE). node < 0: a plain allocation on the calling
-// thread without a policy. Returns nullptr on failure (logged); *bound receives whether the
-// pages are bound to the node.
+// so the pages belong to the node and the driver's clearing of them was done by its CPUs. The
+// pages of a pinned buffer are allocated and pinned inside the cudaHostAlloc call under the
+// policy of the calling thread, which decides their node; nothing moves them later (measured:
+// the pages of a 1 GiB buffer are all on the policy's node before any mbind, and an mbind of
+// the range afterwards changes nothing). node < 0: a plain allocation on the calling thread
+// without a policy. Returns nullptr on failure (logged); *bound receives whether the pages were
+// allocated under the policy of the node (the caller verifies them with move_pages).
 static void * ggml_cuda_numa_host_alloc_on_node(int device, size_t size, int node, bool * bound) {
     *bound = false;
     void *      ptr    = nullptr;
@@ -2169,16 +2167,7 @@ static void * ggml_cuda_numa_host_alloc_on_node(int device, size_t size, int nod
                        __func__, size / 1024.0 / 1024.0, node, cudaGetErrorString(err));
         return nullptr;
     }
-    if (policy) {
-        if (!ggml_cuda_mbind_node(ptr, size, node)) {
-            // not a fallback to an unbound buffer: the placement is what the plan is about
-            GGML_LOG_ERROR("%s: %.2f MiB of mapped host memory could not be bound to NUMA node %d: %s\n",
-                           __func__, size / 1024.0 / 1024.0, node, strerror(errno));
-            CUDA_CHECK(cudaFreeHost(ptr));
-            return nullptr;
-        }
-        *bound = true;
-    }
+    *bound = policy;
     return ptr;
 }
 
@@ -2351,7 +2340,7 @@ static void ggml_cuda_numa_probe_alloc(ggml_cuda_mapped_numa_state & state, int 
     for (size_t n = 0; n < state.nodes.size(); n++) {
         ggml_cuda_numa_probe_buf & buf = state.probe[phys][n];
 
-        // allocated like an arena: on a thread of the node, under its policy, bound to it
+        // allocated like an arena: on a thread of the node, under its policy
         bool bound = false;
         buf.host = ggml_cuda_numa_host_alloc_on_node(phys, GGML_CUDA_MAPPED_PROBE_SIZE, state.nodes[n], &bound);
         if (buf.host == nullptr) {
@@ -2361,7 +2350,7 @@ static void ggml_cuda_numa_probe_alloc(ggml_cuda_mapped_numa_state & state, int 
         }
         if (!bound) {
             // the probe measures one node; a buffer of unknown placement measures nothing
-            GGML_LOG_WARN("%s: physical device %d, node %d: the probe buffer could not be bound to the node\n",
+            GGML_LOG_WARN("%s: physical device %d, node %d: the probe buffer could not be allocated under the policy of the node\n",
                 __func__, phys, state.nodes[n]);
             CUDA_CHECK(cudaFreeHost(buf.host));
             buf.host = nullptr;
@@ -2909,26 +2898,6 @@ static void ggml_cuda_mapped_numa_unplace(int device, int node, size_t size) {
     ggml_cuda_numa_unplace_locked(device, node, size);
 }
 
-// bind an existing page range to one NUMA node and move its pages there
-//
-// cudaHostAlloc is called under set_mempolicy(MPOL_BIND) on the allocating thread, but the pages
-// of a pinned buffer may be faulted in by a thread of the driver that does not inherit that
-// policy. mbind(MPOL_MF_MOVE) moves the pages that exist, so the placement does not depend on
-// which thread touched them first.
-static bool ggml_cuda_mbind_node(void * ptr, size_t size, int node) {
-#if defined(SYS_mbind)
-    std::vector<unsigned long> nodemask;
-    const unsigned long maxnode = ggml_cuda_nodemask_one(node, nodemask);
-
-    return syscall(SYS_mbind, ptr, size, MPOL_BIND, nodemask.data(), maxnode, MPOL_MF_MOVE) == 0;
-#else
-    GGML_UNUSED(ptr);
-    GGML_UNUSED(size);
-    GGML_UNUSED(node);
-    return false;
-#endif
-}
-
 // account the pages move_pages confirmed on the node of one device, for the final placement log
 static void ggml_cuda_numa_verify_record(int device, size_t sampled, size_t on_node) {
     std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
@@ -2941,11 +2910,17 @@ static void ggml_cuda_numa_verify_record(int device, size_t sampled, size_t on_n
 }
 
 // allocate mapped host memory on the given NUMA node: cudaHostAlloc runs on a thread of the
-// node under a memory policy bound to it (ggml_cuda_numa_host_alloc_on_node), the pages are
-// then bound explicitly with mbind(MPOL_MF_MOVE) and the placement is verified.
-// GGML_CUDA_NUMA_NODE_FAIL means that the plan did not fit; the allocation then fails (the
-// caller has logged the details) instead of landing on an unknown node, which could be the
-// device memory of another GPU
+// node under a memory policy bound to it (ggml_cuda_numa_host_alloc_on_node) and the placement
+// is verified with move_pages. The pages of a pinned buffer are allocated and pinned inside the
+// cudaHostAlloc call, under the policy of the calling thread, so the policy decides their node;
+// there is no later fault that could place them elsewhere. An mbind(MPOL_MF_MOVE) of the range
+// afterwards was dropped: pinned pages cannot be migrated, so it never moved anything, and it
+// fails with EINVAL on a small buffer, because the driver carves small allocations out of a
+// shared 2 MiB mapping with 512 byte alignment and the range then does not start on a page
+// boundary (observed with the 1-expert host arenas of the tests). GGML_CUDA_NUMA_NODE_FAIL
+// means that the plan did not fit; the allocation then fails (the caller has logged the
+// details) instead of landing on an unknown node, which could be the device memory of another
+// GPU
 static void * ggml_backend_cuda_mapped_buffer_alloc_numa(int device, size_t size, int node) {
     if (node == GGML_CUDA_NUMA_NODE_FAIL) {
         return nullptr;
