@@ -87,6 +87,17 @@ struct llama_context {
 
     void synchronize();
 
+    // wait only for the host output buffers of the last decode (the device-to-host copies that
+    // extract_outputs posted), not for the whole context: the device streams keep running whatever
+    // was queued after them. Valid after a decode that did not go through the prefill pipeline
+    // (the pipeline posts its copies to the submission workers and records no single event); the
+    // perf counters are updated like synchronize() does
+    void synchronize_outputs();
+
+    // synchronize() unless the host output buffers of the last decode are already complete
+    // (synchronize_outputs() or synchronize() ran after it), see outputs_ready
+    void wait_outputs();
+
     // wait for all in-flight prefill pipeline ubatches without touching the scheduler copy index
     // or the perf counters. callers use it before mutating state the pipeline may still be writing
     void pipeline_drain();
@@ -116,6 +127,7 @@ struct llama_context {
     float * get_logits_ith(int32_t i);
 
     void    set_logits_topk(int32_t k);
+    void    set_logits_topk_only(bool only);
     void    reserve_if_needed();
     int32_t get_logits_topk_ith(int32_t i, const llama_token ** ids, const float ** logits);
 
@@ -177,6 +189,12 @@ struct llama_context {
     // group followed by the pending rows and the draft-step rows; the target allocates them, the
     // draft only reserves the role and is bound to the target sink by link_h_nextn
     bool enable_h_nextn_sink(bool is_target, uint32_t n_h_rows);
+
+    // dchain: MTP draft token ring, see llama_draft_ring_enable / llama_draft_ring_begin
+    bool enable_draft_ring(int32_t n_max, bool with_p);
+    void draft_ring_begin(const llama_token * ids, size_t n);
+    const llama_token * draft_ring_tokens(int32_t step) const;
+    const float       * draft_ring_p     (int32_t step) const;
     // r-mtpdev: link a draft context to this target context, so that the draft reads and writes
     // the target h sink in place and the two sides are ordered by per-group CUDA events
     bool link_h_nextn(llama_context * ctx_dft);
@@ -394,6 +412,10 @@ private:
     // set the threadpool and thread counts for the given batch type
     void graph_set_threads(bool batched);
 
+    // account the queued tokens of the last decode to the perf counters and reset the queue
+    // (shared by synchronize() and synchronize_outputs())
+    void perf_eval_update();
+
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
@@ -513,6 +535,42 @@ private:
 
     // false when the last batch only copied its top-k logits
     bool logits_full = true;
+
+    // dchain: MTP draft token ring (llama_draft_ring_enable). The MTP graph reads the input token of
+    // every draft step from t_draft_ring and writes the argmax of its logits back into it, so the
+    // steps of a chain need no host round trip; the host writes the first token at the chain start
+    // (pinned staging) and reads the drafted tokens once at the end from the pinned readback rows
+    // (one row of n_seq_max slots per step)
+    ggml_context_ptr        ctx_draft_ring;      // declared before the buffers so that they are freed first
+    ggml_context_ptr        ctx_draft_ring_host;
+    ggml_backend_buffer_ptr buf_draft_ring;      // device: t_draft_ring
+    ggml_backend_buffer_ptr buf_draft_ring_host; // pinned host: staging and readback
+    ggml_tensor *           t_draft_ring       = nullptr; // I32 [n_seq_max], MIRRORED on a meta device
+    ggml_tensor *           t_draft_ring_stage = nullptr; // I32 [n_seq_max], host staging of the chain start
+    ggml_tensor *           t_draft_ring_tok   = nullptr; // I32 [n_seq_max, n_max], host readback, one row per step
+    ggml_tensor *           t_draft_ring_p     = nullptr; // F32 [n_seq_max, n_max], host readback of the argmax probability
+    ggml_backend_t          backend_draft_ring = nullptr; // non-owning: the device backend whose streams run the draft
+    bool                    draft_ring_ptop    = false;
+    int32_t                 draft_ring_n_max   = 0;
+    int32_t                 draft_ring_i       = 0;       // readback row of the next draft step
+
+    // dchain: recorded by the decode scheduler right after it handed the host inputs of a graph to
+    // the device stream (ggml_backend_sched_set_inputs_event); process_ubatch waits for it instead
+    // of synchronizing the whole scheduler, so the next draft step is prepared while the previous
+    // one still computes. Only created with the draft ring
+    ggml_backend_event_t    ev_inputs_dec      = nullptr;
+
+    // true once the host output buffers of the last decode are complete (synchronize() or
+    // synchronize_outputs() ran after it); decode()/encode() clear it. The top-k getter only
+    // synchronizes when it is false, so a caller that waited for the outputs pays no second wait
+    bool outputs_ready = true;
+
+    // event recorded on the output backend right after the device-to-host output copies of a
+    // non-pipelined decode (see synchronize_outputs). Created on first use, on the device of the
+    // backend that holds the outputs; ev_outputs_recorded is false after a pipelined decode
+    ggml_backend_event_t ev_outputs          = nullptr;
+    ggml_backend_t       ev_outputs_backend  = nullptr;
+    bool                 ev_outputs_recorded = false;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

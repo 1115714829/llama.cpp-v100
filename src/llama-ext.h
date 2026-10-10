@@ -239,6 +239,28 @@ LLAMA_API int32_t llama_h_nextn_sink_col(struct llama_context * ctx, llama_seq_i
 // not tracked by the pipeline (decode-sized batches).
 LLAMA_API bool llama_synchronize_ubatch(struct llama_context * ctx, int64_t ubatch_id);
 
+// dchain: wait only for the host output buffers of the last decode (its device-to-host copies), not
+// for everything queued on the device streams. Valid after a decode that did not use the prefill
+// pipeline (decode-sized batches). llama_get_logits_topk_ith then reads without another wait.
+LLAMA_API void llama_synchronize_outputs(struct llama_context * ctx);
+
+// dchain: with the top-k output on (llama_set_logits_topk), a batch with a single output normally
+// still copies its full logits to the host. A context whose host only ever reads the top-k rows
+// (the MTP draft steps) turns that copy off here; llama_get_logits_ith is then invalid for it.
+LLAMA_API void llama_set_logits_topk_only(struct llama_context * ctx, bool only);
+
+// dchain: MTP draft token ring. The MTP graph of the draft context reads the input token of every
+// draft step from a device ring and writes the argmax of its logits back into it, so the steps of a
+// chain are submitted without a host round trip in between. The host writes the first token with
+// llama_draft_ring_begin, submits n_max single-token decodes, waits once (llama_synchronize_outputs)
+// and reads the drafted tokens of every step (and with with_p the probability of the argmax over the
+// top 10, for the p_min gate). Returns false if the architecture keeps the chain on the host.
+LLAMA_API bool llama_draft_ring_enable(struct llama_context * ctx, int32_t n_max, bool with_p);
+LLAMA_API void llama_draft_ring_begin(struct llama_context * ctx, const llama_token * ids, size_t n);
+// row of step (0-based): one token / probability per sequence slot, in the batch order of the chain
+LLAMA_API const llama_token * llama_draft_ring_tokens(const struct llama_context * ctx, int32_t step);
+LLAMA_API const float       * llama_draft_ring_p     (const struct llama_context * ctx, int32_t step);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //

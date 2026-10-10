@@ -1841,6 +1841,7 @@ static enum ggml_status ggml_backend_sched_compute_split_sync(
     }
 
     // copy the input tensors to the split backend
+    int n_async_inputs = 0;
     for (int input_id = 0; input_id < split->n_inputs; input_id++) {
         ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
         struct ggml_tensor * input = split->inputs[input_id];
@@ -1851,9 +1852,11 @@ static enum ggml_status ggml_backend_sched_compute_split_sync(
             // synchronously, so the caller can overwrite the host input for the next ubatch as soon
             // as this submission returns (see ggml_backend_sched_compute_splits_pipeline)
             if (sched->async_inputs && sched->n_stages == 1 && sched->n_copies == 1 && input->buffer != NULL && ggml_backend_buffer_is_host(input->buffer)) {
-                // the caller synchronizes the scheduler before writing the input data again,
-                // so the copy can be queued on the split backend without waiting for it to finish
+                // the caller synchronizes the scheduler (or waits for the inputs event below) before
+                // writing the input data again, so the copy can be queued on the split backend
+                // without waiting for it to finish
                 ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                n_async_inputs++;
             } else {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1974,6 +1977,12 @@ static enum ggml_status ggml_backend_sched_compute_split_sync(
                 }
             }
         }
+    }
+
+    // dchain: the host inputs of this split have been handed to the stream, a caller waiting for the
+    // event may now overwrite them (the device copies complete in stream order before the compute)
+    if (n_async_inputs > 0 && sched->ev_inputs[split_backend_id] != NULL) {
+        ggml_backend_event_record(sched->ev_inputs[split_backend_id], split_backend);
     }
 
     if (!sched->callback_eval) {
@@ -2981,6 +2990,17 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
 void ggml_backend_sched_set_async_inputs(ggml_backend_sched_t sched, bool async_inputs) {
     GGML_ASSERT(sched);
     sched->async_inputs = async_inputs;
+}
+
+void ggml_backend_sched_set_inputs_event(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_event_t event) {
+    GGML_ASSERT(sched);
+    for (int b = 0; b < sched->n_backends; b++) {
+        if (sched->backends[b] == backend) {
+            sched->ev_inputs[b] = event;
+            return;
+        }
+    }
+    GGML_ABORT("%s: backend is not part of the scheduler", __func__);
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

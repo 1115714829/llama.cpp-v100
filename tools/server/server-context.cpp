@@ -274,6 +274,9 @@ struct server_slot {
     bool spec_is_replay = false;
     // sparse rejection sampling is enabled for this whole request (draft-dflash only)
     bool spec_use_rejection = false;
+    // dchain: greedy (T = 0) verification reads the top-k rows of the verified tokens instead of
+    // their full logits, which then stay on the device
+    bool spec_greedy_topk = false;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -389,6 +392,7 @@ struct server_slot {
 
         spec_is_replay = false;
         spec_use_rejection = false;
+        spec_greedy_topk = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -2166,26 +2170,53 @@ private:
                 slot.spec_synth_rng.seed(seed);
             }
 
-            // the rejection mode is fixed for the whole request; draft-dflash and draft-mtp both
-            // produce a proposal distribution per token, so both can verify on the sparse top-k rows
-            const bool spec_sparse_draft = std::find(
+            // the rejection mode is fixed for the whole request; draft-dflash and draft-mtp can both
+            // verify on the sparse top-k rows
+            const bool spec_dflash = std::find(
                     params_base.speculative.types.begin(),
                     params_base.speculative.types.end(),
-                    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end() ||
-                std::find(
+                    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
+            const bool spec_mtp_draft = std::find(
                     params_base.speculative.types.begin(),
                     params_base.speculative.types.end(),
                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-            slot.spec_use_rejection = spec && spec_sparse_draft && common_sampler_can_sparse_reject(slot.smpl.get());
+            const bool spec_sparse_draft = spec_dflash || spec_mtp_draft;
 
-            // the rejection reads only the top-k logits of the verified rows, so they do not have to leave
-            // the device; the context setting is shared by the slots, hence a single slot only
+            // the rejection verifier needs the proposal distribution q of every draft token: draft-dflash
+            // reports it (result_q_dflash), draft-mtp only when it samples probabilistically (a greedy draft
+            // reports no q, see the draft-mtp implementation). Without q the verification samples and
+            // matches on the full rows, so the top-k output must stay off: with it on, the full rows of the
+            // verification batch never reach the host and the full-row sampler aborts
+            const bool spec_draft_has_q = spec_dflash || (spec_mtp_draft && params_base.speculative.draft.probabilistic);
+            slot.spec_use_rejection = spec && spec_sparse_draft && spec_draft_has_q && common_sampler_can_sparse_reject(slot.smpl.get());
+
+            // dchain: at T = 0 the verification takes the argmax of every row from its top-k candidates
+            // on the host, so the full rows of the verified tokens stay on the device as well
+            slot.spec_greedy_topk = spec && spec_sparse_draft && !slot.spec_use_rejection && !use_backend_sampling &&
+                !need_pre_sample_logits && common_sampler_can_greedy_topk(slot.smpl.get());
+
+            // the rejection and the greedy top-k verification read only the top-k logits of the verified
+            // rows, so they do not have to leave the device; the context setting is shared by the slots,
+            // hence a single slot only
             if (params_base.n_parallel == 1) {
-                llama_set_logits_topk(ctx_tgt, slot.spec_use_rejection && !use_backend_sampling && !need_pre_sample_logits
-                        ? common_sampler_sparse_k(slot.smpl.get()) : 0);
+                int32_t k = 0;
+                if (slot.spec_use_rejection && !use_backend_sampling && !need_pre_sample_logits) {
+                    k = common_sampler_sparse_k(slot.smpl.get());
+                } else if (slot.spec_greedy_topk) {
+                    k = common_sampler_greedy_topk_k(slot.smpl.get());
+                }
+                llama_set_logits_topk(ctx_tgt, k);
+                SLT_DBG(slot, "verification top-k output: k = %d (rejection = %d, greedy top-k = %d)\n",
+                        k, (int) slot.spec_use_rejection, (int) slot.spec_greedy_topk);
             }
         } else {
             slot.smpl.reset();
+
+            // a task without sampling (decision, embedding, rerank) reads the full rows of its outputs, so
+            // the top-k output of a previous request must not stay on for it (k = 0 keeps the graph)
+            if (params_base.n_parallel == 1) {
+                llama_set_logits_topk(ctx_tgt, 0);
+            }
         }
 
         // the per-request limit takes priority over the global one
@@ -4666,6 +4697,9 @@ private:
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 } else if (use_rejection) {
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                } else if (slot.spec_greedy_topk) {
+                    // dchain: the argmax of every verified row from its top-k candidates, the full rows stayed on the device
+                    accepted = common_sampler_greedy_topk_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }

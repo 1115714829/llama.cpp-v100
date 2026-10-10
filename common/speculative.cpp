@@ -1839,8 +1839,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     std::vector<common_params_sampling> smpls_cfg;
 
-    // backend sampler chain per seq, attached to ctx_dft
-    std::vector<llama_sampler *> backend_chains;
+    // dchain: the greedy draft steps take their argmax from the device top-k rows of ctx_dft
+    // (llama_set_logits_topk): every vocab shard selects its candidates on its own device and only
+    // those come back to the host, no full-vocab logits and no CPU sort per step. The probabilistic
+    // draft keeps the CPU chain (smpls): it samples and reports q from the full row
+    bool topk_device = false;
+
+    // dchain S2: the plain single-head draft keeps its token chain in the device ring: every step reads
+    // its input token from the ring and writes its argmax back, the host submits the n_max steps back
+    // to back and reads the chain once at the end (llama_draft_ring_*). Chained heads re-add the whole
+    // prefix every step and a shared-memory draft reuses one position, both keep the per-step path
+    bool ring_mode = false;
 
     int32_t n_embd = 0;
 
@@ -1923,21 +1932,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             s.reset(common_sampler_init(llama_get_model(ctx_dft), sparams));
         }
 
-        // offload draft sampling to the backend
-        backend_chains.assign(n_seq, nullptr);
-        if (this->params.backend_sampling) {
-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-                llama_sampler * chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
-                llama_sampler_chain_add(chain, llama_sampler_init_top_k(10));
-
-                if (!llama_set_sampler(ctx_dft, seq_id, chain)) {
-                    SPC_WRN("backend offload failed for seq_id=%d; using CPU sampler\n", (int) seq_id);
-                    llama_sampler_free(chain);
-                    chain = nullptr;
-                }
-                backend_chains[seq_id] = chain;
-            }
-        }
+        // dchain: the greedy draft argmax comes from the device top-k rows. The graph selects the
+        // candidates of every vocab shard (k = 1 takes the smallest bucket, 64 per shard), the host
+        // reads only those rows (no raw logits of the single output row either) and takes the best
+        // one. This replaces the backend sampler request, which a tensor-split context rejects
+        topk_device = this->params.backend_sampling && !this->params.probabilistic;
 
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
@@ -1978,6 +1977,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         this->n_max = this->params.n_max;
 
+        // dchain: with the ring the graph does its own argmax and no top-k rows come back per step;
+        // without it the per-step argmax reads the top-k rows. Both read no raw logits (capability
+        // branch per architecture: llama_draft_ring_enable says whether the MTP graph has the ring)
+        if (topk_device) {
+            ring_mode = !chain_heads && !is_mem_shared && this->n_max > 0 &&
+                llama_draft_ring_enable(ctx_dft, this->n_max, this->params.p_min > 0.0f);
+            if (!ring_mode) {
+                llama_set_logits_topk(ctx_dft, 1);
+            }
+            llama_set_logits_topk_only(ctx_dft, true);
+        }
+        SPC_MTP("draft sampling: topk_device=%d ring_mode=%d\n", (int) topk_device, (int) ring_mode);
+
         // catch-up decodes must not write the sink: their output rows have no consumer and
         // would overwrite the target batch columns
         llama_set_h_sink_write(ctx_dft, false);
@@ -2000,18 +2012,43 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         target_first.assign(n_seq, 0);
     }
 
-    ~common_speculative_impl_draft_mtp() override {
-        auto * ctx_dft = this->params.ctx_dft;
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) backend_chains.size(); ++seq_id) {
-            if (backend_chains[seq_id] == nullptr) {
-                continue;
+    // dchain: argmax of the device top-k row of output idx. The shards select their candidates
+    // independently, so the row is a superset of the global top k in no particular order; ties break
+    // like the host sort of the sparse rows, (logit desc, id asc). With p_top set, the probability of
+    // the argmax is normalized over the global top 10, the candidate set the CPU chain (top_k(10) +
+    // dist) normalizes over, so the p_min gate sees the same number as the CPU path
+    static llama_token draft_topk_argmax(llama_context * ctx, int idx, float * p_top) {
+        const llama_token * ids    = nullptr;
+        const float       * logits = nullptr;
+        const int32_t n = llama_get_logits_topk_ith(ctx, idx, &ids, &logits);
+        GGML_ASSERT(n > 0 && "the MTP draft context has no top-k output");
+
+        int32_t best = 0;
+        for (int32_t i = 1; i < n; ++i) {
+            if (logits[i] > logits[best] || (logits[i] == logits[best] && ids[i] < ids[best])) {
+                best = i;
             }
-            if (ctx_dft) {
-                llama_set_sampler(ctx_dft, seq_id, nullptr);
-            }
-            llama_sampler_free(backend_chains[seq_id]);
         }
-        backend_chains.clear();
+
+        if (p_top != nullptr) {
+            const int32_t k = std::min<int32_t>(10, n);
+            std::vector<llama_token_data> cand(n);
+            for (int32_t i = 0; i < n; ++i) {
+                cand[i] = llama_token_data{ids[i], logits[i], 0.0f};
+            }
+            std::partial_sort(cand.begin(), cand.begin() + k, cand.end(), [](const llama_token_data & a, const llama_token_data & b) {
+                return a.logit != b.logit ? a.logit > b.logit : a.id < b.id;
+            });
+            // the same arithmetic as llama_sampler_dist: float exp terms, double running sum
+            const float max_l = cand[0].logit;
+            double sum = 0.0;
+            for (int32_t i = 0; i < k; ++i) {
+                sum += expf(cand[i].logit - max_l);
+            }
+            *p_top = (float) (1.0 / sum);
+        }
+
+        return ids[best];
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
@@ -2283,7 +2320,148 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         return true;
     }
 
+    // dchain S2: the whole chain on the device. Step i reads the ring (step 0: id_last, written by the
+    // host at the chain start), writes its argmax into the ring and into readback row i; the host does
+    // not wait between the steps (process_ubatch only waits for the previous step's host inputs to be
+    // handed over), waits once for the outputs after the last step and then reads the rows. p_min is
+    // applied on the host afterwards, with the probability the graph computed over the global top 10
+    void draft_ring(common_speculative_draft_params_vec & dparams) {
+        auto & ctx_dft = params.ctx_dft;
+
+        batch.clear();
+
+        // every draft step writes its output row into the sink for the next step to read
+        llama_set_h_sink_write(ctx_dft, true);
+        llama_set_h_sink_offset(ctx_dft, h_sink_step0);
+
+        // the draft steps read the pending and step columns only: they must not mark any batch
+        // group as read, or they would release a group the target may still be writing
+        llama_set_h_src_group(ctx_dft, -1);
+
+        std::vector<llama_seq_id> seqs;     // drafting sequences in batch (slot) order
+        std::vector<llama_token>  ids_last; // their last accepted tokens, the input of step 0
+        std::vector<int32_t>      step_cols;
+        seqs.reserve(n_seq);
+        ids_last.reserve(n_seq);
+        step_cols.reserve(n_seq);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+
+            if (!dp.drafting) {
+                continue;
+            }
+
+            // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
+            dp.result_q = nullptr;
+
+            const int32_t slot = (int32_t) seqs.size();
+
+            seqs.push_back(seq_id);
+            ids_last.push_back(dp.id_last);
+
+            // step 0 reads the pending row captured by process() / accept() and writes its own row
+            // at the step column of its slot; every later step reads and rewrites that column
+            step_cols.push_back(pending_col[seq_id]);
+            i_last_col[seq_id] = h_sink_step0 + slot;
+
+            // the token value is not read on the device (the graph takes it from the ring), a valid id
+            // only satisfies the batch validation
+            batch.add(dp.id_last, dp.pos0, seq_id, true);
+
+            if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+                SPC_MTP("draft chain start: seq=%d slot=%d id_last=%d pos0=%d pending_col=%d\n",
+                        (int) seq_id, slot, dp.id_last, dp.pos0, pending_col[seq_id]);
+            }
+        }
+
+        if (seqs.empty()) {
+            return;
+        }
+
+        const int32_t n_slots = (int32_t) seqs.size();
+
+        // ring[slot] = id_last, queued on the draft streams behind the catch-up decode
+        llama_draft_ring_begin(ctx_dft, ids_last.data(), ids_last.size());
+
+        // host time of every submission and of the final wait (trace only, see below)
+        std::vector<int64_t> t_submit_us;
+        t_submit_us.reserve(n_max);
+        const int64_t t_chain0_us = ggml_time_us();
+
+        int n_steps = 0;
+        for (int i = 0; i < n_max; ++i) {
+            if (i > 0) {
+                batch.clear();
+                step_cols.clear();
+                for (int32_t slot = 0; slot < n_slots; ++slot) {
+                    const llama_seq_id seq_id = seqs[slot];
+                    const auto & dp = dparams[seq_id];
+                    batch.add(ids_last[slot], dp.pos0 + i, seq_id, true);
+                    step_cols.push_back(i_last_col[seq_id]);
+                }
+            }
+
+            llama_set_h_source(ctx_dft, true, step_cols.data(), step_cols.size());
+
+            const int64_t t_step0_us = ggml_time_us();
+            const int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            t_submit_us.push_back(ggml_time_us() - t_step0_us);
+            if (ret != 0) {
+                SPC_ERR("llama_process[%d] returned %d\n", i, ret);
+                break;
+            }
+            n_steps++;
+        }
+
+        // one wait for the whole chain: the readback rows of every step are complete
+        const int64_t t_wait0_us = ggml_time_us();
+        llama_synchronize_outputs(ctx_dft);
+        const int64_t t_end_us = ggml_time_us();
+
+        if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+            std::string submits;
+            for (const int64_t t : t_submit_us) {
+                submits += (submits.empty() ? "" : ",") + std::to_string(t);
+            }
+            SPC_MTP("draft chain timing: steps=%d submit_us=[%s] wait_us=%" PRId64 " total_us=%" PRId64 "\n",
+                    n_steps, submits.c_str(), t_end_us - t_wait0_us, t_end_us - t_chain0_us);
+        }
+
+        for (int32_t slot = 0; slot < n_slots; ++slot) {
+            auto & dp = dparams[seqs[slot]];
+            auto & result = *dp.result;
+
+            for (int i = 0; i < n_steps; ++i) {
+                const llama_token id = llama_draft_ring_tokens(ctx_dft, i)[slot];
+                const float * p_row  = llama_draft_ring_p(ctx_dft, i);
+                const float   p_top  = p_row ? p_row[slot] : 1.0f;
+
+                if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+                    SPC_MTP("draft step=%d seq=%d id_last=%d top1=%d p=%.4f (device ring)\n",
+                            i, (int) seqs[slot], dp.id_last, id, p_top);
+                }
+
+                // only collect very high-confidence draft tokens: the first low one ends the draft
+                if (p_top < params.p_min) {
+                    break;
+                }
+
+                result.push_back(id);
+            }
+
+            if (result.size() < (size_t) params.n_min) {
+                result.clear();
+            }
+        }
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
+        if (ring_mode) {
+            draft_ring(dparams);
+            return;
+        }
+
         auto & ctx_dft = params.ctx_dft;
 
         batch.clear();
@@ -2366,10 +2544,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const int64_t t_step0_us = ggml_time_us();
             int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+            const int64_t t_step1_us = ggml_time_us();
             if (ret != 0) {
                 SPC_ERR("llama_process[%d] returned %d\n", i, ret);
                 break;
+            }
+
+            // dchain: one wait per step for the top-k rows of every drafting sequence, on the output
+            // copies only (the device streams are not drained)
+            if (topk_device) {
+                llama_synchronize_outputs(ctx_dft);
+            }
+            if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+                SPC_MTP("draft step timing: step=%d submit_us=%" PRId64 " wait_us=%" PRId64 "\n",
+                        i, t_step1_us - t_step0_us, ggml_time_us() - t_step1_us);
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the
@@ -2384,43 +2574,64 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                auto * smpl = smpls[seq_id].get();
+                auto & dp = dparams.at(seq_id);
 
-                const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                llama_token id    = LLAMA_TOKEN_NULL;
+                float       p_top = 1.0f; // probability of the argmax under the draft's top-k distribution
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                // the CPU candidates, only on the CPU chain path (probabilistic drafting reads them)
+                const llama_token_data_array * cur_p = nullptr;
 
-                if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
-                    SPC_MTP("draft step=%d seq=%d id_last=%d sampled=%d top1=%d p=%.4f\n",
-                            i, (int) seq_id, dparams[seq_id].id_last, id_sampled,
-                            cur_p->size > 0 ? cur_p->data[0].id : -1, cur_p->size > 0 ? cur_p->data[0].p : 0.0f);
+                if (topk_device) {
+                    // greedy: the argmax of the device top-k row. p_top is only needed by the p_min gate
+                    id = draft_topk_argmax(ctx_dft, i_last[seq_id], params.p_min > 0.0f ? &p_top : nullptr);
+
+                    if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+                        SPC_MTP("draft step=%d seq=%d id_last=%d top1=%d p=%.4f (device top-k)\n",
+                                i, (int) seq_id, dp.id_last, id, p_top);
+                    }
+                } else {
+                    auto * smpl = smpls[seq_id].get();
+
+                    const llama_token id_sampled = common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+
+                    cur_p = common_sampler_get_candidates(smpl, true);
+
+                    if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE) {
+                        SPC_MTP("draft step=%d seq=%d id_last=%d sampled=%d top1=%d p=%.4f\n",
+                                i, (int) seq_id, dp.id_last, id_sampled,
+                                cur_p->size > 0 ? cur_p->data[0].id : -1, cur_p->size > 0 ? cur_p->data[0].p : 0.0f);
+                    }
+
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
+
+                    // add drafted token for each sequence
+                    id    = dp.result_q ? id_sampled : cur_p->data[0].id;
+                    p_top = cur_p->data[0].p;
                 }
-
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
-                }
-
-                // add drafted token for each sequence
-                const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (p_top < params.p_min) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
                     continue;
                 }
 
-                common_sampler_accept(smpl, id, true);
+                if (!topk_device) {
+                    common_sampler_accept(smpls[seq_id].get(), id, true);
+                }
 
-                auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
                 result.push_back(id);
 
                 if (dp.result_q) {
+                    GGML_ASSERT(cur_p != nullptr);
                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                 }
 
@@ -2428,6 +2639,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 // CPU chain dist filled .p with the top-k normalized proposal the draft sampled from
                 if (dp.use_rejection && params.probabilistic) {
                     GGML_ASSERT(dp.result_q_dflash);
+                    GGML_ASSERT(cur_p != nullptr);
 
                     common_sampler_draft_q q;
                     q.ids.reserve(cur_p->size);

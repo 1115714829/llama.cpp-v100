@@ -648,6 +648,11 @@ struct llama_model {
     // the h sink is not usable without it
     bool h_nextn_sink_ok = false;
 
+    // dchain: the arch graph_mtp can take its input tokens from the device draft ring and write the
+    // argmax of its logits back into it (t_draft_ring branch in the MTP graph). Set by the model
+    // loader of architectures that implement it; the draft token chain stays on the host without it
+    bool draft_ring_ok = false;
+
     // the merged gate_up expert weight of every layer is loaded with its rows interleaved, so the
     // graph reads it with the fused SwiGLU matmul instead of the split gate and up views.
     // Set by the model loader of the architectures that load it that way, see

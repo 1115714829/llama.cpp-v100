@@ -168,7 +168,10 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
     if (ubatch->token) {
-        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        // dchain: the tokens of a draft step live in the device ring (written by the previous step)
+        if (!tokens_device) {
+            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        }
     } else {
         // note: mtmd embedding input goes through here
         GGML_ASSERT(ubatch->embd);
@@ -1369,6 +1372,9 @@ void llm_graph_result::reset() {
     t_logits_topk     = nullptr;
     t_logits_topk_ids = nullptr;
 
+    t_draft_top1 = nullptr;
+    t_draft_ptop = nullptr;
+
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
@@ -1423,7 +1429,7 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             }
         }
     }
-    for (auto * tensor : { t_logits_topk, t_logits_topk_ids }) {
+    for (auto * tensor : { t_logits_topk, t_logits_topk_ids, t_draft_top1, t_draft_ptop }) {
         if (tensor != nullptr) {
             ggml_set_output(tensor);
         }
@@ -1552,6 +1558,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     h_sink_write     (params.h_sink_write),
     fa_assist        (params.fa_assist),
     mtp_kv_only      (params.mtp_kv_only),
+    t_draft_ring     (params.t_draft_ring),
+    draft_ring_ptop  (params.draft_ring_ptop),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -4019,10 +4027,15 @@ void llm_graph_context::build_logits_topk() const {
     const int32_t k        = cparams.logits_topk;
     const int32_t n_shards = cparams.logits_topk_shards;
 
-    if (k <= 0 || !res->t_logits || res->t_logits->ne[1] == 0) {
+    if (k <= 0 || !res->t_logits) {
         return;
     }
 
+    // a ubatch without output rows (a prefill chunk whose outputs come later) still gets the top-k
+    // nodes, on the empty logits: the graph topology must not depend on the number of outputs, or it
+    // differs from the reserved worst case (which has outputs and the top-k) and the allocator
+    // re-reserves on every such ubatch (a device synchronization plus a full re-plan each time, see
+    // ggml_backend_sched_alloc_splits). The empty nodes compute nothing, like the lm head on no rows
     ggml_tensor * logits = res->t_logits; // [n_vocab, n_outputs]
 
     const int64_t n_vocab = logits->ne[0];

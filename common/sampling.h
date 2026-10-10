@@ -133,6 +133,28 @@ bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl);
 // logit bias) and per penalty window token (penalties); 0 if unavailable
 int32_t common_sampler_sparse_k(const struct common_sampler * gsmpl);
 
+// dchain: greedy verification on the sparse top-k rows. true if the chain of gsmpl replayed on the
+// candidates of a row gives the argmax of the full row: T <= 0 (the temp sampler takes the first
+// maximum), no sampler that rewrites the full logits (a ban-only logit bias and penalties that only
+// lower the logits of the tokens they have seen are admitted), no truncation that can drop the
+// maximum (typical, xtc, dry), and dist as the last sampler
+bool common_sampler_can_greedy_topk(const struct common_sampler * gsmpl);
+
+// number of candidates the top-k rows need for the greedy replay: 1, plus one per banned token and
+// per penalty window token; 0 if unavailable
+int32_t common_sampler_greedy_topk_k(const struct common_sampler * gsmpl);
+
+// greedy variant of common_sampler_sample_and_accept_n that reads the top-k rows of every row in
+// idxs instead of the full logits (the full rows of a verification batch then never leave the
+// device). The candidates are visited like the full row (logit desc, id asc: the first maximum is
+// the smallest id among equal logits), then the chain is replayed on them.
+// requires: common_sampler_can_greedy_topk(gsmpl) and idxs.size() == draft.size() + 1
+std::vector<llama_token> common_sampler_greedy_topk_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const std::vector<int> & idxs,
+        const llama_tokens & draft);
+
 // rejection sampling variant of common_sampler_sample_and_accept_n:
 //
 // - reads the top_k logits of every row in idxs, replays the sampler chain on them to get p

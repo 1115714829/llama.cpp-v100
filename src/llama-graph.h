@@ -165,6 +165,10 @@ public:
     ggml_tensor * h_cols = nullptr;       // I32 [n_batch]
     const int32_t * h_cols_src = nullptr; // host values for h_cols
 
+    // dchain: tokens is a view of the device draft ring (written by the previous draft step), so
+    // set_input does not copy the host tokens
+    bool tokens_device = false;
+
     const int64_t n_embd = 0;
 };
 
@@ -859,6 +863,12 @@ struct llm_graph_params {
     // this flag. Only the MTP context can set it, all other contexts leave it false
     bool mtp_kv_only = false;
 
+    // dchain: MTP draft token ring (llama_draft_ring_enable). A draft step reads its input tokens
+    // from the ring and writes the argmax of its logits back into it; with draft_ring_ptop the
+    // graph also outputs the probability of that argmax over the top 10 (for the p_min gate)
+    ggml_tensor * t_draft_ring    = nullptr;  // draft: I32 [n_seq_max], MIRRORED on a meta device
+    bool          draft_ring_ptop = false;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -941,6 +951,8 @@ struct llm_graph_params {
             h_sink_write          == other.h_sink_write          &&
             fa_assist             == other.fa_assist             &&
             mtp_kv_only           == other.mtp_kv_only           &&
+            t_draft_ring          == other.t_draft_ring          &&
+            draft_ring_ptop       == other.draft_ring_ptop       &&
             layer_inp_sink_layers == other.layer_inp_sink_layers;
     }
 };
@@ -1002,6 +1014,11 @@ public:
     // [k, n_shards, n_outputs] ids local to their vocab shard
     ggml_tensor * t_logits_topk     = nullptr;
     ggml_tensor * t_logits_topk_ids = nullptr;
+
+    // dchain: MTP draft ring outputs of a draft step, [1, n_outputs]: the argmax token of every row
+    // (global ids, also written into the ring) and, with draft_ring_ptop, its probability over the top 10
+    ggml_tensor * t_draft_top1 = nullptr;
+    ggml_tensor * t_draft_ptop = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1114,6 +1131,8 @@ struct llm_graph_context {
     const bool h_sink_write;                 // r-mtpdev: false when this graph skips the sink write
     const bool fa_assist;                    // mark the FA nodes for the 6-card assist path
     const bool mtp_kv_only;                  // MTP catch-up: build only the K/V subgraph
+    ggml_tensor * const t_draft_ring;        // dchain draft: device token ring read and written by the MTP graph
+    const bool draft_ring_ptop;              // dchain draft: also output the probability of the argmax
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
