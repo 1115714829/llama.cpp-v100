@@ -37,4 +37,12 @@ bool ggml_cuda_q8_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const gg
 // the regular path.
 bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx, const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4], int n_nodes, const ggml_tensor * src1);
 
+// The down and up projections of a qwen4exp hyper-connection mixer from the F16 copy of the normed
+// input: gate = up(F16(silu(scale * down(input)))), with the arithmetic of the unfused nodes
+// (q8 skinny down, SCALE -> UNARY(SILU), F32 -> F16, q8 skinny up), so gate is bitwise the same.
+// The down projection must take the split path (a narrow repacked weight, M <= 16).
+bool ggml_cuda_q8_skinny_hc_down_up_supported(const ggml_tensor * w_down, const ggml_tensor * w_up, int64_t m);
+void ggml_cuda_q8_skinny_hc_down_up(ggml_backend_cuda_context & ctx, const ggml_tensor * w_down, const ggml_tensor * w_up,
+                                    const half * input, int64_t m, float scale, float * gate);
+
 void ggml_cuda_q8_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream);

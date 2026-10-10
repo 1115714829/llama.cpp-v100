@@ -13,6 +13,7 @@
 //   gated   SWIGLU(MUL_MAT(G, x), MUL_MAT(U, x))                    q8_skinny_gated_kernel
 //   multi   MUL_MAT(W_i, x) for 2..4 weights sharing one input     q8_skinny_multi_kernel
 //   hcpost  gated DSV4_HC_POST -> RMS_NORM -> MUL (the hyper-connection combine and next mixer norm)
+//   hcmix   hcpost followed by the Q8_0 down projection, SCALE -> SILU and the up projection
 // Not part of the CMake build. Build against a llama.cpp build tree:
 //   g++ -O2 -std=c++17 -I<src>/ggml/include tests/bench-q8-skinny-cold.cpp -o bench-q8-skinny-cold \
 //       -L<build>/bin -lggml -lggml-base -lggml-cuda -Wl,-rpath,<build>/bin
@@ -62,6 +63,8 @@ static std::vector<bench_case> make_cases() {
         { "moe", "multi",  "qsa_q_k_v",      2560, { 2048, 256, 256 } },
         // the hyper-connection combine (gated DSV4_HC_POST) and the next mixer's RMS_NORM -> MUL
         { "hc", "hcpost", "hc_post_norm",  2560, { 4 }, GGML_TYPE_F32 },
+        // the whole mixer opening: the combine, the norm, the Q8_0 down/up projections (n = { hc, lr })
+        { "hc", "hcmix",  "hc_mix",        2560, { 4, 320 }, GGML_TYPE_Q8_0 },
         // the F32/BF16 projections of the decode graph (mul_mat_vec_f)
         { "mmvf", "single", "hc_inject",     10240, { 4 },   GGML_TYPE_F32 },
         { "mmvf", "single", "gate_inp",       2560, { 512 }, GGML_TYPE_F32 },
@@ -99,16 +102,20 @@ static void fill_weight(std::vector<uint8_t> & bytes, ggml_type type, int64_t k,
 // those read and written by the unfused pair.
 static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m, int iters, double min_mib,
                          int * r_out, double * gb_out, const std::string & dump) {
+    const bool    mix    = strcmp(c.pattern, "hcmix") == 0;
     const int64_t n_embd = c.k;
     const int64_t hc     = c.n[0];
-    const size_t copy_bytes = sizeof(float) * (size_t) (n_embd*m + 3*n_embd*hc*m + hc*m);
+    const int64_t n_lr   = mix ? c.n[1] : 0;
+    const size_t w_bytes = mix ? 2 * ggml_row_size(GGML_TYPE_Q8_0, n_embd*hc) * n_lr : 0;
+    const size_t copy_bytes = sizeof(float) * (size_t) (n_embd*m + 3*n_embd*hc*m + hc*m) + w_bytes;
     int r = (int) std::ceil(min_mib * 1024.0 * 1024.0 / (double) copy_bytes);
-    r = std::max(4, std::min(r, 1024));
+    r = std::max(4, std::min(r, mix ? 512 : 1024));
 
-    ggml_init_params ip = { ggml_tensor_overhead() * (size_t) r * 12 + ggml_graph_overhead_custom(8192, false), nullptr, true };
-    ggml_context * ctx = ggml_init(ip);
+    ggml_init_params ip = { ggml_tensor_overhead() * (size_t) r * 20 + ggml_graph_overhead_custom(8192, false), nullptr, true };
+    ggml_context * ctx   = ggml_init(ip);
+    ggml_context * ctx_w = ggml_init(ip);
     ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
-    std::vector<ggml_tensor *> xs(r), res(r), posts(r), first_outs;
+    std::vector<ggml_tensor *> xs(r), res(r), posts(r), w_down(r), w_up(r), first_outs;
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
     for (int i = 0; i < r; ++i) {
         xs[i]    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, m);
@@ -117,15 +124,33 @@ static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m
         ggml_tensor * post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, posts[i], 1.0f / (float) hc)), 2.0f);
         ggml_tensor * hp   = ggml_dsv4_hc_post(ctx, xs[i], res[i], post, nullptr);
         ggml_tensor * xn   = ggml_mul(ctx, ggml_rms_norm(ctx, hp, 1e-6f), gamma);
-        ggml_build_forward_expand(gf, xn);
-        if (i == 0) {
-            first_outs = { hp, xn };
+        if (mix) {
+            // build_hc_mix up to the gate
+            w_down[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q8_0, n_embd*hc, n_lr);
+            w_up[i]   = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q8_0, n_lr, n_embd*hc);
+            ggml_tensor * x2   = ggml_reshape_2d(ctx, xn, n_embd*hc, m);
+            ggml_tensor * lo   = ggml_silu(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, w_down[i], x2), 1.0f / (float) hc));
+            ggml_tensor * gate = ggml_mul_mat(ctx, w_up[i], lo);
+            ggml_build_forward_expand(gf, gate);
+            ggml_build_forward_expand(gf, xn);
+            if (i == 0) {
+                first_outs = { hp, xn, gate };
+            }
+        } else {
+            ggml_build_forward_expand(gf, xn);
+            if (i == 0) {
+                first_outs = { hp, xn };
+            }
         }
     }
-    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
-    if (buf == nullptr) {
+    ggml_backend_buffer_t buf   = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    ggml_backend_buffer_t buf_w = mix ? ggml_backend_alloc_ctx_tensors(ctx_w, backend) : nullptr;
+    if (buf == nullptr || (mix && buf_w == nullptr)) {
         fprintf(stderr, "allocation failed for %s m=%lld r=%d\n", c.what, (long long) m, r);
         exit(1);
+    }
+    if (buf_w) {
+        ggml_backend_buffer_set_usage(buf_w, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     }
     std::mt19937 rng(1234);
     std::uniform_real_distribution<float> ud(-1.0f, 1.0f);
@@ -141,6 +166,15 @@ static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m
         fill(xs[i]);
         fill(res[i]);
         fill(posts[i]);
+    }
+    if (mix) {
+        std::vector<uint8_t> wd, wu;
+        fill_weight(wd, GGML_TYPE_Q8_0, n_embd*hc, n_lr, rng);
+        fill_weight(wu, GGML_TYPE_Q8_0, n_lr, n_embd*hc, rng);
+        for (int i = 0; i < r; ++i) {
+            ggml_backend_tensor_set(w_down[i], wd.data(), 0, wd.size());
+            ggml_backend_tensor_set(w_up[i],   wu.data(), 0, wu.size());
+        }
     }
     for (int i = 0; i < 3; ++i) {
         ggml_backend_graph_compute(backend, gf);
@@ -164,7 +198,11 @@ static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m
         fclose(f);
     }
     ggml_backend_buffer_free(buf);
+    if (buf_w) {
+        ggml_backend_buffer_free(buf_w);
+    }
     ggml_free(ctx);
+    ggml_free(ctx_w);
     return us;
 }
 
@@ -173,7 +211,7 @@ static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, 
     const bool gated  = strcmp(c.pattern, "gated") == 0;
     const bool multi  = strcmp(c.pattern, "multi") == 0;
     const bool hcpost = strcmp(c.pattern, "hcpost") == 0;
-    if (hcpost) {
+    if (hcpost || strcmp(c.pattern, "hcmix") == 0) {
         return run_hcpost(backend, c, m, iters, min_mib, r_out, gb_out, dump);
     }
 

@@ -5134,6 +5134,67 @@ struct test_dsv4_hc_post_norm : public test_dsv4_hc {
     }
 };
 
+// The opening of a qwen4exp hyper-connection mixer on Q8_0 projections (sm_70 repacks them):
+// [gated DSV4_HC_POST ->] RMS_NORM -> MUL -> MUL_MAT(down) -> SCALE -> SILU -> MUL_MAT(up), which
+// backends can run as one norm kernel and two projections that exchange F16 activations. The output
+// adds the gate, the normed input and the new residual so that every output of the group is checked.
+struct test_hc_mix_q8 : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_lr;
+    const int64_t n_tokens;
+    const bool    with_post;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_MIX_Q8";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_lr, n_tokens, with_post);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_hc_mix_q8(int64_t n_embd = 2560, int64_t n_lr = 320, int64_t n_tokens = 4, bool with_post = true)
+        : n_embd(n_embd), n_lr(n_lr), n_tokens(n_tokens), with_post(with_post) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * res = residual;
+        if (with_post) {
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(x, "x");
+            ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+            ggml_set_name(post, "post");
+            post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+            res = ggml_dsv4_hc_post(ctx, x, residual, post, nullptr);
+        }
+
+        ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(gamma, "gamma");
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd*hc, n_lr);
+        ggml_set_name(w_down, "w_down");
+        ggml_tensor * w_up = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_lr, n_embd*hc);
+        ggml_set_name(w_up, "w_up");
+
+        ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, res, 1e-6f), gamma);
+        xn = ggml_reshape_2d(ctx, xn, n_embd*hc, n_tokens);
+        ggml_tensor * lo = ggml_mul_mat(ctx, w_down, xn);
+        lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float) hc));
+        ggml_tensor * gate = ggml_mul_mat(ctx, w_up, lo);
+
+        out = ggml_add(ctx, ggml_add(ctx, gate, xn), ggml_reshape_2d(ctx, res, n_embd*hc, n_tokens));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -11932,6 +11993,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_dsv4_hc_post_norm(1280, 4));
     test_cases.emplace_back(new test_dsv4_hc_post_norm(512, 4));
+    // the mixer opening on Q8_0 projections: fused at M <= 16 (with and without the post before
+    // it), unfused at M = 17
+    for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
+        test_cases.emplace_back(new test_hc_mix_q8(2560, 320, n_tokens, true));
+    }
+    test_cases.emplace_back(new test_hc_mix_q8(2560, 320, 4, false));
+    test_cases.emplace_back(new test_hc_mix_q8(1024, 128, 4, true));
 
     // scale + unary(silu): decode and prefill shapes of the hyper-connection mixer activation
     test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 320, 1, 1, 1 }));

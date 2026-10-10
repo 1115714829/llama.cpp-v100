@@ -17,6 +17,14 @@ bool ggml_cuda_op_dsv4_hc_post_rms_norm_mul_fused(ggml_backend_cuda_context & ct
                                                   ggml_tensor *               rms_norm,
                                                   ggml_tensor *               mul);
 
+// The norm that opens a qwen4exp hyper-connection mixer: [gated DSV4_HC_POST ->] RMS_NORM -> MUL in
+// one kernel (hc_post == nullptr: only the norm), bitwise as the unfused kernels; mul_f16, if not
+// nullptr, receives the F16 copy of the MUL output (rounded like the F32 -> F16 conversion).
+bool ggml_cuda_hc_mix_norm_supported(const ggml_tensor * hc_post, const ggml_tensor * scale_inv_hc,
+                                     const ggml_tensor * rms_norm, const ggml_tensor * mul);
+void ggml_cuda_op_hc_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * hc_post, ggml_tensor * scale_inv_hc,
+                              ggml_tensor * scale_gate, ggml_tensor * rms_norm, ggml_tensor * mul, half * mul_f16);
+
 void ggml_cuda_op_rms_norm_mul_silu_mul_fused(ggml_backend_cuda_context & ctx,
                                               ggml_tensor *               rms_norm,
                                               ggml_tensor *               mul,

@@ -7469,6 +7469,114 @@ static bool ggml_cuda_mul_mat_multi_shared_src1(ggml_backend_cuda_context & ctx,
 }
 
 // try and fuse nodes and return the number of nodes to skip
+// The opening of a qwen4exp hyper-connection mixer on repacked Q8_0 projections:
+//   [SCALE -> UNARY(SIGMOID) -> SCALE -> DSV4_HC_POST ->] RMS_NORM -> MUL -> (views) ->
+//   MUL_MAT(down) -> SCALE -> UNARY(SILU) -> MUL_MAT(up)
+// (build_hc_combine of the previous block, then build_hc_mix up to the gate). Unfused, the down and
+// up projections each convert their F32 input to F16 and a kernel applies the scale and silu
+// between them. Here the norm kernel also writes the F16 copy of its output, the down projection
+// (split kernel, M <= 16) applies the scale and silu in its last CTA and writes F16, and the up
+// projection reads that: two conversions and the scale/silu kernel disappear. Every value is
+// computed with the expressions of the unfused kernels, so the outputs are bitwise the same. The
+// DSV4_HC_POST, MUL and up MUL_MAT outputs are written (they are read after the group); the down
+// projection and the scale/silu outputs are only consumed inside the group and are not written.
+// Returns the number of nodes after i that the group covers, or 0.
+static int ggml_cuda_try_fuse_hc_mix(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * node = cgraph->nodes[i];
+    ggml_tensor * scale_inv_hc = nullptr;
+    ggml_tensor * scale_gate   = nullptr;
+    ggml_tensor * hc_post      = nullptr;
+    int j = i;
+    if (node->op == GGML_OP_SCALE) {
+        if (i + 5 >= cgraph->n_nodes ||
+                cgraph->nodes[i + 1]->op != GGML_OP_UNARY || ggml_get_unary_op(cgraph->nodes[i + 1]) != GGML_UNARY_OP_SIGMOID ||
+                cgraph->nodes[i + 2]->op != GGML_OP_SCALE || cgraph->nodes[i + 3]->op != GGML_OP_DSV4_HC_POST ||
+                !ggml_check_edges(cgraph, i, {{1, 0, 0}, {2, 0, 1}, {3, 2, 2}, {4, 0, 3}}) ||
+                node->src[0]->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
+            return 0;
+        }
+        scale_inv_hc = node;
+        scale_gate   = cgraph->nodes[i + 2];
+        hc_post      = cgraph->nodes[i + 3];
+        j = i + 4;
+    }
+    if (j + 1 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * rms_norm = cgraph->nodes[j];
+    ggml_tensor * mul      = cgraph->nodes[j + 1];
+    if (rms_norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
+            (mul->src[0] != rms_norm && mul->src[1] != rms_norm)) {
+        return 0;
+    }
+
+    // the down projection reads the MUL output through views only
+    const int k = ggml_cuda_next_real_node(cgraph, j + 1);
+    if (k < 0 || k + 3 >= cgraph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * mm_down = cgraph->nodes[k];
+    ggml_tensor * scale   = cgraph->nodes[k + 1];
+    ggml_tensor * silu    = cgraph->nodes[k + 2];
+    ggml_tensor * mm_up   = cgraph->nodes[k + 3];
+    if (mm_down->op != GGML_OP_MUL_MAT || scale->op != GGML_OP_SCALE || silu->op != GGML_OP_UNARY ||
+            ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || mm_up->op != GGML_OP_MUL_MAT ||
+            scale->src[0] != mm_down || silu->src[0] != scale || mm_up->src[1] != silu ||
+            ggml_get_op_params_f32(scale, 1) != 0.0f) {
+        return 0;
+    }
+    const ggml_tensor * x = mm_down->src[1];
+    const ggml_tensor * x_base = x;
+    while (x_base->view_src != nullptr) {
+        x_base = x_base->view_src;
+    }
+    const int64_t m = x->ne[1];
+    if (x_base != mul || x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->data != mul->data ||
+            x->ne[2] != 1 || x->ne[3] != 1 || ggml_nelements(x) != ggml_nelements(mul) ||
+            mm_down->type != GGML_TYPE_F32 || mm_up->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm_up) ||
+            mm_up->ne[1] != m || silu->type != GGML_TYPE_F32 || scale->type != GGML_TYPE_F32 ||
+            !ggml_cuda_q8_skinny_hc_down_up_supported(mm_down->src[0], mm_up->src[0], m) ||
+            !ggml_cuda_hc_mix_norm_supported(hc_post, scale_inv_hc, rms_norm, mul)) {
+        return 0;
+    }
+
+    // the down projection, the scale and the silu are only read inside the group; the post, the
+    // MUL (read by the views, the inject projection and the hc_pre mixer) and the up projection
+    // are outputs
+    int idxs[9];
+    ggml_op ops[9];
+    int n = 0;
+    if (hc_post != nullptr) {
+        for (int t = 0; t < 4; ++t) {
+            idxs[n] = i + t;
+            ops[n]  = cgraph->nodes[i + t]->op;
+            ++n;
+        }
+    }
+    const int rest[6] = { j, j + 1, k, k + 1, k + 2, k + 3 };
+    for (int t = 0; t < 6; ++t) {
+        idxs[n] = rest[t];
+        ops[n]  = cgraph->nodes[rest[t]]->op;
+        ++n;
+    }
+    int outputs[3];
+    int n_out = 0;
+    if (hc_post != nullptr) {
+        outputs[n_out++] = i + 3;
+    }
+    outputs[n_out++] = j + 1;
+    outputs[n_out++] = k + 3;
+    if (!ggml_can_fuse_subgraph_ext(cgraph, idxs, n, ops, outputs, n_out)) {
+        return 0;
+    }
+
+    ggml_cuda_pool_alloc<half> x_f16(cuda_ctx->pool(), ggml_nelements(mul));
+    ggml_cuda_op_hc_mix_norm(*cuda_ctx, hc_post, scale_inv_hc, scale_gate, rms_norm, mul, x_f16.get());
+    ggml_cuda_q8_skinny_hc_down_up(*cuda_ctx, mm_down->src[0], mm_up->src[0], x_f16.get(), m,
+                                   ggml_get_op_params_f32(scale, 0), (float *) mm_up->data);
+    return k + 3 - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -7492,6 +7600,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // kernels take the ids directly and would bypass the trace hook in ggml_cuda_mul_mat_id
     if (ggml_cuda_routing_trace_enabled() && node->op == GGML_OP_MUL_MAT_ID) {
         return 0;
+    }
+
+    if (node->op == GGML_OP_SCALE || node->op == GGML_OP_RMS_NORM) {
+        const int n_hc_mix = ggml_cuda_try_fuse_hc_mix(cuda_ctx, cgraph, i);
+        if (n_hc_mix > 0) {
+            return n_hc_mix;
+        }
     }
 
     // Expert parallelism: the fused kernels write the GLU or ADD node, which does not carry the
