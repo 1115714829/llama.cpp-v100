@@ -228,6 +228,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     )
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
 
+    # the k-pool layout kept across sequence edits against a rebuild, on the dummy models that have a k-pool indexer
+    llama_build(test-kpool-layout.cpp)
+    llama_test(
+        test-kpool-layout
+        LABEL main
+        ARGS --models "${MODEL_DIR}"
+    )
+    set_tests_properties(test-kpool-layout PROPERTIES FIXTURES_REQUIRED generate-models)
+
     llama_build(test-fusion.cpp)
 endif()
 

@@ -5,6 +5,7 @@
 #include <array>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 //
@@ -91,11 +92,16 @@ public:
 
     // Which cells of a sequence make up which pool of kpool consecutive positions (or cells, in order mode).
     // It is kept here because it outlives the batch: pools are fixed by the positions relative to the
-    // sequence's first one, so a ubatch only ever appends to it. Sequence edits drop it, see mem_idx_stale.
+    // sequence's first one, so a ubatch only ever appends to it. A sequence edit drops it from the position
+    // it staled on, see mem_idx_stale.
     struct kpool_layout;
 
     const kpool_layout & kpool_layout_update();
     const kpool_layout & kpool_layout_get() const;
+
+    // For tests: the first difference between the layout as the last update left it and one rebuilt from scratch
+    // over the cache as it is now, empty if none. Call it after a decode, before the next sequence edit.
+    std::string kpool_layout_diff() const;
 
     // The pooled keys persist in the idx cache across batches. A sequence edit can regroup the pools
     // from some position on, which stales every pooled key at or after it. POS_CLEAN means none.
@@ -128,6 +134,9 @@ private:
 
     // whether the current layout has cells shared between sequences (kpool_layout is incomplete here, so out of line)
     bool kpool_layout_shared() const;
+
+    // brings lay up to date with the cache, keeping each sequence's cells before its stale position
+    void kpool_layout_build(kpool_layout & lay, const stale_pos_t & stale) const;
 
     // seq_id < 0 stales every sequence, p0 < 0 stales the sequence from its first position
     void mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0);

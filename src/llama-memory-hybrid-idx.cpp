@@ -409,6 +409,93 @@ int64_t kpool_rank(const std::vector<std::pair<llama_pos, uint32_t>> & cells, ll
     return it != cells.end() && it->second == cell && it->first == pos ? it - cells.begin() : -1;
 }
 
+// Brings one sequence's pools up to date with its cells in the cache.
+// An edit staled from p leaves every cell before p as it was: same position, same cell, so the same rank, which is
+// all the pools and both scans below read. So the cells before p stay, with the pools wholly made of them, and the
+// rest is dropped and appended again like new cells. A clean sequence (POS_CLEAN) keeps every cell, one whose first
+// position moved keeps none, as pools count from it; keeping none is the full rebuild, on the same path.
+void kpool_seq_update(llama_memory_hybrid_idx::kpool_layout::seq & sq, const llama_kv_cells & cells, llama_seq_id s,
+        llama_pos stale, uint32_t kpool, bool by_order, bool unified) {
+    const auto & sp = cells.seq_pos_get(s);
+
+    const llama_pos p_keep = !sp.empty() && sp.begin()->first == sq.pos_min ? stale : 0;
+
+    size_t n_keep = (size_t) (std::partition_point(sq.cells.begin(), sq.cells.end(),
+            [&](const std::pair<llama_pos, uint32_t> & c) { return c.first < p_keep; }) - sq.cells.begin());
+
+    // the kept cells must still open the sequence: an embedding repeating the last position can land on a lower cell
+    // and rank among them without an edit, which the count shows, and then none is known to stand
+    if (n_keep > 0 && n_keep + (size_t) std::distance(sp.upper_bound(sq.cells[n_keep - 1]), sp.end()) != sp.size()) {
+        n_keep = 0;
+    }
+
+    // where the sharing scan resumes: it went through the kept cells, but a set flag cannot tell which cell set it
+    size_t j_shared = n_keep;
+
+    if (n_keep < sq.cells.size()) {
+        // the pools reaching past the kept cells go; after the last pool left the scan stepped through the cells one by
+        // one, so it resumes right after that pool, at a start it took then and a full rebuild takes now
+        sq.pools.erase(std::partition_point(sq.pools.begin(), sq.pools.end(),
+                [&](uint32_t j) { return j + kpool <= n_keep; }), sq.pools.end());
+        sq.j_next = sq.pools.empty() ? 0 : sq.pools.back() + kpool;
+        sq.cells.resize(n_keep);
+
+        if (sq.shared) {
+            sq.shared = false;
+            j_shared  = 0;
+        }
+    }
+
+    // unchanged while any cell is kept
+    sq.pos_min = sp.empty() ? 0 : sp.begin()->first;
+
+    for (auto it = sq.cells.empty() ? sp.begin() : sp.upper_bound(sq.cells.back()); it != sp.end(); ++it) {
+        sq.cells.push_back(*it);
+    }
+
+    // sharing starts with a seq_cp and ends only with a cut above: a seq_rm/state_drop/state_read that can free shared
+    // cells stales every sequence from 0, so once set it holds until a cut and the rescan can be skipped
+    if (unified && !sq.shared) {
+        for (size_t j = j_shared; j < sq.cells.size(); ++j) {
+            if (cells.seq_count(sq.cells[j].second) > 1) {
+                sq.shared = true;
+                break;
+            }
+        }
+    }
+
+    // Pools start at the first valid token
+    size_t j = sq.j_next;
+    if (by_order) {
+        // consecutive cells in sequence order, whatever their positions
+        for (; j + kpool <= sq.cells.size(); j += kpool) {
+            sq.pools.push_back((uint32_t) j);
+        }
+    } else {
+        while (j + kpool <= sq.cells.size()) {
+            const llama_pos p0 = sq.cells[j].first;
+            if ((p0 - sq.pos_min) % (llama_pos) kpool != 0) {
+                ++j;
+                continue;
+            }
+            bool ok = true;
+            for (uint32_t k = 1; k < kpool; ++k) {
+                if (sq.cells[j + k].first != p0 + (llama_pos) k) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                sq.pools.push_back((uint32_t) j);
+                j += kpool;
+            } else {
+                ++j;
+            }
+        }
+    }
+    sq.j_next = j;
+}
+
 }
 
 llama_memory_hybrid_idx::~llama_memory_hybrid_idx() = default;
@@ -423,17 +510,7 @@ bool llama_memory_hybrid_idx::kpool_layout_shared() const {
     return kpool_lay && !kpool_lay->cache_safe;
 }
 
-// Pools are fixed by the positions relative to the sequence's first one, so the layout survives a plain
-// append. A sequence edit can regroup them, and mem_idx_stale tells us it happened.
-const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_layout_update() {
-    GGML_ASSERT(mem_idx != nullptr);
-
-    if (!kpool_lay) {
-        kpool_lay = std::make_unique<kpool_layout>();
-    }
-
-    auto & lay = *kpool_lay;
-
+void llama_memory_hybrid_idx::kpool_layout_build(kpool_layout & lay, const stale_pos_t & stale) const {
     const uint32_t kpool       = get_kpool();
     const uint32_t n_stream_kv = mem_idx->get_n_stream();
     const bool     unified     = n_stream_kv == 1;
@@ -450,79 +527,74 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             continue;
         }
 
-        const auto & cells = mem_idx->get_cells(unified ? 0 : s);
-        const auto & sp    = cells.seq_pos_get(s);
-
         sq.strm = unified ? 0 : mem_idx->get_stream(s);
 
-        size_t n_kept = 0;
-        if (mem_idx_stale[s] == POS_CLEAN && !sq.cells.empty() && !sp.empty() &&
-                sq.pos_min == sp.begin()->first) {
-            n_kept = sq.cells.size();
-            for (auto it = sp.upper_bound(sq.cells.back()); it != sp.end(); ++it) {
-                sq.cells.push_back(*it);
-            }
-        }
-
-        // the appended tail accounts for every cell only if nothing before it was dropped, but an edit can
-        // regroup a sequence without changing its cell count, so a stale sequence must rebuild regardless
-        if (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN) {
-            sq.cells.assign(sp.begin(), sp.end());
-            sq.pools.clear();
-            sq.j_next  = 0;
-            sq.shared  = false;
-            sq.pos_min = sp.empty() ? 0 : sp.begin()->first;
-            n_kept     = 0;
-        }
-
-        // sharing starts with a seq_cp; it ends with an edit, or a seq_rm/state_drop/state_read that frees the
-        // shared cells - each stales every sequence so the rebuild above re-derives it, so once set it holds
-        // until then and the rescan can be skipped
-        if (unified && !sq.shared) {
-            for (size_t j = n_kept; j < sq.cells.size(); ++j) {
-                if (cells.seq_count(sq.cells[j].second) > 1) {
-                    sq.shared = true;
-                    break;
-                }
-            }
-        }
-
-        // Pools start at the first valid token
-        size_t j = sq.j_next;
-        if (hparams_idx.indexer_kpool_by_order) {
-            // consecutive cells in sequence order, whatever their positions
-            for (; j + kpool <= sq.cells.size(); j += kpool) {
-                sq.pools.push_back((uint32_t) j);
-            }
-        } else {
-            while (j + kpool <= sq.cells.size()) {
-                const llama_pos p0 = sq.cells[j].first;
-                if ((p0 - sq.pos_min) % (llama_pos) kpool != 0) {
-                    ++j;
-                    continue;
-                }
-                bool ok = true;
-                for (uint32_t k = 1; k < kpool; ++k) {
-                    if (sq.cells[j + k].first != p0 + (llama_pos) k) {
-                        ok = false;
-                        break;
-                    }
-                }
-                if (ok) {
-                    sq.pools.push_back((uint32_t) j);
-                    j += kpool;
-                } else {
-                    ++j;
-                }
-            }
-        }
-        sq.j_next = j;
+        kpool_seq_update(sq, mem_idx->get_cells(unified ? 0 : s), s, stale[s], kpool, get_kpool_by_order(), unified);
 
         lay.n_pool_real += (uint32_t) sq.pools.size();
         lay.cache_safe   = lay.cache_safe && !sq.shared;
     }
+}
 
-    return lay;
+// Pools are fixed by the positions relative to the sequence's first one, so the layout survives a plain
+// append. A sequence edit can regroup them from the position it staled on, which mem_idx_stale records.
+const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_layout_update() {
+    GGML_ASSERT(mem_idx != nullptr);
+
+    if (!kpool_lay) {
+        kpool_lay = std::make_unique<kpool_layout>();
+    }
+
+    kpool_layout_build(*kpool_lay, mem_idx_stale);
+
+    return *kpool_lay;
+}
+
+std::string llama_memory_hybrid_idx::kpool_layout_diff() const {
+    GGML_ASSERT(mem_idx != nullptr);
+
+    if (!kpool_lay) {
+        return "no layout yet";
+    }
+
+    // a fresh layout keeps no cell whatever the stale positions say, so this is the full rebuild
+    auto ref = std::make_unique<kpool_layout>();
+    stale_pos_t stale;
+    stale.fill(0);
+    kpool_layout_build(*ref, stale);
+
+    const auto & lay = *kpool_lay;
+
+    for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
+        const auto & a = lay.seqs[s];
+        const auto & b = ref->seqs[s];
+
+        if (a.cells != b.cells) {
+            size_t i = 0;
+            while (i < a.cells.size() && i < b.cells.size() && a.cells[i] == b.cells[i]) {
+                ++i;
+            }
+            return format("seq %d: %zu cells, rebuilt %zu, first difference at %zu", s, a.cells.size(), b.cells.size(), i);
+        }
+        if (a.pools != b.pools) {
+            size_t i = 0;
+            while (i < a.pools.size() && i < b.pools.size() && a.pools[i] == b.pools[i]) {
+                ++i;
+            }
+            return format("seq %d: %zu pools, rebuilt %zu, first difference at %zu", s, a.pools.size(), b.pools.size(), i);
+        }
+        if (a.pos_min != b.pos_min || a.strm != b.strm || a.j_next != b.j_next || a.shared != b.shared) {
+            return format("seq %d: pos_min %d strm %u j_next %zu shared %d, rebuilt %d %u %zu %d", s,
+                    a.pos_min, a.strm, a.j_next, (int) a.shared, b.pos_min, b.strm, b.j_next, (int) b.shared);
+        }
+    }
+
+    if (lay.n_pool_real != ref->n_pool_real || lay.cache_safe != ref->cache_safe) {
+        return format("n_pool_real %u cache_safe %d, rebuilt %u %d",
+                lay.n_pool_real, (int) lay.cache_safe, ref->n_pool_real, (int) ref->cache_safe);
+    }
+
+    return "";
 }
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_status status) :
