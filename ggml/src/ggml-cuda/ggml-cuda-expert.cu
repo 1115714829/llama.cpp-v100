@@ -1795,6 +1795,9 @@ void ggml_backend_cuda_expert_verify_all(void) {
     }
     for (ggml_backend_cuda_expert_buffer_context * ctx : list) {
         ggml_cuda_set_device(ctx->device);
+        int64_t n_tensors = 0;
+        int64_t n_checked = 0;
+        int64_t n_skipped = 0;
         for (ggml_cuda_expert_tensor_state & s : ctx->tensors) {
             if (s.verify_done) {
                 continue;
@@ -1804,6 +1807,22 @@ void ggml_backend_cuda_expert_verify_all(void) {
                 GGML_ABORT("%s: expert store byte check failed for tensor %s\n",
                     __func__, s.tensor != nullptr ? s.tensor->name : "?");
             }
+            // placement check: every local expert of this device holds the bytes of the global
+            // expert the active assignment maps it to (the loader registered the source hashes)
+            int64_t checked = 0;
+            int64_t skipped = 0;
+            if (!ggml_expert_store_verify_placement(ctx->store, s.tensor_id,
+                    s.tensor != nullptr ? s.tensor->name : nullptr, &checked, &skipped)) {
+                GGML_ABORT("%s: expert placement check failed for tensor %s on device %d\n",
+                    __func__, s.tensor != nullptr ? s.tensor->name : "?", ctx->device);
+            }
+            n_tensors++;
+            n_checked += checked;
+            n_skipped += skipped;
+        }
+        if (n_tensors > 0) {
+            GGML_LOG_INFO("%s: device %d: expert placement check: %" PRId64 " tensors, %" PRId64 " experts match the assignment (version %" PRIu64 "), %" PRId64 " skipped\n",
+                __func__, ctx->device, n_tensors, n_checked, ggml_expert_store_assignment_version(), n_skipped);
         }
     }
 

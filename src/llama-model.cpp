@@ -2202,11 +2202,50 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         });
     }
 
+    // The expert tensors that are split over the devices along the expert dim: hand the loader the
+    // number of experts every device holds (the same split the meta buffer applies), it lays the
+    // experts of these tensors out by the expert assignment (llama_expert_layout).
+    for (const auto & [name, t] : tensors_by_name) {
+        if (t == nullptr || (t->flags & GGML_TENSOR_FLAG_EXPERT) == 0 || t->ne[2] <= 1) {
+            continue;
+        }
+        if (t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
+            continue;
+        }
+        const ggml_backend_meta_split_state ss = llama_model_tensor_split_state(model, t);
+        if (ss.axis != GGML_BACKEND_SPLIT_AXIS_2) {
+            continue;
+        }
+        // the slices are per simple device of the meta device the buffer belongs to (the model's
+        // own device list holds the meta device as one entry)
+        ggml_backend_dev_t meta_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+        GGML_ASSERT(meta_dev != nullptr && ggml_backend_dev_is_meta(meta_dev));
+        const size_t nd = ggml_backend_meta_dev_n_devs(meta_dev);
+        {
+            std::vector<int64_t> slices(nd, 0);
+            for (size_t j = 0; j < nd; j++) {
+                for (size_t s = 0; s < ss.n_segments; s++) {
+                    slices[j] += ss.ne[s*nd + j] * ss.nr[s];
+                }
+            }
+            ml.expert_dev_slices.emplace(t, std::move(slices));
+        }
+    }
+
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
+    }
+
+    // every expert tensor that is split over the devices is written in the layout of the expert
+    // assignment now: make the assignment the active one, before the placement check below and
+    // before the first graph addresses the experts
+    if (ml.n_expert_tensors_by_table > 0) {
+        ggml_expert_store_activate_assignment();
+        LLAMA_LOG_INFO("%s: %d expert tensors laid out by the expert assignment (version %llu)\n",
+            __func__, ml.n_expert_tensors_by_table, (unsigned long long) ggml_expert_store_assignment_version());
     }
 
     // The expert store buffer types need all tensor data written before they can check their
@@ -2221,6 +2260,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             model_loaded();
         }
     }
+
+    // the source hashes of the placement check were consumed by the hooks above
+    ggml_expert_store_clear_source_hashes();
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {

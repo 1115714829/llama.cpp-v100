@@ -15,6 +15,7 @@
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -205,6 +206,17 @@ struct llama_model_loader {
     // BF16 weights loaded as F16 on devices without native BF16 support
     size_t n_bf16_converted = 0; // elements
     size_t n_bf16_clamped   = 0; // elements clamped to +-65504
+
+    // Expert tensors that are split over the devices along the expert dim, with the number of
+    // experts every device holds (the slice lengths of the meta split, in device order). The
+    // model fills this before load_all_data(): the loader lays every expert of these tensors out
+    // at the position of the expert assignment (ggml_expert_store_load_position), the backend
+    // checks the placement after the load. A tensor that is not in the map holds the whole
+    // expert dim and keeps the file order.
+    std::map<const ggml_tensor *, std::vector<int64_t>> expert_dev_slices;
+    // expert tensors laid out by the assignment in this load; the model activates the
+    // assignment once they are all written
+    int n_expert_tensors_by_table = 0;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
