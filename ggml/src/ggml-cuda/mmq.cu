@@ -247,9 +247,9 @@ void ggml_cuda_mul_mat_q(
     // Expert parallelism skips the ids of other devices, so the compact maps are sparse: the
     // inverse map marks the entries of the other devices with -1, which the scatter quantizer
     // skips (they are not part of any expert's compact range either).
-    // an expert store view addresses its weights from the view start, so the ids stay
-    // view-local numbers and expert_offset only carries the expert parallelism offset
-    int expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
+    // the expert map of the node: which routed id is which local expert of the weight (an expert
+    // store view addresses its weights from the view start, so the ids stay view-local numbers)
+    const ggml_cuda_expert_lut lut = ggml_cuda_mul_mat_id_lut(ctx, dst);
     ggml_cuda_expert_table ex_table;
     if (ggml_cuda_expert_table_get(src0, &ex_table)) {
         if (ex_table.uniform && expert_ptrs == nullptr) {
@@ -270,7 +270,7 @@ void ggml_cuda_mul_mat_q(
 
         if (is_ep) {
             // the MMQ kernel only writes the local entries, zero the others
-            ggml_cuda_mmid_zero_nonlocal(dst_d, (const int32_t *) ids->data, expert_offset, (int) ne02,
+            ggml_cuda_mmid_zero_nonlocal(dst_d, (const int32_t *) ids->data, lut,
                 ne12, (int) n_expert_used, dst->ne[0], ids->nb[1] / sizeof(int32_t),
                 dst->nb[1] / sizeof(float), dst->nb[2] / sizeof(float), stream);
             if (dedup_bcast) {
@@ -284,7 +284,7 @@ void ggml_cuda_mul_mat_q(
 
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast,
-            expert_offset, stream);
+            lut, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 

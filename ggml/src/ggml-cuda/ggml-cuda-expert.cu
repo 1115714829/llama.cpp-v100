@@ -236,21 +236,10 @@ void ggml_cuda_expert_mark_tensor(ggml_backend_buffer_type_t buft, ggml_tensor *
     t->flags |= GGML_TENSOR_FLAG_EXPERT;
 }
 
+// the layer the store files the tensor under: the same reading of "blk.N." as the meta backend uses
+// for ggml_mul_mat_id_set_layer, so the expert map of a node and the plan agree on the row
 static int ggml_cuda_expert_tensor_layer(const ggml_tensor * t) {
-    const char * p = strstr(t->name, "blk.");
-    if (p == nullptr) {
-        return -1;
-    }
-    p += 4;
-    if (*p < '0' || *p > '9') {
-        return -1;
-    }
-    int layer = 0;
-    while (*p >= '0' && *p <= '9') {
-        layer = layer * 10 + (*p - '0');
-        p++;
-    }
-    return layer;
+    return ggml_expert_layer_of_name(t->name);
 }
 
 static int ggml_cuda_expert_tensor_kind(const ggml_tensor * t) {
@@ -272,13 +261,13 @@ static int ggml_cuda_expert_tensor_kind(const ggml_tensor * t) {
 // and (for prefill) sets the routing bits. The bitmap is a plain u32 word per 32 experts.
 // The ids may be a view of a larger tensor, so the row stride is taken from the tensor
 // instead of assuming a contiguous [n_expert_used, n_tokens] array.
-// The ids hold view-local expert numbers, residency / counts / the bitmap are numbered by the
-// store expert number (global). expert_base is the store number of the first expert of the view
-// (0 when src0 is not a view), expert_offset the first expert of this device under expert
-// parallelism, so e = id + expert_base - expert_offset is the store number of the routed expert.
+// The ids are routing ids; the expert map of the launch (lut) gives the local expert of the view
+// they route to (-1: an expert of another device, skipped). residency / counts / the bitmap are
+// numbered by the store expert number, and expert_base is the store number of the first expert of
+// the view (0 when src0 is not a view), so e = local + expert_base is the store number.
 static __global__ void expert_routing_kernel(
         const int32_t * __restrict__ ids, const int64_t n_entries, const int n_expert_used, const int64_t ids_stride,
-        const int expert_offset, const int expert_base, const int n_local, const int32_t * __restrict__ residency, const int64_t host_bytes,
+        const ggml_cuda_expert_lut lut, const int expert_base, const int32_t * __restrict__ residency, const int64_t host_bytes,
         unsigned long long * __restrict__ counters, uint32_t * __restrict__ counts,
         uint32_t * __restrict__ bitmap_or_null) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -287,10 +276,11 @@ static __global__ void expert_routing_kernel(
     }
     const int64_t token = i / n_expert_used;
     const int     slot  = (int) (i - token * n_expert_used);
-    const int e = ids[token*ids_stride + slot] + expert_base - expert_offset;
-    if (e < 0 || e >= n_local) {
+    const int local = ggml_cuda_expert_local(lut, ids[token*ids_stride + slot]);
+    if (local < 0) {
         return;
     }
+    const int e = local + expert_base;
     if (counts != nullptr) {
         atomicAdd(&counts[e], 1u);
     }
@@ -443,7 +433,7 @@ static __global__ void expert_stage_copy_kernel(
 // this launch take the main table (same contract as expert_stage_plan_kernel).
 static __global__ void expert_stage_decode_kernel(
         const int32_t * __restrict__ ids, const int n_entries, const int n_expert_used, const int64_t ids_stride,
-        const int expert_offset, const int expert_base,
+        const ggml_cuda_expert_lut lut, const int expert_base,
         const int expert_lo, const int expert_hi,
         const int32_t * __restrict__ residency, const char * __restrict__ host_dev,
         const int64_t * __restrict__ host_offset,
@@ -459,17 +449,21 @@ static __global__ void expert_stage_decode_kernel(
         return;
     }
 
+    // the ids as store expert numbers: the expert map of the launch gives the local expert of the
+    // view (-1 for the experts of the other devices, which never match a store number), the view
+    // start shifts it to the store numbering. One lookup per id, the comparisons below are plain.
     extern __shared__ int32_t s_ids[];
     for (int i = threadIdx.x; i < n_entries; i += blockDim.x) {
         const int token = i / n_expert_used;
-        s_ids[i] = ids[(int64_t) token * ids_stride + (i - token * n_expert_used)];
+        const int local = ggml_cuda_expert_local(lut, ids[(int64_t) token * ids_stride + (i - token * n_expert_used)]);
+        s_ids[i] = local < 0 ? -1 : local + expert_base;
     }
     __syncthreads();
 
     // is expert e routed by this batch?
     int found = 0;
     for (int i = threadIdx.x; i < n_entries; i += blockDim.x) {
-        found |= s_ids[i] + expert_base - expert_offset == e;
+        found |= s_ids[i] == e;
     }
     unsigned int any = (unsigned int) found;
     for (int off = 16; off > 0; off >>= 1) {
@@ -500,7 +494,7 @@ static __global__ void expert_stage_decode_kernel(
     for (int f = expert_lo + (int) threadIdx.x; f < e; f += blockDim.x) {
         int f_found = 0;
         for (int i = 0; i < n_entries; ++i) {
-            f_found |= s_ids[i] + expert_base - expert_offset == f;
+            f_found |= s_ids[i] == f;
         }
         cnt += f_found && residency[f] < 0;
     }
@@ -988,7 +982,7 @@ ggml_backend_cuda_expert_buffer_context::~ggml_backend_cuda_expert_buffer_contex
 // writes at unload. Without a dump path there is nothing to accumulate, and the kernel is pure
 // overhead - one launch per mul_mat_id plus every routing entry hammering the same counter
 // address - so it only runs when a dump is configured.
-void ggml_cuda_expert_record_usage(const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream) {
+void ggml_cuda_expert_record_usage(const ggml_tensor * src0, const ggml_tensor * ids, const ggml_cuda_expert_lut & lut, cudaStream_t stream) {
     ggml_backend_cuda_expert_buffer_context * ctx = ggml_cuda_expert_buffer_ctx(src0);
     if (ctx->usage_dev == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32) {
         return;
@@ -1010,11 +1004,11 @@ void ggml_cuda_expert_record_usage(const ggml_tensor * src0, const ggml_tensor *
     const int nthreads = 256;
     const int nblocks = (int) ((n_entries + nthreads - 1) / nthreads);
     // counts / residency are arrays of the whole store tensor, so the ids of the view are
-    // counted with their store expert number (id + expert_start) and the range check is against
-    // the expert count of the store tensor, not of the view.
+    // counted with their store expert number (local + expert_start)
+    GGML_ASSERT(ex_table.expert_start + ex_table.n_expert <= s.n_expert);
     expert_routing_kernel<<<nblocks, nthreads, 0, stream>>>(
         (const int32_t *) ids->data, n_entries, (int) ids->ne[0], ids->nb[1] / sizeof(int32_t),
-        expert_offset, (int) ex_table.expert_start, (int) s.n_expert,
+        lut, (int) ex_table.expert_start,
         s.residency_dev, (int64_t) ex_table.blob_bytes,
         ctx->usage_dev, s.counts_dev, nullptr);
     // check right here: a sticky error would otherwise surface at the next unrelated API
@@ -1099,7 +1093,7 @@ void ggml_cuda_expert_stats_tick(const ggml_tensor * src0, cudaStream_t stream) 
 // and copy the routed experts in. All of it is device side and queued on the stream, the
 // host never waits; the bitmap is read back asynchronously for the logs.
 const char * const * ggml_cuda_expert_stage_prepare(
-        const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream) {
+        const ggml_tensor * src0, const ggml_tensor * ids, const ggml_cuda_expert_lut & lut, cudaStream_t stream) {
     ggml_backend_cuda_expert_buffer_context * ctx = ggml_cuda_expert_buffer_ctx(src0);
 
     ggml_cuda_expert_table ex_table;
@@ -1147,10 +1141,10 @@ const char * const * ggml_cuda_expert_stage_prepare(
         const int nblocks = (int) ((n_entries + nthreads - 1) / nthreads);
         // counts == nullptr: the routing statistics of this launch were recorded separately.
         // The bitmap is read by the plan kernel with store expert numbers, so the routing kernel
-        // writes it with the store number of the view (id + expert_start), not with the id itself.
+        // writes it with the store number of the view (local + expert_start), not with the id itself.
         expert_routing_kernel<<<nblocks, nthreads, 0, stream>>>(
             (const int32_t *) ids->data, n_entries, (int) ids->ne[0], ids->nb[1] / sizeof(int32_t),
-            expert_offset, (int) ex_table.expert_start, (int) s.n_expert,
+            lut, (int) ex_table.expert_start,
             s.residency_dev, (int64_t) s.blob_bytes, ctx->usage_dev, nullptr, s.bitmap_dev);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -1217,7 +1211,7 @@ const char * const * ggml_cuda_expert_stage_prepare(
 // decode launch can be recorded into a CUDA graph; the kernel recomputes the routing of the ids
 // it is given when the graph is replayed.
 const char * const * ggml_cuda_expert_stage_prepare_decode(
-        const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream) {
+        const ggml_tensor * src0, const ggml_tensor * ids, const ggml_cuda_expert_lut & lut, cudaStream_t stream) {
     ggml_backend_cuda_expert_buffer_context * ctx = ggml_cuda_expert_buffer_ctx(src0);
 
     ggml_cuda_expert_table ex_table;
@@ -1262,7 +1256,7 @@ const char * const * ggml_cuda_expert_stage_prepare_decode(
     expert_stage_decode_kernel<<<dim3(n_chunks, (unsigned int) s.n_expert), nthreads,
         n_entries * sizeof(int32_t), stream>>>(
         (const int32_t *) ids->data, n_entries, n_expert_used, ids->nb[1] / sizeof(int32_t),
-        expert_offset, (int) ex_table.expert_start, expert_lo, expert_hi,
+        lut, (int) ex_table.expert_start, expert_lo, expert_hi,
         s.residency_dev, st->host_dev, s.host_offset_dev, s.table_main_dev, table_stage,
         ss.stage_dev, s.blob_stride, s.blob_bytes, ss.stage_bytes,
         ++ss.stage_seq, ss.plan_state + 4, ctx->usage_dev);
@@ -1978,27 +1972,27 @@ bool ggml_cuda_expert_table_get(const ggml_tensor * src0, ggml_cuda_expert_table
 }
 
 const char * const * ggml_cuda_expert_stage_prepare(
-        const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream) {
+        const ggml_tensor * src0, const ggml_tensor * ids, const ggml_cuda_expert_lut & lut, cudaStream_t stream) {
     GGML_UNUSED(src0);
     GGML_UNUSED(ids);
-    GGML_UNUSED(expert_offset);
+    GGML_UNUSED(lut);
     GGML_UNUSED(stream);
     return nullptr;
 }
 
 const char * const * ggml_cuda_expert_stage_prepare_decode(
-        const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream) {
+        const ggml_tensor * src0, const ggml_tensor * ids, const ggml_cuda_expert_lut & lut, cudaStream_t stream) {
     GGML_UNUSED(src0);
     GGML_UNUSED(ids);
-    GGML_UNUSED(expert_offset);
+    GGML_UNUSED(lut);
     GGML_UNUSED(stream);
     return nullptr;
 }
 
-void ggml_cuda_expert_record_usage(const ggml_tensor * src0, const ggml_tensor * ids, int expert_offset, cudaStream_t stream) {
+void ggml_cuda_expert_record_usage(const ggml_tensor * src0, const ggml_tensor * ids, const ggml_cuda_expert_lut & lut, cudaStream_t stream) {
     GGML_UNUSED(src0);
     GGML_UNUSED(ids);
-    GGML_UNUSED(expert_offset);
+    GGML_UNUSED(lut);
     GGML_UNUSED(stream);
 }
 
@@ -2074,4 +2068,63 @@ void ggml_cuda_expert_reset_allocation(ggml_backend_buffer_type_t buft) {
 
 #endif // !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
 
+// The expert map of a MUL_MAT_ID launch (see ggml_cuda_expert_lut): the device copy of the host
+// row ggml_expert_store_node_lut() gives for the node. The copies live in the backend context, one
+// per distinct map, so a launch that was captured into a CUDA graph keeps a valid pointer; a copy
+// is rewritten in place when the active assignment changed (the loader activated a permuted
+// assignment, or a test reset it), which happens outside of graph execution.
+ggml_cuda_expert_lut ggml_cuda_mul_mat_id_lut(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    GGML_ASSERT(dst != nullptr && dst->op == GGML_OP_MUL_MAT_ID);
+    const ggml_tensor * src0 = dst->src[0];
 
+    const int  n_local = (int) src0->ne[2];
+    const bool ep      = ggml_mul_mat_id_is_expert_parallel(dst);
+    // without expert parallelism every id is a local expert and keeps its number
+    const int  offset  = ep ? ggml_mul_mat_id_get_expert_offset(dst)  : 0;
+    const int  n_total = ep ? ggml_mul_mat_id_get_n_expert_total(dst) : n_local;
+    const int  layer   = ep ? ggml_mul_mat_id_get_layer(dst)          : 0;
+    const int  device  = ep ? ggml_mul_mat_id_get_device(dst)         : ctx.device;
+    if (n_local <= 0 || n_total < n_local || offset < 0 || offset + n_local > n_total) {
+        GGML_ABORT("%s: node %s: expert state offset %d, local %d, total %d is inconsistent\n",
+            __func__, dst->name, offset, n_local, n_total);
+    }
+    if (ep && ggml_expert_store_active_is_permuted() && device != ctx.device) {
+        // a permuted assignment is per device: the row of the node's device is only right on it
+        GGML_ABORT("%s: node %s is marked for device %d but runs on device %d\n", __func__, dst->name, device, ctx.device);
+    }
+
+    const uint64_t version = ggml_expert_store_assignment_version();
+    const std::array<int, 6> key = { ep ? 1 : 0, device, layer, offset, n_local, n_total };
+    auto it = ctx.expert_luts.find(key);
+    if (it == ctx.expert_luts.end() || it->second.version != version) {
+        const int16_t * host = ggml_expert_store_node_lut(ep, device, layer, offset, n_local, n_total);
+        GGML_ASSERT(host != nullptr);
+
+        // the copy is synchronous: a graph capture in flight would record nothing of it and the
+        // launches of the graph would read a table that is still being written
+        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
+        if (capture != cudaStreamCaptureStatusNone) {
+            GGML_ABORT("%s: the expert map of node %s changed (version %" PRIu64 ") while a CUDA graph is being captured\n",
+                __func__, dst->name, version);
+        }
+
+        ggml_cuda_set_device(ctx.device);
+        if (it == ctx.expert_luts.end()) {
+            ggml_backend_cuda_context::expert_lut_entry entry;
+            CUDA_CHECK(cudaMalloc((void **) &entry.dev, (size_t) n_total * sizeof(int16_t)));
+            entry.n = n_total;
+            it = ctx.expert_luts.emplace(key, entry).first;
+        }
+        GGML_ASSERT(it->second.n == n_total);
+        CUDA_CHECK(cudaMemcpy(it->second.dev, host, (size_t) n_total * sizeof(int16_t), cudaMemcpyHostToDevice));
+        it->second.host    = host;
+        it->second.version = version;
+    }
+
+    ggml_cuda_expert_lut lut;
+    lut.map  = it->second.dev;
+    lut.host = it->second.host;
+    lut.n    = it->second.n;
+    return lut;
+}

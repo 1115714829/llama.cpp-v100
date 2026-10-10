@@ -80,13 +80,13 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         const int64_t n_experts     = ne02;
         const int64_t n_tokens      = ne12;
         const int64_t ne_get_rows   = n_tokens * n_expert_used;
-        // an expert store view reads its weights from the view start (expert_ptrs is
-        // shifted there), so the ids stay view-local numbers
-        const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
+        // the expert map of the node: which routed id is which local expert of the weight (an
+        // expert store view reads its weights from the view start, so the ids stay view-local)
+        const ggml_cuda_expert_lut lut = ggml_cuda_mul_mat_id_lut(ctx, dst);
 
         if (ggml_mul_mat_id_is_expert_parallel(dst)) {
             // the kernel only writes the local entries, zero the others
-            ggml_cuda_mmid_zero_nonlocal(dst_d, ids_d, expert_offset, (int) n_experts,
+            ggml_cuda_mmid_zero_nonlocal(dst_d, ids_d, lut,
                 n_tokens, (int) n_expert_used, dst->ne[0], ids_s1,
                 dst->nb[1] / ts_dst, dst->nb[2] / ts_dst, ctx.stream());
         }
@@ -102,7 +102,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
         ggml_cuda_launch_mm_ids_helper(ids_d, ids_src_compact_dev.get(), ids_dst_compact_dev.get(), expert_bounds_dev.get(),
             static_cast<int>(n_experts), static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ne11), si1, sis1, /*write_inverse =*/ false,
-            expert_offset, ctx.stream());
+            lut, ctx.stream());
         CUDA_CHECK(cudaGetLastError());
 
         ids_info.ids_src_compact   = ids_src_compact_dev.get();
