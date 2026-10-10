@@ -102,10 +102,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if defined(__linux__)
 #include <dirent.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
@@ -2052,6 +2055,133 @@ static void ggml_cuda_mapped_buffer_verify_numa(void * ptr, size_t size, int nod
 #endif
 }
 
+// CPU side of the host placement: the CPUs that allocate and fill device-readable host memory
+//
+// A GPU reads the pages of its own node fastest when the CPUs of that node wrote them last: on
+// the AC922 44 GB/s, against 17-30 GB/s for pages of its node that the other socket wrote last
+// and about 40 GB/s for pages of the other node (tests/bench-pinned-read.cu, 6 x V100, nodes 0
+// and 8). The memory policy decides the node of the pages; the thread that allocates them (the
+// driver clears the pages on it) and the thread that fills them decide which socket wrote them
+// last. So every allocation of such memory runs on a thread bound to the CPUs of its node, and
+// every fill of it binds the filling thread to those CPUs for the duration of the copy.
+
+// CPUs of a host NUMA node (sysfs cpulist), false when the node has none
+static bool ggml_cuda_numa_node_cpuset(int node, cpu_set_t & set) {
+    CPU_ZERO(&set);
+    if (node < 0) {
+        return false;
+    }
+    char path[128];
+    snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node);
+    FILE * f = fopen(path, "r");
+    if (f == nullptr) {
+        return false;
+    }
+    char buf[1024] = {};
+    if (fgets(buf, sizeof(buf), f) != nullptr) {
+        for (char * tok = strtok(buf, ",\n"); tok != nullptr; tok = strtok(nullptr, ",\n")) {
+            int first = -1;
+            int last  = -1;
+            if (sscanf(tok, "%d-%d", &first, &last) == 2) {
+                for (int c = std::max(first, 0); c <= last && c < CPU_SETSIZE; c++) {
+                    CPU_SET(c, &set);
+                }
+            } else if (sscanf(tok, "%d", &first) == 1 && first >= 0 && first < CPU_SETSIZE) {
+                CPU_SET(first, &set);
+            }
+        }
+    }
+    fclose(f);
+    return CPU_COUNT(&set) > 0;
+}
+
+// affinity of the calling thread before ggml_cuda_numa_bind_cpus(), one per thread
+static thread_local cpu_set_t ggml_cuda_numa_bind_saved;
+static thread_local bool      ggml_cuda_numa_bind_active = false;
+
+bool ggml_cuda_numa_bind_cpus(int node) {
+    if (ggml_cuda_numa_bind_active) {
+        return false; // an outer call holds the binding and its unbind restores the affinity
+    }
+    cpu_set_t set;
+    if (!ggml_cuda_numa_node_cpuset(node, set)) {
+        return false;
+    }
+    int err = pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &ggml_cuda_numa_bind_saved);
+    if (err != 0) {
+        GGML_LOG_WARN("%s: cannot read the CPU affinity of the thread: %s\n", __func__, strerror(err));
+        return false;
+    }
+    err = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &set);
+    if (err != 0) {
+        GGML_LOG_WARN("%s: cannot bind the thread to the CPUs of NUMA node %d: %s\n", __func__, node, strerror(err));
+        return false;
+    }
+    ggml_cuda_numa_bind_active = true;
+    return true;
+}
+
+void ggml_cuda_numa_unbind_cpus(void) {
+    if (!ggml_cuda_numa_bind_active) {
+        return;
+    }
+    ggml_cuda_numa_bind_active = false;
+    const int err = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &ggml_cuda_numa_bind_saved);
+    if (err != 0) {
+        GGML_LOG_WARN("%s: cannot restore the CPU affinity of the thread: %s\n", __func__, strerror(err));
+    }
+}
+
+// cudaHostAlloc of `size` bytes of mapped host memory placed on NUMA node `node`: the
+// allocation runs on a thread bound to the CPUs of the node under a memory policy bound to it,
+// so the pages belong to the node and the driver's clearing of them was done by its CPUs. The
+// pages of a pinned buffer are allocated and pinned inside the cudaHostAlloc call under the
+// policy of the calling thread, which decides their node; nothing moves them later (measured:
+// the pages of a 1 GiB buffer are all on the policy's node before any mbind, and an mbind of
+// the range afterwards changes nothing). node < 0: a plain allocation on the calling thread
+// without a policy. Returns nullptr on failure (logged); *bound receives whether the pages were
+// allocated under the policy of the node (the caller verifies them with move_pages).
+static void * ggml_cuda_numa_host_alloc_on_node(int device, size_t size, int node, bool * bound) {
+    *bound = false;
+    void *      ptr    = nullptr;
+    cudaError_t err    = cudaSuccess;
+    bool        policy = false;
+    if (node >= 0) {
+        std::thread([&]() {
+            const bool cpus = ggml_cuda_numa_bind_cpus(node);
+            ggml_cuda_set_device(device);
+            ggml_cuda_mempolicy_saved saved_policy;
+            policy = ggml_cuda_set_mempolicy_node(node, saved_policy);
+            err = cudaHostAlloc(&ptr, size, cudaHostAllocMapped | cudaHostAllocPortable);
+            ggml_cuda_mempolicy_restore(saved_policy);
+            if (cpus) {
+                ggml_cuda_numa_unbind_cpus();
+            }
+        }).join();
+    } else {
+        err = cudaHostAlloc(&ptr, size, cudaHostAllocMapped | cudaHostAllocPortable);
+    }
+    if (err != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("%s: allocating %.2f MiB of mapped host memory on NUMA node %d: cudaHostAlloc failed: %s\n",
+                       __func__, size / 1024.0 / 1024.0, node, cudaGetErrorString(err));
+        return nullptr;
+    }
+    *bound = policy;
+    return ptr;
+}
+
+// write `size` bytes of host memory that lives on NUMA node `node` from the CPUs of that node
+static void ggml_cuda_numa_fill_on_node(void * ptr, size_t size, int node, int value) {
+    std::thread([&]() {
+        const bool cpus = ggml_cuda_numa_bind_cpus(node);
+        memset(ptr, value, size);
+        if (cpus) {
+            ggml_cuda_numa_unbind_cpus();
+        }
+    }).join();
+}
+
 // bandwidth probe and placement of the mapped host buffers
 //
 // The read bandwidth of a GPU to a host NUMA node cannot be derived from the PCI topology: on
@@ -2210,18 +2340,25 @@ static void ggml_cuda_numa_probe_alloc(ggml_cuda_mapped_numa_state & state, int 
     for (size_t n = 0; n < state.nodes.size(); n++) {
         ggml_cuda_numa_probe_buf & buf = state.probe[phys][n];
 
-        ggml_cuda_mempolicy_saved saved;
-        if (!ggml_cuda_set_mempolicy_node(state.nodes[n], saved)) {
+        // allocated like an arena: on a thread of the node, under its policy
+        bool bound = false;
+        buf.host = ggml_cuda_numa_host_alloc_on_node(phys, GGML_CUDA_MAPPED_PROBE_SIZE, state.nodes[n], &bound);
+        if (buf.host == nullptr) {
+            GGML_LOG_WARN("%s: physical device %d, node %d: the probe buffer could not be allocated\n",
+                __func__, phys, state.nodes[n]);
             continue;
         }
-        cudaError_t err = cudaHostAlloc(&buf.host, GGML_CUDA_MAPPED_PROBE_SIZE, cudaHostAllocMapped | cudaHostAllocPortable);
-        ggml_cuda_mempolicy_restore(saved);
-        if (err != cudaSuccess) {
-            (void) cudaGetLastError();
-            GGML_LOG_WARN("%s: physical device %d, node %d: the probe buffer could not be allocated: %s\n",
-                __func__, phys, state.nodes[n], cudaGetErrorString(err));
+        if (!bound) {
+            // the probe measures one node; a buffer of unknown placement measures nothing
+            GGML_LOG_WARN("%s: physical device %d, node %d: the probe buffer could not be allocated under the policy of the node\n",
+                __func__, phys, state.nodes[n]);
+            CUDA_CHECK(cudaFreeHost(buf.host));
+            buf.host = nullptr;
             continue;
         }
+        // the probe reads what an arena reads: pages the CPUs of their own node wrote last
+        // (the loader fills the arenas from those CPUs, see ggml_cuda_numa_bind_cpus)
+        ggml_cuda_numa_fill_on_node(buf.host, GGML_CUDA_MAPPED_PROBE_SIZE, state.nodes[n], 0x5a);
         if (cudaHostGetDevicePointer(&buf.dev, buf.host, 0) != cudaSuccess) {
             (void) cudaGetLastError();
             CUDA_CHECK(cudaFreeHost(buf.host));
@@ -2481,6 +2618,9 @@ static void ggml_cuda_numa_discover(ggml_cuda_mapped_numa_state & state) {
             GGML_LOG_INFO("%s: device %d: the platform reports no NUMA node for the PCI slot\n", __func__, phys);
         }
     }
+
+    GGML_LOG_INFO("%s: device-readable host memory is allocated on a thread of its NUMA node and written by the CPUs of that node\n",
+        __func__);
 
     state.probed = true;
 }
@@ -2769,38 +2909,30 @@ static void ggml_cuda_numa_verify_record(int device, size_t sampled, size_t on_n
     state.verify_on_node[device] += on_node;
 }
 
-// allocate mapped host memory on the given NUMA node: cudaHostAlloc is called under a memory
-// policy bound to that node and the placement is verified with move_pages. The pages of a pinned
-// buffer are allocated and pinned inside the cudaHostAlloc call, under the policy of the calling
-// thread, so the policy decides their node; there is no later fault that could place them
-// elsewhere. An mbind(MPOL_MF_MOVE) of the range afterwards was dropped: pinned pages cannot be
-// migrated, so it never moved anything, and it fails with EINVAL on a small buffer, because the
-// driver carves small allocations out of a shared 2 MiB mapping with 512 byte alignment and the
-// range then does not start on a page boundary (observed with the 1-expert host arenas of the
-// tests). GGML_CUDA_NUMA_NODE_FAIL means that the plan did not fit; the allocation then fails
-// (the caller has logged the details) instead of landing on an unknown node, which could be the
-// device memory of another GPU
+// allocate mapped host memory on the given NUMA node: cudaHostAlloc runs on a thread of the
+// node under a memory policy bound to it (ggml_cuda_numa_host_alloc_on_node) and the placement
+// is verified with move_pages. The pages of a pinned buffer are allocated and pinned inside the
+// cudaHostAlloc call, under the policy of the calling thread, so the policy decides their node;
+// there is no later fault that could place them elsewhere. An mbind(MPOL_MF_MOVE) of the range
+// afterwards was dropped: pinned pages cannot be migrated, so it never moved anything, and it
+// fails with EINVAL on a small buffer, because the driver carves small allocations out of a
+// shared 2 MiB mapping with 512 byte alignment and the range then does not start on a page
+// boundary (observed with the 1-expert host arenas of the tests). GGML_CUDA_NUMA_NODE_FAIL
+// means that the plan did not fit; the allocation then fails (the caller has logged the
+// details) instead of landing on an unknown node, which could be the device memory of another
+// GPU
 static void * ggml_backend_cuda_mapped_buffer_alloc_numa(int device, size_t size, int node) {
     if (node == GGML_CUDA_NUMA_NODE_FAIL) {
         return nullptr;
     }
 
-    ggml_cuda_mempolicy_saved saved_policy;
-    const bool bind = node >= 0 && ggml_cuda_set_mempolicy_node(node, saved_policy);
-
-    void * ptr = nullptr;
-    cudaError_t err = cudaHostAlloc(&ptr, size, cudaHostAllocMapped | cudaHostAllocPortable);
-
-    ggml_cuda_mempolicy_restore(saved_policy);
-
-    if (err != cudaSuccess) {
-        (void) cudaGetLastError();
-        GGML_LOG_ERROR("%s: allocating %.2f MiB of mapped host memory on NUMA node %d: cudaHostAlloc failed: %s\n",
-                       __func__, size / 1024.0 / 1024.0, node, cudaGetErrorString(err));
+    bool bound = false;
+    void * ptr = ggml_cuda_numa_host_alloc_on_node(device, size, node, &bound);
+    if (ptr == nullptr) {
         return nullptr;
     }
 
-    if (bind) {
+    if (bound) {
         size_t sampled = 0;
         size_t on_node = 0;
         ggml_cuda_mapped_buffer_verify_numa(ptr, size, node, &sampled, &on_node);
@@ -3151,6 +3283,14 @@ int ggml_cuda_numa_fixed_alloc(size_t size) {
     return GGML_CUDA_NUMA_NODE_ANY;
 }
 
+bool ggml_cuda_numa_bind_cpus(int node) {
+    GGML_UNUSED(node);
+    return false;
+}
+
+void ggml_cuda_numa_unbind_cpus(void) {
+}
+
 void * ggml_cuda_numa_host_alloc(int device, size_t size, int node) {
     GGML_UNUSED(device);
     if (node == GGML_CUDA_NUMA_NODE_FAIL) {
@@ -3278,16 +3418,27 @@ static enum ggml_status ggml_backend_cuda_mapped_buffer_init_tensor(ggml_backend
     return GGML_STATUS_SUCCESS;
 }
 
+// the host side writes of a mapped buffer run on the CPUs of the node its pages are on: the
+// device reads pages the other socket wrote last at 17-30 GB/s instead of 44 (see
+// ggml_cuda_numa_bind_cpus); a buffer without a node (GGML_CUDA_NUMA_NODE_ANY) binds nothing
 static void ggml_backend_cuda_mapped_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
 
+    const bool bound = ggml_cuda_numa_bind_cpus(ctx->numa_node);
     memset(ggml_backend_cuda_mapped_buffer_host_ptr(ctx, tensor) + offset, value, size);
+    if (bound) {
+        ggml_cuda_numa_unbind_cpus();
+    }
 }
 
 static void ggml_backend_cuda_mapped_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
 
+    const bool bound = ggml_cuda_numa_bind_cpus(ctx->numa_node);
     memcpy(ggml_backend_cuda_mapped_buffer_host_ptr(ctx, tensor) + offset, data, size);
+    if (bound) {
+        ggml_cuda_numa_unbind_cpus();
+    }
 }
 
 static void ggml_backend_cuda_mapped_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -3312,7 +3463,11 @@ static bool ggml_backend_cuda_mapped_buffer_cpy_tensor(ggml_backend_buffer_t buf
 static void ggml_backend_cuda_mapped_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_cuda_mapped_buffer_context * ctx = (ggml_backend_cuda_mapped_buffer_context *) buffer->context;
 
+    const bool bound = ggml_cuda_numa_bind_cpus(ctx->numa_node);
     memset(ctx->host_ptr, value, buffer->size);
+    if (bound) {
+        ggml_cuda_numa_unbind_cpus();
+    }
 }
 
 static const ggml_backend_buffer_i ggml_backend_cuda_mapped_buffer_interface = {
