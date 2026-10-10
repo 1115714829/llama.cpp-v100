@@ -183,6 +183,14 @@ bool ggml_backend_cuda_expert_get_host_peak(ggml_backend_buffer_type_t buft, siz
 // test-backend-ops through a backend proc address, and reserved for --expert-vram-gib later.
 void ggml_cuda_expert_set_slot_limit(ggml_backend_buffer_type_t buft, size_t bytes);
 
+// test hook: release the per-stream staging state of the expert buffers of the device, so the next
+// launch creates it again (the first-launch path of the staging)
+void ggml_cuda_expert_reset_streams(ggml_backend_buffer_type_t buft);
+
+// test hook: the number of host experts the last prefill staging launch of the device copied into
+// the staging area; false when no staging launch ran yet
+bool ggml_cuda_expert_last_stage_hits(ggml_backend_buffer_type_t buft, size_t * n_hit);
+
 // Host NUMA placement of the expert host arena, shared with the CUDA<n>_Mapped buffer type
 // (defined in ggml-cuda.cu): the machine is planned once from the bytes every device reads, the
 // node capacities (MemTotal of the nodes) and the read times measured while all the devices

@@ -1456,6 +1456,20 @@ struct test_case {
     // changes process-wide state for its run (the active expert assignment) restores it here
     virtual void after_eval(ggml_backend_t backend) { GGML_UNUSED(backend); }
 
+    // relaunches after the reference compare: the graph is computed again on backend1 n_relaunch()
+    // times and the output compared with the reference result of the compare, relaunch_prepare()
+    // runs before each of them. For state that a backend creates at the first launch of a graph
+    // and keeps afterwards: the hook puts the backend back into the first-launch state, so every
+    // relaunch exercises it again.
+    virtual int n_relaunch() { return 0; }
+    virtual void relaunch_prepare(ggml_backend_t backend) { GGML_UNUSED(backend); }
+    // checked after the compare and after every relaunch, for state of the backend that the output
+    // compare alone does not cover; false fails the test
+    virtual bool relaunch_check(ggml_backend_t backend) { GGML_UNUSED(backend); return true; }
+
+    ggml_tensor * out_node = nullptr;   // the output of build_graph, for the relaunch compare
+    std::vector<float> out_ref;         // its reference result, captured by the compare callback
+
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
 
@@ -1693,6 +1707,10 @@ struct test_case {
             std::vector<float> f1 = tensor_to_float(t1);
             std::vector<float> f2 = tensor_to_float(t2);
 
+            if (ud->tc->n_relaunch() > 0 && t1 == ud->tc->out_node) {
+                ud->tc->out_ref = f2;
+            }
+
             for (size_t i = 0; i < f1.size(); i++) {
                 // check for nans
                 if (std::isnan(f1[i]) || std::isnan(f2[i])) {
@@ -1737,6 +1755,7 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
+        out_node = out;
         const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
                                                                fused_nodes_to_verify.size());
@@ -1744,6 +1763,32 @@ struct test_case {
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+
+        // relaunches against the reference result of the compare (see n_relaunch)
+        const int n_re = n_relaunch();
+        if (test_passed && n_re > 0) {
+            GGML_ASSERT(!out_ref.empty());
+            if (!relaunch_check(backend1)) {
+                printf("[launch 0/%d] check failed ", n_re);
+                test_passed = false;
+                error_msg   = "relaunch check failed";
+            }
+            for (int r = 0; r < n_re && test_passed; ++r) {
+                relaunch_prepare(backend1);
+                ggml_backend_graph_compute(backend1, gf);
+                std::vector<float> g = tensor_to_float(out);
+                const double e = err(g.data(), out_ref.data(), g.size());
+                if (e > max_err(backend1)) {
+                    printf("[relaunch %d/%d] ERR = %.9f > %.9f ", r + 1, n_re, e, max_err(backend1));
+                    test_passed = false;
+                    error_msg   = "relaunch failed";
+                } else if (!relaunch_check(backend1)) {
+                    printf("[relaunch %d/%d] check failed ", r + 1, n_re);
+                    test_passed = false;
+                    error_msg   = "relaunch check failed";
+                }
+            }
+        }
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -6522,16 +6567,30 @@ static void check_expert_tiers(ggml_backend_reg_t reg, ggml_backend_buffer_type_
 struct test_mul_mat_id_expert : public test_mul_mat_id {
     test_mul_mat_id_expert(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 32, int n_used = 4, int64_t m = 640, int64_t n = 8, int64_t k = 2560,
-            bool all_slot = false)
-        : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k), all_slot(all_slot) {}
+            bool all_slot = false, int n_host = -1, size_t stage_bytes_min = 0)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k), all_slot(all_slot),
+          n_host(n_host < 0 ? n_mats - 2 : n_host), stage_bytes_min(stage_bytes_min) {
+        // the parameter shadows the member: check the member, the parameter is -1 by default
+        GGML_ASSERT(all_slot || this->n_host > 0);
+    }
 
     const bool all_slot;   // every expert in a VRAM slot: no host complement, no staging
+    // how many experts go to the host arena. The staging area is sized for exactly that many, so
+    // a small value puts only a few experts in the staging area and every launch has to fill it
+    // again; the rest of the complement would not fit and the store refuses the budget.
+    const int n_host;
+    // lower bound of the staging budget in bytes (0 = exactly the host complement). A staging
+    // area far larger than the complement makes its clearing at the first launch take long, which
+    // is what test_mul_mat_id_expert_first_launch needs.
+    const size_t stage_bytes_min;
 
     ggml_tensor * expert_weight = nullptr; // the weight tensor, marked in weight_buffer_type()
     ggml_backend_buffer_type_t expert_buft = nullptr;
 
     std::string vars() override {
-        return test_mul_mat_id::vars() + (all_slot ? " all_slot" : "");
+        return test_mul_mat_id::vars() + (all_slot ? " all_slot" : "") +
+            (n_host == n_mats - 2 ? "" : " n_host=" + std::to_string(n_host)) +
+            (stage_bytes_min == 0 ? "" : " stage_min=" + std::to_string(stage_bytes_min >> 20) + "MiB");
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6563,8 +6622,16 @@ struct test_mul_mat_id_expert : public test_mul_mat_id {
                 // slot budget room for every expert and no staging.
                 const size_t blob_bytes   = expert_store_stride(type_a, k, m);
                 const size_t expert_bytes = blob_bytes * (size_t) n_mats;
-                const size_t slot_bytes   = all_slot ? expert_bytes : 2*blob_bytes;
-                const size_t stage_bytes  = all_slot ? 0 : blob_bytes * (size_t) n_mats;
+                const size_t slot_bytes   = all_slot ? expert_bytes : (size_t) (n_mats - n_host) * blob_bytes;
+                // a staging area above the complement (stage_bytes_min) takes what the device can
+                // spare: at most half of its free memory, so the case runs on smaller devices too
+                size_t stage_min = stage_bytes_min;
+                if (stage_min > 0) {
+                    size_t free_mem = 0, total_mem = 0;
+                    ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+                    stage_min = std::min(stage_min, free_mem / 2);
+                }
+                const size_t stage_bytes  = all_slot ? 0 : std::max((size_t) n_host * blob_bytes, stage_min);
                 auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
                 if (set_budget != nullptr) {
@@ -6604,6 +6671,131 @@ struct test_mul_mat_id_expert : public test_mul_mat_id {
         ggml_set_name(out, "out");
 
         return out;
+    }
+};
+
+// Two mul_mat_id on the same expert tensor in one graph, with different routing: the staging
+// pointer table and the staging slots of the second launch are written while the first launch
+// already consumed them, so the first result is wrong if a launch reads the table or the slots
+// of another one. The two ids are drawn independently, so the two launches route to different
+// host experts and reuse the same slots. Both results are compared against the reference, the
+// sum only makes the second one part of the graph the framework computes.
+struct test_mul_mat_id_expert_two_ids : public test_mul_mat_id_expert {
+    test_mul_mat_id_expert_two_ids(ggml_type type_a, ggml_type type_b, int n_mats, int n_used,
+            int64_t m, int64_t n, int64_t k, int n_host)
+        : test_mul_mat_id_expert(type_a, type_b, n_mats, n_used, m, n, k, /*all_slot=*/false, n_host) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_TWO_IDS";
+    }
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + " two_ids" +
+            (n_host == n_mats - 2 ? "" : " n_host=" + std::to_string(n_host));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(as, "blk.0.ffn_gate_expert.weight");
+        expert_weight = as;
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < 2; ++i) {
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+            ggml_set_name(ids, i == 0 ? "ids0" : "ids1");
+            if (n_used != n_mats) {
+                ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+                ggml_set_name(ids, i == 0 ? "view_of_ids0" : "view_of_ids1");
+            }
+            ggml_tensor * o = ggml_mul_mat_id(ctx, as, b, ids);
+            ggml_set_name(o, i == 0 ? "out0" : "out1");
+            out = out == nullptr ? o : ggml_add(ctx, out, o);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// The first launch of a (buffer, stream) creates the staging state of the stream
+// (ggml_backend_cuda_expert_buffer_context::get_stream): the staging area, the plan buffers and the
+// pointer tables are allocated and cleared, and the first routing/plan/copy kernels follow right
+// after. The clearing has to be ordered before those kernels on the stream: a clear that runs
+// unordered (on the legacy default stream) lands while the staging area is being cleared and the
+// plan kernel has already counted the routed host experts, zeroes the count, and the copy kernel
+// copies nothing - the consumer then reads zeroed staging slots and the rows of every routed host
+// expert come out as zero. The staging budget is set far above the host complement (stage_bytes_min)
+// so that its clearing takes milliseconds, longer than the host needs to issue the kernels; with an
+// unordered clear this fails on every launch instead of once in a few hundred. After the reference
+// compare the case releases the stream state through the backend proc and computes again, n_relaunch
+// times, so every compute goes through the first-launch path again.
+struct test_mul_mat_id_expert_first_launch : public test_mul_mat_id_expert {
+    const int n_re;
+
+    test_mul_mat_id_expert_first_launch(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k,
+            int n_re, size_t stage_bytes_min)
+        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, n_mats, n_used, m, n, k, /*all_slot=*/false, /*n_host=*/-1, stage_bytes_min),
+          n_re(n_re) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_FIRST_LAUNCH";
+    }
+
+    std::string vars() override {
+        return test_mul_mat_id_expert::vars() + " relaunch=" + std::to_string(n_re);
+    }
+
+    int n_relaunch() override { return n_re; }
+
+    void relaunch_prepare(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        auto reset = (void (*)(ggml_backend_buffer_type_t))
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_reset_streams");
+        GGML_ASSERT(reset != nullptr);
+        reset(expert_buft);
+    }
+
+    // The plan of the launch must have staged every routed host expert. A clear of the plan
+    // counters or of the routing bitmap that lands after the routing kernel leaves the count short:
+    // the launch then either reads the host arena in place (correct output, no staging) or reads
+    // slots that were never filled (wrong output). The output compare catches only the second, this
+    // catches both. Without a routing profile the store puts experts 0 .. n_slot-1 into the slots
+    // (ggml_expert_store_plan sorts the slot experts), so the host experts are the ids >= n_mats - n_host.
+    bool relaunch_check(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        auto hits = (bool (*)(ggml_backend_buffer_type_t, size_t *))
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_last_stage_hits");
+        GGML_ASSERT(hits != nullptr);
+        size_t n_hit = 0;
+        if (!hits(expert_buft, &n_hit)) {
+            printf("no staging launch recorded ");
+            return false;
+        }
+
+        const ggml_tensor * ids = out_node->src[2];
+        const int64_t stride = ids->nb[1] / sizeof(int32_t);
+        std::vector<int32_t> data((size_t) ((ids->ne[1] - 1) * stride + ids->ne[0]));
+        ggml_backend_tensor_get(ids, data.data(), 0, data.size() * sizeof(int32_t));
+        std::vector<bool> routed((size_t) n_mats, false);
+        for (int64_t t = 0; t < ids->ne[1]; ++t) {
+            for (int64_t s = 0; s < ids->ne[0]; ++s) {
+                routed[(size_t) data[(size_t) (t * stride + s)]] = true;
+            }
+        }
+        size_t expected = 0;
+        for (int e = n_mats - n_host; e < n_mats; ++e) {
+            expected += routed[(size_t) e];
+        }
+        if (n_hit != expected) {
+            printf("staged %zu host experts, the launch routed to %zu ", n_hit, expected);
+            return false;
+        }
+        return true;
     }
 };
 
@@ -13576,6 +13768,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 512, 10, 640, n, 2560, /*all_slot=*/false));
         }
     }
+
+    // The staging area of the cases above holds the whole host complement (510 experts), so a
+    // launch rarely fills it and rarely reuses a slot. These put a single host expert in the
+    // arena and size the staging area for exactly that one: every launch has to assign slot 0,
+    // copy the expert in and rewrite the whole staging table, and a plan that kept an entry or
+    // a slot of an earlier launch shows up in the result instead of in a log line.
+    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640,  512, 2560, /*all_slot=*/false, /*n_host=*/1));
+    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, 640, 2048, 2560, /*all_slot=*/false, /*n_host=*/1));
+    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q4_K, GGML_TYPE_F32,  32,  4, 640,  512, 2560, /*all_slot=*/false, /*n_host=*/1));
+    // two launches of the same shape with different routing in one graph: the staging table and
+    // the slots are reused between them, so this is the consecutive-launch case of one staging
+    // area on one stream. Both node results are compared against the reference.
+    test_cases.emplace_back(new test_mul_mat_id_expert_two_ids(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640,  512, 2560, /*n_host=*/1));
+    test_cases.emplace_back(new test_mul_mat_id_expert_two_ids(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640, 2048, 2560, /*n_host=*/4));
+    // the first launch of a stream, repeated: the staging state is created, cleared and staged into
+    // on every relaunch, with a 6 GiB staging area so that its clearing outlasts the kernel issue
+    // (see the class). The two shapes cover the 32-value (Q8_0) and the 256-value (Q4_K) weight paths.
+    test_cases.emplace_back(new test_mul_mat_id_expert_first_launch(GGML_TYPE_Q8_0,  32,  4, 640, 128, 2560, /*n_re=*/8, /*stage_bytes_min=*/6144ull << 20));
+    test_cases.emplace_back(new test_mul_mat_id_expert_first_launch(GGML_TYPE_Q4_K, 512, 10, 640, 512, 2560, /*n_re=*/8, /*stage_bytes_min=*/6144ull << 20));
 
     // K not a multiple of MATRIX_ROW_PADDING (512): the MMQ loaders read the last row up to a
     // 512-element boundary, so every expert needs trailing bytes past its data. With all_slot
