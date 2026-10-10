@@ -1143,12 +1143,14 @@ static __device__ __forceinline__ void q8_skinny_warp_loop_ahead(
 // output is bitwise the same. It also resets the counter: counters are zero between launches.
 // Gated: the first SplitK / Parts warps of a CTA run the gate weight, the others the up weight,
 // and the epilogue writes silu(gate) * up.
-// Epilogue of the last CTA of a tile: write the sum (F32), or write silu(epi_scale * sum) rounded
-// to F16 into output_f16 (the SCALE -> UNARY(SILU) -> F32 -> F16 conversion before the up projection
-// of a qwen4exp hyper-connection mixer, with the expressions of those kernels).
+// Epilogue of the last CTA of a tile: write the result (F32); write silu(epi_scale * sum) rounded to
+// F16 into output_f16 (the SCALE -> UNARY(SILU) -> F32 -> F16 conversion before the up projection of
+// a qwen4exp hyper-connection mixer, with the expressions of those kernels); or write the result
+// rounded to F16 (the F32 -> F16 conversion before the down projection of a gated pair).
 enum q8_skinny_epilogue {
     Q8_SKINNY_EPI_F32,
     Q8_SKINNY_EPI_SCALE_SILU_F16,
+    Q8_SKINNY_EPI_F16,
 };
 
 template <int SplitK, int NAcc, int Parts, int Depth, int InDepth, bool Gated, bool M1Only, int RowTiles,
@@ -1285,6 +1287,9 @@ __global__ void __launch_bounds__((Gated ? 64 : 32) * (SplitK / Parts)) q8_skinn
                 // scale_silu_kernel, then the F32 -> F16 conversion
                 const float v = epi_scale * value;
                 output_f16[out_index] = __float2half(ggml_cuda_op_silu_single(v));
+            } else if constexpr (Epilogue == Q8_SKINNY_EPI_F16) {
+                // the F32 -> F16 conversion
+                output_f16[out_index] = __float2half(value);
             } else {
                 output[out_index] = value;
             }
@@ -1343,6 +1348,14 @@ static void q8_skinny_split_launch_one(const uint8_t * codes0, const half * scal
                                              out.output_f16, out.epi_scale);
         } else {
             GGML_ABORT("Q8 skinny split: the gated pair has no scale/silu epilogue");
+        }
+    } else if (out.epilogue == Q8_SKINNY_EPI_F16) {
+        if constexpr (Gated) {
+            q8_skinny_split_kernel<SplitK, NAcc, Parts, depth, in_depth, Gated, M1Only, RowTiles, Q8_SKINNY_EPI_F16>
+                <<<grid, block, 0, stream>>>(codes0, scales0, codes1, scales1, input, nullptr, scratch, counters, n, k, m,
+                                             out.output_f16, 0.0f);
+        } else {
+            GGML_ABORT("Q8 skinny split: the F16 epilogue is only used by the gated pair");
         }
     } else {
         q8_skinny_split_kernel<SplitK, NAcc, Parts, depth, in_depth, Gated, M1Only, RowTiles>
@@ -1697,6 +1710,62 @@ void ggml_cuda_q8_skinny_hc_down_up(ggml_backend_cuda_context & ctx, const ggml_
     GGML_ASSERT(ok);
 }
 
+bool ggml_cuda_q8_skinny_gated_down(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
+                                    const ggml_tensor * src1, const ggml_tensor * down_w, ggml_tensor * dst) {
+    if (!ggml_cuda_q8_skinny_is_repacked(gate_w) || !ggml_cuda_q8_skinny_is_repacked(up_w) ||
+            !ggml_cuda_q8_skinny_is_repacked(down_w)) {
+        return false;
+    }
+    const int64_t k = gate_w->ne[0];
+    const int64_t n = gate_w->ne[1];
+    const int64_t m = src1->ne[1];
+    const int64_t n_down = down_w->ne[1];
+    // the pair takes the split path (narrow, M <= 16, the checks of ggml_cuda_q8_skinny_mul_mat_gated)
+    if (!ggml_are_same_shape(gate_w, up_w) ||
+            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
+            src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            dst->ne[0] != n_down || dst->ne[1] != m || dst->ne[2] != 1 || dst->ne[3] != 1 ||
+            m < 1 || m > 16 || k % 16 != 0 || (k / 16) % 8 != 0 || n % 32 != 0 ||
+            n / 32 > q8_skinny_split_max_tiles || n / 32 > GGML_CUDA_MAX_SPLIT_TILES ||
+            down_w->ne[0] != n || q8_skinny_split_k(n) == 0) {
+        return false;
+    }
+    GGML_ASSERT(ctx.tile_counters != nullptr);
+
+    ggml_cuda_pool_alloc<half> input(ctx.pool(), m * k);
+    const to_fp16_cuda_t to_fp16 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+    GGML_ASSERT(to_fp16 != nullptr);
+    to_fp16(src1->data, input.get(), m * k, ctx.stream());
+
+    // the pair: its last CTAs write silu(gate) * up rounded to F16
+    ggml_cuda_pool_alloc<half>  act(ctx.pool(), m * n);
+    ggml_cuda_pool_alloc<float> scratch(ctx.pool(), q8_skinny_split_scratch_floats((int) n, 8, true, (int) m));
+    const uint8_t * gate_data = (const uint8_t *) gate_w->data;
+    const uint8_t * up_data   = (const uint8_t *) up_w->data;
+    const q8_skinny_split_out out = { nullptr, act.get(), 0.0f, Q8_SKINNY_EPI_F16 };
+    q8_skinny_split_launch_m<8, 2, true>(gate_data, (const half *) (gate_data + n * k), up_data,
+                                         (const half *) (up_data + n * k), input.get(), out,
+                                         scratch.get(), ctx.tile_counters + ctx.curr_stream_no * GGML_CUDA_MAX_SPLIT_TILES,
+                                         (int) n, (int) k, (int) m, ctx.stream());
+
+    // the down projection reads the F16 activations, on the path ggml_cuda_q8_skinny_mul_mat takes
+    const uint8_t * down = (const uint8_t *) down_w->data;
+    if (n_down / 32 <= q8_skinny_split_max_tiles) {
+        const q8_skinny_config config = q8_skinny_config_for(n_down, n);
+        ggml_cuda_pool_alloc<float> scratch_down(ctx.pool(), q8_skinny_split_scratch_floats((int) n_down, config.split_k, false, (int) m));
+        const q8_skinny_split_out out_down = { (float *) dst->data, nullptr, 0.0f, Q8_SKINNY_EPI_F32 };
+        q8_skinny_split_launch_single(config, down, (const half *) (down + n_down * n), act.get(), out_down,
+                                      scratch_down.get(), ctx.tile_counters + ctx.curr_stream_no * GGML_CUDA_MAX_SPLIT_TILES,
+                                      (int) n_down, (int) n, (int) m, ctx.stream());
+    } else {
+        const bool ok = q8_skinny_mul_mat_dispatch(down, (const half *) (down + n_down * n), act.get(),
+                                                   (float *) dst->data, (int) n_down, (int) n, (int) m, ctx.stream());
+        GGML_ASSERT(ok);
+    }
+    return true;
+}
+
 bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
                                        const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4],
                                        int n_nodes, const ggml_tensor * src1) {
@@ -1827,6 +1896,12 @@ bool ggml_cuda_q8_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const gg
 
 bool ggml_cuda_q8_skinny_hc_down_up_supported(const ggml_tensor * w_down, const ggml_tensor * w_up, int64_t m) {
     GGML_UNUSED_VARS(w_down, w_up, m);
+    return false;
+}
+
+bool ggml_cuda_q8_skinny_gated_down(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
+                                    const ggml_tensor * src1, const ggml_tensor * down_w, ggml_tensor * dst) {
+    GGML_UNUSED_VARS(ctx, gate_w, up_w, src1, down_w, dst);
     return false;
 }
 

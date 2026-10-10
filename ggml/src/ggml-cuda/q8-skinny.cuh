@@ -45,4 +45,11 @@ bool ggml_cuda_q8_skinny_hc_down_up_supported(const ggml_tensor * w_down, const 
 void ggml_cuda_q8_skinny_hc_down_up(ggml_backend_cuda_context & ctx, const ggml_tensor * w_down, const ggml_tensor * w_up,
                                     const half * input, int64_t m, float scale, float * gate);
 
+// A gated pair followed by its down projection, dst = down(swiglu(gate(src1), up(src1))): the pair
+// (split path, a narrow weight, M <= 16) writes silu(gate) * up rounded to F16 and the down
+// projection reads it, instead of an F32 GLU output and a conversion; bitwise the same. Returns
+// false if the shapes are not covered, the caller then runs the nodes unfused.
+bool ggml_cuda_q8_skinny_gated_down(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
+                                    const ggml_tensor * src1, const ggml_tensor * down_w, ggml_tensor * dst);
+
 void ggml_cuda_q8_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream);

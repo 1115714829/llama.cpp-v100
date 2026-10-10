@@ -11,6 +11,7 @@
 // Patterns:
 //   single  MUL_MAT(W[K,N], x[K,M])                                q8_skinny_kernel
 //   gated   SWIGLU(MUL_MAT(G, x), MUL_MAT(U, x))                    q8_skinny_gated_kernel
+//   ffn     MUL_MAT(D, SWIGLU(MUL_MAT(G, x), MUL_MAT(U, x)))         gated pair + down projection
 //   multi   MUL_MAT(W_i, x) for 2..4 weights sharing one input     q8_skinny_multi_kernel
 //   hcpost  gated DSV4_HC_POST -> RMS_NORM -> MUL (the hyper-connection combine and next mixer norm)
 //   hcmix   hcpost followed by the Q8_0 down projection, SCALE -> SILU and the up projection
@@ -53,6 +54,7 @@ static std::vector<bench_case> make_cases() {
         { "moe", "single", "hc_down",       10240, { 320 } },
         { "moe", "single", "hc_up",           320, { 10240 } },
         { "moe", "gated",  "shexp_gate_up",  2560, { 640 } },
+        { "moe", "ffn",    "shexp_ffn",      2560, { 640 } },
         { "moe", "single", "shexp_down",      640, { 2560 } },
         { "moe", "single", "ssm_out_3h",     1152, { 2560 } },
         { "moe", "single", "ssm_out_2h",      768, { 2560 } },
@@ -208,7 +210,8 @@ static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m
 
 static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, int iters, double min_mib,
                        int * r_out, double * gb_out, const std::string & dump) {
-    const bool gated  = strcmp(c.pattern, "gated") == 0;
+    const bool ffn    = strcmp(c.pattern, "ffn") == 0;
+    const bool gated  = strcmp(c.pattern, "gated") == 0 || ffn;
     const bool multi  = strcmp(c.pattern, "multi") == 0;
     const bool hcpost = strcmp(c.pattern, "hcpost") == 0;
     if (hcpost || strcmp(c.pattern, "hcmix") == 0) {
@@ -219,6 +222,9 @@ static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, 
     std::vector<int64_t> ws;
     if (gated) {
         ws = { c.n[0], c.n[0] };
+        if (ffn) {
+            ws.push_back(c.n[0]); // the down projection [n, k]: the bytes of a [k, n] weight
+        }
     } else {
         ws = c.n;
     }
@@ -237,8 +243,10 @@ static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, 
     std::vector<std::vector<ggml_tensor *>> w(r);
     std::vector<ggml_tensor *> x(r);
     for (int i = 0; i < r; ++i) {
-        for (int64_t n : ws) {
-            w[i].push_back(ggml_new_tensor_2d(ctx_w, c.type, c.k, n));
+        for (size_t j = 0; j < ws.size(); ++j) {
+            // the down projection of the ffn pattern maps the pair width back to k
+            w[i].push_back(ffn && j == 2 ? ggml_new_tensor_2d(ctx_w, c.type, c.n[0], c.k)
+                                         : ggml_new_tensor_2d(ctx_w, c.type, c.k, ws[j]));
         }
         // Q8_0 copies get their own input, so that the multi-weight matcher does not merge
         // neighbouring copies; the F32/BF16 GEMV is never merged and shares one hot input,
@@ -253,6 +261,9 @@ static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, 
             ggml_tensor * up   = ggml_mul_mat(ctx, w[i][1], x[i]);
             ggml_tensor * gate = ggml_mul_mat(ctx, w[i][0], x[i]);
             ggml_tensor * out  = ggml_glu_split(ctx, gate, up, GGML_GLU_OP_SWIGLU);
+            if (ffn) {
+                out = ggml_mul_mat(ctx, w[i][2], out);
+            }
             ggml_build_forward_expand(gf, out);
             if (i == 0) {
                 first_outs.push_back(out);
@@ -288,7 +299,11 @@ static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, 
     std::mt19937 rng(1234);
     std::vector<std::vector<uint8_t>> wdata(ws.size());
     for (size_t j = 0; j < ws.size(); ++j) {
-        fill_weight(wdata[j], c.type, c.k, ws[j], rng);
+        if (ffn && j == 2) {
+            fill_weight(wdata[j], c.type, c.n[0], c.k, rng);
+        } else {
+            fill_weight(wdata[j], c.type, c.k, ws[j], rng);
+        }
     }
     std::vector<float> xdata((size_t) (c.k * m));
     std::uniform_real_distribution<float> ud(-1.0f, 1.0f);

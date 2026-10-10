@@ -5195,6 +5195,44 @@ struct test_hc_mix_q8 : public test_dsv4_hc {
     }
 };
 
+// A gated Q8_0 FFN, down(swiglu(gate(x), up(x))), as the qwen4exp shared expert (sm_70 repacks the
+// weights; a narrow pair hands silu(gate) * up to the down projection as F16)
+struct test_ffn_q8 : public test_case {
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FFN_Q8";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_ff, n_tokens);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_ffn_q8(int64_t n_embd = 2560, int64_t n_ff = 640, int64_t n_tokens = 4)
+        : n_embd(n_embd), n_ff(n_ff), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  n_embd, n_tokens);
+        ggml_tensor * w_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, n_ff);
+        ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, n_ff);
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_ff, n_embd);
+        ggml_set_name(x, "x");
+        ggml_tensor * act = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, w_gate, x), ggml_mul_mat(ctx, w_up, x));
+        ggml_tensor * out = ggml_mul_mat(ctx, w_down, act);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
     const ggml_type type;
@@ -13123,6 +13161,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n_tokens, 640, 2560,
             false, 1, 1, false, false, true, false, {1, 1}));
     }
+    // the shared expert with its down projection: the gated pair hands F16 activations to the
+    // down projection (M <= 16), a wide pair keeps the F32 GLU output (N = 4352)
+    for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
+        test_cases.emplace_back(new test_ffn_q8(2560, 640, n_tokens));
+    }
+    test_cases.emplace_back(new test_ffn_q8(5120, 4352, 4));
 
     // multiple repacked Q2_K~Q6_K matmuls sharing one input: the multi-weight kernel for
     // M <= 16, one M=32 two-phase launch per weight for M = 17..64. The N columns follow the

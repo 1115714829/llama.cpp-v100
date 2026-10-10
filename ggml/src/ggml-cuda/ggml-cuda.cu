@@ -8181,6 +8181,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const ggml_tensor * src1 = up->src[1];
             const ggml_tensor * ids  = up->src[2];
 
+            // q8 skinny gated pair followed by its down projection: the pair writes silu(gate) * up
+            // as F16 and the down projection reads it without the F32 GLU output and a conversion
+            if (op == GGML_OP_MUL_MAT && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
+                    gate->src[1] == up->src[1] && i + 3 < cgraph->n_nodes &&
+                    cgraph->nodes[i + 3]->op == GGML_OP_MUL_MAT && cgraph->nodes[i + 3]->src[1] == glu) {
+                const int     gd_nodes[]   = { i, i + 1, i + 2, i + 3 };
+                const ggml_op gd_ops[]     = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU, GGML_OP_MUL_MAT };
+                const int     gd_outputs[] = { i + 3 };
+                ggml_tensor * down = cgraph->nodes[i + 3];
+                if (ggml_can_fuse_subgraph_ext(cgraph, gd_nodes, 4, gd_ops, gd_outputs, 1) &&
+                        ggml_cuda_q8_skinny_gated_down(*cuda_ctx, gate->src[0], up->src[0], src1, down->src[0], down)) {
+                    fused_mul_mat_vec = true;
+                    fused_node_count  = 4;
+                    break;
+                }
+            }
+
             // q8 skinny gated pair: gate and up in one kernel, GLU written directly
             if (op == GGML_OP_MUL_MAT && ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU &&
                     gate->src[1] == up->src[1] &&
