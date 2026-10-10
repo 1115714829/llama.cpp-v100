@@ -4380,25 +4380,66 @@ static bool ggml_cuda_mul_mat_id_swiglu_mmvq(const ggml_tensor * dst, const int 
 // Prefill batches (above the MMVQ batch) stage the routed host experts into VRAM
 // (the grouped kernel and MMQ both read the staged copies). Decode batches (up to the MMVQ
 // batch) take the MMVQ mmid branch of ggml_cuda_mul_mat_id, which stages them with
-// ggml_cuda_expert_stage_prepare_decode instead. Uses the same conditions as the dispatch so
-// that needs_sync and the dispatch never disagree.
-static bool ggml_cuda_expert_stage_used(const ggml_tensor * dst, const ggml_cuda_expert_table & ex_table, const int cc) {
+// ggml_cuda_expert_stage_prepare_decode instead.
+// [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+// Pure function of the node and the device: it reads the expert table itself and judges the
+// activation the way the dispatch does, so the three places that need to know whether a node
+// stages (the graph capture check, ggml_cuda_mul_mat_id_needs_sync and the dispatch itself)
+// cannot answer differently. A disagreement is what lets a graph that stages be recorded and
+// replayed: the staging (ggml_cuda_expert_stage_prepare) has host side state, so a replay would
+// re-run the captured routing instead of the routing of the launch, and the consumer would read
+// staging slots this launch never filled.
+//
+// The F16 activation is judged after the conversion of ggml_cuda_mul_mat_id: unless the
+// fused-expert kernel takes the node, that function puts the activation into an F32 pool buffer
+// and the F32 paths below run on it. The node handed to the predicates is that converted one,
+// because e.g. ggml_cuda_moe_grouped_mul_mat_id_supported rejects a non-F32 activation and would
+// otherwise answer for the graph tensor while the dispatch answers for the pool buffer.
+//
+// A node that never reaches the dispatch block of ggml_cuda_mul_mat_id (a dst that is neither
+// F32 nor the SwiGLU node, an activation that is neither F32 nor F16) is answered false here;
+// ggml_cuda_mul_mat_id_needs_sync returns true for those before it asks.
+static bool ggml_cuda_expert_mmid_stages(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
-    if (!ex_table.has_stage || ggml_cuda_mul_mat_id_use_mmvq(dst, cc)) {
+    ggml_cuda_expert_table ex_table;
+    if (!ggml_cuda_expert_table_get(src0, &ex_table) || !ex_table.has_stage) {
+        return false;
+    }
+
+    ggml_tensor dst_f32  = *dst;
+    ggml_tensor src1_f32 = *dst->src[1];
+    ggml_tensor * src1   = dst_f32.src[1];
+
+    const bool to_fused = ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc) &&
+        !ggml_cuda_mul_mat_id_swiglu_mmvq(dst, cc);
+    if (src1->type == GGML_TYPE_F16 && !to_fused) {
+        // the conversion writes packed rows, so the strides are the compact F32 ones
+        src1_f32.type   = GGML_TYPE_F32;
+        src1_f32.nb[0] = sizeof(float);
+        src1_f32.nb[1] = src1_f32.nb[0]*src1_f32.ne[0];
+        src1_f32.nb[2] = src1_f32.nb[1]*src1_f32.ne[1];
+        src1_f32.nb[3] = src1_f32.nb[2]*src1_f32.ne[2];
+        src1 = &src1_f32;
+    }
+    dst_f32.src[1] = src1;
+
+    if (ggml_cuda_mul_mat_id_use_mmvq(&dst_f32, cc)) {
+        // decode and verify: the MMVQ mmid branch stages in one kernel without a host side, so
+        // it is not the prefill staging this function is about and stays graph recordable
         return false;
     }
     // prefill reads every routed expert row at least once per column group: copy the routed host
     // experts into VRAM once instead of reading them over the host link in place
-    if (ggml_cuda_fused_expert_mul_mat_id_supported(dst, cc)) {
+    if (ggml_cuda_fused_expert_mul_mat_id_supported(&dst_f32, cc)) {
         return true;
     }
-    if (ggml_cuda_moe_grouped_mul_mat_id_supported(dst, cc)) {
+    if (ggml_cuda_moe_grouped_mul_mat_id_supported(&dst_f32, cc)) {
         return true;
     }
-    return ggml_cuda_should_use_mmq(src0->type, cc, ggml_cuda_mul_mat_id_ncols_typ(dst, src1, ids->ne[0], cc), src0->ne[2]);
+    return ggml_cuda_should_use_mmq(src0->type, cc,
+        ggml_cuda_mul_mat_id_ncols_typ(&dst_f32, src1, ids->ne[0], cc), src0->ne[2]);
 }
 
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
@@ -4431,10 +4472,9 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     // expert store: the prefill staging has a host-side part (the stream state), so launches
     // that stage cannot be recorded into a CUDA graph. The decode staging (the MMVQ mmid
     // branch of ggml_cuda_mul_mat_id) is one kernel without a host-side part, so it stays
-    // graph recordable and is not covered by this test.
-    ggml_cuda_expert_table ex_table;
-    const bool is_expert_store = ggml_cuda_expert_table_get(src0, &ex_table);
-    if (is_expert_store && ggml_cuda_expert_stage_used(dst, ex_table, cc)) {
+    // graph recordable and is not covered by this test. Same function the dispatch asks, so
+    // the two cannot disagree about which nodes stage.
+    if (ggml_cuda_expert_mmid_stages(dst, cc)) {
         return true;
     }
 
@@ -4617,7 +4657,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // prefill re-reads the routed expert rows (per column group or per tile): copy the routed
         // host experts into the staging area once and read them from VRAM (Strata prefill ring)
         const char * const * expert_ptrs = is_expert_store ? ex_table.main : nullptr;
-        if (is_expert_store && ggml_cuda_expert_stage_used(dst, ex_table, cc)) {
+        if (ggml_cuda_expert_mmid_stages(dst, cc)) {
             expert_ptrs = ggml_cuda_expert_stage_prepare(src0, ids, ggml_mul_mat_id_get_expert_offset(dst), ctx.stream());
         }
 
@@ -5367,9 +5407,14 @@ static bool ggml_cuda_tensor_ready_before(const ggml_cgraph * cgraph, const ggml
 }
 
 #ifdef USE_CUDA_GRAPH
-static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+// [TAG_MUL_MAT_ID_CUDA_GRAPHS] has_staging reports whether one of the nodes copies host experts
+// into the VRAM staging area; it is part of the identity of a cached executable (see
+// ggml_cuda_graph_get_key). The scan stops at the first node that rules out a capture, so the flag
+// is only read for a graph that is capture compatible, where no node stages.
+static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, bool * has_staging) {
 
     bool use_cuda_graph = true;
+    *has_staging = false;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -5382,6 +5427,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+            // the staging predicate the dispatch uses, so a node that copies host experts into
+            // VRAM is never judged capturable here and staged there
+            if (ggml_cuda_expert_mmid_stages(node, cc)) {
+                *has_staging = true;
+            }
             if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
                 // the mul_mat_id fallback path synchronizes the stream, so we cannot use CUDA graphs
                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
@@ -5404,11 +5454,30 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return cgraph->nodes[0];
 }
 
-static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+// What a cached executable must have been built from, besides the first node pointer that keys the
+// map (ggml_cuda_graph::cuda_graph): the number of nodes and whether the graph stages expert
+// weights into VRAM. The pointer alone is not an identity - the allocator hands the same address
+// to the next graph and the next test case, so an entry can be found for a graph it was not built
+// for. The two facts are recorded in the entry (ggml_cuda_graph::num_nodes, which nothing else
+// uses) and compared before every reuse; a mismatch re-captures instead of replaying. They are
+// recorded when the update is decided and not when the capture ends: an entry that kept the old
+// value would report a mismatch on every call and never capture again.
+static size_t ggml_cuda_graph_identity(const ggml_cgraph * cgraph, bool has_staging) {
+    return ((size_t) cgraph->n_nodes << 1) | (has_staging ? 1 : 0);
+}
+
+static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, size_t identity) {
     bool res = false;
 
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+
+    // an executable built for a graph of another size or another staging state must not be
+    // replayed, not even through the uid shortcut below
+    if (graph->num_nodes != identity) {
+        graph->num_nodes = identity;
+        res = true;
+    }
 
     // a capture made under another assist descriptor writes to that descriptor's buffers, which the
     // meta backend may already have freed (6-card two-slot servers rebuild them on every switch)
@@ -8486,9 +8555,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
-        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        bool has_staging = false;
+        const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph, &has_staging);
         if (graph_compatible) {
-            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph,
+                ggml_cuda_graph_identity(cgraph, has_staging));
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call

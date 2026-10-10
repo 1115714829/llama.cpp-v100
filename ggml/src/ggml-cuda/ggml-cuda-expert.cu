@@ -563,8 +563,10 @@ struct ggml_cuda_expert_tensor_state {
     int32_t * residency_dev   = nullptr;
     int64_t * host_offset_dev = nullptr; // device copy of the host arena byte offsets
     uint32_t * counts_dev     = nullptr; // per-expert routing counts, for --dump-expert-routing
-    uint32_t * bitmap_dev     = nullptr; // n_expert bits, only allocated when staging applies
-    uint32_t * bitmap_pinned  = nullptr; // async readback of the last bitmap, for the logs
+    // the prefill staging of this tensor is possible: a host tier to stage and a staging area to
+    // stage it into. The bitmap the routing kernel writes is per stream (see
+    // ggml_cuda_expert_stream_state), this is the property of the tensor alone that says so.
+    bool     has_stage  = false;
 
     bool verify_done = false;
 };
@@ -575,8 +577,13 @@ struct ggml_cuda_expert_stream_state {
     char * stage_dev   = nullptr;
     size_t stage_bytes = 0; // from fit: the largest host complement of one expert tensor
 
-    // per tensor: device pointer table through the staging area, and the copy plan buffers
+    // per tensor: device pointer table through the staging area, the routing bitmap and its
+    // readback, and the copy plan buffers. The bitmap is written by the routing kernel of one
+    // launch and read by the plan kernel of the same launch, so two streams that prepare the same
+    // tensor would clear and set each other's bits; it belongs to the stream like the rest.
     std::vector<const char **> tables;
+    std::vector<uint32_t *>     bitmaps;        // n_expert bits, for the tensors that stage
+    std::vector<uint32_t *>     bitmaps_pinned; // async readback of the last bitmap, for the logs
     int32_t *              hit_list   = nullptr;
     // [n_hit, slot_counter, fault_plan, fault_copy, fault_decode]. The two counters are cleared
     // before every prefill launch, the faults are not: a fault of one launch is reported by the
@@ -855,7 +862,7 @@ bool ggml_cuda_expert_table_get(const ggml_tensor * src0, ggml_cuda_expert_table
     table->stage_dev    = nullptr;
     table->stage_size   = 0;
     table->has_host     = s.has_host;
-    table->has_stage    = s.bitmap_dev != nullptr;
+    table->has_stage    = s.has_stage;
     table->tensor_id    = tensor_id;
     table->expert_start = expert_start;
     // without a host tier every expert is a slot and slot e holds expert e (see
@@ -902,6 +909,23 @@ ggml_cuda_expert_stream_state & ggml_backend_cuda_expert_buffer_context::get_str
         CUDA_CHECK(cudaEventCreateWithFlags(&ss.plan_event, cudaEventDisableTiming));
     }
     ss.tables.assign(tensors.size(), nullptr);
+    ss.bitmaps.assign(tensors.size(), nullptr);
+    ss.bitmaps_pinned.assign(tensors.size(), nullptr);
+    // Everything a launch needs is allocated here, while the device of the buffer is current and
+    // before any launch runs: the prepare of a launch must not allocate, so nothing of the host
+    // side of a staging launch lands in the middle of a launch queue (or of a graph capture).
+    for (size_t i = 0; i < tensors.size(); ++i) {
+        const ggml_cuda_expert_tensor_state & s = tensors[i];
+        if (!s.has_stage) {
+            continue;
+        }
+        CUDA_CHECK(cudaMalloc((void **) &ss.tables[i], (size_t) s.n_expert * sizeof(char *)));
+        const size_t n_words = ((size_t) s.n_expert + 31) / 32 * sizeof(uint32_t);
+        CUDA_CHECK(cudaMalloc((void **) &ss.bitmaps[i], n_words));
+        CUDA_CHECK(cudaMemset(ss.bitmaps[i], 0, n_words));
+        CUDA_CHECK(cudaHostAlloc((void **) &ss.bitmaps_pinned[i], n_words, cudaHostAllocDefault));
+        memset(ss.bitmaps_pinned[i], 0, n_words);
+    }
 
     return streams.emplace(stream, std::move(ss)).first->second;
 }
@@ -925,9 +949,15 @@ ggml_backend_cuda_expert_buffer_context::~ggml_backend_cuda_expert_buffer_contex
 
     for (auto & kv : streams) {
         ggml_cuda_expert_stream_state & ss = kv.second;
-        for (const char ** table : ss.tables) {
-            if (table != nullptr) {
-                CUDA_CHECK(cudaFree(table));
+        for (size_t i = 0; i < ss.tables.size(); ++i) {
+            if (ss.tables[i] != nullptr) {
+                CUDA_CHECK(cudaFree(ss.tables[i]));
+            }
+            if (ss.bitmaps[i] != nullptr) {
+                CUDA_CHECK(cudaFree(ss.bitmaps[i]));
+            }
+            if (ss.bitmaps_pinned[i] != nullptr) {
+                CUDA_CHECK(cudaFreeHost(ss.bitmaps_pinned[i]));
             }
         }
         if (ss.stage_dev) {
@@ -958,12 +988,6 @@ ggml_backend_cuda_expert_buffer_context::~ggml_backend_cuda_expert_buffer_contex
         }
         if (s.counts_dev) {
             CUDA_CHECK(cudaFree(s.counts_dev));
-        }
-        if (s.bitmap_dev) {
-            CUDA_CHECK(cudaFree(s.bitmap_dev));
-        }
-        if (s.bitmap_pinned) {
-            CUDA_CHECK(cudaFreeHost(s.bitmap_pinned));
         }
     }
     if (usage_dev) {
@@ -1074,11 +1098,12 @@ void ggml_cuda_expert_stats_tick(const ggml_tensor * src0, cudaStream_t stream) 
         return;
     }
 
-    if (s.bitmap_pinned != nullptr && s.n_expert > 0) {
+    const uint32_t * bitmap_pinned = it->second.bitmaps_pinned[(size_t) ex_table.tensor_id];
+    if (bitmap_pinned != nullptr && s.n_expert > 0) {
         const int n_words = (int) ((s.n_expert + 31) / 32);
         int n_routed = 0;
         for (int i = 0; i < n_words; ++i) {
-            uint32_t v = s.bitmap_pinned[i];
+            uint32_t v = bitmap_pinned[i];
             while (v != 0) {
                 n_routed += (int) (v & 1u);
                 v >>= 1;
@@ -1109,6 +1134,8 @@ const char * const * ggml_cuda_expert_stage_prepare(
     ggml_cuda_expert_tensor_state & s = ctx->tensors[(size_t) ex_table.tensor_id];
     const ggml_expert_store_tensor * st = ggml_expert_store_tensor_at(ctx->store, ex_table.tensor_id);
 
+    ggml_cuda_set_device(ctx->device);
+
     // without a host tier there is nothing to stage: the main table is complete (every
     // entry is a VRAM slot) and is used as-is.
     if (!s.has_host) {
@@ -1119,7 +1146,7 @@ const char * const * ggml_cuda_expert_stage_prepare(
     // a load that cannot hold it (common_params_fit_impl reports the deficit), so the area
     // of this tensor is always complete. Configuration invariants, not a fallback path.
     GGML_ASSERT(ids != nullptr && ids->type == GGML_TYPE_I32);
-    GGML_ASSERT(s.bitmap_dev != nullptr);
+    GGML_ASSERT(s.has_stage);
     GGML_ASSERT(ctx->stage_budget > 0 && ctx->stage_budget >= (size_t) st->host_used);
 
     ggml_cuda_expert_stream_state & ss = ctx->get_stream(stream);
@@ -1127,12 +1154,8 @@ const char * const * ggml_cuda_expert_stage_prepare(
     GGML_ASSERT(ss.stage_bytes >= s.blob_stride && ss.stage_bytes >= (size_t) st->host_used);
 
     const char ** table_stage = ss.tables[(size_t) ex_table.tensor_id];
-    if (table_stage == nullptr) {
-        CUDA_CHECK(cudaMalloc((void **) &table_stage, (size_t) s.n_expert * sizeof(char *)));
-        ss.tables[(size_t) ex_table.tensor_id] = table_stage;
-    }
-
-    ggml_cuda_set_device(ctx->device);
+    uint32_t *   bitmap_dev   = ss.bitmaps[(size_t) ex_table.tensor_id];
+    GGML_ASSERT(table_stage != nullptr && bitmap_dev != nullptr);
 
     const int nthreads = 256;
     const int64_t n_entries = ggml_nelements(ids);
@@ -1141,7 +1164,7 @@ const char * const * ggml_cuda_expert_stage_prepare(
 
     // [n_hit, slot_counter]; the two fault counters stay set until they are reported
     CUDA_CHECK(cudaMemsetAsync(ss.plan_state, 0, 2 * sizeof(int), stream));
-    CUDA_CHECK(cudaMemsetAsync(s.bitmap_dev, 0, (size_t) n_words * sizeof(uint32_t), stream));
+    CUDA_CHECK(cudaMemsetAsync(bitmap_dev, 0, (size_t) n_words * sizeof(uint32_t), stream));
 
     if (n_entries > 0) {
         const int nblocks = (int) ((n_entries + nthreads - 1) / nthreads);
@@ -1151,7 +1174,7 @@ const char * const * ggml_cuda_expert_stage_prepare(
         expert_routing_kernel<<<nblocks, nthreads, 0, stream>>>(
             (const int32_t *) ids->data, n_entries, (int) ids->ne[0], ids->nb[1] / sizeof(int32_t),
             expert_offset, (int) ex_table.expert_start, (int) s.n_expert,
-            s.residency_dev, (int64_t) s.blob_bytes, ctx->usage_dev, nullptr, s.bitmap_dev);
+            s.residency_dev, (int64_t) s.blob_bytes, ctx->usage_dev, nullptr, bitmap_dev);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -1162,7 +1185,7 @@ const char * const * ggml_cuda_expert_stage_prepare(
     const int n_table    = (int) s.n_expert;
     const int plan_blocks = std::max(1, std::min((n_table + nthreads - 1) / nthreads, 1024));
     expert_stage_plan_kernel<<<plan_blocks, nthreads, 0, stream>>>(
-        s.bitmap_dev, expert_lo, expert_hi, n_table, s.residency_dev,
+        bitmap_dev, expert_lo, expert_hi, n_table, s.residency_dev,
         s.table_main_dev, table_stage, block_dev, s.blob_stride, s.blob_bytes, ss.stage_bytes,
         ss.hit_list, ss.hit_cap, ss.plan_state, ss.plan_state + 1, ss.plan_state + 2, ctx->usage_dev);
     CUDA_CHECK(cudaGetLastError());
@@ -1178,8 +1201,8 @@ const char * const * ggml_cuda_expert_stage_prepare(
     // the last batches staged, and a launch whose plan and copy disagree is reported here.
     // The decode staging fault rides in the same readback: a decode launch records nothing
     // itself, so the next prefill launch is the one that reports it.
-    CUDA_CHECK(cudaMemcpyAsync(s.bitmap_pinned, s.bitmap_dev, (size_t) n_words * sizeof(uint32_t),
-        cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(ss.bitmaps_pinned[(size_t) ex_table.tensor_id], bitmap_dev,
+        (size_t) n_words * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaMemcpyAsync(ss.plan_pinned, ss.plan_state, 5 * sizeof(int),
         cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaEventRecord(ss.plan_event, stream));
@@ -1225,6 +1248,8 @@ const char * const * ggml_cuda_expert_stage_prepare_decode(
     ggml_cuda_expert_tensor_state & s = ctx->tensors[(size_t) ex_table.tensor_id];
     const ggml_expert_store_tensor * st = ggml_expert_store_tensor_at(ctx->store, ex_table.tensor_id);
 
+    ggml_cuda_set_device(ctx->device);
+
     // without a host tier there is nothing to stage: the main table is complete (every
     // entry is a VRAM slot) and is used as-is.
     if (!s.has_host) {
@@ -1246,13 +1271,10 @@ const char * const * ggml_cuda_expert_stage_prepare_decode(
     GGML_ASSERT(n_entries > 0 && n_entries <= (int) (32 * 1024 / sizeof(int32_t)));
     GGML_ASSERT((size_t) std::min<int64_t>(n_entries, st->n_host) * s.blob_stride <= ss.stage_bytes);
 
+    // the table is allocated with the stream state, so a launch allocates nothing (see
+    // ggml_backend_cuda_expert_buffer_context::get_stream)
     const char ** table_stage = ss.tables[(size_t) ex_table.tensor_id];
-    if (table_stage == nullptr) {
-        CUDA_CHECK(cudaMalloc((void **) &table_stage, (size_t) s.n_expert * sizeof(char *)));
-        ss.tables[(size_t) ex_table.tensor_id] = table_stage;
-    }
-
-    ggml_cuda_set_device(ctx->device);
+    GGML_ASSERT(table_stage != nullptr);
 
     const int nthreads = 256;
     const int expert_lo = (int) ex_table.expert_start;
@@ -1661,13 +1683,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
         CUDA_CHECK(cudaMemset(s.counts_dev, 0, (size_t) n_expert * sizeof(uint32_t)));
 
         // the staging area only helps the MMQ prefill path, only when host experts exist
-        if (s.has_host && stage_budget > 0) {
-            const int n_words = (int) ((n_expert + 31) / 32);
-            CUDA_CHECK(cudaMalloc((void **) &s.bitmap_dev, (size_t) n_words * sizeof(uint32_t)));
-            CUDA_CHECK(cudaMemset(s.bitmap_dev, 0, (size_t) n_words * sizeof(uint32_t)));
-            CUDA_CHECK(cudaHostAlloc((void **) &s.bitmap_pinned, (size_t) n_words * sizeof(uint32_t), cudaHostAllocDefault));
-            memset(s.bitmap_pinned, 0, (size_t) n_words * sizeof(uint32_t));
-        }
+        s.has_stage = s.has_host && stage_budget > 0;
 
         // the tensor data pointer is not used by the kernels on this path; point it at one
         // of the real allocations so generic ggml code never sees a dangling pointer
@@ -1678,7 +1694,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
 
         GGML_LOG_INFO("%s: device %d tensor %s: %" PRId64 " experts, slots %" PRId64 ", host %" PRId64 ", stage %s\n",
             __func__, device, t->name, n_expert, st->n_slot, st->n_host,
-            s.bitmap_dev != nullptr ? "yes" : "no");
+            s.has_stage ? "yes" : "no");
     }
 
     if (expert_bytes > 0) {

@@ -6505,16 +6505,24 @@ static void check_expert_tiers(ggml_backend_reg_t reg, ggml_backend_buffer_type_
 struct test_mul_mat_id_expert : public test_mul_mat_id {
     test_mul_mat_id_expert(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 32, int n_used = 4, int64_t m = 640, int64_t n = 8, int64_t k = 2560,
-            bool all_slot = false)
-        : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k), all_slot(all_slot) {}
+            bool all_slot = false, int n_host = -1)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k), all_slot(all_slot),
+          n_host(n_host < 0 ? n_mats - 2 : n_host) {
+        GGML_ASSERT(all_slot || n_host > 0);
+    }
 
     const bool all_slot;   // every expert in a VRAM slot: no host complement, no staging
+    // how many experts go to the host arena. The staging area is sized for exactly that many, so
+    // a small value puts only a few experts in the staging area and every launch has to fill it
+    // again; the rest of the complement would not fit and the store refuses the budget.
+    const int n_host;
 
     ggml_tensor * expert_weight = nullptr; // the weight tensor, marked in weight_buffer_type()
     ggml_backend_buffer_type_t expert_buft = nullptr;
 
     std::string vars() override {
-        return test_mul_mat_id::vars() + (all_slot ? " all_slot" : "");
+        return test_mul_mat_id::vars() + (all_slot ? " all_slot" : "") +
+            (n_host == n_mats - 2 ? "" : " n_host=" + std::to_string(n_host));
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6546,8 +6554,8 @@ struct test_mul_mat_id_expert : public test_mul_mat_id {
                 // slot budget room for every expert and no staging.
                 const size_t blob_bytes   = expert_store_stride(type_a, k, m);
                 const size_t expert_bytes = blob_bytes * (size_t) n_mats;
-                const size_t slot_bytes   = all_slot ? expert_bytes : 2*blob_bytes;
-                const size_t stage_bytes  = all_slot ? 0 : blob_bytes * (size_t) n_mats;
+                const size_t slot_bytes   = all_slot ? expert_bytes : (size_t) (n_mats - n_host) * blob_bytes;
+                const size_t stage_bytes  = all_slot ? 0 : (size_t) n_host * blob_bytes;
                 auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
                 if (set_budget != nullptr) {
@@ -6584,6 +6592,53 @@ struct test_mul_mat_id_expert : public test_mul_mat_id {
         ggml_set_name(b, "b");
 
         ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// Two mul_mat_id on the same expert tensor in one graph, with different routing: the staging
+// pointer table and the staging slots of the second launch are written while the first launch
+// already consumed them, so the first result is wrong if a launch reads the table or the slots
+// of another one. The two ids are drawn independently, so the two launches route to different
+// host experts and reuse the same slots. Both results are compared against the reference, the
+// sum only makes the second one part of the graph the framework computes.
+struct test_mul_mat_id_expert_two_ids : public test_mul_mat_id_expert {
+    test_mul_mat_id_expert_two_ids(ggml_type type_a, ggml_type type_b, int n_mats, int n_used,
+            int64_t m, int64_t n, int64_t k, int n_host)
+        : test_mul_mat_id_expert(type_a, type_b, n_mats, n_used, m, n, k, /*all_slot=*/false, n_host) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_TWO_IDS";
+    }
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + " two_ids" +
+            (n_host == n_mats - 2 ? "" : " n_host=" + std::to_string(n_host));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(as, "blk.0.ffn_gate_expert.weight");
+        expert_weight = as;
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < 2; ++i) {
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+            ggml_set_name(ids, i == 0 ? "ids0" : "ids1");
+            if (n_used != n_mats) {
+                ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+                ggml_set_name(ids, i == 0 ? "view_of_ids0" : "view_of_ids1");
+            }
+            ggml_tensor * o = ggml_mul_mat_id(ctx, as, b, ids);
+            ggml_set_name(o, i == 0 ? "out0" : "out1");
+            out = out == nullptr ? o : ggml_add(ctx, out, o);
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -13202,6 +13257,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 512, 10, 640, n, 2560, /*all_slot=*/false));
         }
     }
+
+    // The staging area of the cases above holds the whole host complement (510 experts), so a
+    // launch rarely fills it and rarely reuses a slot. These put a single host expert in the
+    // arena and size the staging area for exactly that one: every launch has to assign slot 0,
+    // copy the expert in and rewrite the whole staging table, and a plan that kept an entry or
+    // a slot of an earlier launch shows up in the result instead of in a log line.
+    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640,  512, 2560, /*all_slot=*/false, /*n_host=*/1));
+    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, 640, 2048, 2560, /*all_slot=*/false, /*n_host=*/1));
+    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q4_K, GGML_TYPE_F32,  32,  4, 640,  512, 2560, /*all_slot=*/false, /*n_host=*/1));
+    // two launches of the same shape with different routing in one graph: the staging table and
+    // the slots are reused between them, so this is the consecutive-launch case of one staging
+    // area on one stream. Both node results are compared against the reference.
+    test_cases.emplace_back(new test_mul_mat_id_expert_two_ids(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640,  512, 2560, /*n_host=*/1));
+    test_cases.emplace_back(new test_mul_mat_id_expert_two_ids(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640, 2048, 2560, /*n_host=*/4));
 
     // K not a multiple of MATRIX_ROW_PADDING (512): the MMQ loaders read the last row up to a
     // 512-element boundary, so every expert needs trailing bytes past its data. With all_slot
