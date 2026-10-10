@@ -2170,17 +2170,25 @@ private:
                 slot.spec_synth_rng.seed(seed);
             }
 
-            // the rejection mode is fixed for the whole request; draft-dflash and draft-mtp both
-            // produce a proposal distribution per token, so both can verify on the sparse top-k rows
-            const bool spec_sparse_draft = std::find(
+            // the rejection mode is fixed for the whole request; draft-dflash and draft-mtp can both
+            // verify on the sparse top-k rows
+            const bool spec_dflash = std::find(
                     params_base.speculative.types.begin(),
                     params_base.speculative.types.end(),
-                    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end() ||
-                std::find(
+                    COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
+            const bool spec_mtp_draft = std::find(
                     params_base.speculative.types.begin(),
                     params_base.speculative.types.end(),
                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-            slot.spec_use_rejection = spec && spec_sparse_draft && common_sampler_can_sparse_reject(slot.smpl.get());
+            const bool spec_sparse_draft = spec_dflash || spec_mtp_draft;
+
+            // the rejection verifier needs the proposal distribution q of every draft token: draft-dflash
+            // reports it (result_q_dflash), draft-mtp only when it samples probabilistically (a greedy draft
+            // reports no q, see the draft-mtp implementation). Without q the verification samples and
+            // matches on the full rows, so the top-k output must stay off: with it on, the full rows of the
+            // verification batch never reach the host and the full-row sampler aborts
+            const bool spec_draft_has_q = spec_dflash || (spec_mtp_draft && params_base.speculative.draft.probabilistic);
+            slot.spec_use_rejection = spec && spec_sparse_draft && spec_draft_has_q && common_sampler_can_sparse_reject(slot.smpl.get());
 
             // dchain: at T = 0 the verification takes the argmax of every row from its top-k candidates
             // on the host, so the full rows of the verified tokens stay on the device as well
@@ -2203,6 +2211,12 @@ private:
             }
         } else {
             slot.smpl.reset();
+
+            // a task without sampling (decision, embedding, rerank) reads the full rows of its outputs, so
+            // the top-k output of a previous request must not stay on for it (k = 0 keeps the graph)
+            if (params_base.n_parallel == 1) {
+                llama_set_logits_topk(ctx_tgt, 0);
+            }
         }
 
         // the per-request limit takes priority over the global one
