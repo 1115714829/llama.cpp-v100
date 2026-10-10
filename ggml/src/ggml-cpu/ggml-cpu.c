@@ -1700,11 +1700,9 @@ static void ggml_compute_forward_mul_mat_id(
 
         // the expert map of the node: local expert number of every routing id, -1 for the experts
         // of the other devices. It is the same row the CUDA kernels read (through a device copy):
-        // identity without expert parallelism, the segment of the device while the experts are the
-        // contiguous split, the row of the permuted assignment once the loader activated one.
-        const int16_t * expert_lut = ggml_expert_store_node_lut(expert_parallel,
-            ggml_mul_mat_id_get_device(dst), ggml_mul_mat_id_get_layer(dst),
-            expert_parallel ? ggml_mul_mat_id_get_expert_offset(dst) : 0, n_as, n_expert_total);
+        // identity without expert parallelism, otherwise the row of (device, layer) of the expert
+        // assignment table the weight of the node was laid out by (ggml-impl.h).
+        const int16_t * expert_lut = ggml_expert_store_node_lut(dst);
         GGML_ASSERT(expert_lut != NULL);
 
         // group rows by src0 matrix

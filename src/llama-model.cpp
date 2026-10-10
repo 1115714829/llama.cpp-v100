@@ -1349,6 +1349,20 @@ struct llama_model::impl {
     impl() = default;
     ~impl() = default;
 
+    // the expert assignment table the expert weights of the model are laid out by (see
+    // ggml_expert_assignment_activate), released with the model. Declared first so that it goes
+    // last, after the buffers of the weights it describes.
+    struct expert_assignment_holder {
+        uint32_t id = 0;
+        expert_assignment_holder() = default;
+        expert_assignment_holder(const expert_assignment_holder &) = delete;
+        expert_assignment_holder & operator=(const expert_assignment_holder &) = delete;
+        ~expert_assignment_holder() {
+            ggml_expert_assignment_release(id);
+        }
+    };
+    expert_assignment_holder expert_assignment;
+
     uint64_t n_elements = 0;
 
     size_t n_bytes = 0;
@@ -2202,14 +2216,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         });
     }
 
-    // The expert tensors that are split over the devices along the expert dim: hand the loader the
-    // number of experts every device holds (the same split the meta buffer applies), it lays the
-    // experts of these tensors out by the expert assignment (llama_expert_layout).
-    for (const auto & [name, t] : tensors_by_name) {
-        if (t == nullptr || (t->flags & GGML_TENSOR_FLAG_EXPERT) == 0 || t->ne[2] <= 1) {
-            continue;
-        }
-        if (t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
+    // The expert weights that are split over the devices along the expert dim: hand the loader the
+    // number of experts every device holds (the same split the meta buffer applies) and the expert
+    // assignment table of the model, it lays the experts of these tensors out by that table
+    // (llama_expert_layout). The weights are those this loader created, in the expert store or
+    // plain device weights (a draft): borrowed tensors of another model keep that model's table.
+    for (const ggml_tensor * t : ml.expert_weights) {
+        if (t->ne[2] <= 1 || t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
             continue;
         }
         const ggml_backend_meta_split_state ss = llama_model_tensor_split_state(model, t);
@@ -2221,15 +2234,52 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ggml_backend_dev_t meta_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
         GGML_ASSERT(meta_dev != nullptr && ggml_backend_dev_is_meta(meta_dev));
         const size_t nd = ggml_backend_meta_dev_n_devs(meta_dev);
-        {
-            std::vector<int64_t> slices(nd, 0);
-            for (size_t j = 0; j < nd; j++) {
-                for (size_t s = 0; s < ss.n_segments; s++) {
-                    slices[j] += ss.ne[s*nd + j] * ss.nr[s];
-                }
+        std::vector<int64_t> slices(nd, 0);
+        for (size_t j = 0; j < nd; j++) {
+            for (size_t s = 0; s < ss.n_segments; s++) {
+                slices[j] += ss.ne[s*nd + j] * ss.nr[s];
             }
-            ml.expert_dev_slices.emplace(t, std::move(slices));
         }
+        ml.expert_dev_slices.emplace(t, std::move(slices));
+    }
+
+    // The table: one per model, for all its split expert weights, which therefore have to be split
+    // alike (the experts of a layer, gate/up and down, live on one device). Experts in the expert
+    // stores are laid out by the proposal the stores were planned with (the profile's permutation),
+    // plain device weights by the contiguous split the meta buffer applies to them; either way the
+    // table is placed by the loader, activated after the load and checked before the first graph.
+    if (!ml.expert_dev_slices.empty()) {
+        const ggml_tensor *          first    = ml.expert_dev_slices.begin()->first;
+        const std::vector<int64_t> & slices   = ml.expert_dev_slices.begin()->second;
+        const int64_t                n_expert = first->ne[2];
+        int  n_layer  = 0;
+        bool in_store = false;
+        bool plain    = false;
+        for (const auto & [t, sl] : ml.expert_dev_slices) {
+            int layer = -1;
+            if (sscanf(ggml_get_name(t), "blk.%d.", &layer) != 1 || layer < 0) {
+                throw std::runtime_error(format("%s: expert tensor '%s' has no layer number in its name", __func__, ggml_get_name(t)));
+            }
+            if (sl != slices || t->ne[2] != n_expert) {
+                throw std::runtime_error(format("%s: expert tensors '%s' and '%s' are split over the devices differently; "
+                    "the experts of a model need one assignment", __func__, ggml_get_name(first), ggml_get_name(t)));
+            }
+            n_layer = std::max(n_layer, layer + 1);
+            ((t->flags & GGML_TENSOR_FLAG_EXPERT) != 0 ? in_store : plain) = true;
+        }
+        if (in_store && plain) {
+            throw std::runtime_error(format("%s: the split expert tensors of the model are partly in the expert store and partly plain", __func__));
+        }
+        const uint32_t table = in_store
+            ? ggml_expert_assignment_from_proposal((int) slices.size(), n_layer, (int) n_expert)
+            : ggml_expert_assignment_contiguous((int) slices.size(), n_layer, (int) n_expert, slices.data());
+        if (table == 0) {
+            throw std::runtime_error(format("%s: no expert assignment table for %d layers of %lld experts over %zu devices%s",
+                __func__, n_layer, (long long) n_expert, slices.size(), in_store ? " (the expert buffers were planned with other sizes or not at all)" : ""));
+        }
+        // released with the model
+        pimpl->expert_assignment.id = table;
+        ml.expert_assignment = table;
     }
 
     // load tensor data
@@ -2239,13 +2289,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // every expert tensor that is split over the devices is written in the layout of the expert
-    // assignment now: make the assignment the active one, before the placement check below and
-    // before the first graph addresses the experts
-    if (ml.n_expert_tensors_by_table > 0) {
-        ggml_expert_store_activate_assignment();
-        LLAMA_LOG_INFO("%s: %d expert tensors laid out by the expert assignment (version %llu)\n",
-            __func__, ml.n_expert_tensors_by_table, (unsigned long long) ggml_expert_store_assignment_version());
+    // every expert tensor that is split over the devices is written in the layout of the table
+    // now: activate it for them, before the placement check below and before the first graph
+    // addresses the experts
+    if (ml.expert_assignment != 0) {
+        ggml_expert_assignment_activate(ml.expert_assignment, ml.expert_tensors_by_table.data(), ml.expert_tensors_by_table.size());
+        LLAMA_LOG_INFO("%s: %zu expert tensors laid out by the expert assignment (version %u)\n",
+            __func__, ml.expert_tensors_by_table.size(), ml.expert_assignment);
     }
 
     // The expert store buffer types need all tensor data written before they can check their

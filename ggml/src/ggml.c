@@ -3451,8 +3451,9 @@ static struct ggml_tensor * ggml_mul_mat_id_impl(
 
     if (swiglu) {
         // op_params[3] is the src1 precision, [4] the expert offset, [5] the expert parallel flag
-        // and [6] the global expert count, so the epilogue takes the next free slot; [8] and [9]
-        // are the layer and the device of the expert map (ggml_mul_mat_id_set_layer / _device)
+        // and [6] the global expert count, so the epilogue takes the next free slot; [8], [9] and
+        // [10] are the layer, the device and the assignment table of the expert map
+        // (ggml_mul_mat_id_set_layer / _device / _assignment)
         ggml_set_op_params_i32(result, 7, (int32_t) epilogue);
     }
 
@@ -3545,6 +3546,18 @@ int32_t ggml_mul_mat_id_get_device(const struct ggml_tensor * a) {
         return 0;
     }
     return ggml_get_op_params_i32(a, 9);
+}
+
+void ggml_mul_mat_id_set_assignment(struct ggml_tensor * a, int32_t assignment) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(a, 10, assignment);
+}
+
+int32_t ggml_mul_mat_id_get_assignment(const struct ggml_tensor * a) {
+    if (a->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+    return ggml_get_op_params_i32(a, 10);
 }
 
 // ggml_out_prod

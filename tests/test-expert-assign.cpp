@@ -1,7 +1,9 @@
-// Expert-to-device assignment (ggml_expert_store_owner and friends): the invariants every
-// consumer of the table relies on. No GPU and no model: the table is computed by the same
-// ggml_expert_store_plan() the backend calls, with a small artificial profile.
+// Expert-to-device assignment: the proposal (ggml_expert_store_owner and friends) and the tables the
+// loaded data follows (ggml_expert_assignment_*), with the invariants every consumer relies on. No
+// GPU and no model: the proposal is computed by the same ggml_expert_store_plan() the backend calls,
+// with a small artificial profile; the MUL_MAT_ID nodes are built in a context without data.
 
+#include "ggml.h"
 #include "ggml-expert-store.h"
 
 #include <cstdint>
@@ -204,26 +206,32 @@ int main() {
     }
     check(hot_on_dev0 < 8, "the hot experts are spread over the devices");
 
-    // ---- load positions: the device segments follow each other in device order, segment j
-    // holds the experts of device j in local order, every position is used once
+    // ---- the table of a model whose experts live in the stores: a snapshot of the proposal. Load
+    // positions: the device segments follow each other in device order, segment j holds the experts
+    // of device j in local order, every position is used once
+    const uint32_t tab_a = ggml_expert_assignment_from_proposal(n_dev, n_layer, n_expert);
+    check(tab_a > 0, "a table from the proposal");
+    check(ggml_expert_assignment_from_proposal(n_dev + 1, n_layer, n_expert) == 0, "no table from a proposal of other devices");
+    check(ggml_expert_assignment_from_proposal(n_dev, n_layer + 1, n_expert) == 0, "no table for more layers than the proposal has");
     {
         int n_dev_q = 0;
         int n_layer_q = 0;
         int n_expert_q = 0;
-        check(ggml_expert_store_assignment_dims(&n_dev_q, &n_layer_q, &n_expert_q), "assignment dims");
+        check(ggml_expert_assignment_dims(tab_a, &n_dev_q, &n_layer_q, &n_expert_q), "table dims");
         check_eq(n_dev_q, n_dev, "dims: devices");
         check_eq(n_layer_q, n_layer, "dims: layers");
         check_eq(n_expert_q, n_expert, "dims: experts");
         for (int j = 0; j < n_dev; ++j) {
-            check_eq(ggml_expert_store_assignment_cap(j), cap, "cap of every device");
+            check_eq(ggml_expert_assignment_cap(tab_a, j), cap, "cap of every device");
         }
-        check_eq(ggml_expert_store_assignment_cap(n_dev), -1, "cap of an unknown device");
+        check_eq(ggml_expert_assignment_cap(tab_a, n_dev), -1, "cap of an unknown device");
         for (int l = 0; l < n_layer; ++l) {
             std::vector<int> seen((size_t) n_expert, 0);
             for (int e = 0; e < n_expert; ++e) {
-                const int64_t pos   = ggml_expert_store_load_position(l, e);
+                const int64_t pos   = ggml_expert_assignment_load_position(tab_a, l, e);
                 const int     owner = ggml_expert_store_owner(l, e);
                 const int16_t * row = ggml_expert_store_local_of(owner, l);
+                check_eq(ggml_expert_assignment_owner(tab_a, l, e), owner, "the table owner is the proposal owner");
                 check(pos >= 0 && pos < n_expert, "load position in range");
                 if (pos < 0 || pos >= n_expert || row == nullptr) {
                     continue;
@@ -232,8 +240,20 @@ int main() {
                 check_eq(seen[(size_t) pos], 0, "load position used once");
                 seen[(size_t) pos] = 1;
             }
+            for (int j = 0; j < n_dev; ++j) {
+                const int16_t * t_row = ggml_expert_assignment_local_of(tab_a, j, l);
+                const int16_t * p_row = ggml_expert_store_local_of(j, l);
+                check(t_row != nullptr && p_row != nullptr && memcmp(t_row, p_row, (size_t) n_expert * sizeof(int16_t)) == 0,
+                    "the table rows are the proposal rows");
+                for (int k = 0; k < cap; ++k) {
+                    check_eq(ggml_expert_assignment_global_of(tab_a, j, l, k), ggml_expert_store_global_of(j, l, k), "table global_of == proposal");
+                }
+            }
         }
-        check_eq(ggml_expert_store_load_position(n_layer, 0), -1, "load position of an unknown layer");
+        check_eq(ggml_expert_assignment_load_position(tab_a, n_layer, 0), -1, "load position of an unknown layer");
+        check_eq(ggml_expert_assignment_load_position(tab_a + 1000, 0, 0), -1, "load position of an unknown table");
+        check(!ggml_expert_assignment_is_active(tab_a), "a table is not active before its loader activates it");
+        check(ggml_expert_assignment_fingerprint(tab_a) != 0, "the table has a fingerprint");
     }
 
     // ---- the device of a slice of the expert dim
@@ -245,62 +265,10 @@ int main() {
     check_eq(ggml_expert_store_slice_device(0, 9),  -2, "a longer slice is no segment");
     check_eq(ggml_expert_store_slice_device(32, 8), -2, "a slice past the end is no segment");
 
-    // ---- the active table before any activation is the contiguous split, whatever the proposal
-    // says: that is the layout of the memory until a loader placed the experts by the proposal.
-    // Seeding it with the contiguous split already gave it a version; an activation adds one.
-    check(!ggml_expert_store_active_is_permuted(), "no activation yet");
-    const uint64_t v_seed = ggml_expert_store_assignment_version();
-    check(v_seed > 0, "the seeded contiguous table has a version");
-    {
-        bool proposal_differs = false;
-        for (int l = 0; l < n_layer; ++l) {
-            for (int e = 0; e < n_expert; ++e) {
-                check_eq(ggml_expert_store_active_owner(l, e), e / cap, "active owner is contiguous before activation");
-                proposal_differs = proposal_differs || ggml_expert_store_owner(l, e) != e / cap;
-            }
-            for (int j = 0; j < n_dev; ++j) {
-                const int16_t * row = ggml_expert_store_active_local_of(j, l);
-                check(row != nullptr, "active local_of row");
-                for (int e = 0; row != nullptr && e < n_expert; ++e) {
-                    check_eq(row[e], e / cap == j ? e % cap : -1, "active local number is contiguous before activation");
-                }
-                for (int k = 0; k < cap; ++k) {
-                    check_eq(ggml_expert_store_active_global_of(j, l, k), j * cap + k, "active global_of is contiguous before activation");
-                }
-            }
-        }
-        check(proposal_differs, "the proposal of the profile differs from the contiguous split");
-    }
-
-    // ---- activation: the proposal becomes the active table
-    ggml_expert_store_activate_assignment();
-    check(ggml_expert_store_active_is_permuted(), "permuted after the first activation");
-    check_eq((long long) ggml_expert_store_assignment_version(), (long long) v_seed + 1, "first activation");
-    for (int l = 0; l < n_layer; ++l) {
-        for (int e = 0; e < n_expert; ++e) {
-            check_eq(ggml_expert_store_active_owner(l, e), ggml_expert_store_owner(l, e), "active owner == proposal after activation");
-        }
-        for (int j = 0; j < n_dev; ++j) {
-            const int16_t * a = ggml_expert_store_active_local_of(j, l);
-            const int16_t * p = ggml_expert_store_local_of(j, l);
-            check(a != nullptr && p != nullptr && memcmp(a, p, (size_t) n_expert * sizeof(int16_t)) == 0,
-                "active local_of == proposal after activation");
-            for (int k = 0; k < cap; ++k) {
-                check_eq(ggml_expert_store_active_global_of(j, l, k), ggml_expert_store_global_of(j, l, k), "active global_of == proposal after activation");
-                check_eq(ggml_expert_store_active_global_of_slice(j * cap, cap, l, k), ggml_expert_store_active_global_of(j, l, k),
-                    "global_of_slice names the device by its segment");
-            }
-        }
-    }
-    check_eq(ggml_expert_store_active_global_of_slice(0, n_expert, 0, 5), 5, "the whole dim maps local to itself");
-    check_eq(ggml_expert_store_active_global_of_slice(1, 8, 0, 0),       -1, "a slice that is no segment has no global expert");
-    check_eq(ggml_expert_store_active_global_of_slice(8, 8, 0, 8),       -1, "a local number past the segment has no global expert");
-    ggml_expert_store_activate_assignment();
-    check_eq((long long) ggml_expert_store_assignment_version(), (long long) v_seed + 2, "every activation counts");
-
     // ---- placement check: a store of device 1 receives the segment the loader lays out for it
-    // (the experts of device 1 in local order); the loader registers the hash of every global
-    // expert, and the check maps local -> global through the active table
+    // (the experts of device 1 in local order of table A); the loader registers the hash of every
+    // global expert, the activation of its table names the table of the tensor, and the check maps
+    // local -> global through that table
     {
         ggml_expert_store_backend be;
         be.user         = nullptr;
@@ -314,7 +282,7 @@ int main() {
 
         ggml_expert_store * store = ggml_expert_store_init(&be, /*device =*/ 1, nullptr);
         const int64_t blob = 1024;
-        std::vector<int64_t> slots((size_t) cap);
+        std::vector<int64_t> slots((size_t) n_expert);
         std::iota(slots.begin(), slots.end(), 0);
         const int id = ggml_expert_store_add_tensor(store, /*layer =*/ 0, /*kind =*/ 7, /*expert_base =*/ 8, cap,
             (size_t) blob, 0, 32, slots.data(), cap, -1);
@@ -323,7 +291,7 @@ int main() {
         std::vector<uint8_t> buf((size_t) blob);
         std::vector<uint8_t> seg((size_t) cap * blob);
         for (int k = 0; k < cap; ++k) {
-            fill_expert(buf, ggml_expert_store_active_global_of(1, 0, k));
+            fill_expert(buf, ggml_expert_assignment_global_of(tab_a, 1, 0, k));
             memcpy(seg.data() + (size_t) k * blob, buf.data(), (size_t) blob);
         }
         ggml_expert_store_write(store, id, seg.data(), 0, seg.size());
@@ -334,28 +302,72 @@ int main() {
             ggml_expert_store_set_source_hash(name, g, ggml_expert_store_hash_expert(buf.data(), (size_t) blob));
         }
 
+        // the loader's weight of that name, bound to table A by the activation
+        ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
+        ggml_context * ctx = ggml_init(ip);
+        ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, n_expert);
+        ggml_set_name(w, name);
+        const ggml_tensor * bind[1] = { w };
+        ggml_expert_assignment_activate(tab_a, bind, 1);
+        check(ggml_expert_assignment_is_active(tab_a), "active after the activation");
+        check_eq(ggml_expert_assignment_of_weight(w), tab_a, "the weight is bound to its table");
+
         int64_t n_checked = 0;
         int64_t n_skipped = 0;
         check(ggml_expert_store_verify_placement(store, id, name, &n_checked, &n_skipped), "the placement check passes");
         check_eq(n_checked, cap, "every local expert checked");
         check_eq(n_skipped, 0, "nothing skipped");
+        const ggml_expert_store_tensor * st = ggml_expert_store_tensor_at(store, id);
+        check(st != nullptr && st->assignment == tab_a && (int64_t) st->global_of.size() == cap, "the check records the table of the tensor");
+        for (int k = 0; st != nullptr && k < cap && k < (int) st->global_of.size(); ++k) {
+            check_eq(st->global_of[(size_t) k], ggml_expert_assignment_global_of(tab_a, 1, 0, k), "the recorded global numbers are the table's");
+        }
 
         check(ggml_expert_store_verify_placement(store, id, "blk.0.ffn_up_exps.weight", &n_checked, &n_skipped),
             "a tensor nobody registered is not a failure");
         check_eq(n_checked, 0, "nothing checked without source hashes");
         check_eq(n_skipped, cap, "every expert skipped without source hashes");
 
-        // the file's expert at one local number is another one than the active table says
-        const int g_wrong = ggml_expert_store_active_global_of(1, 0, 3);
+        // the file's expert at one local number is another one than the table says
+        const int g_wrong = ggml_expert_assignment_global_of(tab_a, 1, 0, 3);
         fill_expert(buf, g_wrong + 100);
         ggml_expert_store_set_source_hash(name, g_wrong, ggml_expert_store_hash_expert(buf.data(), (size_t) blob));
         check(!ggml_expert_store_verify_placement(store, id, name, &n_checked, &n_skipped), "a misplaced expert fails the placement check");
+
+        // a slice of the expert dim written in file order (no table) cannot be numbered
+        ggml_expert_store_clear_source_hashes();
+        for (int g = 0; g < n_expert; ++g) {
+            fill_expert(buf, g);
+            ggml_expert_store_set_source_hash(name, g, ggml_expert_store_hash_expert(buf.data(), (size_t) blob));
+        }
+        check(!ggml_expert_store_verify_placement(store, id, name, &n_checked, &n_skipped), "a split slice without a table fails the check");
 
         ggml_expert_store_clear_source_hashes();
         check(ggml_expert_store_verify_placement(store, id, name, &n_checked, &n_skipped) && n_skipped == cap,
             "cleared hashes: every expert skipped");
 
+        // a tensor that holds the whole expert dim in file order: the identity, no table needed
+        std::vector<int64_t> all_slots((size_t) n_expert);
+        std::iota(all_slots.begin(), all_slots.end(), 0);
+        const int id_all = ggml_expert_store_add_tensor(store, /*layer =*/ 1, /*kind =*/ 7, /*expert_base =*/ 0, n_expert,
+            (size_t) blob, 0, 32, all_slots.data(), n_expert, -1);
+        std::vector<uint8_t> whole((size_t) n_expert * blob);
+        const char * name_all = "blk.1.ffn_down_exps.weight";
+        for (int g = 0; g < n_expert; ++g) {
+            fill_expert(buf, g);
+            memcpy(whole.data() + (size_t) g * blob, buf.data(), (size_t) blob);
+            ggml_expert_store_set_source_hash(name_all, g, ggml_expert_store_hash_expert(buf.data(), (size_t) blob));
+        }
+        ggml_expert_store_write(store, id_all, whole.data(), 0, whole.size());
+        check(ggml_expert_store_verify_placement(store, id_all, name_all, &n_checked, &n_skipped) && n_checked == n_expert,
+            "the whole expert dim in file order passes with the identity");
+        const ggml_expert_store_tensor * st_all = ggml_expert_store_tensor_at(store, id_all);
+        check(st_all != nullptr && st_all->assignment == 0 && (int64_t) st_all->global_of.size() == n_expert &&
+            st_all->global_of[5] == 5, "the identity is recorded for the whole expert dim");
+        ggml_expert_store_clear_source_hashes();
+
         ggml_expert_store_free(store);
+        ggml_free(ctx);
     }
 
     // ---- the expert hash: head, middle and tail windows of a large expert, all bytes of a small one
@@ -451,100 +463,122 @@ int main() {
     check_eq(ggml_expert_store_owner(0, 999),     -1, "owner of an unknown expert");
     check(ggml_expert_store_local_of(n_dev, 0) == nullptr, "local_of of an unknown device");
 
-    // ---- the active table: the contiguous split until the loader activates the proposal, the
-    // proposal after that, the contiguous split again after a reset. The expert maps of the nodes
-    // (ggml_expert_store_node_lut) follow it. The activation above is undone first.
-    ggml_expert_store_reset_assignment();
-    plan_of(n_dev, "test-expert-assign-profile.txt", 0); // proposal: the profile LPT, 4 layers x 32 experts
+    // ---- two models, two tables: the target's experts are laid out by its table (A, the profile
+    // permutation over layers 0..3), the draft's by its own (B, the contiguous split of its slices,
+    // which has a layer 4 that A does not have). Every MUL_MAT_ID node reads the table of its own
+    // weight, whatever the layer number says: the draft's node of layer 4 finds its row, and a node
+    // of layer 0 of either model reads its own row.
     {
-        check(!ggml_expert_store_active_is_permuted(), "contiguous until activated");
-        const uint64_t v0 = ggml_expert_store_assignment_version();
-        check(v0 > 0, "the active table has a version");
-        int a_dev = 0;
-        int a_layer = 0;
-        int a_expert = 0;
-        check(ggml_expert_store_active_dims(&a_dev, &a_layer, &a_expert), "active dims");
-        check_eq(a_dev, n_dev, "active n_dev");
-        check_eq(a_layer, n_layer, "active n_layer");
-        check_eq(a_expert, n_expert, "active n_expert");
-
-        // contiguous rows: device j holds [j*cap, (j+1)*cap)
-        for (int j = 0; j < n_dev; ++j) {
-            for (int l = 0; l < n_layer; ++l) {
-                const int16_t * row = ggml_expert_store_active_local_of(j, l);
-                check(row != nullptr, "active row");
+        const int64_t caps_b[4] = { 7, 9, 8, 8 }; // a split that is not the even one
+        const uint32_t tab_b = ggml_expert_assignment_contiguous(n_dev, n_layer + 1, n_expert, caps_b);
+        check(tab_b > tab_a, "table ids count up");
+        check(ggml_expert_assignment_contiguous(n_dev, n_layer, n_expert + 1, caps_b) == 0, "the caps must cover the experts");
+        check_eq(ggml_expert_assignment_cap(tab_b, 1), 9, "the caps of a contiguous table are the slices");
+        check_eq(ggml_expert_assignment_slice_device(tab_b, 7, 9), 1, "the segment of device 1 of B");
+        check_eq(ggml_expert_assignment_slice_device(tab_b, 8, 8), -2, "the even segment is no segment of B");
+        check_eq(ggml_expert_assignment_slice_device(tab_b, 0, n_expert), -1, "the whole dim");
+        for (int l = 0; l <= n_layer; ++l) {
+            int base = 0;
+            for (int j = 0; j < n_dev; ++j) {
+                const int16_t * row = ggml_expert_assignment_local_of(tab_b, j, l);
+                check(row != nullptr, "contiguous row");
                 for (int e = 0; e < n_expert && row != nullptr; ++e) {
-                    const bool local = e >= j * cap && e < (j + 1) * cap;
-                    check_eq(row[e], local ? e - j * cap : -1, "active contiguous local number");
-                    check_eq(ggml_expert_store_active_owner(l, e) == j ? 1 : 0, local ? 1 : 0, "active contiguous owner");
+                    const bool local = e >= base && e < base + (int) caps_b[j];
+                    check_eq(row[e], local ? e - base : -1, "contiguous local number");
+                    check_eq(ggml_expert_assignment_load_position(tab_b, l, e), e, "contiguous load position is the expert");
                 }
-                for (int kk = 0; kk < cap; ++kk) {
-                    check_eq(ggml_expert_store_active_global_of(j, l, kk), j * cap + kk, "active contiguous global_of");
-                }
+                base += (int) caps_b[j];
             }
         }
 
-        // the map of a node while contiguous: its segment, the same row on every call; the map
-        // of a node without expert parallelism is the identity
-        const int16_t * seg = ggml_expert_store_node_lut(true, 1, 0, cap, cap, n_expert);
-        check(seg != nullptr, "segment row");
-        for (int e = 0; e < n_expert && seg != nullptr; ++e) {
-            check_eq(seg[e], e >= cap && e < 2 * cap ? e - cap : -1, "segment row entry");
-        }
-        check(ggml_expert_store_node_lut(true, 1, 0, cap, cap, n_expert) == seg, "the segment row is kept");
-        const int16_t * idn = ggml_expert_store_node_lut(false, 0, 0, 0, n_expert, n_expert);
-        check(idn != nullptr, "identity row");
+        ggml_init_params ip = { 512 * ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
+        ggml_context * ctx = ggml_init(ip);
+        // the per-device MUL_MAT_ID node of `dev` for a weight slice of n_local experts
+        const auto make_node = [&](int n_local, bool ep, int offset, int layer, int dev, int32_t table) {
+            ggml_tensor * as  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 16, n_local);
+            ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 1, 2);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, 2);
+            ggml_tensor * mm  = ggml_mul_mat_id(ctx, as, b, ids);
+            if (ep) {
+                ggml_mul_mat_id_set_expert_parallel(mm, true);
+                ggml_mul_mat_id_set_expert_offset(mm, offset);
+                ggml_mul_mat_id_set_n_expert_total(mm, n_expert);
+                ggml_mul_mat_id_set_layer(mm, layer);
+                ggml_mul_mat_id_set_device(mm, dev);
+                ggml_mul_mat_id_set_assignment(mm, table);
+            }
+            return mm;
+        };
+
+        ggml_expert_assignment_activate(tab_b, nullptr, 0);
+
+        // the identity without expert parallelism, a segment for a hand-built node (table 0)
+        const int16_t * idn = ggml_expert_store_node_lut(make_node(n_expert, false, 0, 0, 0, 0));
         for (int e = 0; e < n_expert && idn != nullptr; ++e) {
             check_eq(idn[e], e, "identity row entry");
         }
+        const int16_t * seg = ggml_expert_store_node_lut(make_node(cap, true, cap, 0, 1, 0));
+        for (int e = 0; e < n_expert && seg != nullptr; ++e) {
+            check_eq(seg[e], e >= cap && e < 2 * cap ? e - cap : -1, "segment row entry");
+        }
+        check(ggml_expert_store_node_lut(make_node(cap, true, cap, 2, 3, 0)) == seg, "the segment row is shared");
 
-        // activate: the active rows are the proposal, the maps of the expert parallel nodes are them
-        ggml_expert_store_activate_assignment();
-        check(ggml_expert_store_active_is_permuted(), "permuted after activation");
-        check(ggml_expert_store_assignment_version() > v0, "activation bumps the version");
-        bool differs = false;
+        bool rows_differ = false;
         for (int j = 0; j < n_dev; ++j) {
             for (int l = 0; l < n_layer; ++l) {
-                const int16_t * act = ggml_expert_store_active_local_of(j, l);
-                const int16_t * pro = ggml_expert_store_local_of(j, l);
-                check(act != nullptr && pro != nullptr, "active and proposal rows");
-                for (int e = 0; e < n_expert && act != nullptr && pro != nullptr; ++e) {
-                    check_eq(act[e], pro[e], "active row == proposal row");
-                    check_eq(ggml_expert_store_active_owner(l, e), ggml_expert_store_owner(l, e), "active owner == proposal owner");
-                    differs = differs || act[e] != (e >= j * cap && e < (j + 1) * cap ? e - j * cap : -1);
-                }
-                for (int kk = 0; kk < cap; ++kk) {
-                    check_eq(ggml_expert_store_active_global_of(j, l, kk), ggml_expert_store_global_of(j, l, kk), "active global_of == proposal");
-                }
-                check(ggml_expert_store_node_lut(true, j, l, j * cap, cap, n_expert) == act, "node map is the active row");
+                const int16_t * ra = ggml_expert_store_node_lut(make_node(cap, true, j * cap, l, j, (int32_t) tab_a));
+                check(ra == ggml_expert_assignment_local_of(tab_a, j, l), "a node of the target reads its row of A");
+                const int boff = (int) (j == 0 ? 0 : caps_b[0] + (j > 1 ? caps_b[1] : 0) + (j > 2 ? caps_b[2] : 0));
+                const int16_t * rb = ggml_expert_store_node_lut(make_node((int) caps_b[j], true, boff, l, j, (int32_t) tab_b));
+                check(rb == ggml_expert_assignment_local_of(tab_b, j, l), "a node of the draft of the same layer reads its row of B");
+                rows_differ = rows_differ || memcmp(ra, rb, (size_t) n_expert * sizeof(int16_t)) != 0;
             }
+            // the layer only the draft has (the MTP layer after the last layer of the target)
+            const int boff = (int) (j == 0 ? 0 : caps_b[0] + (j > 1 ? caps_b[1] : 0) + (j > 2 ? caps_b[2] : 0));
+            const int16_t * rb = ggml_expert_store_node_lut(make_node((int) caps_b[j], true, boff, n_layer, j, (int32_t) tab_b));
+            check(rb != nullptr && rb == ggml_expert_assignment_local_of(tab_b, j, n_layer), "the draft's own layer has a row in its table");
         }
-        check(differs, "the profile permutes the experts");
-        // a node without expert parallelism keeps the identity whatever the active table
-        check(ggml_expert_store_node_lut(false, 0, 0, 0, n_expert, n_expert) == idn, "identity row unchanged");
+        check(rows_differ, "the two tables give the nodes of one layer different rows");
 
-        // a plan without a profile (another device allocating) leaves the active table alone
-        {
-            ggml_expert_store_plan_tensor t = device_tensor(0);
-            ggml_expert_store_placement plan;
-            ggml_expert_store_plan(&t, 1, n_dev, -1, nullptr, &plan);
-        }
-        check(ggml_expert_store_active_is_permuted(), "a later plan keeps the activated table");
-        check(ggml_expert_store_active_dims(&a_dev, &a_layer, &a_expert) && a_layer == n_layer, "a later plan keeps the dims");
+        // weights: the binding the meta backend reads, a view answers for its tensor
+        ggml_tensor * w_a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 16, n_expert);
+        ggml_tensor * w_b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 16, n_expert);
+        ggml_tensor * w_off = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 16, n_expert);
+        ggml_tensor * v_a   = ggml_view_3d(ctx, w_a, 32, 16, n_expert / 2, w_a->nb[1], w_a->nb[2], 0);
+        ggml_set_name(w_a, "blk.0.ffn_gate_exps.weight");
+        ggml_set_name(w_b, "blk.4.ffn_gate_exps.weight");
+        const uint32_t tab_c = ggml_expert_assignment_contiguous(n_dev, 1, n_expert, caps_b);
+        const ggml_tensor * bind_c[1] = { w_b };
+        ggml_expert_assignment_activate(tab_c, bind_c, 1);
+        check_eq(ggml_expert_assignment_of_weight(w_b), tab_c, "the draft weight is bound to its table");
+        check_eq(ggml_expert_assignment_of_weight(w_a), -1, "a weight bound to nothing yet");
+        // the proposal of the profile again (the plans above computed others), the target's table
+        plan_of(n_dev, "test-expert-assign-profile.txt", 0);
+        const uint32_t tab_d = ggml_expert_assignment_from_proposal(n_dev, n_layer, n_expert);
+        check(tab_d > tab_c, "the target's table");
+        const ggml_tensor * bind_d[1] = { w_a };
+        ggml_expert_assignment_activate(tab_d, bind_d, 1);
+        check_eq(ggml_expert_assignment_of_weight(w_a), tab_d, "the target weight is bound to its table");
+        check_eq(ggml_expert_assignment_of_weight(v_a), tab_d, "a view answers for the tensor it views");
+        check_eq(ggml_expert_assignment_of_weight(w_off), -1, "an unbound weight");
 
-        // reset: back to the contiguous split, the segment rows again
-        const uint64_t v1 = ggml_expert_store_assignment_version();
-        ggml_expert_store_reset_assignment();
-        check(!ggml_expert_store_active_is_permuted(), "contiguous after reset");
-        check(ggml_expert_store_assignment_version() > v1, "reset bumps the version");
-        for (int j = 0; j < n_dev; ++j) {
-            const int16_t * row = ggml_expert_store_active_local_of(j, 0);
-            for (int e = 0; e < n_expert && row != nullptr; ++e) {
-                const bool local = e >= j * cap && e < (j + 1) * cap;
-                check_eq(row[e], local ? e - j * cap : -1, "contiguous again after reset");
-            }
-        }
-        check(ggml_expert_store_node_lut(true, 1, 0, cap, cap, n_expert) == seg, "the segment row again after reset");
+        // releasing a model drops its table and its bindings, the other model keeps its own
+        const size_t n_tables = ggml_expert_assignment_count();
+        ggml_expert_assignment_release(tab_d);
+        check_eq((long long) ggml_expert_assignment_count(), (long long) n_tables - 1, "one table less");
+        check_eq(ggml_expert_assignment_of_weight(w_a), -1, "the released weight is unbound");
+        check_eq(ggml_expert_assignment_of_weight(w_b), tab_c, "the other model keeps its binding");
+        check(!ggml_expert_assignment_is_active(tab_d) && ggml_expert_assignment_local_of(tab_d, 0, 0) == nullptr, "the released table is gone");
+        const uint32_t tab_e = ggml_expert_assignment_contiguous(n_dev, 1, n_expert, caps_b);
+        check(tab_e > tab_d, "a released id is not reused");
+        ggml_expert_assignment_release(tab_e);
+        ggml_expert_assignment_release(tab_c);
+        ggml_expert_assignment_release(tab_b);
+        ggml_expert_assignment_release(tab_a);
+        ggml_expert_assignment_release(0);
+        check_eq((long long) ggml_expert_assignment_count(), 0, "every table released");
+
+        ggml_free(ctx);
     }
 
     if (g_fail == 0) {

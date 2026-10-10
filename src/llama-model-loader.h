@@ -207,16 +207,23 @@ struct llama_model_loader {
     size_t n_bf16_converted = 0; // elements
     size_t n_bf16_clamped   = 0; // elements clamped to +-65504
 
+    // The routed expert weights this loader created (by their role), whether they go into the
+    // expert store or stay plain device weights (no_expert_store): both are laid out by the expert
+    // assignment table of the model when they are split over the devices along the expert dim.
+    std::set<const ggml_tensor *> expert_weights;
+
     // Expert tensors that are split over the devices along the expert dim, with the number of
     // experts every device holds (the slice lengths of the meta split, in device order). The
-    // model fills this before load_all_data(): the loader lays every expert of these tensors out
-    // at the position of the expert assignment (ggml_expert_store_load_position), the backend
-    // checks the placement after the load. A tensor that is not in the map holds the whole
-    // expert dim and keeps the file order.
+    // model fills this before load_all_data(), together with expert_assignment: the loader lays
+    // every expert of these tensors out at the position of that table
+    // (ggml_expert_assignment_load_position), the backend checks the placement after the load. A
+    // tensor that is not in the map holds the whole expert dim and keeps the file order.
     std::map<const ggml_tensor *, std::vector<int64_t>> expert_dev_slices;
-    // expert tensors laid out by the assignment in this load; the model activates the
-    // assignment once they are all written
-    int n_expert_tensors_by_table = 0;
+    // the expert assignment table of the model (0: no tensor is split along the expert dim)
+    uint32_t expert_assignment = 0;
+    // expert tensors laid out by the table in this load; the model activates the table for them
+    // once they are all written
+    std::vector<const ggml_tensor *> expert_tensors_by_table;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {

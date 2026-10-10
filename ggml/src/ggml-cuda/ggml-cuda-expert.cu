@@ -1989,9 +1989,11 @@ void ggml_backend_cuda_expert_verify_all(void) {
     }
     for (ggml_backend_cuda_expert_buffer_context * ctx : list) {
         ggml_cuda_set_device(ctx->device);
-        int64_t n_tensors = 0;
-        int64_t n_checked = 0;
-        int64_t n_skipped = 0;
+        int64_t  n_tensors = 0;
+        int64_t  n_checked = 0;
+        int64_t  n_skipped = 0;
+        uint32_t table     = 0;     // the table the tensors of the buffer were laid out by
+        bool     tables_differ = false;
         for (ggml_cuda_expert_tensor_state & s : ctx->tensors) {
             if (s.verify_done) {
                 continue;
@@ -2010,13 +2012,19 @@ void ggml_backend_cuda_expert_verify_all(void) {
                 GGML_ABORT("%s: expert placement check failed for tensor %s on device %d\n",
                     __func__, s.tensor != nullptr ? s.tensor->name : "?", ctx->device);
             }
+            const ggml_expert_store_tensor * st = ggml_expert_store_tensor_at(ctx->store, s.tensor_id);
+            if (n_tensors > 0 && st->assignment != table) {
+                tables_differ = true;
+            }
+            table = st->assignment;
             n_tensors++;
             n_checked += checked;
             n_skipped += skipped;
         }
         if (n_tensors > 0) {
-            GGML_LOG_INFO("%s: device %d: expert placement check: %" PRId64 " tensors, %" PRId64 " experts match the assignment (version %" PRIu64 "), %" PRId64 " skipped\n",
-                __func__, ctx->device, n_tensors, n_checked, ggml_expert_store_assignment_version(), n_skipped);
+            // one buffer holds the experts of one model, so one table; version 0 is the file order
+            GGML_LOG_INFO("%s: device %d: expert placement check: %" PRId64 " tensors, %" PRId64 " experts match the assignment (version %u%s), %" PRId64 " skipped\n",
+                __func__, ctx->device, n_tensors, n_checked, table, tables_differ ? ", tables differ" : "", n_skipped);
         }
     }
 
@@ -2293,9 +2301,11 @@ void ggml_cuda_expert_reset_allocation(ggml_backend_buffer_type_t buft) {
 
 // The expert map of a MUL_MAT_ID launch (see ggml_cuda_expert_lut): the device copy of the host
 // row ggml_expert_store_node_lut() gives for the node. The copies live in the backend context, one
-// per distinct map, so a launch that was captured into a CUDA graph keeps a valid pointer; a copy
-// is rewritten in place when the active assignment changed (the loader activated a permuted
-// assignment, or a test reset it), which happens outside of graph execution.
+// per distinct map, so a launch that was captured into a CUDA graph keeps a valid pointer. A row is
+// named by one 64-bit key read from the op params of the node - (assignment table, device, layer)
+// when the weight was laid out by a table, (expert_offset, n_local, n_total) for a contiguous
+// segment or the identity -, and a table never changes, so the copy is made once and every later
+// launch is one hash probe and a comparison of the slice it was made for: O(1), no lock, no atomic.
 ggml_cuda_expert_lut ggml_cuda_mul_mat_id_lut(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
     GGML_ASSERT(dst != nullptr && dst->op == GGML_OP_MUL_MAT_ID);
     const ggml_tensor * src0 = dst->src[0];
@@ -2303,24 +2313,46 @@ ggml_cuda_expert_lut ggml_cuda_mul_mat_id_lut(ggml_backend_cuda_context & ctx, c
     const int  n_local = (int) src0->ne[2];
     const bool ep      = ggml_mul_mat_id_is_expert_parallel(dst);
     // without expert parallelism every id is a local expert and keeps its number
-    const int  offset  = ep ? ggml_mul_mat_id_get_expert_offset(dst)  : 0;
-    const int  n_total = ep ? ggml_mul_mat_id_get_n_expert_total(dst) : n_local;
-    const int  layer   = ep ? ggml_mul_mat_id_get_layer(dst)          : 0;
-    const int  device  = ep ? ggml_mul_mat_id_get_device(dst)         : ctx.device;
-    if (n_local <= 0 || n_total < n_local || offset < 0 || offset + n_local > n_total) {
+    const int     offset  = ep ? ggml_mul_mat_id_get_expert_offset(dst)  : 0;
+    const int     n_total = ep ? ggml_mul_mat_id_get_n_expert_total(dst) : n_local;
+    const int32_t table   = ep ? ggml_mul_mat_id_get_assignment(dst)     : 0;
+    if (n_local <= 0 || n_total < n_local || n_total > INT16_MAX || offset < 0 || offset + n_local > n_total) {
         GGML_ABORT("%s: node %s: expert state offset %d, local %d, total %d is inconsistent\n",
             __func__, dst->name, offset, n_local, n_total);
     }
-    if (ep && ggml_expert_store_active_is_permuted() && device != ctx.device) {
-        // a permuted assignment is per device: the row of the node's device is only right on it
-        GGML_ABORT("%s: node %s is marked for device %d but runs on device %d\n", __func__, dst->name, device, ctx.device);
+
+    uint64_t key;
+    if (table > 0) {
+        // the row of a table belongs to one device: a node marked for another one would read the
+        // experts of that device's slice from this device's weights
+        const int device = ggml_mul_mat_id_get_device(dst);
+        const int layer  = ggml_mul_mat_id_get_layer(dst);
+        if (device != ctx.device) {
+            GGML_ABORT("%s: node %s is marked for device %d but runs on device %d\n", __func__, dst->name, device, ctx.device);
+        }
+        if (layer < 0 || layer > 0xFFFF || device < 0 || device > 0xFF) {
+            GGML_ABORT("%s: node %s: layer %d / device %d out of range\n", __func__, dst->name, layer, device);
+        }
+        key = (uint64_t) 1 << 63 | (uint64_t) table << 24 | (uint64_t) device << 16 | (uint64_t) layer;
+    } else if (table == 0) {
+        key = (uint64_t) offset << 32 | (uint64_t) n_local << 16 | (uint64_t) n_total;
+    } else {
+        // the weight of an expert parallel node was laid out by no table: the host side says why
+        ggml_expert_store_node_lut(dst);
+        GGML_ABORT("%s: node %s has no expert assignment\n", __func__, dst->name);
     }
 
-    const uint64_t version = ggml_expert_store_assignment_version();
-    const std::array<int, 6> key = { ep ? 1 : 0, device, layer, offset, n_local, n_total };
     auto it = ctx.expert_luts.find(key);
-    if (it == ctx.expert_luts.end() || it->second.version != version) {
-        const int16_t * host = ggml_expert_store_node_lut(ep, device, layer, offset, n_local, n_total);
+    if (it != ctx.expert_luts.end()) {
+        // the same row for another node of the same table, device and layer: its slice must be the
+        // one the host side checked against the table when the row was made
+        if (it->second.offset != offset || it->second.n_local != n_local || it->second.n != n_total) {
+            GGML_ABORT("%s: node %s: slice [%d, %d) of %d experts differs from the slice [%d, %d) of %d its expert map was made for\n",
+                __func__, dst->name, offset, offset + n_local, n_total,
+                it->second.offset, it->second.offset + it->second.n_local, it->second.n);
+        }
+    } else {
+        const int16_t * host = ggml_expert_store_node_lut(dst);
         GGML_ASSERT(host != nullptr);
 
         // the copy is synchronous: a graph capture in flight would record nothing of it and the
@@ -2328,21 +2360,19 @@ ggml_cuda_expert_lut ggml_cuda_mul_mat_id_lut(ggml_backend_cuda_context & ctx, c
         cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
         CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture));
         if (capture != cudaStreamCaptureStatusNone) {
-            GGML_ABORT("%s: the expert map of node %s changed (version %" PRIu64 ") while a CUDA graph is being captured\n",
-                __func__, dst->name, version);
+            GGML_ABORT("%s: the expert map of node %s is first needed while a CUDA graph is being captured\n",
+                __func__, dst->name);
         }
 
         ggml_cuda_set_device(ctx.device);
-        if (it == ctx.expert_luts.end()) {
-            ggml_backend_cuda_context::expert_lut_entry entry;
-            CUDA_CHECK(cudaMalloc((void **) &entry.dev, (size_t) n_total * sizeof(int16_t)));
-            entry.n = n_total;
-            it = ctx.expert_luts.emplace(key, entry).first;
-        }
-        GGML_ASSERT(it->second.n == n_total);
-        CUDA_CHECK(cudaMemcpy(it->second.dev, host, (size_t) n_total * sizeof(int16_t), cudaMemcpyHostToDevice));
-        it->second.host    = host;
-        it->second.version = version;
+        ggml_backend_cuda_context::expert_lut_entry entry;
+        CUDA_CHECK(cudaMalloc((void **) &entry.dev, (size_t) n_total * sizeof(int16_t)));
+        CUDA_CHECK(cudaMemcpy(entry.dev, host, (size_t) n_total * sizeof(int16_t), cudaMemcpyHostToDevice));
+        entry.host    = host;
+        entry.n       = n_total;
+        entry.offset  = offset;
+        entry.n_local = n_local;
+        it = ctx.expert_luts.emplace(key, entry).first;
     }
 
     ggml_cuda_expert_lut lut;

@@ -1279,10 +1279,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // Mark the MoE expert weights explicitly while the tensor is created, so the expert store
     // identifies them by the flag and never by the name. The flag is set for every load
     // (device, host, and the no-alloc fit trials); the store decides from its own buffer type
-    // and the layout whether it can place the tensor.
+    // and the layout whether it can place the tensor. Without the store (no_expert_store) they
+    // stay plain device weights; they are still expert weights for their layout over the devices.
     auto mark_expert_tensor = [&](ggml_tensor * tensor) {
-        if (!no_expert_store && llm_tensor_is_expert_weight(tn)) {
-            tensor->flags |= GGML_TENSOR_FLAG_EXPERT;
+        if (llm_tensor_is_expert_weight(tn)) {
+            expert_weights.insert(tensor);
+            if (!no_expert_store) {
+                tensor->flags |= GGML_TENSOR_FLAG_EXPERT;
+            }
         }
     };
 
@@ -1782,20 +1786,22 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
 
 // Layout of the experts of one expert tensor in the host buffer the loader writes. A tensor that is
 // split over the devices along the expert dim takes its experts at the positions of the expert
-// assignment: the buffer is the concatenation of the device segments (the meta buffer hands
-// segment j to device j), segment j holds the experts of device j in local order, so global expert
-// e sits at sum(experts of the devices before owner(e)) + local(e) (ggml_expert_store_load_position).
-// A tensor that holds the whole expert dim keeps the file order. Without a routing profile the
-// assignment is the contiguous split and the position of every expert is its own number: that is
-// the capability branch of a missing profile, not another code path - the same formula and the
-// same placement check run.
+// assignment table of the model: the buffer is the concatenation of the device segments (the meta
+// buffer hands segment j to device j), segment j holds the experts of device j in local order, so
+// global expert e sits at sum(experts of the devices before owner(e)) + local(e)
+// (ggml_expert_assignment_load_position). A tensor that holds the whole expert dim keeps the file
+// order. The table of a model whose experts live in the expert stores is the profile's proposal;
+// without a profile, and for plain device weights, it is the contiguous split and the position of
+// every expert is its own number: that is the capability branch of those cases, not another code
+// path - the same formula, the same activation and the same checks run.
 struct llama_expert_layout {
-    bool by_table = false;       // the experts are laid out by the expert assignment
+    bool by_table = false;       // the experts are laid out by the expert assignment table
     bool identity = true;        // position(e) == e for every expert
-    // the devices receive whole experts (a tensor on one device, or split along the expert dim),
-    // so the loader registers the hash of every expert for the placement check of the backend.
-    // A tensor the meta buffer splits along another axis hands every device a part of every
-    // expert; its bytes are not comparable per expert and the check skips it.
+    // the experts go into expert stores whose devices receive whole experts (a tensor on one
+    // device, or split along the expert dim), so the loader registers the hash of every expert for
+    // the placement check of the backend. A tensor the meta buffer splits along another axis hands
+    // every device a part of every expert; its bytes are not comparable per expert and the check
+    // skips it. Plain device weights have no store that could compare them.
     bool check    = false;
     int  layer    = -1;
     std::vector<int64_t> pos_of; // [n_expert] position of global expert e (by_table only)
@@ -1806,13 +1812,15 @@ struct llama_expert_layout {
 };
 
 // dev_slices: the experts every device holds of this tensor, nullptr when the tensor is not split
-// over the devices. The assignment must describe exactly the split the meta buffer applies (as many
-// devices, the quota of every device equal to its slice), otherwise the positions and the device
-// segments would disagree, which nothing downstream could repair: that is an error of the run.
-static llama_expert_layout llama_expert_layout_of(const ggml_tensor * cur, const std::vector<int64_t> * dev_slices) {
+// over the devices; table: the expert assignment table of the model. The table must describe
+// exactly the split the meta buffer applies (as many devices, the quota of every device equal to
+// its slice), otherwise the positions and the device segments would disagree, which nothing
+// downstream could repair: that is an error of the run.
+static llama_expert_layout llama_expert_layout_of(const ggml_tensor * cur, const std::vector<int64_t> * dev_slices, uint32_t table) {
     llama_expert_layout layout;
+    const bool in_store = (cur->flags & GGML_TENSOR_FLAG_EXPERT) != 0;
     if (dev_slices == nullptr) {
-        layout.check = cur->buffer == nullptr || !ggml_backend_buffer_is_meta(cur->buffer);
+        layout.check = in_store && (cur->buffer == nullptr || !ggml_backend_buffer_is_meta(cur->buffer));
         return layout;
     }
     const char *  name     = ggml_get_name(cur);
@@ -1829,9 +1837,9 @@ static llama_expert_layout llama_expert_layout_of(const ggml_tensor * cur, const
     int n_dev = 0;
     int n_layer = 0;
     int n_expert_table = 0;
-    if (!ggml_expert_store_assignment_dims(&n_dev, &n_layer, &n_expert_table)) {
+    if (table == 0 || !ggml_expert_assignment_dims(table, &n_dev, &n_layer, &n_expert_table)) {
         throw std::runtime_error(format("%s: tensor '%s' is split over the devices along the expert dim, "
-            "but no expert assignment exists (the expert buffers were not planned)", __func__, name));
+            "but the model has no expert assignment table", __func__, name));
     }
     if ((size_t) n_dev != dev_slices->size() || n_expert_table != n_expert || layer >= n_layer) {
         throw std::runtime_error(format("%s: tensor '%s' (layer %d, %" PRId64 " experts over %zu devices) does not match the "
@@ -1839,7 +1847,7 @@ static llama_expert_layout llama_expert_layout_of(const ggml_tensor * cur, const
             n_layer, n_expert_table, n_dev));
     }
     for (int j = 0; j < n_dev; j++) {
-        const int cap = ggml_expert_store_assignment_cap(j);
+        const int cap = ggml_expert_assignment_cap(table, j);
         if ((int64_t) cap != (*dev_slices)[(size_t) j]) {
             throw std::runtime_error(format("%s: tensor '%s': device %d holds %" PRId64 " experts but the expert assignment "
                 "gives it %d; the tensor split is not the even expert split the assignment is built for", __func__, name, j,
@@ -1848,12 +1856,12 @@ static llama_expert_layout llama_expert_layout_of(const ggml_tensor * cur, const
     }
 
     layout.by_table = true;
-    layout.check    = true;
+    layout.check    = in_store;
     layout.layer    = layer;
     layout.pos_of.resize((size_t) n_expert);
     std::vector<uint8_t> taken((size_t) n_expert, 0);
     for (int64_t e = 0; e < n_expert; e++) {
-        const int64_t pos = ggml_expert_store_load_position(layer, (int) e);
+        const int64_t pos = ggml_expert_assignment_load_position(table, layer, (int) e);
         GGML_ASSERT(pos >= 0 && pos < n_expert && !taken[(size_t) pos]);
         taken[(size_t) pos]      = 1;
         layout.pos_of[(size_t) e] = pos;
@@ -2189,15 +2197,15 @@ bool llama_model_loader::load_all_data(
     for (struct ggml_tensor * cur : tensors) {
         const std::string cur_name = ggml_get_name(cur);
 
-        // an expert tensor (one expert per ne[2] slice, placed by the expert store): where every
-        // expert goes in the buffer that is written, see llama_expert_layout
-        const bool is_expert = (cur->flags & GGML_TENSOR_FLAG_EXPERT) != 0 && cur->ne[2] > 1;
+        // a routed expert weight (one expert per ne[2] slice; in the expert store or a plain device
+        // weight): where every expert goes in the buffer that is written, see llama_expert_layout
+        const bool is_expert = expert_weights.count(cur) != 0 && cur->ne[2] > 1;
         llama_expert_layout layout;
         if (is_expert) {
             const auto sit = expert_dev_slices.find(cur);
-            layout = llama_expert_layout_of(cur, sit != expert_dev_slices.end() ? &sit->second : nullptr);
+            layout = llama_expert_layout_of(cur, sit != expert_dev_slices.end() ? &sit->second : nullptr, expert_assignment);
             if (layout.by_table) {
-                n_expert_tensors_by_table++;
+                expert_tensors_by_table.push_back(cur);
             }
         }
 
@@ -2387,9 +2395,11 @@ bool llama_model_loader::load_all_data(
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                // An expert tensor is read whole below instead: its experts are hashed for the
-                // placement check and laid out by the assignment, which needs the whole tensor.
-                if (upload_backend && !is_expert) {
+                // An expert tensor of the store or one laid out by the assignment table is read whole
+                // below instead: its experts are hashed for the placement check and laid out by the
+                // table, which needs the whole tensor.
+                const bool expert_whole = is_expert && ((cur->flags & GGML_TENSOR_FLAG_EXPERT) != 0 || layout.by_table);
+                if (upload_backend && !expert_whole) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);

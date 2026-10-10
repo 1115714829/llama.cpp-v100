@@ -2053,10 +2053,13 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 // slice, the kernels need the global count to estimate the columns per expert
                 ggml_mul_mat_id_set_n_expert_total(t_ij, (int32_t) tensor->src[0]->ne[2]);
                 // the expert map of the node (ggml_expert_store_node_lut) is the row of the layer of
-                // the weight on this device; the layer is the one the expert store files the weight
-                // under, i.e. the same reading of the "blk.N." name
+                // the weight on this device in the expert assignment table the loader laid the weight
+                // out by; the layer is the one the expert store files the weight under, i.e. the same
+                // reading of the "blk.N." name. The table is the one of the weight's own model: a
+                // draft and its target are laid out by different tables.
                 ggml_mul_mat_id_set_layer(t_ij, ggml_expert_layer_of_name(tensor->src[0]->name));
                 ggml_mul_mat_id_set_device(t_ij, ggml_backend_meta_buft_simple_device(tensor->buffer->buft, j));
+                ggml_mul_mat_id_set_assignment(t_ij, ggml_expert_assignment_of_weight(tensor->src[0]));
             }
         }
         if (tensor_is_expert && split_state.axis == GGML_BACKEND_SPLIT_AXIS_2) {

@@ -7398,21 +7398,22 @@ static int backend_device_index(ggml_backend_t backend) {
 }
 
 // Expert store under a permuted expert assignment. The loader of a model places the experts of a
-// device by the LPT proposal computed from the routing profile (local expert k of device d holds
-// global expert global_of(d, layer, k), see ggml_expert_store_compute_assignment) and activates the
-// assignment; from then on every consumer of the routing ids goes through the row of (device,
-// layer) of that assignment (ggml_expert_store_node_lut) instead of a contiguous range test. This
-// test plays the loader: it computes an assignment from an artificial profile, activates it, writes
-// the experts of its device into the store tensors in that order and marks the MUL_MAT_ID nodes
-// with the layer and the device like the meta backend does. The ids are global ids over all
-// n_mats experts, one store tensor per layer.
+// device by its table, a snapshot of the LPT proposal computed from the routing profile (local
+// expert k of device d holds global expert global_of(d, layer, k), see
+// ggml_expert_store_compute_assignment), and activates the table; from then on every consumer of
+// the routing ids of a node of that model goes through the row of (device, layer) of the table
+// (ggml_expert_store_node_lut) instead of a contiguous range test. This test plays the loader: it
+// computes a proposal from an artificial profile, takes its table, activates it, writes the experts
+// of its device into the store tensors in that order and marks the MUL_MAT_ID nodes with the layer,
+// the device and the table like the meta backend does. The ids are global ids over all n_mats
+// experts, one store tensor per layer.
 //   check_naive == false: the permuted node against the CPU reference, which reads the same row;
 //   check_naive == true:  the difference between the permuted node and the naive computation on the
 //                         full unpermuted weight (the slots of the other devices zeroed by a mask),
 //                         which has to be zero on both backends - a table error that both backends
 //                         share shows up here, the plain comparison would not see it.
 // The device of the test is the device of the backend; devices without a row in the n_dev
-// assignment skip the test. after_eval() restores the contiguous split for the cases after it.
+// assignment skip the test. after_eval() releases the table.
 struct test_mul_mat_id_expert_permute : public test_case {
     const ggml_type type_a;
     const int n_mats;    // global experts
@@ -7427,8 +7428,8 @@ struct test_mul_mat_id_expert_permute : public test_case {
 
     const int n_local;   // experts of the device of the test
 
-    int  dev       = -1;    // device of the backend, set in weight_buffer_type()
-    bool activated = false; // the permuted assignment is the active one
+    int      dev   = -1; // device of the backend, set in weight_buffer_type()
+    uint32_t table = 0;  // the activated table of the permutation, 0 in perf mode
 
     std::vector<ggml_tensor *> as_perm; // per layer: the store tensor of the device, n_local experts in local order
     std::vector<ggml_tensor *> as_full; // per layer: the full unpermuted weight the store tensor is cut from
@@ -7530,9 +7531,9 @@ struct test_mul_mat_id_expert_permute : public test_case {
                 continue;
             }
 
-            // the loader's part: the proposal from the profile, activated. The plan of the store
-            // allocation recomputes the proposal without a profile afterwards, which leaves the
-            // active table alone (it describes placed data).
+            // the loader's part: the proposal from the profile, its table, activated. The plan of
+            // the store allocation recomputes the proposal without a profile afterwards, which leaves
+            // the table alone (a table never changes).
             ggml_expert_store_profile profile;
             profile.n_layer  = n_layer;
             profile.n_expert = n_mats;
@@ -7543,15 +7544,15 @@ struct test_mul_mat_id_expert_permute : public test_case {
                 }
             }
             ggml_expert_store_compute_assignment("test-backend-ops permute", &profile, n_dev, n_layer, n_mats);
-            ggml_expert_store_activate_assignment();
-            activated = true;
-            GGML_ASSERT(ggml_expert_store_active_is_permuted());
+            table = ggml_expert_assignment_from_proposal(n_dev, n_layer, n_mats);
+            GGML_ASSERT(table != 0);
+            ggml_expert_assignment_activate(table, nullptr, 0);
 
             // the permutation must be a real one for the test to mean anything: the row of the
             // device differs from its contiguous segment
             bool permuted = false;
             for (int l = 0; l < n_layer && !permuted; ++l) {
-                const int16_t * row = ggml_expert_store_active_local_of(dev, l);
+                const int16_t * row = ggml_expert_assignment_local_of(table, dev, l);
                 GGML_ASSERT(row != nullptr);
                 int held = 0;
                 for (int e = 0; e < n_mats; ++e) {
@@ -7563,11 +7564,12 @@ struct test_mul_mat_id_expert_permute : public test_case {
             }
             GGML_ASSERT(permuted);
 
-            // the meta backend marks every per-device MUL_MAT_ID node with its device and the
-            // (unused under a permutation) contiguous segment start; the layer was set at build
+            // the meta backend marks every per-device MUL_MAT_ID node with its device, the start of
+            // the segment of the device and the table of its weight; the layer was set at build
             for (ggml_tensor * mm : mm_perm) {
                 ggml_mul_mat_id_set_device(mm, dev);
                 ggml_mul_mat_id_set_expert_offset(mm, dev * n_local);
+                ggml_mul_mat_id_set_assignment(mm, (int32_t) table);
             }
 
             // budgets: every expert in a slot, or two experts per tensor in the slots and the
@@ -7596,10 +7598,8 @@ struct test_mul_mat_id_expert_permute : public test_case {
 
     void after_eval(ggml_backend_t backend) override {
         GGML_UNUSED(backend);
-        if (activated) {
-            ggml_expert_store_reset_assignment();
-            activated = false;
-        }
+        ggml_expert_assignment_release(table);
+        table = 0;
     }
 
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
@@ -7692,7 +7692,7 @@ struct test_mul_mat_id_expert_permute : public test_case {
             if (!in_context(ctx, mask_l[l])) {
                 continue;
             }
-            const int16_t * row = activated ? ggml_expert_store_active_local_of(dev, (int) l) : nullptr;
+            const int16_t * row = table != 0 ? ggml_expert_assignment_local_of(table, dev, (int) l) : nullptr;
             std::vector<int32_t> ids((size_t) n_used * n);
             ggml_backend_tensor_get(ids_l[l], ids.data(), 0, ids.size() * sizeof(int32_t));
             std::vector<float> mask(ids.size());
@@ -7717,9 +7717,362 @@ struct test_mul_mat_id_expert_permute : public test_case {
             ggml_backend_tensor_get(as_full[l], full.data(), 0, full.size());
             for (int kk = 0; kk < n_local; ++kk) {
                 // perf mode has no activated assignment: the tensor is the contiguous segment then
-                const int g = activated ? ggml_expert_store_active_global_of(dev, (int) l, kk) : kk;
+                const int g = table != 0 ? ggml_expert_assignment_global_of(table, dev, (int) l, kk) : kk;
                 GGML_ASSERT(g >= 0 && g < n_mats);
                 ggml_backend_tensor_set(as_perm[l], full.data() + (size_t) g * expert_bytes, (size_t) kk * expert_bytes, expert_bytes);
+            }
+        }
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+
+    static bool in_context(ggml_context * ctx, const ggml_tensor * t) {
+        for (ggml_tensor * c = ggml_get_first_tensor(ctx); c != NULL; c = ggml_get_next_tensor(ctx, c)) {
+            if (c == t) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+// Two models on one device, each with its own expert assignment table, in one graph: the target's
+// experts are laid out by the permutation of its routing profile (table A, layer 0 only), the
+// draft's by its own table (table B, layers 0 and 1: a different permutation, or the contiguous split
+// of its slices). The draft has the layer number the target has (0) and one the target does not have
+// (1, like the MTP layer after the last layer of the target). Every MUL_MAT_ID node reads the table of
+// its own weight (op param assignment, which the meta backend writes from the binding of the weight):
+// the draft's node of layer 0 reads B and not A, the draft's node of layer 1 finds its row in B. A
+// node that read the other model's table would compute other experts than its weight holds, which
+// the naive variant catches; with one table for the process the draft's layer 1 had no row at all.
+// The target's weight is a store tensor; the draft's weights are store tensors too (b_in_store) or
+// plain device tensors of the same buffer, as the MTP draft keeps its experts (no_expert_store).
+//   check_naive == false: against the CPU reference, which reads the same rows;
+//   check_naive == true:  the difference to the naive computation on the full unpermuted weights
+//                         masked to the experts of this device, zero on both backends.
+struct test_mul_mat_id_expert_two_tables : public test_case {
+    const ggml_type type_a;
+    const int n_mats;    // global experts of every weight
+    const int n_used;
+    const int n_dev;     // devices of both tables, n_mats is a multiple
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool b_permuted;
+    const bool b_in_store;
+    const bool check_naive;
+
+    const int n_local;   // experts of the device of the test
+
+    int      dev     = -1;
+    uint32_t table_a = 0;
+    uint32_t table_b = 0;
+
+    // the three weights: [0] target layer 0 (table A), [1] draft layer 0 (table B), [2] draft layer 1 (table B)
+    static constexpr int N_W = 3;
+    ggml_tensor * as_w[N_W]   = {};
+    ggml_tensor * as_full[N_W] = {};
+    ggml_tensor * ids_w[N_W]  = {};
+    ggml_tensor * mask_w[N_W] = {};
+    ggml_tensor * mm_w[N_W]   = {};
+    ggml_tensor * out_diff = nullptr;
+    ggml_backend_buffer_type_t expert_buft = nullptr;
+
+    static int w_layer(int w) { return w == 2 ? 1 : 0; }
+    uint32_t w_table(int w) const { return w == 0 ? table_a : table_b; }
+
+    std::string vars() override {
+        return VARS_TO_STR10(type_a, n_mats, n_used, n_dev, m, n, k, b_permuted, b_in_store, check_naive);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_TWO_TABLES";
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * n_used * N_W;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (!check_naive) {
+            return test_case::err(a, b, n);
+        }
+        double result = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            result = std::max(result, (double) std::max(fabsf(a[i]), fabsf(b[i])));
+        }
+        return result;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        if (!check_naive) {
+            return test_case::max_err(backend);
+        }
+        GGML_UNUSED(backend);
+        return 1e-2;
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return check_naive; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return check_naive ? std::vector<ggml_tensor *>{ out_diff } : std::vector<ggml_tensor *>{};
+    }
+
+    test_mul_mat_id_expert_two_tables(ggml_type type_a = GGML_TYPE_Q4_K,
+            int n_mats = 48, int n_used = 4, int n_dev = 3,
+            int64_t m = 640, int64_t n = 8, int64_t k = 2560,
+            bool b_permuted = false, bool b_in_store = false, bool check_naive = false)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), n_dev(n_dev), m(m), n(n), k(k),
+            b_permuted(b_permuted), b_in_store(b_in_store), check_naive(check_naive), n_local(n_mats / n_dev) {
+            GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(n_dev > 0 && n_mats % n_dev == 0 && n_local >= 2);
+        }
+
+    bool use_weight_context() override { return true; }
+    bool requires_weight_buffer_type() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    // routing counts of the two models: pseudo-random and different, so the two permutations differ
+    static int64_t profile_count(int model, int layer, int expert) {
+        return model == 0
+            ? (int64_t) ((expert * 7919 + layer * 104729 + 17) % 101) + 1
+            : (int64_t) ((expert * 6007 + layer * 3571 + 71) % 97) + 1;
+    }
+
+    // a permutation table of n_layer layers from the counts of model `model`, activated
+    uint32_t permuted_table(int model, int n_layer) const {
+        ggml_expert_store_profile profile;
+        profile.n_layer  = n_layer;
+        profile.n_expert = n_mats;
+        profile.count.assign((size_t) n_layer * n_mats, 0);
+        for (int l = 0; l < n_layer; ++l) {
+            for (int e = 0; e < n_mats; ++e) {
+                profile.count[(size_t) l * n_mats + e] = profile_count(model, l, e);
+            }
+        }
+        ggml_expert_store_compute_assignment(model == 0 ? "test-backend-ops two tables A" : "test-backend-ops two tables B",
+            &profile, n_dev, n_layer, n_mats);
+        const uint32_t t = ggml_expert_assignment_from_proposal(n_dev, n_layer, n_mats);
+        GGML_ASSERT(t != 0);
+        return t;
+    }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        ggml_backend_dev_t bdev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg  = ggml_backend_dev_backend_reg(bdev);
+        if (reg == nullptr) {
+            return nullptr;
+        }
+        auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra == nullptr) {
+            return nullptr;
+        }
+        dev = backend_device_index(backend);
+        if (dev < 0 || dev >= n_dev) {
+            return nullptr;
+        }
+        for (ggml_backend_buffer_type_t * extra = get_extra(bdev); extra && *extra; ++extra) {
+            const std::string name = ggml_backend_buft_name(*extra);
+            if (name.size() < 8 || name.compare(name.size() - 8, 8, "_Experts") != 0) {
+                continue;
+            }
+
+            // the two loaders: the target's table from its profile, the draft's from its own
+            // profile or the contiguous split of its slices; both activated, neither replaces the other
+            table_a = permuted_table(0, 1);
+            if (b_permuted) {
+                table_b = permuted_table(1, 2);
+            } else {
+                std::vector<int64_t> caps((size_t) n_dev, n_local);
+                table_b = ggml_expert_assignment_contiguous(n_dev, 2, n_mats, caps.data());
+                GGML_ASSERT(table_b != 0);
+            }
+            ggml_expert_assignment_activate(table_a, nullptr, 0);
+            ggml_expert_assignment_activate(table_b, nullptr, 0);
+
+            // the test only means something if the two tables give the nodes of layer 0 of this
+            // device different rows, and the target's row is not the contiguous segment
+            const int16_t * ra = ggml_expert_assignment_local_of(table_a, dev, 0);
+            const int16_t * rb = ggml_expert_assignment_local_of(table_b, dev, 0);
+            GGML_ASSERT(ra != nullptr && rb != nullptr && ggml_expert_assignment_local_of(table_b, dev, 1) != nullptr);
+            GGML_ASSERT(ggml_expert_assignment_local_of(table_a, dev, 1) == nullptr); // the target has no layer 1
+            bool differ = false;
+            bool a_permuted = false;
+            for (int e = 0; e < n_mats; ++e) {
+                differ = differ || ra[e] != rb[e];
+                const int seg = e >= dev * n_local && e < (dev + 1) * n_local ? e - dev * n_local : -1;
+                a_permuted = a_permuted || ra[e] != seg;
+            }
+            GGML_ASSERT(differ && a_permuted);
+
+            // the meta backend marks every per-device node with its device, segment start and the
+            // table of its weight; the layers were set at build
+            for (int w = 0; w < N_W; ++w) {
+                ggml_mul_mat_id_set_device(mm_w[w], dev);
+                ggml_mul_mat_id_set_expert_offset(mm_w[w], dev * n_local);
+                ggml_mul_mat_id_set_assignment(mm_w[w], (int32_t) w_table(w));
+            }
+
+            // budgets: two experts per store tensor in the slots, the complement in the host arena
+            // with a staging area for the whole complement of one tensor
+            const int n_store = b_in_store ? N_W : 1;
+            const size_t blob_bytes  = expert_store_stride(type_a, k, m);
+            const size_t slot_bytes  = 2 * blob_bytes * (size_t) n_store;
+            const size_t stage_bytes = blob_bytes * (size_t) n_local;
+            auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
+            if (set_budget != nullptr) {
+                set_budget(*extra, slot_bytes, stage_bytes);
+            }
+            mark_expert_tensor(reg, *extra, as_w[0]);
+            if (b_in_store) {
+                mark_expert_tensor(reg, *extra, as_w[1]);
+                mark_expert_tensor(reg, *extra, as_w[2]);
+            }
+            expert_buft = *extra;
+            return *extra;
+        }
+        return nullptr;
+    }
+
+    void check_weight_alloc(ggml_backend_t backend) override {
+        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, /*all_slot =*/ false);
+    }
+
+    void after_eval(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        ggml_expert_assignment_release(table_a);
+        ggml_expert_assignment_release(table_b);
+        table_a = 0;
+        table_b = 0;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(b, "b");
+
+        // the target's gate weight of layer 0, the draft's gate weights of layers 0 and 1
+        static const char * const names[N_W] = {
+            "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.1.ffn_gate_exps.weight",
+        };
+
+        ggml_tensor * out  = nullptr;
+        ggml_tensor * diff = nullptr;
+        for (int w = 0; w < N_W; ++w) {
+            char name[64];
+
+            ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_local);
+            ggml_set_name(as, names[w]);
+            as_w[w] = as;
+
+            snprintf(name, sizeof(name), "as_full_%d", w);
+            as_full[w] = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+            ggml_set_name(as_full[w], name);
+
+            snprintf(name, sizeof(name), "ids_%d", w);
+            ids_w[w] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+            ggml_set_name(ids_w[w], name);
+
+            ggml_tensor * mm = ggml_mul_mat_id(ctx, as, b, ids_w[w]);
+            ggml_mul_mat_id_set_expert_parallel(mm, true);
+            ggml_mul_mat_id_set_n_expert_total(mm, n_mats);
+            ggml_mul_mat_id_set_layer(mm, w_layer(w));
+            // the device, the segment start and the table follow in weight_buffer_type()
+            snprintf(name, sizeof(name), "out_w%d", w);
+            ggml_set_name(mm, name);
+            mm_w[w] = mm;
+
+            out = out == nullptr ? mm : ggml_concat(ctx, out, mm, 2);
+
+            if (check_naive) {
+                snprintf(name, sizeof(name), "mask_%d", w);
+                mask_w[w] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+                ggml_set_name(mask_w[w], name);
+
+                ggml_tensor * naive = ggml_mul(ctx, ggml_mul_mat_id(ctx, as_full[w], b, ids_w[w]), mask_w[w]);
+                snprintf(name, sizeof(name), "naive_%d", w);
+                ggml_set_name(naive, name);
+
+                ggml_tensor * d = ggml_sub(ctx, mm, naive);
+                diff = diff == nullptr ? d : ggml_concat(ctx, diff, d, 2);
+            }
+        }
+        if (check_naive) {
+            ggml_set_name(diff, "out_diff");
+            out_diff = diff;
+            return diff;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = t->name;
+            if (name.compare(0, 4, "ids_") == 0) {
+                // top-k like: n_used distinct experts per token over the whole numbering
+                std::vector<int32_t> data(n_mats);
+                for (int i = 0; i < n_mats; i++) {
+                    data[i] = i;
+                }
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    std::shuffle(data.begin(), data.end(), rng);
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else if (name.compare(0, 5, "mask_") == 0 || name.compare(0, 4, "blk.") == 0) {
+                // filled below from the ids / the full weights
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+
+        // the mask of a weight: 1 for the slots routed to an expert this device holds of it
+        for (int w = 0; w < N_W; ++w) {
+            if (mask_w[w] == nullptr || !in_context(ctx, mask_w[w])) {
+                continue;
+            }
+            const uint32_t tab = w_table(w);
+            const int16_t * row = tab != 0 ? ggml_expert_assignment_local_of(tab, dev, w_layer(w)) : nullptr;
+            std::vector<int32_t> ids((size_t) n_used * n);
+            ggml_backend_tensor_get(ids_w[w], ids.data(), 0, ids.size() * sizeof(int32_t));
+            std::vector<float> mask(ids.size());
+            for (size_t i = 0; i < ids.size(); ++i) {
+                // perf mode has no table: the node is the contiguous segment [0, n_local)
+                const bool local = row != nullptr ? row[ids[i]] >= 0 : ids[i] < n_local;
+                mask[i] = local ? 1.0f : 0.0f;
+            }
+            ggml_backend_tensor_set(mask_w[w], mask.data(), 0, mask.size() * sizeof(float));
+        }
+
+        // the weight of the device: local expert kk is the global expert its own table names, what
+        // its loader writes. The compute context (the full weights) is initialized first.
+        for (int w = 0; w < N_W; ++w) {
+            if (!in_context(ctx, as_w[w])) {
+                continue;
+            }
+            const uint32_t tab = w_table(w);
+            const size_t expert_bytes = as_full[w]->nb[2];
+            GGML_ASSERT(as_w[w]->nb[2] == expert_bytes);
+            std::vector<uint8_t> full(ggml_nbytes(as_full[w]));
+            ggml_backend_tensor_get(as_full[w], full.data(), 0, full.size());
+            for (int kk = 0; kk < n_local; ++kk) {
+                const int g = tab != 0 ? ggml_expert_assignment_global_of(tab, dev, w_layer(w), kk) : kk;
+                GGML_ASSERT(g >= 0 && g < n_mats);
+                ggml_backend_tensor_set(as_w[w], full.data() + (size_t) g * expert_bytes, (size_t) kk * expert_bytes, expert_bytes);
             }
         }
     }
@@ -13840,6 +14193,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat_id_expert_permute(type_a, 48, 4, 2, 1, 640, 16,  2560, /*all_slot=*/true, true));
         test_cases.emplace_back(new test_mul_mat_id_expert_permute(type_a, 48, 4, 2, 1, 640, 512, 2560, /*all_slot=*/true, true));
+    }
+
+    // Two models with two expert assignment tables in one graph, the target and its MTP draft: every
+    // node reads the table of its own weight, the draft's layer after the target's last one has its
+    // row in the draft's table. The draft's weights are plain device tensors laid out by the
+    // contiguous split (what the MTP draft is), or store tensors under another permutation. n covers
+    // the MMVQ path with decode staging (1, 16) and the prefill path with the staging area (128).
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 16, 128}) {
+            for (bool check_naive : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id_expert_two_tables(type_a, 48, 4, 3, 640, n, 2560,
+                    /*b_permuted=*/false, /*b_in_store=*/false, check_naive));
+                test_cases.emplace_back(new test_mul_mat_id_expert_two_tables(type_a, 48, 4, 3, 640, n, 2560,
+                    /*b_permuted=*/true,  /*b_in_store=*/true,  check_naive));
+            }
+        }
     }
 
     // the expert weights in a plain device weight buffer, exactly as model loading leaves them:

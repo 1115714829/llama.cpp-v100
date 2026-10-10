@@ -1493,17 +1493,20 @@ struct ggml_backend_cuda_context {
     const struct ggml_backend_meta_assist_rank * assist = nullptr;
 
     // device copies of the expert maps of the MUL_MAT_ID launches (ggml_cuda_mul_mat_id_lut), one
-    // per distinct map, keyed by (expert parallel, device, layer, expert_offset, n_local, n_total).
-    // An entry lives as long as the context: a captured graph keeps the device pointer of its
-    // launches, so a map is only ever rewritten in place (when the active assignment changes, see
-    // ggml_expert_store_assignment_version), never moved or freed before the context goes.
+    // per distinct map, keyed by one 64-bit word: (assignment table, device, layer) for a node whose
+    // weight was laid out by a table, (expert_offset, n_local, n_total) for a contiguous segment or
+    // the identity. A table never changes and its id is never reused, so an entry is made once and
+    // stays right for the life of the context: a captured graph keeps the device pointer of its
+    // launches, which is never moved or freed before the context goes. The lookup is one hash
+    // probe per launch; the slice of the node is compared with the one the entry was made for.
     struct expert_lut_entry {
         int16_t *       dev     = nullptr;
         const int16_t * host    = nullptr;
         int             n       = 0;
-        uint64_t        version = 0;
+        int             offset  = 0; // the slice of the node the row was made for
+        int             n_local = 0;
     };
-    std::map<std::array<int, 6>, expert_lut_entry> expert_luts;
+    std::unordered_map<uint64_t, expert_lut_entry> expert_luts;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
@@ -1618,9 +1621,9 @@ struct ggml_backend_cuda_context {
 // weight slice and into the expert store tables) or -1 for an expert held by another device; ids
 // outside [0, n) are not local either. The row is a device copy of ggml_expert_store_node_lut()
 // (ggml-impl.h) made by ggml_cuda_mul_mat_id_lut(): the identity for a node without expert
-// parallelism, the contiguous segment of the device while the experts are the contiguous split,
-// and the row of the permuted assignment once the loader activated one. The kernels never test an
-// id against a range: this map is the one place that knows which expert is local.
+// parallelism, otherwise the row of (device, layer) of the expert assignment table the weight of
+// the node was laid out by. The kernels never test an id against a range: this map is the one
+// place that knows which expert is local.
 struct ggml_cuda_expert_lut {
     const int16_t * map  = nullptr; // device memory
     const int16_t * host = nullptr; // the same row in host memory, for the host side sorted path

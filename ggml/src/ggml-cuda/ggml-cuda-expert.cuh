@@ -84,12 +84,13 @@ bool ggml_cuda_expert_supported(void);
 bool ggml_cuda_expert_table_get(const ggml_tensor * src0, ggml_cuda_expert_table * table);
 
 // The expert map of a MUL_MAT_ID node (see ggml_cuda_expert_lut in common.cuh): the device copy of
-// ggml_expert_store_node_lut() for the node, held by the context and keyed by the inputs of that
-// row (expert parallel flag, device, layer, expert offset, local and global expert count of the
-// node). The copy is made on the first launch that needs it and remade when the active assignment
-// changed (ggml_expert_store_assignment_version); both happen outside of a graph capture, a capture
-// in flight at that moment aborts instead of recording a stale table. dst is the MUL_MAT_ID node
-// itself; a fused launch passes the MUL_MAT_ID node that carries the expert state.
+// ggml_expert_store_node_lut() for the node, held by the context and keyed by the row it is: the
+// (assignment table, device, layer) of a node whose weight was laid out by an expert assignment
+// table, the (expert offset, local and global expert count) of a contiguous segment or the
+// identity. A table never changes, so the copy is made once, on the first launch that needs it,
+// which happens outside of a graph capture (a capture in flight at that moment aborts instead of
+// recording a table that is still being written); every later launch is one hash probe. dst is the
+// MUL_MAT_ID node itself; a fused launch passes the MUL_MAT_ID node that carries the expert state.
 ggml_cuda_expert_lut ggml_cuda_mul_mat_id_lut(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
 
 // prepare the staging area for one prefill launch: the routed host experts of this batch
