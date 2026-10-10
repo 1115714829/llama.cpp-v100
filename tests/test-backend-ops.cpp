@@ -6508,7 +6508,8 @@ struct test_mul_mat_id_expert : public test_mul_mat_id {
             bool all_slot = false, int n_host = -1)
         : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k), all_slot(all_slot),
           n_host(n_host < 0 ? n_mats - 2 : n_host) {
-        GGML_ASSERT(all_slot || n_host > 0);
+        // the parameter shadows the member: check the member, the parameter is -1 by default
+        GGML_ASSERT(all_slot || this->n_host > 0);
     }
 
     const bool all_slot;   // every expert in a VRAM slot: no host complement, no staging
