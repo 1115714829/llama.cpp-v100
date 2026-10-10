@@ -119,8 +119,8 @@ void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_device) {
     }
 
     // tensors of the same layer (gate/up/down) share one profile row: sum their counts.
-    // With expert parallelism a store holds a contiguous slice of the experts, so the local
-    // expert numbers are shifted by the tensor's global expert base.
+    // With expert parallelism a store holds one device's segment of the experts; which global
+    // expert a local one is comes from the active assignment (the layout the kernels counted on).
     int64_t n_layer = 0;
     for (const ggml_expert_store_tensor & t : store->tensors) {
         if (!t.stat_experts.empty() && t.layer >= 0) {
@@ -772,10 +772,28 @@ void ggml_expert_store_plan(
             order[(size_t) e] = e;
         }
         if (have_profile && in.layer >= 0 && profile.n_layer > in.layer && profile.n_expert > 0) {
+            // the profile row of a local expert is the one of the global expert the assignment
+            // puts there: the loader lays the slice out by the proposal computed above, so the
+            // proposal (not the active table of the layout still in memory) is the right map here
+            const int dev = ggml_expert_store_slice_device(in.expert_base, in.n_expert);
+            if (dev == -2) {
+                GGML_ABORT("%s: layer %d: experts [%" PRId64 ", %" PRId64 ") are no segment of the expert assignment\n",
+                    __func__, in.layer, in.expert_base, in.expert_base + in.n_expert);
+            }
+            const auto global_of = [&](int64_t local) -> int64_t {
+                if (dev == -1) {
+                    return local; // the whole expert dim on one device
+                }
+                const int g = ggml_expert_store_global_of(dev, in.layer, (int) local);
+                GGML_ASSERT(g >= 0);
+                return g;
+            };
+            const auto count_of = [&](int64_t local) -> int64_t {
+                const int64_t g = global_of(local);
+                return g < profile.n_expert ? profile.at(in.layer, g) : 0;
+            };
             std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
-                const int64_t ca = a + in.expert_base < profile.n_expert ? profile.at(in.layer, a + in.expert_base) : 0;
-                const int64_t cb = b + in.expert_base < profile.n_expert ? profile.at(in.layer, b + in.expert_base) : 0;
-                return ca > cb;
+                return count_of(a) > count_of(b);
             });
         }
 

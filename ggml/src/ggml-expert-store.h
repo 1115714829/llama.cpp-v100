@@ -146,9 +146,12 @@ struct ggml_expert_store_backend {
 struct ggml_expert_store_tensor {
     int      layer      = -1;
     int      kind       = -1; // llm tensor id of one of the ffn_*_exps tensors
-    // global index of expert 0 of this tensor: with expert parallelism each device holds a
-    // contiguous slice of the expert dim, so the profile and the routing dump need the base
-    // to address global (layer, expert) entries. Always 0 for layer-split tensors.
+    // start of this device's segment of the expert dim (the prefix sum of the segment lengths
+    // of the preceding devices): with expert parallelism each device holds n_expert experts of
+    // the tensor. Which global expert a local one is comes from the assignment table
+    // (ggml_expert_store_active_global_of_slice with expert_base and n_expert), not from
+    // expert_base + local: the loader lays the experts out by that table. Always 0 for
+    // layer-split tensors, which hold the whole expert dim.
     int64_t  expert_base = 0;
     int64_t  n_expert   = 0;
     size_t   blob_bytes = 0;  // data bytes of one expert inside this tensor
@@ -265,8 +268,10 @@ GGML_API void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_de
 struct ggml_expert_store_plan_tensor {
     int     layer      = -1; // profile row of the tensor
     int64_t n_expert   = 0;
-    // global index of expert 0 of this tensor (expert parallelism). The profile is addressed
-    // with expert_base + local expert, so the per-device slices of a tensor share one row.
+    // start of this device's segment of the expert dim (expert parallelism): the prefix sum of
+    // the segment lengths of the preceding devices. Together with n_expert it names the device
+    // (ggml_expert_store_slice_device); the profile row of a local expert is the one of the
+    // global expert the assignment maps it to, not expert_base + local.
     int64_t expert_base = 0;
     size_t  blob_bytes = 0;  // data bytes of one expert
     // trailing bytes one expert needs past its data for the row padding of the kernels.
