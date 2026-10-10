@@ -12913,6 +12913,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, 5120, {1, 1}, {1, 1}));
 
+    // Q8_0 skinny GEMM on the narrow Qwen3.8-Flash-Next decode shapes (6-card tensor split): the
+    // hyper-connection down projection (N = 320, 10 tiles) splits K over several CTAs per tile
+    // for M <= 16; the up projection (K = 320) and the shared expert down (K = 640) keep one CTA
+    for (int64_t n_tokens : {1, 2, 4, 7, 8, 9, 16, 17, 32}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320, n_tokens, 10240, {1, 1}, {1, 1}));
+    }
+    for (int64_t n_tokens : {1, 4, 8, 16}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, n_tokens, 320, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, n_tokens, 640, {1, 1}, {1, 1}));
+    }
+
     // Q2_K/Q3_K/Q4_K/Q5_K/Q6_K skinny GEMM (repacked codes + raw super-block meta, sm_70):
     // M <= 16 runs the single-stage kernel, M = 17..64 the two-phase M=32 kernel (split-16
     // shapes), M > 64 expands the repacked weights to F16 and uses the regular dense path. The
@@ -12972,6 +12983,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // M=32 kernels plus the elementwise SWIGLU
     for (int64_t n_tokens : {1, 8, 16, 24, 32, 48, 64}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n_tokens, 4352, 5120,
+            false, 1, 1, false, false, true, false, {1, 1}));
+    }
+    // the Qwen3.8-Flash-Next shared expert gate/up (N = 640, 20 tiles): K split over several CTAs
+    for (int64_t n_tokens : {1, 2, 4, 8, 9, 16}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n_tokens, 640, 2560,
             false, 1, 1, false, false, true, false, {1, 1}));
     }
 

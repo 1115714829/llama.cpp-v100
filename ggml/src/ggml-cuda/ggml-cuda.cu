@@ -894,6 +894,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (tile_counters != nullptr) {
+        CUDA_CHECK(cudaFree(tile_counters));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -10401,6 +10404,15 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
     if (ctx == nullptr) {
         GGML_LOG_ERROR("%s: failed to allocate context\n", __func__);
         return nullptr;
+    }
+
+    // the split-K q8 skinny kernels count CTAs per tile in these (see q8-skinny.cu); they are
+    // allocated here because a skinny kernel may first run inside a CUDA graph capture
+    if (ggml_cuda_info().devices[device].cc == GGML_CUDA_CC_VOLTA) {
+        const size_t bytes = sizeof(unsigned int) * GGML_CUDA_MAX_STREAMS * GGML_CUDA_MAX_SPLIT_TILES;
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaMalloc((void **) &ctx->tile_counters, bytes));
+        CUDA_CHECK(cudaMemset(ctx->tile_counters, 0, bytes));
     }
 
     ggml_backend_t cuda_backend = new ggml_backend {
