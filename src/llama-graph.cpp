@@ -4027,10 +4027,15 @@ void llm_graph_context::build_logits_topk() const {
     const int32_t k        = cparams.logits_topk;
     const int32_t n_shards = cparams.logits_topk_shards;
 
-    if (k <= 0 || !res->t_logits || res->t_logits->ne[1] == 0) {
+    if (k <= 0 || !res->t_logits) {
         return;
     }
 
+    // a ubatch without output rows (a prefill chunk whose outputs come later) still gets the top-k
+    // nodes, on the empty logits: the graph topology must not depend on the number of outputs, or it
+    // differs from the reserved worst case (which has outputs and the top-k) and the allocator
+    // re-reserves on every such ubatch (a device synchronization plus a full re-plan each time, see
+    // ggml_backend_sched_alloc_splits). The empty nodes compute nothing, like the lm head on no rows
     ggml_tensor * logits = res->t_logits; // [n_vocab, n_outputs]
 
     const int64_t n_vocab = logits->ne[0];

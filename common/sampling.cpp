@@ -1101,6 +1101,11 @@ static llama_token common_sampler_sample_greedy_topk(struct common_sampler * gsm
         return a.logit != b.logit ? a.logit > b.logit : a.id < b.id;
     });
 
+    if (common_log_get_verbosity_thold() >= LOG_LEVEL_TRACE && n >= 2) {
+        LOG_INF("spec %12.*s: row %d top-2: id=%d logit=%.6f | id=%d logit=%.6f%s\n", (int) strlen(__func__), __func__,
+                idx, cur[0].id, cur[0].logit, cur[1].id, cur[1].logit, cur[0].logit == cur[1].logit ? " TIE" : "");
+    }
+
     cur_p = { cur.data(), cur.size(), -1, true };
 
     llama_sampler_apply(gsmpl->chain, &cur_p);
