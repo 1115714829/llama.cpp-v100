@@ -377,6 +377,25 @@ static ggml_backend_buffer_type_t ggml_backend_meta_buft_simple_expert_buft(ggml
     return meta_buft_ctx->simple_expert_bufts[index];
 }
 
+// Device number of the simple buffer type at index: the position of its device in the registry of
+// its backend. The CUDA registry lists its devices in CUDA device order, so this is the number the
+// expert store (one store per device) and the expert maps of the MUL_MAT_ID nodes are keyed by.
+// -1 when the device is not listed by its registry.
+static int ggml_backend_meta_buft_simple_device(ggml_backend_buffer_type_t meta_buft, size_t index) {
+    ggml_backend_buffer_type_t simple_buft = ggml_backend_meta_buft_simple_buft(meta_buft, index);
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(simple_buft);
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return -1;
+    }
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
 // the simple buffers of this type are views of one host allocation shared by all devices
 static bool ggml_backend_meta_buft_is_shared(ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(ggml_backend_buft_is_meta(buft));
@@ -2033,6 +2052,11 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
                 // the global expert count of the unsplit weight: as->ne[2] is only this device's
                 // slice, the kernels need the global count to estimate the columns per expert
                 ggml_mul_mat_id_set_n_expert_total(t_ij, (int32_t) tensor->src[0]->ne[2]);
+                // the expert map of the node (ggml_expert_store_node_lut) is the row of the layer of
+                // the weight on this device; the layer is the one the expert store files the weight
+                // under, i.e. the same reading of the "blk.N." name
+                ggml_mul_mat_id_set_layer(t_ij, ggml_expert_layer_of_name(tensor->src[0]->name));
+                ggml_mul_mat_id_set_device(t_ij, ggml_backend_meta_buft_simple_device(tensor->buffer->buft, j));
             }
         }
         if (tensor_is_expert && split_state.axis == GGML_BACKEND_SPLIT_AXIS_2) {

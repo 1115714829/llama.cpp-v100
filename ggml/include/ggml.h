@@ -1551,6 +1551,15 @@ extern "C" {
     // use this global count instead. Returns 0 when the node is not MUL_MAT_ID or it is not set.
     GGML_API void    ggml_mul_mat_id_set_n_expert_total(struct ggml_tensor * a, int32_t n_expert_total);
     GGML_API int32_t ggml_mul_mat_id_get_n_expert_total(const struct ggml_tensor * a);
+    // expert parallelism: the layer of the expert weight (the N of its "blk.N." name) and the device
+    // that computes this node. The two select the expert map of the node (which global expert id is
+    // which local expert of the device, see ggml_expert_store_node_lut); the map replaces the
+    // [expert_offset, expert_offset + as->ne[2]) range test once the experts of a layer are no
+    // longer a contiguous range of the numbering. Both return 0 when the node is not MUL_MAT_ID.
+    GGML_API void    ggml_mul_mat_id_set_layer(struct ggml_tensor * a, int32_t layer);
+    GGML_API int32_t ggml_mul_mat_id_get_layer(const struct ggml_tensor * a);
+    GGML_API void    ggml_mul_mat_id_set_device(struct ggml_tensor * a, int32_t device);
+    GGML_API int32_t ggml_mul_mat_id_get_device(const struct ggml_tensor * a);
 
     // A: m columns, n rows,
     // B: p columns, n rows,
