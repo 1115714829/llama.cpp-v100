@@ -20,7 +20,7 @@ inline constexpr size_t COMMON_FIT_TARGET_DEFAULT = 1024ull*1024*1024;
 // runs of 75 requests of 15 shapes: short to 200K prompts, outputs up to 2048, prefix reuse):
 // at most 521 MiB per card with NCCL 2.27 and 443 MiB with NCCL 2.21, flat from the third round
 // on; NCCL 2.29 projects to at most 540 MiB. The default keeps at least 250 MiB free above each
-// of them (mimo-runs/margin-report.md, section 7).
+// of them.
 inline constexpr size_t COMMON_FIT_EP_MARGIN_DEFAULT = 800ull*1024*1024;
 
 enum common_params_fit_status {
