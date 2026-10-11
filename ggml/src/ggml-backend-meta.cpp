@@ -1434,10 +1434,11 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1, {0}, false};
     };
 
-    // the selection reads every pool of every token: all mirrored
+    // the selection reads every pool of every token: all mirrored (q, the key table, pool_idxs, tail_idxs, pool_rng,
+    // pool_cells)
     auto handle_qsa_select = [&](
             const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
-        for (size_t i = 0; i < 5; i++) {
+        for (size_t i = 0; i < 6; i++) {
             GGML_ASSERT(src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
         return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1, {0}, false};

@@ -2768,20 +2768,24 @@ extern "C" {
     // QSA selection: score the pooled keys like the lightning indexer with every head weight set to
     // head_scale, keep the n_top_pool best pools a token can see and expand them into cell ids.
     //
-    // q         [n_embd_idx, n_head_idx, n_tokens]  F32, normed and rotated
-    // k         [n_embd_idx, 1,          n_pool  ]  pooled keys, one per block
-    // pool_idxs [kpool,      n_pool]                I32 member cells of each block
-    // tail_idxs [kpool - 1,  n_tokens]              I32 incomplete tail cells of each token
-    // pool_rng  [2,          n_tokens]              I32 the pools [lo, hi) a token can see
-    // res       [kpool*n_top_pool + kpool - 1, n_tokens] I32
+    // q          [n_embd_idx, n_head_idx, n_tokens]  F32, normed and rotated
+    // k          [n_embd_idx, 1,          n_rows  ]  key table (the pooled keys in the indexer cache rows)
+    // pool_cells [n_pool]                            I32 row of k holding the pooled key of each block
+    // pool_idxs  [kpool,      n_pool]                I32 member cells of each block
+    // tail_idxs  [kpool - 1,  n_tokens]              I32 incomplete tail cells of each token
+    // pool_rng   [2,          n_tokens]              I32 the pools [lo, hi) a token can see
+    // res        [kpool*n_top_pool + kpool - 1, n_tokens] I32
     //
-    // The kept pools are the n_top_pool highest scores of [lo, hi), equal scores by ascending pool
-    // index. A row holds the cells of the kept pools in ascending pool index, then the tail cells
-    // that are not sentinel, then -1 up to the end: the valid ids are a prefix of the row.
+    // Pool b is scored with the key in row pool_cells[b] of k, read in place (the rows may be strided
+    // and quantized, every pool_cells entry must address a row of k). The kept pools are the
+    // n_top_pool highest scores of [lo, hi), equal scores by ascending pool index. A row holds the
+    // cells of the kept pools in ascending pool index, then the tail cells that are not sentinel,
+    // then -1 up to the end: the valid ids are a prefix of the row.
     GGML_API struct ggml_tensor * ggml_qsa_select(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
+        struct ggml_tensor  * pool_cells,
         struct ggml_tensor  * pool_idxs,
         struct ggml_tensor  * tail_idxs,
         struct ggml_tensor  * pool_rng,

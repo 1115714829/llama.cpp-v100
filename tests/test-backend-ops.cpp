@@ -11982,8 +11982,10 @@ struct test_lightning_indexer : public test_case {
 };
 
 // GGML_OP_QSA_SELECT
-// integer-valued q and keys keep every score exact on every backend (the CUDA scorer stages the keys in half), so the
-// selection, equal scores included, must match the CPU id for id
+// integer-valued q and keys keep every score exact on every backend, so the selection, equal scores included, must
+// match the CPU id for id. The keys are read in place through pool_cells from a cache-like table: rows of raw key |
+// pooled key (the selection reads the second half, rows are strided), more rows than pools, the pools in shuffled rows.
+// real: uniform q and keys for the perf cases (a realistic spread of the scores for the top-k), not exact
 struct test_qsa_select : public test_case {
     const int64_t n_pool;  // pools, the last n_pad of them padded
     const int64_t n_pad;
@@ -11991,9 +11993,10 @@ struct test_qsa_select : public test_case {
     const int64_t kpool;
     const int64_t n_top;
     const ggml_type type_K;
+    const bool    real;
 
     std::string vars() override {
-        return VARS_TO_STR6(n_pool, n_pad, nb, kpool, n_top, type_K);
+        return VARS_TO_STR7(n_pool, n_pad, nb, kpool, n_top, type_K, real);
     }
 
     // the ids are exact, so any wrong id fails, however close its cell number
@@ -12002,14 +12005,23 @@ struct test_qsa_select : public test_case {
     }
 
     test_qsa_select(int64_t n_pool = 512, int64_t n_pad = 8, int64_t nb = 16, int64_t kpool = 4, int64_t n_top = 64,
-            ggml_type type_K = GGML_TYPE_F16)
-        : n_pool(n_pool), n_pad(n_pad), nb(nb), kpool(kpool), n_top(n_top), type_K(type_K) {}
+            ggml_type type_K = GGML_TYPE_F16, bool real = false)
+        : n_pool(n_pool), n_pad(n_pad), nb(nb), kpool(kpool), n_top(n_top), type_K(type_K), real(real) {}
+
+    int64_t n_rows() const {
+        return n_pool*kpool + 5;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 4, nb);
         ggml_set_name(q, "q");
-        ggml_tensor * k = ggml_new_tensor_3d(ctx, type_K, 128, 1, n_pool);
-        ggml_set_name(k, "k");
+        ggml_tensor * kt = ggml_new_tensor_3d(ctx, type_K, 256, 1, n_rows());
+        ggml_set_name(kt, "k");
+        ggml_tensor * k = ggml_view_3d(ctx, kt, 128, 1, n_rows(), ggml_row_size(type_K, 128), kt->nb[2],
+                                       ggml_row_size(type_K, 128));
+        ggml_set_name(k, "k_pooled");
+        ggml_tensor * pcell = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_pool);
+        ggml_set_name(pcell, "pcell");
         ggml_tensor * pidx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool, n_pool);
         ggml_set_name(pidx, "pidx");
         ggml_tensor * tidx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool - 1, nb);
@@ -12017,7 +12029,7 @@ struct test_qsa_select : public test_case {
         ggml_tensor * prng = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, nb);
         ggml_set_name(prng, "prng");
 
-        ggml_tensor * out = ggml_qsa_select(ctx, q, k, pidx, tidx, prng, 0.25f, (int32_t) n_top, -1);
+        ggml_tensor * out = ggml_qsa_select(ctx, q, k, pcell, pidx, tidx, prng, 0.25f, (int32_t) n_top, -1);
         ggml_set_name(out, "out");
         return out;
     }
@@ -12026,7 +12038,12 @@ struct test_qsa_select : public test_case {
         std::mt19937 gen(0x51ec7);
         const int64_t n_real = n_pool - n_pad;
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "q") == 0 || strcmp(t->name, "k") == 0) {
+            if (t->view_src != nullptr) {
+                continue; // k_pooled is a window of k
+            }
+            if (real && (strcmp(t->name, "q") == 0 || strcmp(t->name, "k") == 0)) {
+                init_tensor_uniform(t);
+            } else if (strcmp(t->name, "q") == 0 || strcmp(t->name, "k") == 0) {
                 if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
                     // small integers: exact in half, and many equal scores to exercise the tie order
                     std::uniform_int_distribution<int> dist(-2, 2);
@@ -12059,6 +12076,16 @@ struct test_qsa_select : public test_case {
                     ggml_quantize_chunk(t->type, v.data(), dataq.data(), 0, (int64_t) (v.size()/blck), (int64_t) blck, nullptr);
                     ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
                 }
+            } else if (strcmp(t->name, "pcell") == 0) {
+                // the real pools in distinct shuffled rows of the table, the padded ones on the first of them
+                std::vector<int32_t> rows(n_rows());
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    rows[i] = (int32_t) i;
+                }
+                std::shuffle(rows.begin(), rows.end(), gen);
+                std::vector<int32_t> v(n_pool, rows[0]);
+                std::copy(rows.begin(), rows.begin() + n_real, v.begin());
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "pidx") == 0) {
                 // the real pools address distinct cells in a shuffled order, the padded ones are -1
                 std::vector<int32_t> cells(n_real*kpool);
@@ -12078,13 +12105,14 @@ struct test_qsa_select : public test_case {
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "prng") == 0) {
-                // visible ranges inside the real pools: empty, shorter and longer than n_top
+                // visible ranges inside the real pools: empty, shorter and longer than n_top (perf: all of them, as a
+                // decode step sees)
                 std::uniform_int_distribution<int64_t> dist(0, n_real);
                 std::vector<int32_t> v(2*nb);
                 for (int64_t i = 0; i < nb; ++i) {
                     int64_t a = dist(gen);
                     int64_t b = dist(gen);
-                    if (i % 4 == 0) {
+                    if (real || i % 4 == 0) {
                         a = 0;
                         b = n_real;
                     } else if (i % 4 == 1) {
@@ -15952,8 +15980,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_qsa_select(4096, 3, 20, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(100, 0, 9, 4, 100, type_K));
-        // the 1024-thread kernels: at the register kernel's bound (1024*33) and past it (the wide kernel)
+        // the 1024-thread kernels: the register kernel at each of its sizes (4096, 8192, 16384, 24576 and 33792 pools,
+        // the last at its bound) and the wide kernel past it
         test_cases.emplace_back(new test_qsa_select(6000, 8, 4, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(12000, 8, 4, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(20000, 8, 4, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(33792, 8, 4, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(40000, 8, 4, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(50000, 8, 4, 4, 512, type_K));
@@ -16560,6 +16591,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_qsa_attn(2, 16384,  nb, 1, 2051, 2051, type_KV)); // 16K context
             test_cases.emplace_back(new test_qsa_attn(2, 204800, nb, 1, 2051, 2051, type_KV)); // 200K context
         }
+    }
+    // the same selection on uniform data (a realistic spread of the scores for the top-k), Q8_0 keys as with -ctk q8_0:
+    // decode (1) and MTP verify (4) at 16K, 128K and 200K (kpool_pad: 64 above the real pools), one prefill pass (64)
+    // and a whole prefill batch (2048)
+    for (int64_t nb : { 1, 4, 64 }) {
+        for (int64_t n_pool : { 4032, 32832, 52288 }) {
+            test_cases.emplace_back(new test_qsa_select(n_pool, 40, nb, 4, 512, GGML_TYPE_Q8_0, true));
+        }
+    }
+    for (int64_t n_pool : { 16448, 52288 }) {
+        test_cases.emplace_back(new test_qsa_select(n_pool, 40, 2048, 4, 512, GGML_TYPE_Q8_0, true));
     }
 
     // the cost of the padded pools: the same real pools under a count padded to 64 pools and under the n_kv-grain

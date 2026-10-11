@@ -12482,11 +12482,12 @@ void ggml_compute_forward_qsa_select(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
-    const ggml_tensor * q    = dst->src[0];
-    const ggml_tensor * k    = dst->src[1];
-    const ggml_tensor * pidx = dst->src[2]; // member cells of each pool
-    const ggml_tensor * tidx = dst->src[3]; // tail cells of each token
-    const ggml_tensor * prng = dst->src[4]; // visible pools [lo, hi) of each token
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1]; // key table
+    const ggml_tensor * pidx  = dst->src[2]; // member cells of each pool
+    const ggml_tensor * tidx  = dst->src[3]; // tail cells of each token
+    const ggml_tensor * prng  = dst->src[4]; // visible pools [lo, hi) of each token
+    const ggml_tensor * pcell = dst->src[5]; // row of k holding each pool's key
 
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     GGML_ASSERT(  q->type == GGML_TYPE_F32);
@@ -12494,7 +12495,8 @@ void ggml_compute_forward_qsa_select(
     const int64_t n_embd     = q->ne[0];
     const int64_t n_head     = q->ne[1];
     const int64_t n_tokens   = q->ne[2];
-    const int64_t n_pool     = k->ne[2];
+    const int64_t n_pool     = pcell->ne[0];
+    const int64_t n_rows     = k->ne[2];
     const int64_t kpool      = pidx->ne[0];
     const int64_t n_sel      = dst->ne[0];
 
@@ -12522,7 +12524,9 @@ void ggml_compute_forward_qsa_select(
 
         const int64_t nv = hi - lo;
         for (int64_t p = lo; p < hi; ++p) {
-            const char * k_row = (const char *) k->data + p*k->nb[2];
+            const int32_t row = *(const int32_t *) ((const char *) pcell->data + p*pcell->nb[0]);
+            GGML_ASSERT(0 <= row && row < n_rows && "qsa select: a pool key outside the key table");
+            const char * k_row = (const char *) k->data + row*k->nb[2];
             const float * kf = (const float *) k_row;
             if (k_to_float) {
                 k_to_float(k_row, k_f32, n_embd);

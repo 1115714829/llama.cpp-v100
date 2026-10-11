@@ -171,6 +171,8 @@ public:
         ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
         ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
+        // the pooled slots of every cache row in place, [n_embd, 1, n_cells]: the key table of ggml_qsa_select
+        ggml_tensor * pooled_table() const { return pooled_rows; }
 
     private:
         friend class llama_memory_hybrid_idx_context;
@@ -180,6 +182,7 @@ public:
         ggml_context * ctx;
         ggml_tensor  * key_gate;
         ggml_tensor  * pooled;
+        ggml_tensor  * pooled_rows;
     };
 
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;

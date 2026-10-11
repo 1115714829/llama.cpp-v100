@@ -3133,7 +3133,7 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         // one widened key, the scores of the visible pools and their order, see ops.cpp
                         const int64_t n_embd = node->src[1]->ne[0];
-                        const int64_t n_pool = node->src[1]->ne[2];
+                        const int64_t n_pool = node->src[5]->ne[0];
                         cur += ((n_embd + 2*n_pool)*sizeof(float) + CACHE_LINE_SIZE)*n_tasks;
                     } break;
                 case GGML_OP_QSA_ATTN:

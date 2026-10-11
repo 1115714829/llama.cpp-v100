@@ -48,12 +48,6 @@ static constexpr int QSA_TOPK_MIN_POOLS = 4608;
 // ---------------------------------------------------------------------------------------------------------------------
 // selection
 
-static __global__ void qsa_fill_f32(float * dst, const int n, const float v) {
-    if ((int) threadIdx.x < n) {
-        dst[threadIdx.x] = v;
-    }
-}
-
 // total order of the scores as unsigned keys, NaN lowest
 static __device__ __forceinline__ uint32_t qsa_order_key(const float s) {
     const float v = s + 0.0f;
@@ -556,27 +550,23 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_wide_kernel(
 }
 
 void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * q    = dst->src[0];
-    const ggml_tensor * k    = dst->src[1];
-    const ggml_tensor * pidx = dst->src[2];
-    const ggml_tensor * tidx = dst->src[3];
-    const ggml_tensor * prng = dst->src[4];
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1]; // key table, read in place through pool_cells
+    const ggml_tensor * pidx  = dst->src[2];
+    const ggml_tensor * tidx  = dst->src[3];
+    const ggml_tensor * prng  = dst->src[4];
+    const ggml_tensor * pcell = dst->src[5];
 
     const float head_scale = ggml_get_op_params_f32(dst, 0);
     const int   n_top      = ggml_get_op_params_i32(dst, 1);
     const int   sentinel   = ggml_get_op_params_i32(dst, 2);
 
-    const int64_t n_head   = q->ne[1];
     const int64_t n_tokens = q->ne[2];
-    const int64_t n_pool   = k->ne[2];
+    const int64_t n_pool   = pcell->ne[0];
     const int     kpool    = (int) pidx->ne[0];
     const int     n_sel    = (int) dst->ne[0];
 
     cudaStream_t stream = ctx.stream();
-
-    // every head weight is head_scale; one row shared by all tokens
-    ggml_cuda_pool_alloc<float> w(ctx.pool(), n_head);
-    qsa_fill_f32<<<1, 32, 0, stream>>>(w.get(), (int) n_head, head_scale);
 
     const int64_t tile = std::min<int64_t>(n_tokens, QSA_SELECT_TILE);
     ggml_cuda_pool_alloc<float> scores(ctx.pool(), n_pool*tile);
@@ -585,7 +575,8 @@ void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         const int64_t nt = std::min<int64_t>(tile, n_tokens - t0);
 
         const float * q_d = (const float *) ((const char *) q->data + t0*q->nb[2]);
-        ggml_cuda_lightning_indexer_scores(q_d, q->nb[1], q->nb[2], nt, k, w.get(), scores.get(), n_pool*sizeof(float), stream);
+        ggml_cuda_lightning_indexer_scores(q_d, q->nb[1], q->nb[2], nt, k, (const int32_t *) pcell->data, n_pool,
+                                           head_scale, scores.get(), n_pool*sizeof(float), stream);
 
         // the kernel holds QSA_TOPK_T*QSA_TOPK_PER pools at most; n_pool bounds every query's visible range
         const int32_t * rng = (const int32_t *) ((const char *) prng->data + t0*prng->nb[1]);
@@ -613,14 +604,22 @@ void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
 bool ggml_cuda_qsa_select_supported(int device, const ggml_tensor * dst) {
     GGML_UNUSED(device);
-    const ggml_tensor * q    = dst->src[0];
-    const ggml_tensor * k    = dst->src[1];
-    const ggml_tensor * pidx = dst->src[2];
-    const ggml_tensor * tidx = dst->src[3];
-    const ggml_tensor * prng = dst->src[4];
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * pidx  = dst->src[2];
+    const ggml_tensor * tidx  = dst->src[3];
+    const ggml_tensor * prng  = dst->src[4];
+    const ggml_tensor * pcell = dst->src[5];
 
     // the scoring kernels are written for 128-wide keys and 4 heads
     if (q->ne[0] != 128 || q->ne[1] != 4 || q->nb[0] != sizeof(float) || q->nb[1] % 16 != 0 || q->nb[2] % 16 != 0) {
+        return false;
+    }
+    // the key rows are read in place: contiguous values in a row, rows nb[2] apart; F32 rows as float4
+    if (k->nb[0] != ggml_type_size(k->type) || (k->type == GGML_TYPE_F32 && k->nb[2] % 16 != 0)) {
+        return false;
+    }
+    if (!ggml_is_contiguous(pcell)) {
         return false;
     }
     switch (k->type) {

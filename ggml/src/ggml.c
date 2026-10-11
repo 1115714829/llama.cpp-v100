@@ -1217,7 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
-    "qsa_select(q, k, pool_idxs, tail_idxs, pool_rng)",
+    "qsa_select(q, k, pool_cells, pool_idxs, tail_idxs, pool_rng)",
     "qsa_attn(q, k, v, ids)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
@@ -6643,6 +6643,7 @@ struct ggml_tensor * ggml_qsa_select(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
+        struct ggml_tensor  * pool_cells,
         struct ggml_tensor  * pool_idxs,
         struct ggml_tensor  * tail_idxs,
         struct ggml_tensor  * pool_rng,
@@ -6650,18 +6651,20 @@ struct ggml_tensor * ggml_qsa_select(
         int32_t               n_top_pool,
         int32_t               sentinel) {
 
-    GGML_ASSERT(        q->type == GGML_TYPE_F32);
-    GGML_ASSERT(pool_idxs->type == GGML_TYPE_I32);
-    GGML_ASSERT(tail_idxs->type == GGML_TYPE_I32);
-    GGML_ASSERT( pool_rng->type == GGML_TYPE_I32);
+    GGML_ASSERT(         q->type == GGML_TYPE_F32);
+    GGML_ASSERT(pool_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT( pool_idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT( tail_idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT(  pool_rng->type == GGML_TYPE_I32);
     GGML_ASSERT(q->ne[0] == k->ne[0]);
     GGML_ASSERT(k->ne[1] == 1);
     GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1);
-    GGML_ASSERT(pool_idxs->ne[1] == k->ne[2]);
+    GGML_ASSERT(ggml_is_vector(pool_cells));
+    GGML_ASSERT(pool_idxs->ne[1] == pool_cells->ne[0]);
     GGML_ASSERT(tail_idxs->ne[0] == pool_idxs->ne[0] - 1);
     GGML_ASSERT(tail_idxs->ne[1] == q->ne[2]);
     GGML_ASSERT( pool_rng->ne[0] == 2 && pool_rng->ne[1] == q->ne[2]);
-    GGML_ASSERT(n_top_pool > 0 && n_top_pool <= k->ne[2]);
+    GGML_ASSERT(n_top_pool > 0 && n_top_pool <= pool_cells->ne[0]);
 
     const int64_t kpool = pool_idxs->ne[0];
     GGML_ASSERT(kpool >= 1);
@@ -6678,6 +6681,7 @@ struct ggml_tensor * ggml_qsa_select(
     result->src[2] = pool_idxs;
     result->src[3] = tail_idxs;
     result->src[4] = pool_rng;
+    result->src[5] = pool_cells;
 
     return result;
 }

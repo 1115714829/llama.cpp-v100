@@ -879,13 +879,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     pooled_new = ggml_reshape_2d(ctx0, pooled_new, idx_dim, n_new);
     cb(pooled_new, "indexer_pool_k_new", il);
 
-    // scatter the fresh pooled keys, then gather all n_pool of them by cell, in both cache modes:
-    // the reserved graph cannot branch on cache_safe, and without sharing every pool is re-pooled
-    // anyway (n_new == n_pool_real, layout order), so the gather returns exactly pooled_new
+    // scatter the fresh pooled keys, then let the selection read all n_pool of them in place through pool_cells, in
+    // both cache modes: the reserved graph cannot branch on cache_safe, and without sharing every pool is re-pooled
+    // anyway (n_new == n_pool_real, layout order). The scatter is expanded first, so it runs before the selection.
     ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
-    ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
-    cb(pooled, "indexer_k", il);
+    ggml_tensor * pooled = kpool_cache.pooled_table();
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
@@ -899,8 +897,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // score with every head weight set to that scale. The selection keeps the top blocks a token can see, expands
     // them into cells and appends the tail; the ids drive the attention directly, nothing grows with n_kv*n_tokens
     const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
-    ggml_tensor * ids = ggml_qsa_select(ctx0, q, pooled, inp_kpool->pool_idxs, inp_kpool->tail_idxs, inp_kpool->pool_rng,
-            1.0f/sqrtf((float) idx_dim), (int32_t) n_top_pool, -1);
+    ggml_tensor * ids = ggml_qsa_select(ctx0, q, pooled, inp_kpool->pool_cells, inp_kpool->pool_idxs, inp_kpool->tail_idxs,
+            inp_kpool->pool_rng, 1.0f/sqrtf((float) idx_dim), (int32_t) n_top_pool, -1);
     GGML_ASSERT(ids->ne[0] == inp_kpool->n_sel);
     cb(ids, "indexer_sel", il);
 

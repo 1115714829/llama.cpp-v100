@@ -899,8 +899,10 @@ llama_memory_hybrid_idx_context::kpool_access::kpool_access(ggml_context * ctx, 
 
     // Pool indices can refer to other streams. Revisit these full-storage views if that changes:
     // https://github.com/ggml-org/llama.cpp/pull/27773#discussion_r4130905603
-    key_gate = ggml_view_2d(ctx, k, n_tok,  n_cells, k->nb[1], 0);
-    pooled   = ggml_view_2d(ctx, k, n_embd, n_cells, k->nb[1], ggml_row_size(k->type, n_tok));
+    key_gate    = ggml_view_2d(ctx, k, n_tok,  n_cells, k->nb[1], 0);
+    pooled      = ggml_view_2d(ctx, k, n_embd, n_cells, k->nb[1], ggml_row_size(k->type, n_tok));
+    pooled_rows = ggml_view_3d(ctx, k, n_embd, 1, n_cells, ggml_row_size(k->type, n_embd), k->nb[1],
+                               ggml_row_size(k->type, n_tok));
 }
 
 ggml_tensor * llama_memory_hybrid_idx_context::kpool_access::gather_key_gate(ggml_tensor * idxs) const {
@@ -949,7 +951,8 @@ llama_memory_hybrid_idx_context::kpool_state llama_memory_hybrid_idx_context::kp
 // 1. cpy_k writes each token's key | gate into its idx cache row, pooled slot are zeroed.
 // 2. This marks the pools the ubatch touches or completes as new, during decode that's one pool every kpool tokens, zero elsewise.
 // 3. The graph pools only the new pools and set_rows each result into the pooled slot of the pool's last member row.
-// 4. All pools are gathered in one get_rows via pool_cells, fresh ones just written, older ones from whatever batch last wrote them.
+// 4. All pools are read through pool_cells, fresh ones just written, older ones from whatever batch last wrote them
+//    (qwen4exp: ggml_qsa_select reads the pooled slots in place; glm5-next: one get_rows).
 // A seq_* edit regroups the pools from the edited position on, so it stales them and the first ubatch of the next batch
 // rebuilds them from the still-valid key | gate rows, rewriting the (possibly different) rep rows.
 // Orphaned pooled slots are never cleared, a slot is only ever read through pool_cells, which follows the current grouping.
