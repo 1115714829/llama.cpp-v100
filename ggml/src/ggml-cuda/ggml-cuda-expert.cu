@@ -323,6 +323,37 @@ static __global__ void expert_routing_kernel(
     }
 }
 
+// Counts the launch once for every expert it routes to, however many entries route there: the
+// number of launches that routed an expert is what a host arena expert costs (one staging copy per
+// launch), see ggml_expert_store_profile. One block; the routed experts of the launch are collected
+// in a shared bitmap first (n_expert bits of the store tensor), then every set bit adds one.
+static __global__ void expert_launch_count_kernel(
+        const int32_t * __restrict__ ids, const int64_t n_entries, const int n_expert_used, const int64_t ids_stride,
+        const ggml_cuda_expert_lut lut, const int expert_base, const int n_expert, uint32_t * __restrict__ launches) {
+    extern __shared__ uint32_t s_routed[];
+    const int n_words = (n_expert + 31) / 32;
+    for (int w = threadIdx.x; w < n_words; w += blockDim.x) {
+        s_routed[w] = 0;
+    }
+    __syncthreads();
+    for (int64_t i = threadIdx.x; i < n_entries; i += blockDim.x) {
+        const int64_t token = i / n_expert_used;
+        const int     slot  = (int) (i - token * n_expert_used);
+        const int local = ggml_cuda_expert_local(lut, ids[token*ids_stride + slot]);
+        if (local < 0) {
+            continue;
+        }
+        const int e = local + expert_base;
+        atomicOr(&s_routed[e >> 5], 1u << (e & 31));
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < n_expert; e += blockDim.x) {
+        if (s_routed[e >> 5] & (1u << (e & 31))) {
+            launches[e] += 1u;
+        }
+    }
+}
+
 // Assigns the routed host experts of this batch to staging slots and rewrites the staging
 // pointer table: staged address for the routed host experts, main table entry for everyone
 // else. fit sizes the staging area for the largest host complement of one tensor, so every
@@ -585,6 +616,7 @@ struct ggml_cuda_expert_tensor_state {
     int32_t * residency_dev   = nullptr;
     int64_t * host_offset_dev = nullptr; // device copy of the host arena byte offsets
     uint32_t * counts_dev     = nullptr; // per-expert routing counts, for --dump-expert-routing
+    uint32_t * launches_dev   = nullptr; // per-expert counts of the launches that routed it, same dump
     // the prefill staging of this tensor is possible: a host tier to stage and a staging area to
     // stage it into. The bitmap the routing kernel writes is per stream (see
     // ggml_cuda_expert_stream_state), this is the property of the tensor alone that says so.
@@ -1098,12 +1130,14 @@ ggml_backend_cuda_expert_buffer_context::~ggml_backend_cuda_expert_buffer_contex
     // buffers go away; the store skips the file when nothing was routed (memory-fit loads)
     if (store != nullptr) {
         for (ggml_cuda_expert_tensor_state & s : tensors) {
-            if (s.counts_dev == nullptr || s.n_expert <= 0) {
+            if (s.counts_dev == nullptr || s.launches_dev == nullptr || s.n_expert <= 0) {
                 continue;
             }
             std::vector<uint32_t> counts((size_t) s.n_expert);
+            std::vector<uint32_t> launches((size_t) s.n_expert);
             CUDA_CHECK(cudaMemcpy(counts.data(), s.counts_dev, counts.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-            ggml_expert_store_set_tensor_stats(store, s.tensor_id, counts.data(), counts.size());
+            CUDA_CHECK(cudaMemcpy(launches.data(), s.launches_dev, launches.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
+            ggml_expert_store_set_tensor_stats(store, s.tensor_id, counts.data(), launches.data(), counts.size());
         }
         ggml_expert_store_dump_profile(store, ggml_backend_cuda_get_device_count());
     }
@@ -1123,6 +1157,9 @@ ggml_backend_cuda_expert_buffer_context::~ggml_backend_cuda_expert_buffer_contex
         }
         if (s.counts_dev) {
             CUDA_CHECK(cudaFree(s.counts_dev));
+        }
+        if (s.launches_dev) {
+            CUDA_CHECK(cudaFree(s.launches_dev));
         }
     }
     if (usage_dev) {
@@ -1181,6 +1218,15 @@ void ggml_cuda_expert_record_usage(const ggml_tensor * src0, const ggml_tensor *
         ctx->usage_dev, s.counts_dev, nullptr);
     // check right here: a sticky error would otherwise surface at the next unrelated API
     // call and hide which kernel actually faulted
+    CUDA_CHECK(cudaGetLastError());
+
+    // the routed experts of the launch, each counted once (one block, the bitmap of the store
+    // tensor in shared memory)
+    const size_t smem = (size_t) ((s.n_expert + 31) / 32) * sizeof(uint32_t);
+    GGML_ASSERT(smem <= 48 * 1024);
+    expert_launch_count_kernel<<<1, 1024, smem, stream>>>(
+        (const int32_t *) ids->data, n_entries, (int) ids->ne[0], ids->nb[1] / sizeof(int32_t),
+        lut, (int) ex_table.expert_start, (int) s.n_expert, s.launches_dev);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1909,6 +1955,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
 
         CUDA_CHECK(cudaMalloc((void **) &s.counts_dev, (size_t) n_expert * sizeof(uint32_t)));
         CUDA_CHECK(cudaMemset(s.counts_dev, 0, (size_t) n_expert * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc((void **) &s.launches_dev, (size_t) n_expert * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(s.launches_dev, 0, (size_t) n_expert * sizeof(uint32_t)));
 
         // the staging area only helps the MMQ prefill path, only when host experts exist
         s.has_stage = s.has_host && stage_budget > 0;

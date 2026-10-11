@@ -23,31 +23,48 @@ static bool ggml_expert_store_read_profile(const char * path, ggml_expert_store_
 
     int64_t n_layer  = 0;
     int64_t n_expert = 0;
-    std::vector<std::tuple<int64_t, int64_t, int64_t>> rows;
+    // layer, expert, count, launches (-1: the line has no launches field)
+    std::vector<std::tuple<int64_t, int64_t, int64_t, int64_t>> rows;
+    bool any_launch = false;
 
     char line[256];
     while (fgets(line, sizeof(line), f) != nullptr) {
         if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
             continue;
         }
-        int64_t layer, expert, count;
-        if (sscanf(line, "%" SCNd64 " %" SCNd64 " %" SCNd64, &layer, &expert, &count) != 3) {
+        int64_t layer, expert, count, launches = -1;
+        const int n = sscanf(line, "%" SCNd64 " %" SCNd64 " %" SCNd64 " %" SCNd64, &layer, &expert, &count, &launches);
+        if (n < 3) {
             continue;
         }
-        if (layer < 0 || expert < 0 || count < 0) {
+        if (layer < 0 || expert < 0 || count < 0 || (n == 4 && launches < 0)) {
             continue;
         }
+        if (n == 3) {
+            launches = -1;
+        }
+        any_launch = any_launch || n == 4;
         n_layer  = std::max(n_layer,  layer + 1);
         n_expert = std::max(n_expert, expert + 1);
-        rows.emplace_back(layer, expert, count);
+        rows.emplace_back(layer, expert, count, launches);
     }
     fclose(f);
 
     profile.n_layer  = n_layer;
     profile.n_expert = n_expert;
     profile.count.assign((size_t) (n_layer * n_expert), 0);
+    profile.launch.clear();
+    if (any_launch) {
+        profile.launch.assign((size_t) (n_layer * n_expert), 0);
+    }
     for (const auto & row : rows) {
-        profile.count[(size_t) (std::get<0>(row) * n_expert + std::get<1>(row))] = std::get<2>(row);
+        const size_t i = (size_t) (std::get<0>(row) * n_expert + std::get<1>(row));
+        profile.count[i] = std::get<2>(row);
+        if (any_launch) {
+            // the launches field ranks the slots of the whole file: a line without it is a pair
+            // that no launch was recorded for, the same as a pair missing from the file
+            profile.launch[i] = std::max<int64_t>(std::get<3>(row), 0);
+        }
     }
     return true;
 }
@@ -136,6 +153,7 @@ void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_device) {
     }
 
     std::vector<std::vector<int64_t>> counts((size_t) n_layer);
+    std::vector<std::vector<int64_t>> launches((size_t) n_layer);
     bool any = false;
     for (const ggml_expert_store_tensor & t : store->tensors) {
         if (t.stat_experts.empty() || t.layer < 0) {
@@ -146,12 +164,16 @@ void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_device) {
                 __func__, store->device, t.layer, t.expert_base, t.expert_base + t.n_expert);
             continue;
         }
-        std::vector<int64_t> & row = counts[(size_t) t.layer];
+        GGML_ASSERT(t.stat_launches.size() == t.stat_experts.size());
+        std::vector<int64_t> & row  = counts[(size_t) t.layer];
+        std::vector<int64_t> & lrow = launches[(size_t) t.layer];
         for (size_t e = 0; e < t.stat_experts.size(); ++e) {
             const int64_t g = t.global_of[e];
             GGML_ASSERT(g >= 0);
             row.resize(std::max<size_t>(row.size(), (size_t) g + 1), 0);
-            row[(size_t) g] += t.stat_experts[e];
+            lrow.resize(row.size(), 0);
+            row [(size_t) g] += t.stat_experts[e];
+            lrow[(size_t) g] += t.stat_launches[e];
             any = any || t.stat_experts[e] > 0;
         }
     }
@@ -166,13 +188,15 @@ void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_device) {
         GGML_LOG_ERROR("%s: cannot write expert routing profile '%s'\n", __func__, path.c_str());
         return;
     }
-    fprintf(f, "# expert routing profile: layer expert count\n");
+    fprintf(f, "# expert routing profile: layer expert count launches\n");
+    fprintf(f, "# count: routing entries, launches: mul_mat_id launches that routed the expert (see ggml_expert_store_profile)\n");
     fprintf(f, "# generated from runtime routing statistics, one run can feed the next one\n");
     for (int64_t l = 0; l < n_layer; ++l) {
-        const std::vector<int64_t> & row = counts[(size_t) l];
+        const std::vector<int64_t> & row  = counts[(size_t) l];
+        const std::vector<int64_t> & lrow = launches[(size_t) l];
         for (size_t e = 0; e < row.size(); ++e) {
             if (row[e] > 0) {
-                fprintf(f, "%" PRId64 " %zu %" PRId64 "\n", l, e, row[e]);
+                fprintf(f, "%" PRId64 " %zu %" PRId64 " %" PRId64 "\n", l, e, row[e], lrow[e]);
             }
         }
     }
@@ -181,6 +205,7 @@ void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_device) {
 
     for (ggml_expert_store_tensor & t : store->tensors) {
         t.stat_experts.clear();
+        t.stat_launches.clear();
     }
 }
 
@@ -1115,9 +1140,30 @@ void ggml_expert_store_plan(
                 const int64_t g = global_of(local);
                 return g < profile.n_expert ? profile.at(in.layer, g) : 0;
             };
-            std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
-                return count_of(a) > count_of(b);
-            });
+            // the slots go to the experts the most launches route to: a host expert is copied into
+            // the staging area once per launch that routes it, however many tokens of the launch
+            // do. Ranking by routing entries instead lets the thousands of tokens of a prefill
+            // batch decide, and the experts the decode batches route to - which are not the
+            // ones the prompt tokens route to most - end up in the host arena and are copied
+            // on every decode step. A profile without the launches field ranks by count.
+            const auto launch_of = [&](int64_t local) -> int64_t {
+                const int64_t g = global_of(local);
+                return g < profile.n_expert ? profile.launch_at(in.layer, g) : 0;
+            };
+            if (profile.has_launch()) {
+                std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+                    const int64_t la = launch_of(a);
+                    const int64_t lb = launch_of(b);
+                    if (la != lb) {
+                        return la > lb;
+                    }
+                    return count_of(a) > count_of(b);
+                });
+            } else {
+                std::stable_sort(order.begin(), order.end(), [&](int64_t a, int64_t b) {
+                    return count_of(a) > count_of(b);
+                });
+            }
         }
 
         placement->n_slot[i]    = n_slot;
@@ -1633,10 +1679,12 @@ void ggml_expert_store_set_tensor_id(ggml_expert_store * store, const ggml_tenso
     store->tensor_map.emplace_back(tensor, tensor_id);
 }
 
-void ggml_expert_store_set_tensor_stats(ggml_expert_store * store, int tensor_id, const uint32_t * counts, size_t n) {
+void ggml_expert_store_set_tensor_stats(ggml_expert_store * store, int tensor_id,
+        const uint32_t * counts, const uint32_t * launches, size_t n) {
     if (tensor_id < 0 || tensor_id >= (int) store->tensors.size()) {
         return;
     }
     ggml_expert_store_tensor & t = store->tensors[(size_t) tensor_id];
     t.stat_experts.assign(counts, counts + n);
+    t.stat_launches.assign(launches, launches + n);
 }

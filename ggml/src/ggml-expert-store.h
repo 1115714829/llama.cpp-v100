@@ -202,7 +202,8 @@ struct ggml_expert_store_tensor {
     // statistics (filled at runtime by the kernels' dispatch code)
     int64_t stat_hits_vram = 0;
     int64_t stat_hits_host = 0;
-    std::vector<uint32_t> stat_experts; // [n_expert] routing count per local expert, for the profile dump
+    std::vector<uint32_t> stat_experts;  // [n_expert] routing count per local expert, for the profile dump
+    std::vector<uint32_t> stat_launches; // [n_expert] launches that routed the local expert, for the profile dump
 };
 
 // one store per device
@@ -220,16 +221,29 @@ struct ggml_expert_store {
     int64_t host_used = 0; // bytes allocated in host arenas
 };
 
-// profile: text file, one line per entry "layer expert count", lines starting with '#'
-// are ignored. Counts are per (layer, expert) hits; higher is hotter. Missing entries
-// count as zero. The format is intentionally trivially writable from shell pipelines.
+// profile: text file, one line per entry "layer expert count [launches]", lines starting with
+// '#' are ignored. count is the number of routing entries of the (layer, expert) pair - every
+// token routes to n_expert_used experts - and orders the experts by traffic: the expert
+// assignment balances it over the devices. The optional launches field is the number of
+// mul_mat_id launches that routed the expert at least once. That is what an expert in the host
+// arena costs: every such launch copies it into the staging area (a decode batch of a few tokens
+// as much as a prefill batch of thousands), so the device slots go to the experts with the most
+// launches. A file without the field ranks the slots by count. Missing entries count as zero.
+// The format is intentionally trivially writable from shell pipelines.
 struct ggml_expert_store_profile {
     int64_t n_layer  = 0;
     int64_t n_expert = 0;
-    std::vector<int64_t> count; // [n_layer * n_expert], 0 if absent
+    std::vector<int64_t> count;  // [n_layer * n_expert], 0 if absent
+    std::vector<int64_t> launch; // [n_layer * n_expert] launches, empty when the file has no launches field
 
     int64_t at(int64_t layer, int64_t expert) const {
         return count[layer * n_expert + expert];
+    }
+    bool has_launch() const {
+        return !launch.empty();
+    }
+    int64_t launch_at(int64_t layer, int64_t expert) const {
+        return launch[layer * n_expert + expert];
     }
 };
 
@@ -451,6 +465,7 @@ GGML_API const ggml_expert_store_tensor * ggml_expert_store_tensor_at(const ggml
 GGML_API int ggml_expert_store_tensor_id(const ggml_expert_store * store, const ggml_tensor * tensor);
 GGML_API void ggml_expert_store_set_tensor_id(ggml_expert_store * store, const ggml_tensor * tensor, int tensor_id);
 
-// store the per-expert routing counts of one tensor read back from the device; they are
-// merged per layer and written by ggml_expert_store_dump_profile()
-GGML_API void ggml_expert_store_set_tensor_stats(ggml_expert_store * store, int tensor_id, const uint32_t * counts, size_t n);
+// store the per-expert routing counts and launch counts of one tensor read back from the
+// device; they are merged per layer and written by ggml_expert_store_dump_profile()
+GGML_API void ggml_expert_store_set_tensor_stats(ggml_expert_store * store, int tensor_id,
+        const uint32_t * counts, const uint32_t * launches, size_t n);

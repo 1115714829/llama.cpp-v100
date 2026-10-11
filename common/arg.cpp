@@ -2812,7 +2812,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
     add_opt(common_arg(
         {"--expert-profile"}, "FILE",
-        "expert routing profile for tiered expert weights: lines of 'layer expert count',\n"
+        "expert routing profile for tiered expert weights: lines of 'layer expert count [launches]'\n"
+        "(the launches field, written by --dump-expert-routing, ranks the device slots by the mul_mat_id\n"
+        "launches that route to an expert; the count balances the experts over the devices),\n"
         "the experts with the most hits keep a device memory slot (default: uniform placement)",
         [](common_params & params, const std::string & value) {
             params.expert_profile = value;
@@ -2821,8 +2823,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ));
     add_opt(common_arg(
         {"--dump-expert-routing"}, "FILE",
-        "write the observed per-layer per-expert routing counts to this file when the model\n"
-        "unloads; the file has the same format as --expert-profile, so one run profiles the next.\n"
+        "write the observed per-layer per-expert routing counts and launch counts to this file\n"
+        "when the model unloads; the file has the same format as --expert-profile, so one run profiles the next.\n"
         "With more than one GPU every device writes FILE.devN with its own experts; concatenate\n"
         "these files to get one profile",
         [](common_params & params, const std::string & value) {

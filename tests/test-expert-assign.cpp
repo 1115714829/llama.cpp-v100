@@ -6,6 +6,7 @@
 #include "ggml.h"
 #include "ggml-expert-store.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -579,6 +580,78 @@ int main() {
         check_eq((long long) ggml_expert_assignment_count(), 0, "every table released");
 
         ggml_free(ctx);
+    }
+
+    // ---- the launches field of a profile: the device slots go to the experts the most launches
+    //      route to, the routing counts still decide the assignment (same table with and without it)
+    {
+        const int nl = 2;
+        std::vector<std::vector<int64_t>> cnt((size_t) nl, std::vector<int64_t>((size_t) n_expert, 0));
+        std::vector<std::vector<int64_t>> lau((size_t) nl, std::vector<int64_t>((size_t) n_expert, 0));
+        for (int l = 0; l < nl; ++l) {
+            for (int e = 0; e < n_expert; ++e) {
+                // routing entries fall with the expert number; the launches rank the experts the other
+                // way round (a decode-hot expert sees few entries but many launches), with ties broken
+                // by the count
+                cnt[(size_t) l][(size_t) e] = 4000 - 97 * e + l;
+                lau[(size_t) l][(size_t) e] = (e / 2) * 3;
+            }
+        }
+        write_profile("test-expert-assign-profile-cnt.txt", cnt);
+        {
+            FILE * f = fopen("test-expert-assign-profile-lau.txt", "w");
+            check(f != nullptr, "write the launches profile");
+            if (f != nullptr) {
+                fprintf(f, "# layer expert count launches\n");
+                for (int l = 0; l < nl; ++l) {
+                    for (int e = 0; e < n_expert; ++e) {
+                        fprintf(f, "%d %d %lld %lld\n", l, e, (long long) cnt[(size_t) l][(size_t) e], (long long) lau[(size_t) l][(size_t) e]);
+                    }
+                }
+                fclose(f);
+            }
+        }
+
+        // three slots of device 0's slice of layer 1 (stride 1024 B)
+        const auto slots_of = [&](const char * path, std::vector<std::vector<int16_t>> & table) {
+            ggml_expert_store_plan_tensor t = device_tensor(1);
+            ggml_expert_store_placement plan;
+            ggml_expert_store_plan(&t, 1, n_dev, 3 * 1024, path, &plan);
+            table = dump_table(n_dev, nl, n_expert);
+            return plan.slot_experts[0];
+        };
+        std::vector<std::vector<int16_t>> tab_cnt, tab_lau;
+        const std::vector<int64_t> s_cnt = slots_of("test-expert-assign-profile-cnt.txt", tab_cnt);
+        const std::vector<int64_t> s_lau = slots_of("test-expert-assign-profile-lau.txt", tab_lau);
+        check(tab_cnt == tab_lau, "the launches field does not change the expert assignment");
+
+        // expected: device 0's local experts of layer 1 ranked by count / by (launches, count)
+        std::vector<int> loc;
+        const int16_t * row = ggml_expert_store_local_of(0, 1);
+        check(row != nullptr, "local_of row of device 0");
+        for (int e = 0; row != nullptr && e < n_expert; ++e) {
+            if (row[e] >= 0) {
+                loc.push_back(e);
+            }
+        }
+        std::vector<int> by_cnt = loc, by_lau = loc;
+        std::stable_sort(by_cnt.begin(), by_cnt.end(), [&](int a, int b) { return cnt[1][(size_t) a] > cnt[1][(size_t) b]; });
+        std::stable_sort(by_lau.begin(), by_lau.end(), [&](int a, int b) {
+            if (lau[1][(size_t) a] != lau[1][(size_t) b]) {
+                return lau[1][(size_t) a] > lau[1][(size_t) b];
+            }
+            return cnt[1][(size_t) a] > cnt[1][(size_t) b];
+        });
+        std::vector<int64_t> want_cnt, want_lau;
+        for (int k = 0; k < 3 && k < (int) loc.size(); ++k) {
+            want_cnt.push_back(row[by_cnt[(size_t) k]]);
+            want_lau.push_back(row[by_lau[(size_t) k]]);
+        }
+        std::sort(want_cnt.begin(), want_cnt.end());
+        std::sort(want_lau.begin(), want_lau.end());
+        check(s_cnt == want_cnt, "without the launches field the slots go to the highest counts");
+        check(s_lau == want_lau, "with the launches field the slots go to the most launches");
+        check(s_cnt != s_lau, "the two rankings differ in this profile");
     }
 
     if (g_fail == 0) {
