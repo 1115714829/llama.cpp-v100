@@ -1316,6 +1316,7 @@ private:
         llama_reserve(ctx_tgt);
         if (ctx_dft) {
             llama_reserve(ctx_dft);
+            common_fit_log_memory_stage(model_tgt, "spec_ready");
         }
 
         if (has_mmproj) {
@@ -1485,6 +1486,9 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                // the device memory the runtime has grown to after a request: the expert slot
+                // budget of the fit has to leave room for it (common_fit_ep runtime reserve)
+                common_fit_log_memory_stage(model_tgt, "request_done");
                 queue_tasks.pop_deferred_task(id_slot);
             };
 

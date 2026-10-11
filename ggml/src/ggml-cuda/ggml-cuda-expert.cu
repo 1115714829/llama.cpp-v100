@@ -78,33 +78,50 @@ void ggml_backend_cuda_expert_device_ready(ggml_backend_buffer_type_t buft) {
     CUDA_CHECK(cudaFree(nullptr));
 }
 
+// what the memory callbacks of the store of one expert buffer work on
+struct ggml_cuda_expert_backend_user {
+    int device = -1;
+
+    // The slot arrays of all expert tensors of the buffer are carved from one device allocation
+    // of the planned slot bytes. A cudaMalloc per tensor rounds every array up to the 2 MiB
+    // granularity of the device allocator: about 1 MiB per tensor, 25-130 MiB per card with the
+    // 96 expert tensors of a 48-layer MoE, which the slot budget of the fit does not see (the
+    // plan counts the exact array bytes). Measured on 6 x V100: 24-131 MiB per card.
+    char * slab      = nullptr;
+    size_t slab_size = 0;
+    size_t slab_used = 0;
+};
+
+static int ggml_cuda_expert_user_device(void * user) {
+    return ((const ggml_cuda_expert_backend_user *) user)->device;
+}
+
+// base alignment of a slot array inside the slab: every array is a whole number of expert
+// strides (multiples of GGML_EXPERT_STORE_ALIGN), the page alignment keeps every base at least as
+// aligned as the separate allocations were for the vector loads of the kernels
+static constexpr size_t GGML_CUDA_EXPERT_SLAB_ALIGN = 4096;
+
 static void * ggml_cuda_expert_alloc_device(void * user, size_t size) {
-    const int device = (int) (intptr_t) user;
-    ggml_cuda_set_device(device);
-
-    size_t free_before = 0;
-    size_t total       = 0;
-    ggml_cuda_expert_get_mem(device, &free_before, &total);
-
-    void * ptr = nullptr;
-    cudaError_t err = cudaMalloc(&ptr, size);
-    if (err != cudaSuccess) {
-        (void) cudaGetLastError();
-        GGML_LOG_ERROR("%s: device %d: cudaMalloc of %.2f MiB failed (%s), %.2f MiB free of %.2f MiB\n",
-            __func__, device, size / 1024.0 / 1024.0, cudaGetErrorString(err),
-            free_before / 1024.0 / 1024.0, total / 1024.0 / 1024.0);
+    ggml_cuda_expert_backend_user * u = (ggml_cuda_expert_backend_user *) user;
+    // the store fills the array right after this call; keep the device of the buffer current
+    ggml_cuda_set_device(u->device);
+    const size_t take = GGML_PAD(size, GGML_CUDA_EXPERT_SLAB_ALIGN);
+    if (u->slab == nullptr || u->slab_used + take > u->slab_size) {
+        GGML_LOG_ERROR("%s: device %d: a slot array of %.2f MiB does not fit the slot block of the plan (%.2f of %.2f MiB used)\n",
+            __func__, u->device, size / 1024.0 / 1024.0, u->slab_used / 1024.0 / 1024.0, u->slab_size / 1024.0 / 1024.0);
         return nullptr;
     }
-    GGML_LOG_DEBUG("%s: device %d: cudaMalloc %.2f MiB, free %.2f -> %.2f MiB of %.2f MiB\n",
-        __func__, device, size / 1024.0 / 1024.0,
-        free_before / 1024.0 / 1024.0, (free_before - size) / 1024.0 / 1024.0, total / 1024.0 / 1024.0);
+    void * ptr = u->slab + u->slab_used;
+    u->slab_used += take;
+    GGML_LOG_DEBUG("%s: device %d: slot array %.2f MiB at %.2f MiB of the %.2f MiB slot block\n",
+        __func__, u->device, size / 1024.0 / 1024.0, (u->slab_used - take) / 1024.0 / 1024.0, u->slab_size / 1024.0 / 1024.0);
     return ptr;
 }
 
 static void ggml_cuda_expert_free_device(void * user, void * ptr) {
-    const int device = (int) (intptr_t) user;
-    ggml_cuda_set_device(device);
-    CUDA_CHECK(cudaFree(ptr));
+    // the slot arrays live in the slot block, which the buffer frees as a whole
+    GGML_UNUSED(user);
+    GGML_UNUSED(ptr);
 }
 
 // node and size of every live host arena allocation, for the NUMA accounting and for the
@@ -124,7 +141,7 @@ static int ggml_cuda_expert_host_node(const void * host_ptr) {
 }
 
 static void * ggml_cuda_expert_alloc_host(void * user, size_t size, void ** dev_ptr) {
-    const int device = (int) (intptr_t) user;
+    const int device = ggml_cuda_expert_user_device(user);
     ggml_cuda_set_device(device);
 
     // the host arena of the device follows the node of the machine plan: the plan is computed
@@ -156,7 +173,7 @@ static void * ggml_cuda_expert_alloc_host(void * user, size_t size, void ** dev_
 }
 
 static void ggml_cuda_expert_free_host(void * user, void * ptr) {
-    const int device = (int) (intptr_t) user;
+    const int device = ggml_cuda_expert_user_device(user);
     ggml_cuda_set_device(device);
 
     int    node = GGML_CUDA_NUMA_NODE_ANY;
@@ -186,27 +203,27 @@ static void ggml_cuda_expert_free_host(void * user, void * ptr) {
 }
 
 static void ggml_cuda_expert_copy_h2d(void * user, void * dst_dev, const void * src_host, size_t size) {
-    const int device = (int) (intptr_t) user;
+    const int device = ggml_cuda_expert_user_device(user);
     ggml_cuda_set_device(device);
     ggml_cuda_memcpy_h2d_async(dst_dev, src_host, size, cudaStreamPerThread);
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
 static void ggml_cuda_expert_copy_d2h(void * user, void * dst_host, const void * src_dev, size_t size) {
-    const int device = (int) (intptr_t) user;
+    const int device = ggml_cuda_expert_user_device(user);
     ggml_cuda_set_device(device);
     CUDA_CHECK(cudaMemcpy(dst_host, src_dev, size, cudaMemcpyDeviceToHost));
 }
 
 static void ggml_cuda_expert_table_upload(void * user, void * dst_dev, const char * const * src_host, size_t n) {
-    const int device = (int) (intptr_t) user;
+    const int device = ggml_cuda_expert_user_device(user);
     ggml_cuda_set_device(device);
     CUDA_CHECK(cudaMemcpy(dst_dev, src_host, n * sizeof(char *), cudaMemcpyHostToDevice));
 }
 
-static ggml_expert_store_backend ggml_cuda_expert_backend(int device) {
+static ggml_expert_store_backend ggml_cuda_expert_backend(ggml_cuda_expert_backend_user * user) {
     ggml_expert_store_backend backend;
-    backend.user         = (void *) (intptr_t) device;
+    backend.user         = user;
     backend.alloc_device = ggml_cuda_expert_alloc_device;
     backend.free_device  = ggml_cuda_expert_free_device;
     backend.alloc_host   = ggml_cuda_expert_alloc_host;
@@ -619,6 +636,7 @@ struct ggml_cuda_expert_stream_state {
 
 struct ggml_backend_cuda_expert_buffer_context {
     int device = -1;
+    ggml_cuda_expert_backend_user backend_user; // device and slot block of the store callbacks
     ggml_expert_store_backend backend;
     ggml_expert_store * store = nullptr;
 
@@ -970,6 +988,9 @@ ggml_cuda_expert_stream_state & ggml_backend_cuda_expert_buffer_context::get_str
         memset(ss.bitmaps_pinned[i], 0, n_words);
     }
 
+    GGML_LOG_DEBUG("%s: device %d: staging state of stream %zu: %.2f MiB staging, %zu tensors\n",
+        __func__, device, streams.size(), ss.stage_bytes/1024.0/1024.0, tensors.size());
+
     return streams.emplace(stream, std::move(ss)).first->second;
 }
 
@@ -1123,6 +1144,9 @@ ggml_backend_cuda_expert_buffer_context::~ggml_backend_cuda_expert_buffer_contex
         CUDA_CHECK(cudaFree(plain_dev));
     }
     ggml_expert_store_free(store);
+    if (backend_user.slab) {
+        CUDA_CHECK(cudaFree(backend_user.slab));
+    }
 }
 
 // records the tier hits and the per-expert routing counts of one mul_mat_id launch. The
@@ -1740,7 +1764,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
 
     ggml_backend_cuda_expert_buffer_context * ctx = new ggml_backend_cuda_expert_buffer_context();
     ctx->device       = device;
-    ctx->backend      = ggml_cuda_expert_backend(device);
+    ctx->backend_user.device = device;
+    ctx->backend      = ggml_cuda_expert_backend(&ctx->backend_user);
     ctx->store        = ggml_expert_store_init(&ctx->backend, device, nullptr);
     ctx->stage_budget = stage_budget;
 
@@ -1797,6 +1822,36 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
                 free_now / 1024.0 / 1024.0, (need_now - free_now) / 1024.0 / 1024.0);
             delete ctx;
             return nullptr;
+        }
+    }
+
+    // one block for the slot arrays of every expert tensor (see ggml_cuda_expert_backend_user):
+    // the arrays of the plan, each at a page-aligned offset, in the order the tensors are added
+    {
+        size_t slab = 0;
+        for (size_t k = 0; k < expert_tensors.size(); ++k) {
+            const ggml_tensor * t = expert_tensors[k];
+            const size_t stride = ggml_expert_store_stride((size_t) t->nb[2], ggml_cuda_expert_blob_pad(t->type, t->ne[0]),
+                ggml_type_size(t->type));
+            slab += GGML_PAD((size_t) plan.n_slot[k] * stride, GGML_CUDA_EXPERT_SLAB_ALIGN);
+        }
+        if (slab > 0) {
+            size_t free_before = 0;
+            size_t total       = 0;
+            ggml_cuda_expert_get_mem(device, &free_before, &total);
+            ggml_cuda_set_device(device);
+            const cudaError_t err = cudaMalloc((void **) &ctx->backend_user.slab, slab);
+            if (err != cudaSuccess) {
+                (void) cudaGetLastError();
+                GGML_LOG_ERROR("%s: device %d: cudaMalloc of the %.2f MiB slot block failed (%s), %.2f MiB free of %.2f MiB\n",
+                    __func__, device, slab / 1024.0 / 1024.0, cudaGetErrorString(err),
+                    free_before / 1024.0 / 1024.0, total / 1024.0 / 1024.0);
+                delete ctx;
+                return nullptr;
+            }
+            ctx->backend_user.slab_size = slab;
+            GGML_LOG_DEBUG("%s: device %d: slot block cudaMalloc %.2f MiB for %zu tensors, free %.2f MiB before\n",
+                __func__, device, slab / 1024.0 / 1024.0, expert_tensors.size(), free_before / 1024.0 / 1024.0);
         }
     }
 

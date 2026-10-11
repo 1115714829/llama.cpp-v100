@@ -616,6 +616,10 @@ const ggml_cuda_device_info & ggml_cuda_info() {
 
 // #define DEBUG_CUDA_MALLOC
 
+// the graph node the calling thread is evaluating, so that the growth of a pool can be attributed
+// to the op that asked for the memory (startup memory accounting, debug log only)
+static thread_local const ggml_tensor * ggml_cuda_cur_node = nullptr;
+
 // buffer pool for cuda (legacy)
 struct ggml_cuda_pool_leg : public ggml_cuda_pool {
     static const int MAX_BUFFERS = 256;
@@ -839,9 +843,14 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             // add to the pool
             pool_size += reserve_size;
 
-            //printf("cuda pool[%d]: size increased to %llu MB (reserved %llu MB)\n",
-            //       device, (unsigned long long) (pool_size/1024/1024),
-            //       (unsigned long long) (reserve_size/1024/1024));
+            // the pool never shrinks: its growth is device memory the runtime adds after the
+            // fit measured the device, so it is reported for the startup memory accounting
+            const ggml_tensor * node = ggml_cuda_cur_node;
+            GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: grew by %.2f MiB to %.2f MiB for a request of %.2f MiB (%s %s [%lld, %lld, %lld, %lld])\n",
+                device, reserve_size/1024.0/1024.0, pool_size/1024.0/1024.0, size/1024.0/1024.0,
+                node ? ggml_op_desc(node) : "-", node ? node->name : "-",
+                node ? (long long) node->ne[0] : 0LL, node ? (long long) node->ne[1] : 0LL,
+                node ? (long long) node->ne[2] : 0LL, node ? (long long) node->ne[3] : 0LL);
         }
 
         GGML_ASSERT(pool_addr != 0);
@@ -1485,6 +1494,15 @@ static void ggml_backend_cuda_comm_init_nccl(ggml_backend_cuda_comm_context * re
     ggml_backend_cuda_comm_init_internal(ret);
 }
 
+// Device memory the communication contexts created since the last reset took at their creation,
+// per device: the NCCL communicator (its device structures; NCCL >= 2.22 allocates the
+// connection buffers later, at the first collective that needs them) and the push all-reduce
+// buffers. Every context of a tensor split creates one, after the fit sampled the free memory of
+// the devices, so it is device memory the expert slot budget has to leave room for. fit creates
+// the contexts of its measurement, reads what they took here and budgets the same for the real
+// contexts.
+static std::atomic<int64_t> ggml_cuda_comm_device_bytes[GGML_CUDA_MAX_DEVICES];
+
 // Top-level init.  Picks one of the three init paths based on
 // GGML_CUDA_ALLREDUCE (or the platform default) and lets the chain handle
 // any fallback.  Unrecognised env values warn and fall through to the
@@ -1501,6 +1519,15 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     ret->dev_ids.reserve(n_backends);
     for (size_t i = 0; i < n_backends; i++) {
         ret->dev_ids.push_back(static_cast<ggml_backend_cuda_context *>(backends[i]->context)->device);
+    }
+
+    // the communicator and the push buffers are device memory every context of a tensor split
+    // adds after the fit measured the devices: sample it for the startup memory accounting
+    std::vector<size_t> free_before(n_backends, 0);
+    for (size_t i = 0; i < n_backends; i++) {
+        size_t total = 0;
+        ggml_cuda_set_device(ret->dev_ids[i]);
+        CUDA_CHECK(cudaMemGetInfo(&free_before[i], &total));
     }
 
     const char * env = getenv("GGML_CUDA_ALLREDUCE");
@@ -1530,6 +1557,17 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
     // that backend.
     if (env == nullptr || std::string(env) != "none") {
         ret->ar_push = ggml_cuda_ar_push_init(ret->dev_ids.data(), ret->dev_ids.size());
+    }
+
+    for (size_t i = 0; i < n_backends; i++) {
+        size_t free_after = 0;
+        size_t total = 0;
+        ggml_cuda_set_device(ret->dev_ids[i]);
+        CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
+        const int64_t taken = (int64_t) free_before[i] - (int64_t) free_after;
+        ggml_cuda_comm_device_bytes[ret->dev_ids[i]] += taken;
+        GGML_LOG_DEBUG("%s: device %d: communication context takes %.2f MiB of device memory\n",
+            __func__, ret->dev_ids[i], taken/1024.0/1024.0);
     }
 
     return ret;
@@ -5543,6 +5581,25 @@ static bool ggml_cuda_tensor_ready_before(const ggml_cgraph * cgraph, const ggml
     return true;
 }
 
+// cudaGraphInstantiate with the device memory the executable takes reported at debug level: the
+// executables are device memory the runtime adds after the fit measured the devices
+static cudaError_t ggml_cuda_graph_instantiate(cudaGraphExec_t * exec, cudaGraph_t graph, int device) {
+    size_t free_before = 0;
+    size_t free_after  = 0;
+    size_t total       = 0;
+    ggml_cuda_set_device(device);
+    CUDA_CHECK(cudaMemGetInfo(&free_before, &total));
+    const cudaError_t err = cudaGraphInstantiate(exec, graph, NULL, NULL, 0);
+    if (err == cudaSuccess) {
+        size_t n_nodes = 0;
+        CUDA_CHECK(cudaGraphGetNodes(graph, nullptr, &n_nodes));
+        CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
+        GGML_LOG_DEBUG("%s: device %d: CUDA graph of %zu nodes instantiated, %.2f MiB of device memory\n",
+            __func__, device, n_nodes, ((double) free_before - (double) free_after)/1024.0/1024.0);
+    }
+    return err;
+}
+
 #ifdef USE_CUDA_GRAPH
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS] has_staging reports whether one of the nodes copies host experts
 // into the VRAM staging area; it is part of the identity of a cached executable (see
@@ -5718,7 +5775,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        CUDA_CHECK(ggml_cuda_graph_instantiate(&graph->instance, graph->graph, cuda_ctx->device));
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
@@ -8977,6 +9034,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_cur_node = node;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -9044,7 +9102,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            CUDA_CHECK(ggml_cuda_graph_instantiate(&graph->instance, graph->graph, cuda_ctx->device));
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
@@ -9192,7 +9250,7 @@ static void * ggml_backend_cuda_capture_end(ggml_backend_t backend) {
 
     cudaGraphExec_t exec = nullptr;
     if (err == cudaSuccess && graph != nullptr) {
-        err = cudaGraphInstantiate(&exec, graph, NULL, NULL, 0);
+        err = ggml_cuda_graph_instantiate(&exec, graph, cuda_ctx->device);
     }
     if (graph != nullptr) {
         CUDA_CHECK(cudaGraphDestroy(graph));
@@ -9712,6 +9770,20 @@ struct ggml_backend_cuda_device_context {
     std::string pci_bus_id;
     int op_offload_min_batch_size;
 };
+
+// reset / read the device memory of the communication contexts created since the last reset
+// (see ggml_cuda_comm_device_bytes); fit brackets the contexts of its measurement with them
+static void ggml_backend_cuda_comm_memory_reset(void) {
+    for (std::atomic<int64_t> & bytes : ggml_cuda_comm_device_bytes) {
+        bytes.store(0);
+    }
+}
+
+static size_t ggml_backend_cuda_comm_memory(ggml_backend_dev_t dev) {
+    const ggml_backend_cuda_device_context * ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    const int64_t bytes = ggml_cuda_comm_device_bytes[ctx->device].load();
+    return bytes > 0 ? (size_t) bytes : 0;
+}
 
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
@@ -10690,6 +10762,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_free") == 0) {
         return (void *)ggml_backend_cuda_comm_free;
+    }
+    if (strcmp(name, "ggml_backend_comm_memory_reset") == 0) {
+        return (void *)ggml_backend_cuda_comm_memory_reset;
+    }
+    if (strcmp(name, "ggml_backend_comm_memory") == 0) {
+        return (void *)ggml_backend_cuda_comm_memory;
     }
     if (strcmp(name, "ggml_backend_comm_allreduce_tensor") == 0) {
         return (void *)ggml_backend_cuda_comm_allreduce_tensor;
