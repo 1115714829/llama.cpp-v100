@@ -15996,8 +15996,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_select(8192 + 7, 7, 70, 4, 512, type_K));
         // the pool counts qwen4exp takes (llama_memory_hybrid_idx::kpool_n_pool): the pools of the used cells padded
         // to the n_kv grain plus one, so up to a grain of padded pools after the real ones. A short context, decode
-        // and prompt; 16K; past 16K and past 128K the count picks the register and the wide kernel while the real
-        // pools still fit the 256-thread and the register kernel; 200K; the whole 256K cache
+        // and prompt; 16K; past 16K and past 128K the count picks a larger register kernel and the multi-block kernel
+        // while the real pools still fit the smaller ones; 200K; the whole 256K cache
         test_cases.emplace_back(new test_qsa_select(513,   497,  4,  4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(513,   497,  66, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(4097,  81,   4,  4, 512, type_K));
@@ -16608,7 +16608,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
     // the cost of the padded pools: the same real pools under a count padded to 64 pools and under the n_kv-grain
-    // count (llama_memory_hybrid_idx::kpool_n_pool), F32 keys as gathered from the cache. MTP verify at 16K, at the
+    // count (llama_memory_hybrid_idx::kpool_n_pool), F32 keys read through pool_cells. MTP verify at 16K, at the
     // start of the n_kv bucket (3584 real) and late in it (4016 real); at 200K at the start of the bucket (49152 real);
     // a prompt batch past 64K, where the grain is 4096 cells (16896 real)
     for (int64_t n_real : { 3584, 4016 }) {
