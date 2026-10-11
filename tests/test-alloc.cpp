@@ -642,6 +642,49 @@ static void test_reallocation() {
     }
 }
 
+// A leaf that no node reads (an input kept allocated for set_input, a spare copy of a double-buffered input) is
+// placed from the leaf allocations alone. When it grows between two graphs that are otherwise the same,
+// ggml_gallocr_alloc_graph must lay the graph out again instead of writing the leaf past its old size.
+static void test_unread_leaf_grows() {
+    dummy_backend    backend = dummy_backend_init(256, /*align*/ 4);
+    ggml_gallocr_ptr galloc;
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * x[4];
+        x[0] = make_input_with_size(ctx, 16); // no node reads it
+        x[1] = make_input_with_size(ctx, 16);
+        x[2] = make_input_with_size(ctx, 16);
+        x[3] = ggml_add(ctx, x[1], x[2]);
+        assign_names(ctx);
+        ggml_build_forward_expand(graph, x[0]);
+
+        galloc = allocate_graph(graph, x[3], &backend.buffer_type);
+        check_all_allocated(graph);
+        GGML_ASSERT(graph->n_leafs == 3 && graph->n_nodes == 1);
+    }
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * x[4];
+        x[0] = make_input_with_size(ctx, 64); // the unread leaf grew, nothing else changed
+        x[1] = make_input_with_size(ctx, 16);
+        x[2] = make_input_with_size(ctx, 16);
+        x[3] = ggml_add(ctx, x[1], x[2]);
+        assign_names(ctx);
+        ggml_build_forward_expand(graph, x[0]);
+        ggml_set_output(x[3]);
+        ggml_build_forward_expand(graph, x[3]);
+        GGML_ASSERT(graph->n_leafs == 3 && graph->n_nodes == 1);
+
+        bool result = ggml_gallocr_alloc_graph(galloc.get(), graph);
+        GGML_ASSERT(result);
+        check_all_allocated(graph);
+        GGML_ASSERT(x[0]->buffer != nullptr && x[0]->data != nullptr);
+        for (int i = 1; i < 4; ++i) {
+            GGML_ASSERT(!memory_overlap(x[0], x[i]));
+        }
+    }
+}
+
 static void test_backend_graph_optimize(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -1120,6 +1163,7 @@ int main() {
     run("test_multiple_buffer_types", test_multiple_buffer_types);
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
+    run("test_unread_leaf_grows", test_unread_leaf_grows);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
