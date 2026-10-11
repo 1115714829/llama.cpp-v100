@@ -1,43 +1,16 @@
 # llama.cpp-v100
 
-**简体中文** | [English](README.en.md)
+**简体中文** | [English](README.en.md) | [27B 稠密模型（Qwen3.8-27B + DFlash2）](docs/v100/27b.md) | [2.0.0 大 MoE（Qwen3.8-Flash-Next + MTP）](docs/v100/moe-2.0.0.md) | [更新日志](CHANGELOG.md)
 
-面向 NVIDIA V100（SM70）的 llama.cpp 修改版。当前版本 **1.1.1**，各版本的更新内容见 [CHANGELOG.md](CHANGELOG.md)。
+面向 NVIDIA V100（SM70）的 llama.cpp 修改版。当前版本 **2.0.0**，各版本的更新内容见 [CHANGELOG.md](CHANGELOG.md)。
 
----
-
-## 本版更新（1.1.1）
-
-1.1.1 合并上游 llama.cpp v0.6.0，功能与性能保持与 1.1.0 相同；以下数字均为与 1.1.0 同一时段交替测量。
-
-- **同步上游 v0.6.0**：带入上游这段时间的更新（新的批处理接口、上游新增的模型与修复等）。本项目的投机解码（DFlash2 设备端注入、稀疏拒绝采样、多路注入）、预填充限流、视觉模块放 GPU、检查点策略等功能已移植到上游新的批处理接口上；SM70 内核、张量并行与 all-reduce 等改动保持不变。
-- 与 1.1.0 交替测量：4/6 卡 T=0 输出逐字相同，每 token 耗时 5.66 / 5.65 ms；4 卡真实 16K 预填充 2579.0 / 2585.4 tok/s；2 卡 Q4 262144 合成 209715 预填充 1082.6 / 1081.0 tok/s、每轮投机 43.7 / 43.7 ms；6 卡 524288 合成 419430 预填充 1505.9 / 1503.2 tok/s、吐字 239.6 / 239.4 tok/s；多路并发首字相同；多模态图片、视频正常；各卡显存峰值相同。
-- **为 Qwen3.8-Flash-Next 做准备**：上游 v0.6.0 新增了 Qwen3.8-Flash-Next（架构 `qwen4exp`，大 MoE）的支持，1.1.1 合并后可以加载运行（模型放不下显存时，可用上游的 `--n-cpu-moe` / `-ot` 把部分专家放到 CPU）。本项目尚未对它做 V100 专项优化，专项优化（专家矩阵乘、专家并行、显存/内存/硬盘三级存储、MTP 投机解码）在 2.0.0 中进行。
-- **Docker 镜像**：`ghcr.io/1115714829/llama.cpp-v100:1.1.1`，同一标签含 x86_64 与 IBM Power AC922（ppc64le），见“Docker”一节。
-- **参数说明补充**：`--cache-ram`、`--ctx-checkpoints` 与主机内存的关系，请求级思考强度 `reasoning_effort`，以及 ppc64le 上自动设置的 `NCCL_P2P_LEVEL`，见“参数说明”。
-
----
-
-## 致谢
-
-**特别感谢 [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)。** 它在 V100 上的工程实践给了本项目很多参考，部分 SM70 计算内核移植自它。
-
-同样感谢：
-
-- **[llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml)**：本项目的基础框架。
-- **[vLLM](https://github.com/vllm-project/vllm)**：投机解码等方面的设计给了本项目很多借鉴。
+**快速部署**：两个详情页按硬件给出可直接复制的完整命令，最后一节“快速部署（给 AI 助手与新手）”（[27B](docs/v100/27b.md#快速部署给-ai-助手与新手) / [大 MoE](docs/v100/moe-2.0.0.md#快速部署给-ai-助手与新手)）列出每个参数对能力 / 速度 / 显存的影响、选配置的判断步骤和常见问题对照，可以把详情页直接交给 AI 助手照着部署。
 
 ---
 
 ## 简介
 
-基于 llama.cpp（上游 v0.6.0，2026-10-05 的 `d81235049`）修改。部分 SM70 计算内核移植自 1Cat-vLLM，出处与许可见各文件头和 `licenses/` 目录。
-
-下面的测试数据都用 Qwen3.8-27B（Q8_0）配合 DFlash2 投机解码。
-
----
-
-## 本项目优化的方向
+基于 llama.cpp（上游 v0.6.0，2026-10-05 的 `d81235049`）修改，从计算内核到运行时为 V100 重新实现与优化；引用的外部实现见文末致谢，出处与许可见各文件头和 `licenses/` 目录。
 
 围绕 V100（SM70）的硬件特性，从计算内核到运行时进行了系统性优化：
 
@@ -48,496 +21,64 @@
 - **平台适配**：针对 IBM AC922 的 NVLink 互联与 NUMA 内存架构进行适配。
 - **多路并发**：多路请求时吐字优先、限制提示词处理占用的时间，多路的解码批次、投机解码与显存预留都按路数优化。
 - **多模态**：支持视觉模块（mmproj）在 GPU 上运行，处理图片、PDF 与视频。
+- **大 MoE 模型**（2.0.0）：专家并行与张量并行结合的多卡切分；显存放不下的专家放在锁页主机内存，由 GPU 直接读取并按 NUMA 节点放置；按路由画像决定哪些专家常驻显存、各卡分配哪些专家；MTP 投机解码与稀疏注意力针对 V100 优化。
 
 ---
 
-## 测试数据
+## 致谢
 
-测试环境：
-- 服务器：IBM Power AC922（2 × POWER9），6 × Tesla V100-SXM2-16GB（NVLink），CUDA 12.4。4 卡测试用 0、1、3、4 号卡（两颗 CPU 各两张）。
-- 模型：Qwen3.8-27B，Q8_0 GGUF；投机解码用 DFlash2 草稿模型（F16），每轮起草 7 个。
-- 启动参数：见“启动参数”一节的对应配置。
-- 除“多路并发”和“多模态”外，每个用例都在全新启动的服务上测；这两节的用例在同一个服务里依次测。
-- “卡数与量化适配”的单路表为 1.0.6 实测，两路表为 1.0.5 实测（2026-09-30）；其余各节为 1.0.4 实测（2026-09-29～30）。4 卡 Q8 在 1.0.5、1.0.6 上输出与 1.0.4 逐字相同、速度不变；6 卡从 1.0.6 起预填充更快（见“本版更新”），6 卡各表的吐字与显存不变。1.0.7 的 3 卡均衡与长上下文显存变化见“本版更新”。1.0.8 实测的数字在表中注明“1.0.8”（4 卡与 6 卡 200K 合成、6 卡 419430、视觉模块显存）；其余数字为旧版实测，6 卡长上下文预填充从 1.0.8 起更快。
-- 标注“1.1.1”的数字为 1.1.1 版本实测（2026-10-06，与 1.1.0 同一时段交替测量，各项持平）。
-- 真实内容的吐字速度随接受率变化，部分表格同时给出每轮投机耗时。
+**感谢群友 [umacro](https://github.com/umacro)、看透<!-- TODO: GitHub 链接待补 -->、[天语星落](https://github.com/ativx928)、[lsaac](https://github.com/isaac-bj)。** 没有他们提供的测试机设备与 token，本项目不会这么快实现。
 
-### 4 卡，上下文 262144
+参与开发：仓库作者（发起项目，提供硬件与测试环境，确定目标与取舍）；外部贡献者 [天语星落（ATIVX928）](https://github.com/ativx928)（[PR #1](https://github.com/1115714829/llama.cpp-v100/pull/1)、[PR #2](https://github.com/1115714829/llama.cpp-v100/pull/2)）。参考的项目与使用的 AI 助手见[文末致谢](#致谢项目与-ai-助手)。
 
-| 输入 | 预填充 | 吐字 | 每轮投机耗时 | 每卡显存峰值 |
-|---|---:|---:|---:|---:|
-| 合成 209715 token（输出 512，1.1.1） | 1772 tok/s | 282.0 tok/s | 28.3 ms | 12.9 GB |
-| 真实代码 209228 token（输出 1024） | 1635 tok/s | 88.0 tok/s | 28.6 ms | 13.3 GB |
-| 合成 131072 token（输出 512） | 1976 tok/s | 306.0 tok/s | 26.1 ms | 13.3 GB |
-| 真实代码 131184 token（输出 1024） | 1966 tok/s | 102.6 tok/s | 25.9 ms | 13.3 GB |
-| 真实代码 16500 token（输出 1024，1.1.1） | 2584 tok/s | 131.7 tok/s | 21.9 ms | 12.9 GB |
+---
 
-<sub>数据来源：标注 1.1.1 的为 1.1.1 版本实测（2026-10-06，与 1.1.0 同一时段交替测量各项持平）；未标注的为表下或“测试环境”中所注的旧版实测。</sub>
+## 2.0.0 更新内容
 
-**草稿模型量化**（4 卡 Q8，各 2 遍）：
+2.0.0 新增大 MoE 模型 Qwen3.8-Flash-Next 的 V100 专项支持；Qwen3.8-27B 的功能不变，并带上下一节的修复。本版支持的大 MoE 配置：**6 × V100-16GB + Qwen3.8-Flash-Next UD-Q4_K_XL + MTP 草稿（Q4_K_M）** 是标准配置，本页与详情页的实测数据都来自它；**4 × V100-32GB（x86，PCIe）** 可以运行，专家全部常驻显存、不走主机内存（参考数据见 [MoE 详情页](docs/v100/moe-2.0.0.md#实测数据)）；其他卡数、其他量化（如 Q8_0 主模型）与更多模型后续陆续兼容。
 
-| 草稿模型 | 每轮产出 token（短 / 16K / 128K） | 每轮投机耗时（短 / 16K / 128K） | 每卡显存峰值 |
-|---|---:|---:|---:|
-| F16 | 3.23 / 2.51 / 2.46 | 21.3 / 22.1 / 26.0 ms | 13.3 GB |
-| Q8_0 | 2.76 / 2.55 / 2.75 | 20.6 / 21.3 / 25.3 ms | 12.9 GB |
-| Q4_K_M | 2.84 / 2.56 / 2.43 | 20.6 / 21.3 / 25.3 ms | 12.6 GB |
+- **大 MoE 模型 Qwen3.8-Flash-Next**：多卡 `--split-mode tensor` 时，路由专家按专家分到各卡（专家并行），注意力、线性注意力、共享专家等稠密部分按张量并行。推荐配置为 6 张 16 GB 的 V100、上下文 262144、带 MTP 投机解码。
+- **专家放在显存与主机内存两级**：启动时按每张卡剩下的显存自动决定每层常驻显存的专家，其余放在 GPU 能直接读取的锁页主机内存里、仍由 GPU 计算，不需要 `--n-cpu-moe` / `-ot`；锁页内存按 GPU 所在的 CPU 节点（NUMA）分配和填充。
+- **专家路由画像**：`--expert-profile` 按一份路由统计把最常用的专家留在显存，并据此调整专家在各卡之间的分配，使各卡的计算量接近；`scripts/v100-expert-profile.sh` 用一段校准文本生成画像。
+- **n-gram 嵌入表放主机内存**：模型的 n-gram 嵌入表与词嵌入表放在锁页主机内存，各卡共用一份、由 GPU 直接查表，不占显存。
+- **稀疏注意力（QSA）**：全注意力层只对索引器选出的位置做注意力（此前的上游实现在 V100 上按全部上下文计算），计算缓冲不再随上下文线性增长，262144 上下文可以在 16 GB 的卡上运行。
+- **MTP 投机解码的 V100 优化**：草稿链在 GPU 上连续执行、每轮只回传一次结果；草稿层只看最近的若干位置（新参数 `--spec-draft-window`）；草稿上下文可以单独设物理批大小（新参数 `--spec-draft-ubatch`）。
+- **内核与运行时**：预填充的专家矩阵乘使用 Volta 张量核的融合内核；吐字时合并多个小算子；多卡执行计划第一次运行时由各卡的发射线程并行提交。
 
-短任务 F16 接受率明显更高，长上下文三者在噪声内；显存够用选 F16，紧张时 Q8_0/Q4_K_M 损失很小。
+实测（2026-10-11，IBM AC922 + 6 × V100-SXM2-16GB，构建 `4d50148cc`；上下文 262144、带 MTP 与专家路由画像；约 20 万 token 真实代码，新起服务、温度 0、不开思考，输出 686 token 时自然结束）：预填充 2334.8 / 2340.8 tok/s，吐字 107.9 / 109.7 tok/s。同一台机器上，大 MoE 的约 20 万 token 预填充比 27B 高约 13%，吐字约为 27B 的 87%。
 
-### 4 卡，模型卡推荐的采样参数
+---
 
-真实代码，输出 1024：
+## 27B 修复内容
 
-| 模式 | 输入 | 预填充 | 吐字 | 接受率 | 每轮投机耗时 |
-|---|---|---:|---:|---:|---:|
-| 思考模式（T=1.0、top_p 0.95、top_k 20） | 16K | 2552 tok/s | 116.5 tok/s | 0.22 | 22.0 ms |
-| 思考模式 | 128K | 1963 tok/s | 97.6 tok/s | 0.22 | 25.9 ms |
-| 非思考模式（T=0.7、top_p 0.8、top_k 20、presence_penalty 1.5） | 16K | 2620 tok/s | 105.4 tok/s | 0.25 | 26.0 ms |
-| 非思考模式 | 128K | 1971 tok/s | 89.1 tok/s | 0.24 | 29.8 ms |
+- **开启 top-k 输出时每批重新规划显存**（1.1.1 中已存在）：目标模型开启 top-k 输出（设备端 top-k 或拒绝采样）时，没有输出行的预填充批与预留的计算图不一致，每批都会重新规划显存并让全部 GPU 同步。27B 现有的 DFlash2 配置不触发，实测修复前后无差别；这项修复为 27B 以后支持 MTP 预先处理。
+- **层切分 + DFlash2 启动即失败**（1.1.1 中已存在）：`--split-mode layer` 配合 DFlash2 草稿时启动失败；现在可以启动，启动时的显存规划同时计入 DFlash2 草稿的隐状态缓冲。
+- **其他**：ggml 分配器在只作叶子出现的输入变大时会覆盖相邻内存的问题；POWER9（ppc64le）上 CPU 计算 IQ1_S 点积的结果错误（只影响 CPU 计算，GPU 推理不受影响）。
 
-1.0.7 起非思考模式（presence penalty）不再退回主机采样，每轮投机耗时 26.2 → 21.8 ms（表中为 1.0.4 实测）。
+实测（2026-10-11，IBM AC922 + 6 × V100-SXM2-16GB；1.1.1 与 2.0.0 构建 `4d50148cc` 同一时段交替各两轮；上下文 262144、DFlash2，条件见 [27B 详情页](docs/v100/27b.md#实测数据)）：短提示吐字 186.2 / 188.9 → 218.3 / 206.9 tok/s；约 1.6 万 token 预填充 2863.4 / 2842.7 → 3119.1 / 3121.1 tok/s；约 20 万 token 预填充 2047.8 / 2047.1 → 2066.6 / 2063.2 tok/s、吐字 114.5 / 115.6 → 122.2 / 127.0 tok/s。
 
-### 4 卡，批大小（`-ub`），上下文 262144
+---
 
-| `-ub` | 结果 |
-|---|---|
-| 2048 | 正常运行，每卡显存峰值 13.3 GB |
-| 4096 | 正常运行，每卡显存峰值 14.5 GB；合成 209715 token（输出 512）：预填充 1801 tok/s，吐字 277.1 tok/s |
-| 8192 | 显存不够，启动失败 |
+## 测试平台
 
-### 6 卡，上下文 262144
+**标准测试机**（两个详情页的主要数据都在这台机器上测）：IBM Power AC922，2 × POWER9，96 GB 内存（两个 CPU 节点各 48 GB），6 × Tesla V100-SXM2-16GB，CUDA 12.4。每颗 CPU 连 3 张 GPU，同一颗 CPU 下的 GPU 之间 NVLink 直连；GPU 与 CPU 之间是 NVLink 2.0。
 
-| `-ub` | 输入 | 预填充 | 吐字 | 每轮投机耗时 | 每卡显存峰值 |
-|---|---|---:|---:|---:|---:|
-| 2048 | 合成 209715 token（输出 512，1.1.1） | 2102 tok/s | 300.5 tok/s | 26.6 ms | 10.0 GB |
-| 2048 | 真实代码 209227 token（输出 1024） | 1703 tok/s | 103.7 tok/s | 27.2 ms | 10.2 GB |
-| 2048 | 真实代码 16494 token（输出 1024） | 2569 tok/s | 146.9 tok/s | 20.6 ms | 10.2 GB |
-| 4096 | 合成 209715 token（输出 512） | 1897 tok/s | 292.2 tok/s | 27.3 ms | 11.4 GB |
-| 4096 | 真实代码 209236 token（输出 1024） | 1889 tok/s | 89.4 tok/s | 27.2 ms | 11.4 GB |
-| 4096 | 真实代码 16500 token（输出 1024） | 2690 tok/s | 121.4 tok/s | 20.6 ms | 11.4 GB |
-| 8192 | 合成 209715 token（输出 512） | 1905 tok/s | 291.4 tok/s | 27.4 ms | 13.8 GB |
+**参考主机**（x86）：4 × Tesla V100-SXM2-32GB（GPU 之间 NVLink 全互联，GPU 与主机之间 PCIe 3.0，136 GB 内存，CUDA 12.8），用于大 MoE 的 4 卡参考数据；2 × Tesla V100-SXM2-16GB（NVLink，PCIe 3.0，CUDA 12.8），用于编译与正确性测试。
 
-<sub>数据来源：标注 1.1.1 的为 1.1.1 版本实测（2026-10-06，与 1.1.0 同一时段交替测量各项持平）；未标注的为表下或“测试环境”中所注的旧版实测。</sub>
+AC922 与 x86 服务器的基础区别，以及它们对加速效果的间接影响（大 MoE 尤其明显）：
 
-### 6 卡，上下文 524288（YaRN）
-
-| `-ub` | 输入 | 首字 | 预填充 | 吐字 | 每卡显存峰值 |
-|---|---|---:|---:|---:|---:|
-| 2048 | 合成 419430 token（输出 512，1.1.1） | 278.9 s | 1504 tok/s | 238.8 tok/s | 11.5 GB |
-| 4096 | 合成 419430 token（输出 512） | 320 s | 1312 tok/s | 230.3 tok/s | 13.9 GB |
-
-<sub>数据来源：标注 1.1.1 的为 1.1.1 版本实测（2026-10-06，与 1.1.0 同一时段交替测量各项持平）；未标注的为表下或“测试环境”中所注的旧版实测。</sub>
-
-`-ub 4096` 一行为旧版实测（1.0.8 起预填充同样更快）。`-ub 8192` 显存不够，启动失败。只测了速度和显存，没有测 262144 以上的输出质量。YaRN 设置对所有长度都生效。
-
-### 多路并发
-
-真实代码，思考模式（T=0.6），每路输出 1024，默认 `--prefill-pace 30`。同一个服务里依次测，“同时请求”指各路同时发出。
-- 首字从发出请求算起；每路吐字 = 这一路从第一个字到结束的速度。
-- 合计吐字 = 所有路的输出总数 ÷（最早的第一个字 → 最后一路结束）。
-- 全部完成 = 从发出请求到最后一路结束。
-
-**4 卡，`-c 262144 -np 2`（每路 131072）**，每卡启动显存 13.5 GB，峰值 13.7 GB：
-
-| 场景 | 首字 | 每路吐字 | 合计吐字 | 全部完成 |
-|---|---|---:|---:|---:|
-| 单路 16K（1.1.1） | 6.4 s | 120.9 tok/s | 121 tok/s | 14.9 s |
-| 两路各 16K 同时请求（1.1.1） | 8.1 s / 22.2 s | 84.1 / 103.6 tok/s | 86 tok/s | 32.0 s |
-| 单路约 11.5 万 token | 55.8 s | 99.9 tok/s | 100 tok/s | 66.0 s |
-| 两路各约 11.5 万 token 同时请求（1.1.1） | 55.1 s / 118.9 s | 60.0 / 103.8 tok/s | 28 tok/s | 128.8 s |
-
-<sub>数据来源：标注 1.1.1 的为 1.1.1 版本实测（2026-10-06，与 1.1.0 同一时段交替测量各项持平）；未标注的为表下或“测试环境”中所注的旧版实测。</sub>
-
-**4 卡，`-c 262144 -np 4`（每路 65536）**，每卡启动显存 14.2 GB，峰值 14.3 GB：
-
-| 场景 | 首字 | 每路吐字 | 合计吐字 | 全部完成 |
-|---|---|---:|---:|---:|
-| 单路 16K | 6.5 s | 116.0 tok/s | 116 tok/s | 15.3 s |
-| 四路各 16K 同时请求（1.1.1） | 8.2 / 23.2 / 39.0 / 52.5 s | 76.3 / 82.8 / 83.7 / 106.8 tok/s | 73 tok/s | 62.1 s |
-
-<sub>数据来源：标注 1.1.1 的为 1.1.1 版本实测（2026-10-06，与 1.1.0 同一时段交替测量各项持平）；未标注的为表下或“测试环境”中所注的旧版实测。</sub>
-
-**6 卡，`-c 524288 -np 2`（YaRN，每路 262144）**，每卡启动显存 12.4～12.8 GB，峰值 12.7～13.0 GB（1.0.4 实测；1.0.8 起每卡多约 0.3 GB，为分担注意力的工作区）：
-
-| 场景 | 首字 | 每路吐字 | 合计吐字 | 全部完成 |
-|---|---|---:|---:|---:|
-| 单路 16K | 6.4 s | 118.5 tok/s | 119 tok/s | 15.0 s |
-| 两路各 16K 同时请求（1.1.1） | 8.0 s / 20.1 s | 94.0 / 104.3 tok/s | 94 tok/s | 29.9 s |
-| 两路各约 11.5 万 token 同时请求（1.1.1） | 47.4 s / 101.6 s | 75.0 / 88.4 tok/s | 31 tok/s | 113.2 s |
-
-<sub>数据来源：标注 1.1.1 的为 1.1.1 版本实测（2026-10-06，与 1.1.0 同一时段交替测量各项持平）；未标注的为表下或“测试环境”中所注的旧版实测。</sub>
-
-同一配置把两路各自填到接近 256K 的实测（1.0.9，视觉模块按层分到 6 卡，思考模式，每卡启动后 12.44～12.60 GB）：
-
-| 场景 | 首字 | 预填充 | 每路吐字 | 各卡显存峰值 |
-|---|---|---|---|---|
-| 两路同时各约 24.4 万 token 纯文字 | 126 s / 251 s | 1964 / 1855 tok/s | 54.0 / 69.0 tok/s | 12.9～13.1 GB |
-| 两路同时：约 23.2 万 token 文字 + 图片 / 约 23.5 万 token 文字 + 视频 | 253.5 s / 146.4 s | — | 60.8 / 67.9 tok/s | 12.9～13.1 GB |
-
-`-c 1048576 -np 2`（每路 524288）也能启动、文字正常，但处理图片时视觉模块的计算缓冲分配不到显存；需要每路 512K 又要图片时，可用 `--no-mmproj-offload` 把视觉模块放 CPU（编码明显变慢）。
-
-与 1.0.3 对比（4 卡，同一测试）：
-
-| 场景 | 1.0.3 | 1.0.4 |
+| | IBM AC922 | x86 服务器 |
 |---|---|---|
-| `-np 2` 两路各 16K：首字 | 9.2 s / 16.7 s | 8.1 s / 22.7 s |
-| `-np 2` 两路各 16K：每路吐字 | 45.7 / 58.8 tok/s | 81.4 / 111.4 tok/s |
-| `-np 2` 两路各 16K：全部完成 | 34.1 s | 31.9 s |
-| `-np 2` 两路各 11.5 万：首字 | 59.6 s / 133.0 s | 58.0 s / 122.6 s |
-| `-np 2` 两路各 11.5 万：每路吐字 | 11.4 / 58.9 tok/s | 70.2 / 81.4 tok/s |
-| `-np 2` 两路各 11.5 万：全部完成 | 150.6 s | 135.2 s |
-| `-np 2` 每卡启动显存 | 14.0 GB | 13.5 GB |
-| `-np 4`（每路 64K） | 启动即显存不足 | 可以运行 |
-
-说明：
-- 提示词处理是按顺序排队的，多路同时请求时后面几路的首字要等前面的处理完。所有请求全部完成的总时间与依次处理差不多；多路的好处是先开始吐字的请求不会被后来的长提示词卡住，后来的请求也不必等前一路全部吐完才开始。
-- `--prefill-pace` 调大，后来请求的首字更快，但正在吐字的请求更慢；设为 0 或 100 等于不限流（与 1.0.3 相同）。16K 这类短提示词时，默认 30 会让第二路的首字晚几秒（上表 16.7 → 22.7 s）。
-- 单路长上下文（例如一个 Agent 开满 256K）仍建议 `-np 1`，多路时每路的上下文是总上下文的几分之一。
-
-### 卡数与量化适配
-
-单路表为 1.0.6 实测，两路表为 1.0.5 实测。两套配置：
-- **Q8**：主模型 Q8_0、KV 缓存 q8_0（`-ctk q8_0 -ctv q8_0`）；
-- **Q4**：主模型 UD-Q4_K_M、KV 缓存 q4_0（`-ctk q4_0 -ctv q4_0`）。
-
-草稿模型默认用 DFlash2 F16；2 卡 Q4 要开到 262144 时改用 DFlash2 Q4_K_M（F16 草稿时最高 131072）。卡号：2 卡 0、1，3 卡 0、1、2，4 卡 0、1、3、4，5 卡 0～4，6 卡 0～5。每种组合从 524288 起逐档往下试，下表是能启动的最高上下文；524288 需要 YaRN（见“启动参数”）。
-
-**单路**（真实代码 16K 输入、输出 1024；合成输入为上下文的 80%，输出 512）：
-
-| 卡数 | 配置 | 上下文 | 真实 16K：预填充 / 吐字 / 每轮投机 | 合成长输入：token / 首字 / 预填充 / 吐字 | 每卡显存峰值 |
-|---|---|---:|---|---|---:|
-| 2 | Q4（草稿 Q4_K_M） | 262144 | 1841 / 78.6 tok/s / 35.8 ms | 209715 / 197 s / 1065 / 162.4 tok/s | 14.1 GB |
-| 2 | Q4（草稿 F16） | 131072 | 1861 / 63.4 tok/s / 37.1 ms | 104857 / 74 s / 1419 / 184.4 tok/s | 13.7 GB |
-| 3 | Q8 | 131072 | 2470 / 90.0 tok/s / 28.2 ms | 104857 / 59 s / 1779 / 231.5 tok/s | 14.8 GB |
-| 3 | Q4 | 524288 | 2353 / 78.3 tok/s / 31.6 ms | 419430 / 530 s / 792 / 134.9 tok/s | 14.2 GB |
-| 4 | Q8 | 262144 | 2584 / 131.7 tok/s / 21.9 ms（1.1.1） | 209715 / 118 s / 1772 / 282.0 tok/s（1.1.1） | 12.9 GB（1.1.1） |
-| 4 | Q4 | 524288 | 2458 / 110.4 tok/s / 26.7 ms | 419430 / 379 s / 1107 / 198.5 tok/s | 11.6 GB |
-| 5 | Q8 | 524288 | 2612 / 126.1 tok/s / 22.2 ms | 419430 / 367 s / 1143 / 222.4 tok/s | 14.2 GB |
-| 5 | Q4 | 524288 | 2489 / 93.2 tok/s / 26.5 ms | 419430 / 374 s / 1122 / 198.7 tok/s | 10.3 GB |
-| 6 | Q8 | 524288 | 2774 / 114.1 tok/s / 20.5 ms | 419430 / 278.9 s / 1504 / 238.8 tok/s（1.1.1） | 12.8 GB |
-| 6 | Q4 | 524288 | 2599 / 110.6 tok/s / 25.5 ms | 419430 / 358 s / 1171 / 203.3 tok/s | 9.5 GB |
-
-<sub>数据来源：标注 1.1.1 的为 1.1.1 版本实测（2026-10-06，与 1.1.0 同一时段交替测量各项持平）；未标注的为表下或“测试环境”中所注的旧版实测。</sub>
-
-- 2 卡请用 Q4 配置：Q8_0 主模型约 29 GB，2 张 16 GB 卡放不下。
-- 3 卡 Q8 的 262144 显存不够（换 Q4_K_M 草稿也不够），最高 131072。
-- Q4 配置的吐字仍比 Q8 慢；1.0.9 起 Q2_K～Q6_K 都走小批量内核并启用 gate/up 与多权重融合，Q4 吐字约快 10%（见“本版更新”，表中 Q4 各行为旧版实测）。
-- 3 卡 Q8 从 1.0.7 起注意力均衡（表中为 1.0.6 实测）；6 卡从 1.0.8 起长上下文预填充更快，6 卡 Q8 的合成长输入已更新为 1.0.8 实测，6 卡 Q4 一行为旧版实测。
-
-**两路并发**（`-np 2`，每路上下文 = 上下文 ÷ 2；1 路 16K 与 2 路各 16K 同时请求，输出 1024）：
-
-| 卡数 | 配置 | 上下文（每路） | 单路 16K：首字 / 吐字 | 两路各 16K 同时：首字 | 每路吐字 | 每卡显存峰值 |
-|---|---|---:|---|---|---|---:|
-| 2 | Q4 | 131072（65536） | 10.0 s / 67.2 tok/s | 12.5 s / 37.2 s | 44.6 / 64.7 tok/s | 14.4 GB |
-| 3 | Q8 | 131072（65536） | 7.3 s / 74.1 tok/s | 9.1 s / 26.4 s | 64.4 / 103.8 tok/s | 15.2 GB |
-| 3 | Q4 | 524288（262144） | 7.6 s / 82.0 tok/s | 9.5 s / 28.7 s | 57.5 / 62.8 tok/s | 14.7 GB |
-| 4 | Q8 | 262144（131072） | 6.5 s / 117.0 tok/s | 8.2 s / 23.9 s | 70.6 / 89.6 tok/s | 13.7 GB |
-| 4 | Q4 | 524288（262144） | 6.7 s / 78.9 tok/s | 8.5 s / 24.5 s | 69.4 / 87.9 tok/s | 12.0 GB |
-| 5 | Q8 | 524288（262144） | 6.7 s / 109.2 tok/s | 8.6 s / 22.8 s | 84.2 / 121.5 tok/s | 14.5 GB |
-| 5 | Q4 | 524288（262144） | 6.8 s / 76.5 tok/s | 8.4 s / 26.4 s | 61.4 / 98.2 tok/s | 10.6 GB |
-| 6 | Q8 | 524288（262144） | 6.4 s / 117.7 tok/s | 8.0 s / 23.1 s | 73.7 / 121.4 tok/s | 13.0 GB |
-| 6 | Q4 | 524288（262144） | 6.5 s / 81.9 tok/s | 8.0 s / 24.8 s | 66.1 / 78.7 tok/s | 9.7 GB |
-
-真实内容的吐字随接受率波动较大（单次测量），比较引擎快慢请看单路表的“每轮投机”。
-
-### 多模态（图片 / PDF / 视频）
-
-6 卡、上下文 524288（YaRN）、视觉模块放 GPU、思考模式，同一个服务里依次测：
-
-| 输入 | token 数 | 提示词处理 | 吐字 |
-|---|---:|---:|---:|
-| 图片（论文配图，1.1.1） | 3078 | 4.8 s | 145 tok/s |
-| 图片（示意图） | 4069 | 5.7 s | 163 tok/s |
-| PDF 前 6 页（每页一张图） | 3590 | 3.5 s | 190 tok/s |
-| 视频 12 秒（幻灯片，1.1.1） | 23104 | 18.7 s | 173 tok/s |
-| 视频 10 秒 | 6387 | 7.3 s | 131 tok/s |
-| 20 万 token 文本 + 1 张图 | 206958 | 122.7 s | 87 tok/s |
-
-<sub>数据来源：标注 1.1.1 的为 1.1.1 版本实测（2026-10-06，与 1.1.0 同一时段交替测量各项持平）；未标注的为表下或“测试环境”中所注的旧版实测。</sub>
-
-- 1.0.8 起视觉模块按层分到全部 GPU：6 卡图片、视频请求后各卡显存峰值 11.6～11.8 GB（1.1.1 实测；1.0.7 为 0 号卡 12.2 GB、其余 10.8～11.2 GB）。表中未标注的行为 1.0.4 实测。
-- 4 卡、上下文 262144、视觉模块放 GPU：图片提示词处理 4.2 s，12 秒视频 18.5 s；各卡显存峰值 13.5 GB、相差 26 MiB（1.1.1 实测）。PDF 前 6 页 3.2 s（1.1.0 实测）。1.0.7 为 0 号卡 14.2 GB。
-- 同一会话在 20.9 万 token 之后追加 8034 token：首字 7.7 s（只处理新增部分；1.0.3 实测）。
-- 视觉模块放 CPU（`--no-mmproj-offload`，1.0.1 实测）时：同样两张图片首字 150 s、232 s，12 秒视频 649 s。
-
----
-
-## 编译
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 -DGGML_CUDA_FA=ON -DGGML_CUDA_GRAPHS=ON \
-  -DGGML_CUDA_NCCL=ON -DNCCL_INCLUDE_DIR=/path/to/nccl/include -DNCCL_LIBRARY=/path/to/nccl/lib/libnccl.so.2
-cmake --build build -j --target llama-server llama-quantize
-```
-
-多卡张量并行需要 NCCL。编译器用 GCC 12 或更新的版本。
-
-GitHub 上每次推送都会自动按 sm_70 编译检查；发布版本时附带 x86_64 Linux 的预编译程序（CUDA 12，见 Releases 页面）。POWER9 等其他平台按上面的命令自行编译。
-
----
-
-## 模型下载
-
-测试用的是下面这些文件，视觉模块只在处理图片、视频时需要。**国内用户建议从魔搭（ModelScope）下载。**
-
-| 用途 | 文件 | 魔搭 ModelScope | Hugging Face |
-|---|---|---|---|
-| 目标模型 | `Qwen3.8-27B-Q8_0.gguf`（约 29 GB） | [unsloth/Qwen3.8-27B-GGUF](https://modelscope.cn/models/unsloth/Qwen3.8-27B-GGUF) | [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) |
-| 草稿模型（DFlash2） | `Qwen3.8-27B-DFlash2-BF16.gguf`（约 3.9 GB），下载后转成 F16 | [z-lab/Qwen3.8-27B-DFlash2-GGUF](https://modelscope.cn/models/z-lab/Qwen3.8-27B-DFlash2-GGUF) | [z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF) |
-| 目标模型（Q4 配置） | `Qwen3.8-27B-UD-Q4_K_M.gguf`（约 16.5 GB） | [unsloth/Qwen3.8-27B-GGUF](https://modelscope.cn/models/unsloth/Qwen3.8-27B-GGUF) | [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) |
-| 草稿模型（显存紧张时） | `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`（约 1.1 GB），直接用 | [z-lab/Qwen3.8-27B-DFlash2-GGUF](https://modelscope.cn/models/z-lab/Qwen3.8-27B-DFlash2-GGUF) | [z-lab/Qwen3.8-27B-DFlash2-GGUF](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF) |
-| 视觉模块（可选） | `mmproj-F16.gguf`（约 0.9 GB） | [unsloth/Qwen3.8-27B-GGUF](https://modelscope.cn/models/unsloth/Qwen3.8-27B-GGUF) | [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) |
-
-目标模型下载后直接用。草稿模型官方只发布了 BF16、Q8_0、Q4_K_M 三种 GGUF，测试用的是 F16（V100 没有 BF16 硬件支持），需要用本项目编译出的 `llama-quantize` 转换一次。
-
-先按上一节编译，然后一条命令完成下载和转换：
-
-```bash
-scripts/v100-get-models.sh            # 默认从魔搭下载到 ./models
-scripts/v100-get-models.sh -s hf      # 改用 Hugging Face
-```
-
-脚本会下载目标模型和草稿模型（支持断点续传，已下载的文件自动跳过），再把草稿模型转成 `Qwen3.8-27B-DFlash2-F16.gguf`。`-d` 指定模型目录，`-q` 指定 `llama-quantize` 的路径，`-h` 查看用法。视觉模块不在脚本里，需要时从上表的仓库单独下载 `mmproj-F16.gguf`。
-
-如果已经自己下载好了，只需要转换这一步：
-
-```bash
-./build/bin/llama-quantize Qwen3.8-27B-DFlash2-BF16.gguf Qwen3.8-27B-DFlash2-F16.gguf F16
-```
-
----
-
-## Docker
-
-镜像只包含 sm_70（V100）代码，基于 CUDA 12.4.1，内含 NCCL、ffmpeg（视频输入）、numactl 和 `llama-quantize`。宿主机需要 NVIDIA 驱动 550 或更新。镜像发布在 GitHub Container Registry，同一个标签同时包含 linux/amd64 与 linux/ppc64le，`docker pull` 时按宿主机架构自动选择。
-
-| 平台 | 支持范围 | 容器内使用 GPU |
-|---|---|---|
-| linux/amd64 | x86_64 + V100 | NVIDIA Container Toolkit，`--gpus all` |
-| linux/ppc64le | 仅 IBM Power AC922（POWER9 + V100-SXM2） | CDI 描述（`.devops/v100-ac922-cdi.sh` 生成），`--device nvidia.com/gpu=all` |
-
-镜像的入口是 `llama-server`，`docker run` 镜像名之后的参数直接传给它（参数见“启动参数”一节，路径改成容器内的 `/models/...`）。
-
-x86_64，4 卡、上下文 262144（模型放在 `/path/to/models`，见“模型下载”）：
-
-```bash
-docker run -d --name llama-v100 --gpus all --ipc=host --ulimit memlock=-1 \
-  -p 8080:8080 -v /path/to/models:/models \
-  ghcr.io/1115714829/llama.cpp-v100:1.1.1 \
-  -m /models/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
-  --split-mode tensor --tensor-split 1,1,1,1 \
-  -c 262144 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
-  --model-draft /models/Qwen3.8-27B-DFlash2-F16.gguf \
-  --spec-type draft-dflash --spec-draft-n-max 7 \
-  --port 8080
-```
-
-AC922（podman，`podman-docker` 提供同名的 `docker` 命令）：
-
-```bash
-sudo dnf install -y podman podman-docker
-sudo bash .devops/v100-ac922-cdi.sh        # 生成 /etc/cdi/nvidia.yaml；驱动升级后重新执行
-docker run -d --name llama-v100 --device nvidia.com/gpu=all --ipc=host --ulimit memlock=-1 \
-  -e LLAMA_NUMA_MEMBIND=0,8 \
-  -p 8080:8080 -v /path/to/models:/models \
-  ghcr.io/1115714829/llama.cpp-v100:1.1.1 \
-  ...（同上，按卡数改 --tensor-split）
-```
-
-草稿模型转 F16 也可以用镜像里的 `llama-quantize`：
-
-```bash
-docker run --rm --entrypoint /app/llama-quantize -v /path/to/models:/models \
-  ghcr.io/1115714829/llama.cpp-v100:1.1.1 \
-  /models/Qwen3.8-27B-DFlash2-BF16.gguf /models/Qwen3.8-27B-DFlash2-F16.gguf F16
-```
-
-参数说明：
-
-| 参数 | 作用 |
-|---|---|
-| `--gpus all` / `--device nvidia.com/gpu=all` | 把宿主机全部 GPU 交给容器；只用部分 GPU 时 x86 写 `--gpus '"device=0,1"'`，AC922 写 `--device nvidia.com/gpu=0` 等 |
-| `--ipc=host`、`--ulimit memlock=-1` | 多卡通信需要的共享内存与锁页内存 |
-| `-v /path/to/models:/models` | 挂载模型目录 |
-| `-e LLAMA_NUMA_MEMBIND=<节点>` | 用 `numactl --membind=<节点>` 启动，把主机内存限定在指定 NUMA 节点。只用于把 GPU 显存上线为 NUMA 节点的机器（如 AC922，填有 CPU 的节点 `0,8`），防止主机内存与页缓存占用显存。普通 x86 服务器不要设置；节点号必须是 `numactl --hardware` 中存在的节点，否则容器启动即退出 |
-| `--video-ffmpeg-dir /opt/tools/bin` | 视频输入使用镜像内的 ffmpeg |
-| `--api-key-file /run/llama.apikey` | 配合 `-v <密钥文件>:/run/llama.apikey:ro` 启用 API 密钥 |
-
-- 镜像默认设置环境变量 `LLAMA_ARG_HOST=0.0.0.0`，在容器内监听所有地址；对外是否可访问由 `-p` 或 `--network host` 决定。
-- 不要用 `--cpuset-mems` 限定内存节点：GPU 显存作为 NUMA 节点上线时，这会使容器内 CUDA 初始化失败；请用 `LLAMA_NUMA_MEMBIND`。
-- 2 卡请用 Q4 配置（见“卡数与量化适配”）。
-- 不能访问 ghcr.io 时，可从 Releases 页面下载镜像文件（`llama.cpp-v100-server-<版本>-<架构>.tar.gz`），`docker load -i <文件>` 导入；也可以在源码目录自行构建：`docker build -f .devops/v100-cuda.Dockerfile -t llama.cpp-v100:server .`。
-
----
-
-## 启动参数
-
-以下是测试数据对应的启动命令。`numactl --membind=0,8` 把主机内存限定在本机的两个 CPU 节点（AC922 把 GPU 显存上线成 NUMA 节点，不限定时页缓存可能占用显存），其他机器用 `numactl -H` 查看节点编号。
-
-### 4 卡，上下文 262144
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,3,4 numactl --membind=0,8 ./build/bin/llama-server \
-  -m ./models/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
-  --split-mode tensor --tensor-split 1,1,1,1 \
-  -c 262144 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
-  --model-draft ./models/Qwen3.8-27B-DFlash2-F16.gguf \
-  --spec-type draft-dflash --spec-draft-n-max 7 \
-  --host 127.0.0.1 --port 8080 --metrics
-```
-
-### 6 卡，上下文 262144
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 numactl --membind=0,8 ./build/bin/llama-server \
-  -m ./models/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
-  --split-mode tensor --tensor-split 1,1,1,1,1,1 \
-  -c 262144 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
-  --model-draft ./models/Qwen3.8-27B-DFlash2-F16.gguf \
-  --spec-type draft-dflash --spec-draft-n-max 7 \
-  --host 127.0.0.1 --port 8080 --metrics
-```
-
-### 6 卡，上下文 524288（YaRN）
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 numactl --membind=0,8 ./build/bin/llama-server \
-  -m ./models/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
-  --split-mode tensor --tensor-split 1,1,1,1,1,1 \
-  -c 524288 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
-  --rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 262144 \
-  --override-kv qwen35.context_length=int:524288 \
-  --model-draft ./models/Qwen3.8-27B-DFlash2-F16.gguf \
-  --spec-type draft-dflash --spec-draft-n-max 7 \
-  --host 127.0.0.1 --port 8080 --metrics
-```
-
-### 多路并发
-
-在上面单路命令的基础上改 `-np`，总上下文按路数平分：
-
-```bash
-# 4 卡两路，每路 131072
-CUDA_VISIBLE_DEVICES=0,1,3,4 numactl --membind=0,8 ./build/bin/llama-server \
-  -m ./models/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
-  --split-mode tensor --tensor-split 1,1,1,1 \
-  -c 262144 -np 2 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
-  --model-draft ./models/Qwen3.8-27B-DFlash2-F16.gguf \
-  --spec-type draft-dflash --spec-draft-n-max 7 \
-  --prefill-pace 30 \
-  --host 127.0.0.1 --port 8080 --metrics
-
-# 4 卡四路，每路 65536：把上面的 -np 2 换成 -np 4
-
-# 6 卡两路，每路 262144（YaRN）
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 numactl --membind=0,8 ./build/bin/llama-server \
-  -m ./models/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
-  --split-mode tensor --tensor-split 1,1,1,1,1,1 \
-  -c 524288 -np 2 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
-  --rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 262144 \
-  --override-kv qwen35.context_length=int:524288 \
-  --model-draft ./models/Qwen3.8-27B-DFlash2-F16.gguf \
-  --spec-type draft-dflash --spec-draft-n-max 7 \
-  --prefill-pace 30 \
-  --host 127.0.0.1 --port 8080 --metrics
-```
-
-`--prefill-pace 30` 是默认值，写出来只为说明，可以省略。
-
-### 多模态：6 卡，上下文 524288（YaRN），视觉模块放 GPU
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 numactl --membind=0,8 ./build/bin/llama-server \
-  -m ./models/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
-  --split-mode tensor --tensor-split 1,1,1,1,1,1 \
-  -c 524288 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
-  --rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 262144 \
-  --override-kv qwen35.context_length=int:524288 \
-  --model-draft ./models/Qwen3.8-27B-DFlash2-F16.gguf \
-  --spec-type draft-dflash --spec-draft-n-max 7 \
-  --mmproj ./models/mmproj-F16.gguf \
-  --video-ffmpeg-dir /path/to/ffmpeg/bin \
-  --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 \
-  --chat-template-kwargs '{"enable_thinking":true}' \
-  --host 127.0.0.1 --port 8080 --metrics
-```
-
-### 多模态：4 卡，上下文 262144，视觉模块放 GPU
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,3,4 numactl --membind=0,8 ./build/bin/llama-server \
-  -m ./models/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
-  --split-mode tensor --tensor-split 1,1,1,1 \
-  -c 262144 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
-  --model-draft ./models/Qwen3.8-27B-DFlash2-F16.gguf \
-  --spec-type draft-dflash --spec-draft-n-max 7 \
-  --mmproj ./models/mmproj-F16.gguf \
-  --video-ffmpeg-dir /path/to/ffmpeg/bin \
-  --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 \
-  --chat-template-kwargs '{"enable_thinking":true}' \
-  --host 127.0.0.1 --port 8080 --metrics
-```
-
-多模态请求走 OpenAI 兼容的 `/v1/chat/completions`：图片用 `image_url`，视频用 `input_video`（或 `video_url`），视频默认每秒取 4 帧。PDF 由客户端把每页渲染成图片后发送（80 dpi 时一页约 600 token）。
-
-### 其他卡数与 Q4 配置
-
-在上面命令的基础上改这几处：
-- 卡数：`CUDA_VISIBLE_DEVICES` 与 `--tensor-split`（几张卡就写几个 1）；
-- Q4 配置：`-m ./models/Qwen3.8-27B-UD-Q4_K_M.gguf`，`-ctk q4_0 -ctv q4_0`；
-- 上下文：按“卡数与量化适配”表选，524288 加上 YaRN 那三个参数；
-- 2 卡 Q4 开 262144：`--model-draft ./models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf`。
-
-例如 2 卡 Q4、上下文 262144：
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1 numactl --membind=0,8 ./build/bin/llama-server \
-  -m ./models/Qwen3.8-27B-UD-Q4_K_M.gguf -ngl 999 \
-  --split-mode tensor --tensor-split 1,1 \
-  -c 262144 -np 1 -fa on -ctk q4_0 -ctv q4_0 -b 2048 -ub 2048 \
-  --model-draft ./models/Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
-  --spec-type draft-dflash --spec-draft-n-max 7 \
-  --host 127.0.0.1 --port 8080 --metrics
-```
-
-### 参数说明
-
-| 参数 | 说明 |
-|---|---|
-| `numactl --membind=<节点>` | 把主机内存限定在指定的 NUMA 节点（写在 `llama-server` 前面）。用于把 GPU 显存上线为 NUMA 节点的机器（如 AC922，填有 CPU 的节点 `0,8`），防止主机内存与页缓存占用显存；普通 x86 服务器不需要。节点号用 `numactl --hardware` 查看，必须是存在的节点，否则无法启动。Docker 中用环境变量 `LLAMA_NUMA_MEMBIND` |
-| `-ngl 999` | 所有层放 GPU |
-| `--split-mode tensor --tensor-split 1,…,1` | 张量并行，各卡均分 |
-| `-c` | 上下文长度 |
-| `-np` | 并发路数，每路上下文 = `-c` ÷ 路数 |
-| `--prefill-pace` | 多路时，有请求在吐字，其他请求的提示词处理最多占用的时间百分比（0～100，默认 30；0 或 100 为不限流） |
-| `-fa on` | Flash Attention（SM70 注意力内核需要） |
-| `-ctk q8_0 -ctv q8_0` | KV 缓存用 8 位；`-ctk q4_0 -ctv q4_0` 为 4 位，显存减半 |
-| `-b 2048 -ub 2048` | 批大小，测试数据除注明外都按 2048 |
-| `--model-draft …`、`--spec-type draft-dflash`、`--spec-draft-n-max 7` | DFlash2 投机解码，每轮起草 7 个 |
-| `--rope-scaling yarn --rope-scale 2 --yarn-orig-ctx 262144` | 用 YaRN 把上下文扩到 524288（模型原生 262144） |
-| `--override-kv qwen35.context_length=int:524288` | 允许单路上下文超过模型训练长度 |
-| `--mmproj` | 视觉模块 |
-| `--video-ffmpeg-dir` | `ffmpeg`、`ffprobe` 所在目录，处理视频时需要 |
-| `--no-mmproj-offload` | 视觉模块放 CPU 运行（默认按层分到主模型使用的全部 GPU）。可省下 GPU 显存，但处理图片、视频会慢很多 |
-| `-mmdev <设备>` | 视觉模块只放在指定的一张 GPU 上（设备名用 `--list-devices` 查看，如 `CUDA0`）；`-mmdev none` 等同放 CPU |
-| `--temp`、`--top-p`、`--top-k`、`--min-p`、`--chat-template-kwargs` | 默认采样参数与思考模式开关（上面是模型卡的思考模式参数） |
-| `--metrics` | Prometheus 指标（可选） |
-| `--cache-ram <MiB>` | 主机内存中保存的提示词缓存上限（上游参数，默认 8192）。多个对话轮流使用时，可从主机内存恢复，不必整段重算。取值要按主机内存定：主机内存占用约为 基础占用 + `--cache-ram` + 路数 × `--ctx-checkpoints` × 每个检查点的大小，超出主机内存会被系统结束进程 |
-| `--ctx-checkpoints <N>` | 每路保留的递归状态检查点个数（上游参数，默认 32），用于复用前缀；每个检查点占一份递归状态大小的主机内存（大小取决于模型），多路时按路数成倍增加 |
-| `reasoning_effort`（请求参数） | 思考强度，由模型的聊天模板解释。Qwen3.8 的模板支持 `low`、`medium`、`high`、`xhigh`（默认），`none` 关闭思考；也可用 `--chat-template-kwargs '{"reasoning_effort":"medium"}'` 设为服务默认 |
-| `NCCL_P2P_LEVEL`（环境变量） | 在 ppc64le 上，程序在初始化 NCCL 前自动设为 `SYS`，让跨 CPU 插槽的 GPU 之间也走 P2P；已自行设置时不覆盖 |
-
-采样：`top_k ≤ 64` 且只用 top-k、top-p、min-p、temperature 时，在设备端取 top-k 候选；repeat/presence/frequency penalties 也在设备端取 top-k 候选（候选数 = `top_k` + penalty 窗口内的 token，上限 256）；DRY 等其他采样器或 `top_k` 更大时，仍在主机上对全词表采样。
-
----
-
-## 下一步
-
-- **大 MoE（2.0.0）**：针对 Qwen3.8-Flash-Next 等大 MoE 模型做 V100 专项优化：专家矩阵乘、多卡专家并行、显存 → 主机内存 → 硬盘三级存放专家（放不下显存的专家由 GPU 直接读主机内存计算）、MTP 投机解码，目标是在有限显存下加载并高效运行完整的大 MoE。
-- **多卡切分**：3 卡已在 1.0.7 均衡；6 卡长上下文（32768 以上）时空闲的 2 张 GPU 已分担注意力（1.0.8）；5 卡、以及 6 卡短上下文时每个注意力层仍有 1～2 张 GPU 空闲，后续继续。
-- **长上下文**：预填充的 K/V 副本已改为窗口（1.0.7）；后续是长上下文吐字（投机验证注意力内核）与追加预填充的速度。
-- **多路并发**：多路的总吞吐仍与依次处理相当。后续将优化多路同时吐字时每轮的耗时，以及多路之间的前缀缓存复用。
+| GPU 与主机之间 | NVLink 2.0（6 卡配置每张 GPU 2 条，理论单向 50 GB/s） | PCIe 3.0（x16 理论单向约 16 GB/s） |
+| GPU 显存与系统内存 | 显存作为 NUMA 内存节点并入系统内存，每张 GPU 一个节点 | 显存不并入系统内存 |
+| CPU 与 GPU 的归属 | 2 个 CPU 节点，各连 3 张 GPU；跨节点读内存要经过 CPU 之间的总线 | 视主板而定（上面的 4 卡参考主机只有 1 个 NUMA 节点） |
+
+- **页缓存可能占用显存**：AC922 上系统把显存当作内存节点，读大文件（例如加载模型）产生的页缓存可能落进 GPU 的节点，CUDA 回收不了，表现为显存不足。所以 AC922 上要用 `numactl --membind=<CPU 节点>` 启动（例如 `0,8`），x86 不需要。
+- **可用显存略少**：显存并入系统内存时驱动按内存块保留一部分显存，AC922 上每张卡可用的显存比同型号卡在 x86 上少一些；对大 MoE 来说，显存少一点就意味着更多专家要放在主机内存。
+- **主机内存里的专家经 NVLink 读取**：16 GB 的卡放不下全部专家，吐字时用到主机内存里的专家要由 GPU 搬进显存再算。AC922 的 GPU 与主机之间的带宽约为 PCIe 3.0 的 3 倍（理论值），专家放在主机内存的代价因此小得多；跨 CPU 节点读取更慢。
+- **锁页内存的放置**：主机内存里的专家与 n-gram 嵌入表都放在锁页内存。程序启动时按 GPU 所在的 CPU 节点分配和填充这些内存，并实测各 GPU 读取各节点的速度来决定放置；只有一个 NUMA 节点的机器没有这项差别。
+
+当前是通用版本，同一套代码在 AC922 与 x86 上运行；之后会按架构分别优化。
 
 ---
 
@@ -549,18 +90,21 @@ CUDA_VISIBLE_DEVICES=0,1 numactl --membind=0,8 ./build/bin/llama-server \
 
 ---
 
-## 贡献
+## 版本与许可
 
-- **仓库作者**：发起项目，提供硬件与测试环境，确定目标与取舍，参与测试。
-- **Claude**（Anthropic，Claude Opus 5.5，通过 Claude Code）：方案设计，测量与分析，服务器上的编译、测试与压测，代码审核，提交与文档。
-- **DeepSeek V4.1 Flash**：2026-09-26 晚起承担大部分代码实现，以及源码调研、设计初稿和诊断脚本，约 170 次任务。
-- **小米 MiMo v2.6-pro**：项目初期（2026-09-26）的代码调研与第一版实现，以及之后的深度调研与方案设计，约 33 次任务。
-- **[ATIVX928](https://github.com/ATIVX928)**（外部贡献者）：SM70 注意力内核支持 q4_0 KV 缓存、2 卡 internal all-reduce 修复（[PR #1](https://github.com/1115714829/llama.cpp-v100/pull/1)，1.0.5 合入）；Q2_K～Q6_K 小批量矩阵乘、Q4 的 gate/up 与多权重融合、q4_0 KV 反量化向量化与 q4_1 未对齐修复（[PR #2](https://github.com/1115714829/llama.cpp-v100/pull/2)，1.0.9 合入）。
+### 版本
 
-感谢以上所有项目和参与者。
+- 当前版本 2.0.0（发布日期 2026-10-12），各版本的更新内容见 [CHANGELOG.md](CHANGELOG.md)。
+- 编译方法、Releases 页面的 x86_64 Linux 预编译程序，以及 Docker 镜像 `ghcr.io/1115714829/llama.cpp-v100:2.0.0`（同一标签含 x86_64 与 IBM Power AC922）见两个详情页。
+- 1.1.1 及更早版本的完整说明（27B 在 2～6 卡、Q4 配置、多路并发、多模态等的测试表）见对应标签的 README，例如 [v100-1.1.1](https://github.com/1115714829/llama.cpp-v100/blob/v100-1.1.1/README.md)。
+
+### 许可
+
+继承 llama.cpp 的 MIT 许可（见 `LICENSE`）。移植的代码保留原许可，出处与许可见各文件头。
 
 ---
 
-## 许可
+## 致谢（项目与 AI 助手）
 
-继承 llama.cpp 的 MIT 许可（见 `LICENSE`）。移植的代码保留原许可，出处与许可见各文件头。
+- **参考与借鉴的项目**：[llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml)（本项目的基础框架）；[1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)（V100 工程实践的参考，早期部分 SM70 内核移植自它，出处与许可见各文件头与 `licenses/`）；[vLLM](https://github.com/vllm-project/vllm)（投机解码等设计的参考）。
+- **AI 助手**：开发过程由 Claude、DeepSeek、小米 MiMo、MiniMax 协作完成。
