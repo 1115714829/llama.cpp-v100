@@ -1,6 +1,9 @@
-// Adapted from 1Cat-vLLM (Apache-2.0), https://github.com/1CatAI/1Cat-vLLM:
+// Adapted from csrc/attention/sm70_grouped_long/ of 1Cat-vLLM (https://github.com/1CatAI/1Cat-vLLM),
+// which is BSD-3-Clause, Copyright (c) 2025, D.Skryabin (flash-attention-v100,
+// https://github.com/ai-bond/flash-attention-v100), see licenses/LICENSE-ai-bond-flash-attention-v100;
+// 1Cat-vLLM itself is Apache-2.0, see licenses/LICENSE-1Cat-vLLM:
 //   include/fused_mma.h (Volta WMMA wrapper)
-//   csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu (grouped verify kernel)
+//   kernel/grouped-attention.cu (grouped verify kernel)
 // K/V cache types: F16, Q8_0 or Q4_0. Quantized tiles are staged in raw block
 // form and dequantized into the shared memory panel.
 
