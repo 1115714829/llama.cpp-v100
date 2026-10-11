@@ -105,6 +105,8 @@ extern "C" {
     GGML_API size_t         ggml_backend_meta_n_backends    (ggml_backend_t meta_backend);
     GGML_API ggml_backend_t ggml_backend_meta_simple_backend(ggml_backend_t meta_backend, size_t index);
 
+    // ggml_backend_dev_is_meta and the meta device accessors are declared in ggml-backend.h
+
     //
     // Backend (stream)
     //

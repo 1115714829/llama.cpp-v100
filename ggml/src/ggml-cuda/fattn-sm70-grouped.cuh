@@ -1,6 +1,9 @@
-// Adapted from 1Cat-vLLM (Apache-2.0), https://github.com/1CatAI/1Cat-vLLM:
+// Adapted from csrc/attention/sm70_grouped_long/ of 1Cat-vLLM (https://github.com/1CatAI/1Cat-vLLM),
+// which is BSD-3-Clause, Copyright (c) 2025, D.Skryabin (flash-attention-v100,
+// https://github.com/ai-bond/flash-attention-v100), see licenses/LICENSE-ai-bond-flash-attention-v100;
+// 1Cat-vLLM itself is Apache-2.0, see licenses/LICENSE-1Cat-vLLM:
 //   include/fused_mma.h (Volta WMMA wrapper)
-//   csrc/attention/sm70_grouped_long/kernel/grouped-attention.cu (grouped verify kernel)
+//   kernel/grouped-attention.cu (grouped verify kernel)
 // K/V cache types: F16, Q8_0 or Q4_0. Quantized tiles are staged in raw block
 // form and dequantized into the shared memory panel.
 
@@ -446,20 +449,25 @@ struct GroupedVerifyMaskPair {
     bool  visible[2];
 };
 
-// [lo, hi) interval of a range mask row. It stays the same for every KV tile.
+// Two [lo, hi) intervals of a range mask row. The second is empty when hi1 <= lo1.
+// The intervals stay the same for every KV tile.
 struct GroupedVerifyMaskRange {
-    int lo;
-    int hi;
+    int lo0;
+    int hi0;
+    int lo1;
+    int hi1;
 };
 
 __device__ __forceinline__ GroupedVerifyMaskRange grouped_verify_load_mask_range(
         const char * __restrict__ mask, const int64_t seq_mask_off, const int64_t nb31,
         const int token_idx, const int n_q) {
-    GroupedVerifyMaskRange range = {0, 0}; // an empty interval hides every column
+    GroupedVerifyMaskRange range = {0, 0, 0, 0}; // an empty interval hides every column
     if (token_idx < n_q) {
         const int32_t * r = reinterpret_cast<const int32_t *>(mask + seq_mask_off + nb31 * token_idx);
-        range.lo = r[0];
-        range.hi = r[1];
+        range.lo0 = r[0];
+        range.hi0 = r[1];
+        range.lo1 = r[2];
+        range.hi1 = r[3];
     }
     return range;
 }
@@ -487,8 +495,9 @@ __device__ __forceinline__ GroupedVerifyMaskPair grouped_verify_load_mask_pair(
         return pair;
     }
     if (mask_is_range) {
-        pair.visible[0] = kv_idx >= range.lo && kv_idx < range.hi;
-        pair.visible[1] = kv_idx + 1 < n_kv && kv_idx + 1 >= range.lo && kv_idx + 1 < range.hi;
+        pair.visible[0] = (kv_idx >= range.lo0 && kv_idx < range.hi0) || (kv_idx >= range.lo1 && kv_idx < range.hi1);
+        pair.visible[1] = kv_idx + 1 < n_kv &&
+            ((kv_idx + 1 >= range.lo0 && kv_idx + 1 < range.hi0) || (kv_idx + 1 >= range.lo1 && kv_idx + 1 < range.hi1));
         return pair;
     }
     const __half * mask_row = reinterpret_cast<const __half *>(mask + seq_mask_off + nb31 * token_idx);
@@ -623,7 +632,7 @@ static __global__ void flash_attn_ext_sm70_grouped(
 
     const int64_t seq_mask_off = mask ? nb33 * (seq % ne33) : 0;
 
-    // With a range mask only the KV rows below the widest [lo, hi) of this sequence's query rows can
+    // With a range mask only the KV rows below the widest window of this sequence's query rows can
     // contribute, so the tiles are split over [0, kv_end) instead of the whole view: a verify batch that
     // views the whole cache keeps the parallelism of its real length.
     int kv_end = n_kv;
@@ -631,7 +640,7 @@ static __global__ void flash_attn_ext_sm70_grouped(
         int hi_max = 0;
         for (int t = 0; t < n_q; ++t) {
             const int32_t * r = reinterpret_cast<const int32_t *>(mask + seq_mask_off + nb31 * t);
-            hi_max = max(hi_max, r[1]);
+            hi_max = max(hi_max, max(r[1], r[3]));
         }
         kv_end = min(n_kv, max(hi_max, 0));
     }
@@ -705,7 +714,7 @@ static __global__ void flash_attn_ext_sm70_grouped(
             v_regs, V, nb21, nb22, nb23, seq, kv_head, split_start, n_kv);
     }
 
-    // A range mask row has a fixed [lo, hi) interval, so load it once instead of on every
+    // A range mask row has two fixed [lo, hi) intervals, so load them once instead of on every
     // tile. The tile loop then only compares against these registers.
     GroupedVerifyMaskRange row_range[kGroupedVerifyRowsPerWarp] = {};
     if (mask_is_range) {

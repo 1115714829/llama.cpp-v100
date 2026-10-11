@@ -595,4 +595,109 @@ private:
     }
 };
 
+// A single-sequence SWA cache is written as a ring: the cells take the positions in order, from cell 0 on and
+// wrapping around the cell array, the write head pointing at the next cell. Removing the newest positions (the
+// rejected tail of a speculative round) frees the cells right before the head and moves the head back to the
+// first of them, so the empty cells, if any, are one run in ring order starting at the head,
+// [head, head + size - used), and the used cells are one run from the oldest cell, right after the empty run,
+// to the newest, right before the head. A ring that has not wrapped yet is the case of the empty run
+// [used, size) with the oldest cell 0; a full ring has no empty run and its oldest cell is the head.
+//
+// Returns the oldest cell when the cells are in that layout and the positions strictly increase by one along
+// the used run, -1 otherwise (and for an empty cache). The visible set of a token is then a run of cells
+// ending at its own cell, see llama_kv_cells_ring_window.
+// true if pos[j] == pos[j - 1] + 1 for every j in [j0, j1): a branch-free scan that vectorizes
+static inline bool llama_kv_cells_pos_run_ok(const llama_pos * pos, uint32_t j0, uint32_t j1) {
+    int32_t broken = 0;
+    for (uint32_t j = j0; j < j1; ++j) {
+        broken |= pos[j] != pos[j - 1] + 1;
+    }
+    return !broken;
+}
+
+// true if every cell in [j0, j1) is empty: a branch-free scan that vectorizes
+static inline bool llama_kv_cells_pos_empty(const llama_pos * pos, uint32_t j0, uint32_t j1) {
+    int32_t used = 0;
+    for (uint32_t j = j0; j < j1; ++j) {
+        used |= pos[j] != -1;
+    }
+    return !used;
+}
+
+// This runs for every ubatch of the cache (the MTP draft's 32K window: four times a decode round), so both runs
+// are walked as at most two contiguous array segments each, without a modulo per cell.
+static inline int64_t llama_kv_cells_ring_oldest(const llama_kv_cells & cells, uint32_t head) {
+    const uint32_t size = cells.size();
+    const uint32_t used = cells.get_used();
+
+    if (size == 0 || used == 0) {
+        return -1;
+    }
+
+    const llama_pos * pos = cells.pos_data();
+
+    head %= size; // the head is size after a write that ended at the last cell
+
+    // the empty run [head, head + size - used)
+    const uint32_t e_end = head + (size - used);
+    if (e_end <= size) {
+        if (!llama_kv_cells_pos_empty(pos, head, e_end)) {
+            return -1;
+        }
+    } else if (!llama_kv_cells_pos_empty(pos, head, size) || !llama_kv_cells_pos_empty(pos, 0, e_end - size)) {
+        return -1;
+    }
+
+    const uint32_t oldest = e_end % size;
+
+    // the used run: `used` cells from the oldest one, with the seam pair (size - 1, 0) when it wraps. An empty
+    // cell inside the run breaks the chain at itself (pos -1 never follows a used position); only an empty
+    // first cell has to be checked on its own
+    if (pos[oldest] < 0) {
+        return -1;
+    }
+    const uint32_t u_end = oldest + used;
+    if (u_end <= size) {
+        if (!llama_kv_cells_pos_run_ok(pos, oldest + 1, u_end)) {
+            return -1;
+        }
+    } else if (!llama_kv_cells_pos_run_ok(pos, oldest + 1, size) || pos[0] != pos[size - 1] + 1 ||
+               !llama_kv_cells_pos_run_ok(pos, 1, u_end - size)) {
+        return -1;
+    }
+
+    return oldest;
+}
+
+// The cells a token at cell `end` of such a ring attends with a standard window of n_swa positions: the
+// min(n_swa, avail) cells ending at its own cell, where avail counts the used cells from the oldest one up to
+// and including its own (the newer cells of its batch and the empty run lie after it). The run wraps the cell
+// array at most once: row = [lo0, hi0, lo1, hi1], the second segment empty (hi1 <= lo1) when it does not.
+static inline void llama_kv_cells_ring_window(uint32_t size, uint32_t oldest, uint32_t end, uint32_t n_swa, int32_t * row) {
+    const uint32_t avail = (end + size - oldest) % size + 1;
+    const uint32_t span  = n_swa < avail ? n_swa : avail;
+
+    if (span == 0) {
+        row[0] = 0;
+        row[1] = 0;
+        row[2] = 0;
+        row[3] = 0;
+        return;
+    }
+
+    const uint32_t start = (end + size - (span - 1)) % size;
+
+    if (start <= end) {
+        row[0] = (int32_t) start;
+        row[1] = (int32_t) end + 1;
+        row[2] = 0;
+        row[3] = 0;
+    } else {
+        row[0] = (int32_t) start;
+        row[1] = (int32_t) size;
+        row[2] = 0;
+        row[3] = (int32_t) end + 1;
+    }
+}
+
 using llama_kv_cells_vec = std::vector<llama_kv_cells>;

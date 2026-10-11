@@ -183,6 +183,11 @@ llama_pos llama_memory_hybrid::seq_pos_max(llama_seq_id seq_id) const {
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
 }
 
+void llama_memory_hybrid::collect_tensors(std::vector<std::pair<std::string, ggml_tensor *>> & out) const {
+    mem_attn->collect_tensors(out);
+    mem_recr->collect_tensors(out);
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = mem_attn->memory_breakdown();
     for (const auto & buft_size : mem_recr->memory_breakdown()) {

@@ -11,6 +11,7 @@
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
+    uint32_t n_swa_mtp = 0;   // SWA window of the MTP draft context, in tokens (0 = attend the whole context)
     uint32_t n_batch;
     uint32_t n_ubatch;
     uint32_t n_seq_max;
@@ -67,6 +68,10 @@ struct llama_cparams {
     int32_t logits_topk_shard_off[LLAMA_MAX_DEVICES] = {0};
 
     bool    logits_topk_active = false; // the current request reads the top-k output (the graph may keep a top-k output while it is off)
+    // the host never reads the raw logits of this context while the top-k output is on: a batch with a
+    // single output then only copies its top-k rows back as well (the MTP draft steps, see
+    // llama_set_logits_topk_only). Off by default: a single-output batch keeps its full logits
+    bool    logits_topk_only   = false;
 
     enum llama_context_type ctx_type;
     enum llama_rope_scaling_type rope_scaling_type;
@@ -76,4 +81,7 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
+    // target lending token_embd/output to a draft head without them, set from ctx_other
+    // from unsloth PR #240
+    const llama_model * model_tgt = nullptr;
 };

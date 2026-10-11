@@ -161,6 +161,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-grammar-integration.cpp)
     llama_build_and_test(test-llama-grammar.cpp)
     llama_build_and_test(test-batch-alloc.cpp)
+    llama_build_and_test(test-kv-ring.cpp)
     llama_build_and_test(test-chat.cpp WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
     target_include_directories(test-chat PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-chat PRIVATE server-context)
@@ -195,6 +196,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build(test-llama-archs.cpp)
 
+    # expert assignment table; ggml-expert-store.h lives in ggml/src, so the test includes it directly
+    llama_build_and_test(test-expert-assign.cpp)
+    target_include_directories(test-expert-assign PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 
@@ -227,6 +232,15 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         ARGS --models "${MODEL_DIR}"
     )
     set_tests_properties(test-save-load-state PROPERTIES FIXTURES_REQUIRED generate-models)
+
+    # the k-pool layout kept across sequence edits against a rebuild, on the dummy models that have a k-pool indexer
+    llama_build(test-kpool-layout.cpp)
+    llama_test(
+        test-kpool-layout
+        LABEL main
+        ARGS --models "${MODEL_DIR}"
+    )
+    set_tests_properties(test-kpool-layout PROPERTIES FIXTURES_REQUIRED generate-models)
 
     llama_build(test-fusion.cpp)
 endif()
@@ -290,9 +304,30 @@ endif()
 
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build(test-backend-ops.cpp)
+# the permuted expert store test drives the expert assignment of ggml-expert-store.h (ggml/src)
+target_include_directories(test-backend-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+# needs the non-public ggml-expert-store.h
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    llama_build_and_test(test-expert-store.cpp)
+    target_include_directories(test-expert-store PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+endif()
+
+# needs the non-public ggml-cuda-numa-plan.h
+if (NOT LLAMA_USE_SYSTEM_GGML)
+    llama_build_and_test(test-numa-plan.cpp)
+    target_include_directories(test-numa-plan PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+endif()
+
+llama_build_and_test(test-sched-pipeline.cpp)
 
 # Multi-GPU AllReduce comm test; skips when CUDA or < 2 devices are available.
 llama_build(test-cuda-allreduce.cpp)
+
+# CUDA host registration test; skips when no CUDA device is available.
+if (GGML_CUDA)
+    llama_build_and_test(test-cuda-host-register.cpp)
+endif()
 
 llama_build_and_test(test-tiled-mulmat.cpp)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

@@ -101,15 +101,11 @@ NVIDIA Collective Communications Library (NCCL) is unavailable, multi GPU perfor
 ```
 
 When using the "ROCm" backend (which is the ggml CUDA code translated for AMD via HIP), the AMD equivalent RCCL can be used by compiling with `-DGGML_HIP_RCCL=ON`. Note that RCCL is by default *disabled* because (unlike NCCL) it was not universally beneficial during testing.
-### 6. With CUDA peer-to-peer access (`GGML_CUDA_P2P`)
+### 6. With CUDA peer-to-peer access
 
-CUDA peer-to-peer (P2P) lets GPUs transfer data directly between each other instead of going through system memory, which generally improves multi-GPU performance. It is **opt-in** at runtime - set the environment variable `GGML_CUDA_P2P` to any value to enable it:
+CUDA peer-to-peer (P2P) lets GPUs transfer data directly between each other instead of going through system memory, which generally improves multi-GPU performance. P2P is enabled automatically at startup for every pair of devices that the driver reports as capable (`cudaDeviceCanAccessPeer`); no environment variable is needed. The startup log prints a `P2P enabled` line listing the enabled pairs. Pairs that the driver reports as not capable keep going through system memory - a hardware/topology limit, not a fallback.
 
-```bash
-GGML_CUDA_P2P=1 llama-cli -m model.gguf -sm tensor
-```
-
-P2P requires driver support (usually restricted to workstation/datacenter GPUs) and **may cause crashes or corrupted outputs on some motherboards or BIOS configurations** (e.g. when IOMMU is enabled). If you see instability after enabling it, unset the variable.
+P2P requires driver support (usually restricted to workstation/datacenter GPUs) and **may cause crashes or corrupted outputs on some motherboards or BIOS configurations** (e.g. when IOMMU is enabled). If the `P2P enabled` line lists pairs on an unstable system, check the BIOS/IOMMU settings for those links; there is no runtime switch to disable P2P.
 
 ---
 
@@ -124,4 +120,4 @@ P2P requires driver support (usually restricted to workstation/datacenter GPUs) 
 | CUDA OOM at startup or during prefill in `--split-mode tensor` | Auto-fit is disabled in this mode, so reduce memory pressure yourself. In order from least to most disruptive: lower `--ctx-size` (`-c`) (KV cache is roughly proportional to `n_ctx`); for `llama-server`, lower `--parallel` (`-np`) (a slot KV cache is allocated per concurrent sequence); as a last resort, reduce `--n-gpu-layers` (`-ngl`) (the remaining layers run on CPU and inference will be much slower). |
 | Performance is worse with multi-GPU than single-GPU | The performance is bottlenecked by GPU interconnect speed. For `--split-mode tensor`, verify that NCCL is being used. Try `--split-mode layer` (less communication than `tensor`). Increase GPU interconnect speed via more PCIe lanes or e.g. NVLink (if available). |
 | GPU not used at all | `--n-gpu-layers` is `0` or too low - try explicitly setting `-ngl all`. Or you are accidentally hiding the GPUs via an environment variable like `CUDA_VISIBLE_DEVICES=-1`. Or your build doesn't include support for the relevant backend. |
-| Crashes or corrupted outputs after setting `GGML_CUDA_P2P=1` | Some motherboards and BIOS settings (e.g. with IOMMU enabled) don't support CUDA peer-to-peer reliably. Unset `GGML_CUDA_P2P`. |
+| Crashes or corrupted outputs with multi-GPU and P2P enabled | Some motherboards and BIOS settings (e.g. with IOMMU enabled) don't support CUDA peer-to-peer reliably. Check the `P2P enabled` startup line; the listed pairs are the ones to investigate (e.g. BIOS/IOMMU settings). |

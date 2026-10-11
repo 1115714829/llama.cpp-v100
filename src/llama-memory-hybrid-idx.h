@@ -5,6 +5,7 @@
 #include <array>
 #include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 //
@@ -59,6 +60,9 @@ public:
 
     void clear(bool data) override;
 
+    // the indexer cache tracks the attention cache cell for cell, so it takes the same n_kv rule
+    void set_kq_range_allowed(bool allowed) override;
+
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
     void seq_keep(llama_seq_id seq_id)                                                          override;
@@ -66,6 +70,8 @@ public:
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+
+    void collect_tensors(std::vector<std::pair<std::string, ggml_tensor *>> & out) const override;
 
     // state write/load
 
@@ -86,11 +92,33 @@ public:
 
     // Which cells of a sequence make up which pool of kpool consecutive positions (or cells, in order mode).
     // It is kept here because it outlives the batch: pools are fixed by the positions relative to the
-    // sequence's first one, so a ubatch only ever appends to it. Sequence edits drop it, see mem_idx_stale.
+    // sequence's first one, so a ubatch only ever appends to it. A sequence edit drops it from the position
+    // it staled on, see mem_idx_stale.
     struct kpool_layout;
 
     const kpool_layout & kpool_layout_update();
     const kpool_layout & kpool_layout_get() const;
+
+    // The graph's pool count for a layout of n_pool_real pools over the cells in use now: padded like the n_kv of a
+    // ubatch that does not view the whole cache, so a decode step changes it only where its n_kv changes. Always
+    // above n_pool_real: the last padded pool is unused.
+    uint32_t kpool_n_pool(uint32_t n_pool_real) const;
+
+    // For tests: kpool_n_pool for the current layout.
+    uint32_t kpool_n_pool_layout() const;
+
+    // For tests: the first way the current layout's pool count breaks its bounds (no padded pool after the real ones,
+    // more pools than the reserved graph holds), empty if none. Call it where kpool_layout_diff is called.
+    std::string kpool_n_pool_check() const;
+
+    // For tests: the first difference between the layout as the last update left it and one rebuilt from scratch
+    // over the cache as it is now, empty if none. Call it after a decode, before the next sequence edit.
+    std::string kpool_layout_diff() const;
+
+    // For tests: picks the cells of padded new-pool entries over the current layout as set_input_kpool does, for
+    // counts up to every cell that is no rep, and returns the first pick that is out of range, a pool's rep, taken
+    // twice or short of the count, empty if none. Call it where kpool_layout_diff is called.
+    std::string kpool_pad_check() const;
 
     // The pooled keys persist in the idx cache across batches. A sequence edit can regroup the pools
     // from some position on, which stales every pooled key at or after it. POS_CLEAN means none.
@@ -124,6 +152,9 @@ private:
     // whether the current layout has cells shared between sequences (kpool_layout is incomplete here, so out of line)
     bool kpool_layout_shared() const;
 
+    // brings lay up to date with the cache, keeping each sequence's cells before its stale position
+    void kpool_layout_build(kpool_layout & lay, const stale_pos_t & stale) const;
+
     // seq_id < 0 stales every sequence, p0 < 0 stales the sequence from its first position
     void mem_idx_stale_set(llama_seq_id seq_id, llama_pos p0);
 
@@ -140,6 +171,8 @@ public:
         ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
         ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
+        // the pooled slots of every cache row in place, [n_embd, 1, n_cells]: the key table of ggml_qsa_select
+        ggml_tensor * pooled_table() const { return pooled_rows; }
 
     private:
         friend class llama_memory_hybrid_idx_context;
@@ -149,6 +182,7 @@ public:
         ggml_context * ctx;
         ggml_tensor  * key_gate;
         ggml_tensor  * pooled;
+        ggml_tensor  * pooled_rows;
     };
 
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
@@ -192,14 +226,16 @@ public:
     uint32_t get_n_stream() const;
 
     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
-    uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
+    uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused, see kpool_n_pool.
     uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
     ggml_tensor * gather_mla_rows(ggml_context * ctx, ggml_tensor * idxs, int64_t n_rows, int64_t n_embd, int32_t il) const;
     // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
+    // pool_rng (I32 [2, n_tokens]): the pools [lo, hi) each token sees, for ggml_qsa_select; with it pool_mask may be
+    // null and the padded member and tail cells are -1 instead of the n_kv sentinel
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
-                         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
+                         const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr, ggml_tensor * pool_rng = nullptr) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;

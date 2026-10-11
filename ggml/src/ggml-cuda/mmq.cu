@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "ggml-cuda-expert.cuh"
 
 #include <cstdint>
 
@@ -133,7 +134,8 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
 }
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+        const char * const * expert_ptrs) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -171,7 +173,7 @@ void ggml_cuda_mul_mat_q(
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s1  =  dst->nb[1] / ts_dst;
-    const int64_t s02 = src0->nb[2] / ts_src0;
+    int64_t s02 = src0->nb[2] / ts_src0;
     const int64_t s2  =  dst->nb[2] / ts_dst;
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
@@ -223,7 +225,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1, ne1};
+            ne1, ne1, nullptr};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
@@ -242,15 +244,47 @@ void ggml_cuda_mul_mat_q(
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
-    const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
+    // Expert parallelism skips the ids of other devices, so the compact maps are sparse: the
+    // inverse map marks the entries of the other devices with -1, which the scatter quantizer
+    // skips (they are not part of any expert's compact range either).
+    // the expert map of the node: which routed id is which local expert of the weight (an expert
+    // store view addresses its weights from the view start, so the ids stay view-local numbers)
+    const ggml_cuda_expert_lut lut = ggml_cuda_mul_mat_id_lut(ctx, dst);
+    ggml_cuda_expert_table ex_table;
+    if (ggml_cuda_expert_table_get(src0, &ex_table)) {
+        if (ex_table.uniform && expert_ptrs == nullptr) {
+            // fully resident expert store tensor: the experts are one strided block of device
+            // memory, so address them from the store base and pitch. Reading the pointer table
+            // instead would put a dependent global load in front of every weight access.
+            src0_d = ex_table.plain_base;
+            s02    = (int64_t) ex_table.plain_pitch / ts_src0;
+        }
+    }
+    const bool is_ep         = ggml_mul_mat_id_is_expert_parallel(dst);
+    const bool dedup_bcast   = ne11 == 1 && n_expert_used > 1;
 
     {
         GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
+        if (is_ep) {
+            // the MMQ kernel only writes the local entries, zero the others
+            ggml_cuda_mmid_zero_nonlocal(dst_d, (const int32_t *) ids->data, lut,
+                ne12, (int) n_expert_used, dst->ne[0], ids->nb[1] / sizeof(int32_t),
+                dst->nb[1] / sizeof(float), dst->nb[2] / sizeof(float), stream);
+            if (dedup_bcast) {
+                // -1 marks the entries of the other devices, the scatter quantizer skips them
+                CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0xFF, ne_get_rows*sizeof(int32_t), stream));
+            } else {
+                // the plain quantizer walks every compact row, point the unused tail at row 0
+                CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows*sizeof(int32_t), stream));
+            }
+        }
+
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast,
+            lut, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
@@ -296,11 +330,13 @@ void ggml_cuda_mul_mat_q(
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
 
-    // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-    // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+    // Each expert only sees ne12*n_expert_used/n_experts tokens on average.
+    // On RDNA3, RDNA4 and Volta it is faster to pick the tile size against this value instead of ne12:
+    // Volta has no int8 tensor cores, so padding a tile to J columns costs real dp4a time.
     int64_t ncols_opt = ne12;
-    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-        ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
+    if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) || cc == GGML_CUDA_CC_VOLTA) {
+        const int64_t n_experts = ggml_cuda_mul_mat_id_n_expert_density(dst);
+        ncols_opt = (ne12*n_expert_used + n_experts - 1) / n_experts;
     }
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
@@ -310,18 +346,12 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12, ncols_opt};
+        ne12, ncols_opt, expert_ptrs};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
 
-bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
-#ifdef GGML_CUDA_FORCE_CUBLAS
-    return false;
-#endif // GGML_CUDA_FORCE_CUBLAS
-
-    bool mmq_supported;
-
+bool ggml_cuda_mmq_supports_type(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
@@ -348,14 +378,18 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
 // -------------------------------------------------
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_NVFP4:
-            mmq_supported = true;
-            break;
+            return true;
         default:
-            mmq_supported = false;
-            break;
+            return false;
     }
+}
 
-    if (!mmq_supported) {
+bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
+#ifdef GGML_CUDA_FORCE_CUBLAS
+    return false;
+#endif // GGML_CUDA_FORCE_CUBLAS
+
+    if (!ggml_cuda_mmq_supports_type(type)) {
         return false;
     }
 

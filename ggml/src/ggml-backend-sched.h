@@ -1,0 +1,248 @@
+#pragma once
+
+// ggml-backend internal header: scheduler state shared between ggml-backend.cpp
+// and ggml-backend-pipeline.cpp
+
+#include "ggml-backend.h"
+#include "ggml-alloc.h"
+#include "ggml-impl.h"
+
+#ifdef  __cplusplus
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
+#endif
+
+#ifdef  __cplusplus
+// one submission thread per non-CPU backend; created only in pipeline mode (n_copies > 1).
+// the thread only runs tasks posted with ggml_backend_sched_worker_post()
+struct ggml_backend_sched_worker {
+    std::thread             thread;
+    std::mutex              mtx;
+    std::condition_variable cv;       // wakes the worker
+    std::condition_variable cv_done;  // signals progress of n_done
+    std::deque<std::function<void()>> tasks;
+    uint64_t                n_posted = 0; // tasks posted so far
+    uint64_t                n_done   = 0; // tasks executed (enqueued on the device stream) so far
+    bool                    stop     = false;
+};
+#endif
+
+#ifdef  __cplusplus
+extern "C" {
+#endif
+
+#ifndef GGML_SCHED_MAX_BACKENDS
+#define GGML_SCHED_MAX_BACKENDS 16
+#endif
+
+#ifndef GGML_SCHED_MAX_SPLIT_INPUTS
+#define GGML_SCHED_MAX_SPLIT_INPUTS 30
+#endif
+
+// input copies of the pipeline. the copies are double buffered and independent of the pipeline
+// depth: ubatch i uses copy i % n_copies on every backend, so two copies suffice for any depth
+#ifndef GGML_SCHED_MAX_COPIES
+#define GGML_SCHED_MAX_COPIES 2
+#endif
+
+// pipeline parallelism: max number of ubatches of one prefill in flight at once
+#ifndef GGML_SCHED_MAX_STAGES
+#define GGML_SCHED_MAX_STAGES 8
+#endif
+
+// a group of input copies of a split whose slots ggml-alloc placed back to back: the host data of all of
+// them is staged with the same relative layout and uploaded with one copy through `window`, a byte
+// tensor that aliases the memory of the group (or the copy itself for a group of one)
+struct ggml_backend_sched_upload_run {
+    struct ggml_tensor * window;
+    size_t               stage_offs; // offset of the group in the staging entry of the backend
+    size_t               size;       // bytes uploaded
+};
+
+struct ggml_backend_sched_split {
+    int backend_id;
+    int i_start;
+    int i_end;
+    struct ggml_tensor ** inputs;
+    // per input: index of its copy among the nodes of the graph copy (where ggml-alloc places it),
+    // and the offset of its host data in the staging entry of the backend (SIZE_MAX: the input is not
+    // staged, see ggml_backend_sched_upload_runs)
+    int    * inputs_cpy_node;
+    size_t * inputs_stage_offs;
+    int n_inputs;
+    int inputs_capacity;
+    // the staged host inputs of this split, grouped by adjacency of their copies (capacity: inputs)
+    struct ggml_backend_sched_upload_run * runs;
+    int n_runs;
+    // graph view of this split
+    struct ggml_cgraph graph;
+};
+
+// one in-flight ubatch of a pipeline-parallel prefill
+//
+// every ubatch has its own graph (the caller rebuilds it) and uses the input copy of its
+// submission index, so a later ubatch can be split and allocated while the earlier ones are still
+// running. the input copies are small: only the graph inputs and the split inputs are duplicated
+struct ggml_backend_sched_stage {
+    int slot;          // input copy slot used by this stage (ubatch_id % n_copies)
+    int64_t ubatch_id; // logical batch index, for ordering checks
+    bool in_flight;
+    // completion of this ubatch, recorded by the submission tasks after their split. the slot
+    // events are shared by every n_copies submissions, so only these events can tell whether the
+    // ubatch on this stage is still running
+    ggml_backend_event_t done[GGML_SCHED_MAX_BACKENDS];
+    // last submission-worker task posted for this stage, per backend (0 = none); the stage events
+    // can only be synchronized once these tasks have been enqueued
+    uint64_t backend_seq[GGML_SCHED_MAX_BACKENDS];
+    // this stage's input copy context. the next ubatch rebuilds the active sched->ctx, which would
+    // overwrite the copy tensor structs that the submission workers of this stage still read
+    char *                context_buffer;
+    size_t                context_buffer_size;
+    struct ggml_context * ctx;
+    // handoff events of this stage, one per split. the stage is only reused after its previous
+    // ubatch completed (n_stages away), so a re-record cannot race a consumer of the previous batch.
+    // pointer because the stage array lives in a calloc'ed scheduler
+    std::vector<ggml_backend_event_t> * handoff_events;
+    // error of this stage's submission, set by the first failing task. checked after the workers of
+    // the stage are known to have run (pipeline_wait_stage), not at submit time
+    std::shared_ptr<std::atomic<int>> error;
+};
+
+// pinned host staging of the pipeline user inputs. one ring per backend: the main thread copies the
+// inputs of a ubatch into the entry of its stage, the backend submission worker uploads the entry
+// before the graph computes, and the entry is reused once the upload of n_stages submissions ago
+// completed
+struct ggml_backend_sched_staging {
+    ggml_backend_buffer_t buf; // n_stages entries of `size` bytes
+    size_t size;               // bytes per entry
+    ggml_backend_event_t done[GGML_SCHED_MAX_STAGES]; // upload completion of each entry
+};
+
+// shared with ggml-backend-pipeline.cpp: enqueue the splits of the currently allocated graph
+enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched);
+
+struct ggml_backend_sched {
+    bool is_reset; // true if the scheduler has been reset since the last graph split
+    bool is_alloc;
+
+    int n_backends;
+
+    ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
+    ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
+    ggml_gallocr_t galloc;
+
+    // hash map of the nodes in the graph
+    struct ggml_hash_set  hash_set;
+    int                 * hv_tensor_backend_ids; // [hash_set.size]
+    struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
+
+    int * node_backend_ids; // [graph_size]
+    int * leaf_backend_ids; // [graph_size]
+
+    int * prev_node_backend_ids; // [graph_size]
+    int * prev_leaf_backend_ids; // [graph_size]
+
+    // copy of the graph with modified inputs
+    struct ggml_cgraph graph;
+
+    // graph splits
+    struct ggml_backend_sched_split * splits;
+    int n_splits;
+    int splits_capacity;
+
+    // pipeline parallelism support
+    int n_copies;
+    int cur_copy;
+    int next_copy;
+    ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    struct ggml_tensor ** graph_inputs;
+    int n_graph_inputs;
+    int graph_inputs_capacity;
+
+    // pinned host staging of the pipeline user inputs, indexed by backend
+    struct ggml_backend_sched_staging staging[GGML_SCHED_MAX_BACKENDS];
+    // worst case staging entry size of the reserved graph, per backend. the ring is sized from this
+    // at reserve time, so the steady state (graphs no larger than the reserve) never grows again
+    size_t staging_reserve[GGML_SCHED_MAX_BACKENDS];
+
+    // pinned host staging of the host user inputs on the synchronous submission path, per backend:
+    // one entry per input copy slot. the splits of a backend use disjoint areas of an entry, and the
+    // copies whose slots are adjacent are uploaded together (see ggml_backend_sched_upload_runs)
+    ggml_backend_buffer_t inputs_staging[GGML_SCHED_MAX_BACKENDS];      // n_copies entries
+    size_t                inputs_staging_size[GGML_SCHED_MAX_BACKENDS]; // bytes per entry
+    size_t                inputs_stage_need[GGML_SCHED_MAX_BACKENDS];   // bytes the current graph stages
+    size_t                inputs_stage_reserve[GGML_SCHED_MAX_BACKENDS];// worst case of the reserved graphs
+
+    // pipeline depth; 1 = no pipeline (single ubatch at a time)
+    int n_stages;
+    struct ggml_backend_sched_stage stages[GGML_SCHED_MAX_STAGES];
+    int next_stage;   // ring index for submission
+    int oldest_stage; // ring index of the oldest in-flight batch
+
+    // pipeline state; each in-flight ubatch has its own freshly built graph and input copy, so the
+    // scheduler only tracks which stage is being prepared and the submission order
+    int pipeline_stage;              // stage prepared by ggml_backend_sched_pipeline_begin, or -1
+    int pipeline_post_stage;         // stage of the last submission; its worker tasks extend this stage
+    int64_t pipeline_last_ubatch_id; // last submitted ubatch id, for ordering checks
+    enum ggml_status pipeline_error; // first compute error observed at a stage wait, sticky until advance
+
+#ifdef __cplusplus
+    // per-backend submission threads, pipeline mode only (n_copies > 1), indexed by backend id;
+    // NULL for the CPU backend. pointer because the scheduler is calloc'ed
+    std::vector<std::unique_ptr<struct ggml_backend_sched_worker>> * workers;
+
+    // handoff events of a plain asynchronous submission on a pipeline scheduler (no stage), one
+    // per split. the pipeline path keeps one set per stage instead, see ggml_backend_sched_stage
+    std::vector<ggml_backend_event_t> * handoff_events;
+#endif
+
+    struct ggml_context * ctx;
+
+    ggml_backend_sched_eval_callback callback_eval;
+    void * callback_eval_user_data;
+
+    char * context_buffer;
+    size_t context_buffer_size;
+
+    bool op_offload;
+
+    // if true, user inputs are copied to the split backends asynchronously
+    // in that case, the caller must synchronize the scheduler before overwriting the inputs
+    bool async_inputs;
+
+    // dchain: optional caller-owned event per backend, recorded on the backend stream right after
+    // the asynchronous user-input copies of a split (async_inputs, single copy). A caller that
+    // waits for it may overwrite the host inputs while the compute of that graph still runs
+    ggml_backend_event_t ev_inputs[GGML_SCHED_MAX_BACKENDS];
+
+    int debug;
+
+    // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
+    // ref: https://github.com/ggml-org/llama.cpp/pull/17617
+    int debug_realloc;
+    int debug_graph_size;
+    int debug_prev_graph_size;
+};
+
+#define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
+#define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
+#define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
+#define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+#ifdef  __cplusplus
+}
+
+// per-backend submission workers, implemented in ggml-backend.cpp; started by
+// ggml_backend_sched_set_n_stages when pipeline overlap is enabled
+void ggml_backend_sched_workers_start(ggml_backend_sched_t sched);
+uint64_t ggml_backend_sched_worker_post(ggml_backend_sched_t sched, int backend_id, std::function<void()> fn);
+void ggml_backend_sched_worker_wait_done(ggml_backend_sched_t sched, int backend_id, uint64_t seq);
+void ggml_backend_sched_workers_drain(ggml_backend_sched_t sched);
+bool ggml_backend_sched_has_workers(ggml_backend_sched_t sched);
+#endif

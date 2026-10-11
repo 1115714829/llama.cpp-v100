@@ -18,9 +18,12 @@
 #endif
 
 #ifdef  __cplusplus
-extern "C" {
+#include <functional>
 #endif
 
+#ifdef  __cplusplus
+extern "C" {
+#endif
     typedef struct ggml_backend_buffer_type * ggml_backend_buffer_type_t;
     typedef struct ggml_backend_buffer * ggml_backend_buffer_t;
     typedef struct ggml_backend_event * ggml_backend_event_t;
@@ -195,6 +198,10 @@ extern "C" {
     GGML_API bool                          ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
     GGML_API bool                          ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
 
+    // true if the device has native BF16 support; devices without it are expected to be given
+    // F16 weights instead (BF16 -> F16 is exact inside the F16 range)
+    GGML_API bool                          ggml_backend_dev_supports_bf16(ggml_backend_dev_t device);
+
     //
     // Backend (reg)
     //
@@ -350,12 +357,16 @@ extern "C" {
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
+    GGML_API int                  ggml_backend_sched_get_n_stages(ggml_backend_sched_t sched);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
+    // Backend id of the node, as returned by ggml_backend_sched_get_n_backends. -1 if unassigned.
+    // Resolve it before the next graph is allocated: the assignment map is reset then.
+    GGML_API int                  ggml_backend_sched_get_tensor_backend_id(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
@@ -366,10 +377,54 @@ extern "C" {
     GGML_API enum ggml_status     ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
 
+    // Pipeline parallelism primitives for multi-ubatch prefill.
+    // n_stages is the pipeline depth: the number of ubatches that may be in flight at once.
+    // n_stages == 1 means no overlap, equivalent to ggml_backend_sched_graph_compute_async.
+    GGML_API void                 ggml_backend_sched_set_n_stages(ggml_backend_sched_t sched, int n_stages);
+    // Split and allocate one ubatch graph on its input copy slot (ubatch_id % n_copies), without
+    // computing it. ubatch_id must increase across calls.
+    GGML_API bool                 ggml_backend_sched_pipeline_begin(ggml_backend_sched_t sched, struct ggml_cgraph * graph, int64_t ubatch_id);
+    // Stage index that the next ggml_backend_sched_pipeline_begin will use. The caller uses it to
+    // pick the per-stage graph result before it rebuilds the graph.
+    GGML_API int                  ggml_backend_sched_pipeline_next_stage(ggml_backend_sched_t sched);
+    // Wait until the stage that the next ggml_backend_sched_pipeline_begin will use is reusable.
+    // The caller must call this before it rebuilds the graph result of that stage, so no submission
+    // worker still reads the old nodes. ggml_backend_sched_pipeline_begin then does not wait again.
+    GGML_API void                 ggml_backend_sched_pipeline_wait_next_stage(ggml_backend_sched_t sched);
+    // Enqueue all splits of the graph prepared by ggml_backend_sched_pipeline_begin, without waiting.
+    // ubatch_id must increase across calls.
+    GGML_API enum ggml_status     ggml_backend_sched_pipeline_submit(ggml_backend_sched_t sched, int64_t ubatch_id);
+    // Wait for the ubatch with this ubatch_id to complete on all backends.
+    GGML_API void                 ggml_backend_sched_pipeline_wait(ggml_backend_sched_t sched, int64_t ubatch_id);
+    // Wait for all in-flight ubatches and reset the pipeline ring.
+    GGML_API void                 ggml_backend_sched_pipeline_advance(ggml_backend_sched_t sched);
+    // Block until every task already posted to the submission thread of backend is enqueued on its
+    // stream (not until the device finished). Returns immediately if the scheduler has no
+    // submission threads, or if backend is not one of its backends.
+    GGML_API void                 ggml_backend_sched_wait_submitted(ggml_backend_sched_t sched, ggml_backend_t backend);
+
+#ifdef  __cplusplus
+    // Post a host task to the submission worker of backend_id. The task runs after every task
+    // already posted to that worker, so a copy enqueued here is ordered after this ubatch's compute
+    // on the backend stream, without waiting on the caller thread. Backends without a submission
+    // worker (CPU) run the task directly.
+    GGML_API void                 ggml_backend_sched_post_task(ggml_backend_sched_t sched, int backend_id, std::function<void()> fn);
+#endif
+
     // copy user input tensors to the split backends asynchronously (default: false)
     // the caller synchronizes the scheduler before it writes the input tensors again, so user inputs
-    // can be copied asynchronously (see ggml_backend_sched_compute_splits)
+    // can be copied asynchronously (see ggml_backend_sched_compute_splits). on a scheduler with a
+    // single input copy the host inputs are staged in a pinned area per backend and uploaded with one
+    // copy per run of adjacent input copies, and the next graph reuses that area: the synchronization
+    // also covers it
     GGML_API void                 ggml_backend_sched_set_async_inputs(ggml_backend_sched_t sched, bool async_inputs);
+
+    // dchain: record event on the stream of backend right after the asynchronous user-input copies of
+    // every split that runs on it (async inputs, single input copy). Waiting for the event instead of
+    // synchronizing the scheduler lets the caller overwrite the host input tensors for the next graph
+    // while the compute of the previous one is still running. The event stays owned by the caller;
+    // NULL removes it.
+    GGML_API void                 ggml_backend_sched_set_inputs_event(ggml_backend_sched_t sched, ggml_backend_t backend, ggml_backend_event_t event);
 
     // Reset all assignments and allocators - must be called before changing the node backends or allocating a new graph.
     // This in effect deallocates all tensors that were previously allocated and leaves them with dangling pointers.
@@ -397,6 +452,9 @@ extern "C" {
 
         GGML_BACKEND_SPLIT_AXIS_MIRRORED = 10, // all values on all backends
         GGML_BACKEND_SPLIT_AXIS_PARTIAL  = 11, // each backend has a partial sum
+        // each backend holds a private slice of the values (expert parallel: the routed experts are
+        // split along the expert dim, the per-device results cover disjoint slots and are not summed)
+        GGML_BACKEND_SPLIT_AXIS_LOCAL_PARTIAL = 12,
 
         // for internal bookkeeping only:
         GGML_BACKEND_SPLIT_AXIS_NONE    = 98,
@@ -440,8 +498,29 @@ extern "C" {
     GGML_API ggml_backend_dev_t ggml_backend_meta_device(
         ggml_backend_dev_t * devs, size_t n_devs, ggml_backend_meta_get_split_state_t get_split_state, void * get_split_state_ud);
 
+    // the simple devices a meta device is made of, in device order
+    GGML_API bool               ggml_backend_dev_is_meta        (ggml_backend_dev_t dev);
+    GGML_API size_t             ggml_backend_meta_dev_n_devs    (ggml_backend_dev_t meta_dev);
+    GGML_API ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t meta_dev, size_t index);
+
     // returns true if the buffer belongs to a meta backend
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
+
+    // The buffer type of a meta device for the weights that its GPUs read in place (the n-gram
+    // table and the token embedding table): all devices share one mapped host allocation, so the
+    // tables are MIRRORED and every device reads the same rows over UVA. Returns NULL when none
+    // of the devices offers such a buffer type, the caller then keeps the CPU path.
+    GGML_API ggml_backend_buffer_type_t ggml_backend_meta_mapped_weights_buffer_type(ggml_backend_dev_t meta_dev);
+
+    // true when the tensors of this buffer type live in device-readable host memory instead of
+    // device memory (a mapped host buffer): they take no device VRAM. A meta buffer type is host
+    // memory when its simple buffers are views of one shared host allocation (the mapped weights
+    // buffer type) or when all of its simple buffer types are device mapped themselves.
+    GGML_API bool ggml_backend_meta_buft_is_device_mapped(ggml_backend_buffer_type_t buft);
+
+    // the same query for any buffer type: the meta backend answers for its buffer types, every
+    // other backend through its own registry proc
+    GGML_API bool ggml_backend_buft_is_device_mapped(ggml_backend_buffer_type_t buft);
 
     // Copies nbytes from src (at byte offset src_offs) to dst (at dst_offs) asynchronously on every
     // device of the meta backend. src and dst are static (non-view) meta tensors that are MIRRORED,
@@ -499,7 +578,7 @@ extern "C" {
 
         // Mask: the same mirrored copy exists on every device, the descriptor holds this device's.
         const void * mask;
-        int64_t mask_row_stride;   // range mask: int2 units, f16 mask: halfs
+        int64_t mask_row_stride;   // range mask: int4 units, f16 mask: halfs
         int64_t mask_batch_stride; // same units, 0 when the mask has a single batch
         bool    mask_is_range;
 

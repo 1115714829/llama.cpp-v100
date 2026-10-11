@@ -38,6 +38,8 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    void collect_tensors(std::vector<std::pair<std::string, ggml_tensor *>> & out) const;
+
     void state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, const std::vector<uint32_t> & rs_idx) const;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
 
@@ -87,6 +89,9 @@ private:
 
 class llama_kv_cache_dsv4 : public llama_memory_i {
 public:
+    // seq_rm / seq_cp clear the compressed state streams on the device synchronously
+    bool seq_ops_write_device() const override { return true; }
+
     llama_kv_cache_dsv4(
             const llama_model & model,
                     ggml_type   type_k,
@@ -132,6 +137,8 @@ public:
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
+
+    void collect_tensors(std::vector<std::pair<std::string, ggml_tensor *>> & out) const override;
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;

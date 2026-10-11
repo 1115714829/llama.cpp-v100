@@ -73,6 +73,13 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+// slot that ggml-alloc reserved for node i of the graph it allocated last (the node allocation is shared
+// by every graph that reuses the reserved layout): the buffer index, chunk and byte offset where the
+// tensor is placed, and the size of the slot, i.e. the aligned allocation size of the reserved graph,
+// at least the size of the tensor placed there now. No other tensor overlaps the slot while the node is
+// alive. Returns false if ggml-alloc did not place the node (a view, a pre-allocated or an unused tensor)
+GGML_API bool ggml_gallocr_get_node_slot(ggml_gallocr_t galloc, int node_index, int * buffer_id, int * chunk, size_t * offset, size_t * size);
+
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
 

@@ -643,6 +643,22 @@ struct llama_model {
 
     std::string name = "n/a";
 
+    // r-mtpdev: the arch graph_mtp reads the nextn h rows from the device sink (t_embd_h_src
+    // branch in the MTP graph). Set by the model loader of architectures that implement it;
+    // the h sink is not usable without it
+    bool h_nextn_sink_ok = false;
+
+    // dchain: the arch graph_mtp can take its input tokens from the device draft ring and write the
+    // argmax of its logits back into it (t_draft_ring branch in the MTP graph). Set by the model
+    // loader of architectures that implement it; the draft token chain stays on the host without it
+    bool draft_ring_ok = false;
+
+    // the merged gate_up expert weight of every layer is loaded with its rows interleaved, so the
+    // graph reads it with the fused SwiGLU matmul instead of the split gate and up views.
+    // Set by the model loader of the architectures that load it that way, see
+    // TENSOR_GATE_UP_INTERLEAVE and ggml_mul_mat_id_swiglu
+    bool gate_up_fused_swiglu = false;
+
     llama_hparams hparams = {};
     llama_vocab   vocab;
 
@@ -785,6 +801,9 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // true if any tensor override sends a weight to a non-GPU (host) buffer
+    bool has_host_tensor_overrides() const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;
@@ -835,18 +854,23 @@ struct llama_model_base : public llama_model {
     const int TENSOR_SKIP_IF_VIRTUAL;
     const int TENSOR_ALLOW_RESHAPE;
     const int TENSOR_READ_LAZY;
+    const int TENSOR_GATE_UP_INTERLEAVE;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;
 
-    ggml_tensor * create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+    ggml_tensor * create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+            const LLM_TN_IMPL * tn_src_gate = nullptr, const LLM_TN_IMPL * tn_src_up = nullptr);
 
     // convenience overload of create_tensor that doesn't require llama_model_loader
-    ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+    ggml_tensor * create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+            const LLM_TN_IMPL * tn_src_gate = nullptr, const LLM_TN_IMPL * tn_src_up = nullptr);
 
     // helper: try merged gate_up_exps first, fall back to separate gate and up
+    // when the file ships gate and up separately and the model wants the fused SwiGLU path
+    // (TENSOR_GATE_UP_INTERLEAVE), the two weights are merged into one tensor while loading
     void create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_,
-                int64_t n_ff_, int64_t n_expert_, int flags);
+                int64_t n_ff_, int64_t n_expert_, int flags, int flags_extra = 0);
 
     // helper: try to load merged qkv first, fall back to separate q, k, v
     void create_tensor_qkv(llama_layer & layer, int bid,

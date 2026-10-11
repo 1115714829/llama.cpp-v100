@@ -195,7 +195,8 @@ llama_option_depr(WARNING     LLAMA_CANN                GGML_CANN)
 llama_option_depr(WARNING     LLAMA_CURL)
 
 include("cmake/license.cmake")
-license_add_file("llama.cpp" "LICENSE")
+license_add_file("llama.cpp-v100" "LICENSE")
+license_add_file("llama.cpp (upstream)" "licenses/LICENSE-llama.cpp")
 
 #
 # compile options

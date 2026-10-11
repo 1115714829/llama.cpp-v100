@@ -160,6 +160,15 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
     ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
 
+    // r-mtpdev: device path, the h rows are gathered from the target sink in the graph. h is not
+    // created then and the column of each row is an input
+    ggml_tensor * h_cols = nullptr;       // I32 [n_batch]
+    const int32_t * h_cols_src = nullptr; // host values for h_cols
+
+    // dchain: tokens is a view of the device draft ring (written by the previous draft step), so
+    // set_input does not copy the host tokens
+    bool tokens_device = false;
+
     const int64_t n_embd = 0;
 };
 
@@ -355,7 +364,7 @@ public:
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
-                                              // or I32 [2, n_batch/n_stream, 1, n_stream] range mask
+                                              // or I32 [4, n_batch/n_stream, 1, n_stream] range mask
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
     // whether the graph was built with a range mask allowed, and the n_kv it was built with
@@ -837,9 +846,28 @@ struct llm_graph_params {
     std::vector<uint32_t> layer_inp_sink_layers; // target: row order within the sink
     size_t token_offset = 0;                     // target: first sink column written by this ubatch
 
+    // r-mtpdev device sink for the nextn hidden state
+    ggml_tensor * t_h_sink      = nullptr;       // both: the local sink, written by this graph
+    ggml_tensor * t_embd_h_src  = nullptr;       // draft: sink read in place by the mtp graph
+    const int32_t * h_src_cols  = nullptr;       // draft: sink column of each h row, host side
+    size_t h_token_offset = 0;                   // draft: first sink column written by this ubatch
+    bool h_sink_is_target = false;               // true: the local sink is the target h sink
+    bool h_sink_write = true;                    // false: this graph does not write the sink
+
     // 6-card FA assist: whether this ubatch marks the FA nodes as shareable (see qwen35). The
     // marked/unmarked nodes are different graphs, so reuse must not cross this flag
     bool fa_assist = false;
+
+    // MTP catch-up builds only the subgraph that produces the K/V cache writes (n_outputs == 0).
+    // A kv-only graph and a full-layer graph have different topologies, so reuse must not cross
+    // this flag. Only the MTP context can set it, all other contexts leave it false
+    bool mtp_kv_only = false;
+
+    // dchain: MTP draft token ring (llama_draft_ring_enable). A draft step reads its input tokens
+    // from the ring and writes the argmax of its logits back into it; with draft_ring_ptop the
+    // graph also outputs the probability of that argmax over the top 10 (for the p_min gate)
+    ggml_tensor * t_draft_ring    = nullptr;  // draft: I32 [n_seq_max], MIRRORED on a meta device
+    bool          draft_ring_ptop = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -916,7 +944,15 @@ struct llm_graph_params {
             t_layer_inp_sink      == other.t_layer_inp_sink      &&
             t_embd_src            == other.t_embd_src            &&
             token_offset          == other.token_offset          &&
+            t_h_sink              == other.t_h_sink              &&
+            t_embd_h_src          == other.t_embd_h_src          &&
+            h_token_offset        == other.h_token_offset        &&
+            h_sink_is_target      == other.h_sink_is_target      &&
+            h_sink_write          == other.h_sink_write          &&
             fa_assist             == other.fa_assist             &&
+            mtp_kv_only           == other.mtp_kv_only           &&
+            t_draft_ring          == other.t_draft_ring          &&
+            draft_ring_ptop       == other.draft_ring_ptop       &&
             layer_inp_sink_layers == other.layer_inp_sink_layers;
     }
 };
@@ -978,6 +1014,11 @@ public:
     // [k, n_shards, n_outputs] ids local to their vocab shard
     ggml_tensor * t_logits_topk     = nullptr;
     ggml_tensor * t_logits_topk_ids = nullptr;
+
+    // dchain: MTP draft ring outputs of a draft step, [1, n_outputs]: the argmax token of every row
+    // (global ids, also written into the ring) and, with draft_ring_ptop, its probability over the top 10
+    ggml_tensor * t_draft_top1 = nullptr;
+    ggml_tensor * t_draft_ptop = nullptr;
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1082,7 +1123,16 @@ struct llm_graph_context {
     ggml_tensor * const t_embd_src;          // draft: staging sink read by the injection graph
     const std::vector<uint32_t> layer_inp_sink_layers;
     const size_t token_offset;               // target: first sink column written by this ubatch
+    ggml_tensor * const t_h_sink;            // r-mtpdev: the local nextn sink written by this graph
+    ggml_tensor * const t_embd_h_src;        // r-mtpdev draft: nextn sink read in place
+    const int32_t * const h_src_cols;        // r-mtpdev draft: sink column of each h row
+    const size_t h_token_offset;             // r-mtpdev draft: first sink column written by this ubatch
+    const bool h_sink_is_target;             // r-mtpdev: true when the local sink is the target h sink
+    const bool h_sink_write;                 // r-mtpdev: false when this graph skips the sink write
     const bool fa_assist;                    // mark the FA nodes for the 6-card assist path
+    const bool mtp_kv_only;                  // MTP catch-up: build only the K/V subgraph
+    ggml_tensor * const t_draft_ring;        // dchain draft: device token ring read and written by the MTP graph
+    const bool draft_ring_ptop;              // dchain draft: also output the probability of the argmax
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
@@ -1180,7 +1230,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             bool gate_up_swiglu = false) const;
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
@@ -1206,7 +1257,8 @@ struct llm_graph_context {
              ggml_tensor * up_exps_s = nullptr,
              ggml_tensor * gate_exps_s = nullptr,
              ggml_tensor * down_exps_s = nullptr,
-             ggml_tensor * selected_experts_in = nullptr) const;
+             ggml_tensor * selected_experts_in = nullptr,
+             bool gate_up_swiglu = false) const;
 
     //
     // inputs
@@ -1448,6 +1500,13 @@ struct llm_graph_context {
 
     // append copies of the extracted layer inputs into the device sink (target side, no-op when not enabled)
     void build_layer_inp_sink() const;
+
+    //
+    // r-mtpdev device nextn sink
+    //
+
+    // append a copy of the nextn hidden state into the device sink (no-op when not enabled)
+    void build_h_nextn_sink() const;
 };
 
 // TODO: better name

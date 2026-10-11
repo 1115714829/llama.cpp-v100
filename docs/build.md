@@ -319,9 +319,9 @@ The environment variable `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` can be used to enab
 
 ### Peer Access
 
-The environment variable `GGML_CUDA_P2P` can be set to enable peer-to-peer access between multiple GPUs, allowing them to transfer data directly rather than to go through system memory.
+Peer-to-peer access between multiple GPUs is enabled automatically at startup for every pair of devices that the driver reports as capable (`cudaDeviceCanAccessPeer`), allowing them to transfer data directly rather than to go through system memory. The startup log prints a `P2P enabled` line listing the enabled pairs. Pairs that the driver reports as not capable keep going through system memory.
 Requires driver support (usually restricted to workstation/datacenter GPUs).
-May cause crashes or corrupted outputs for some motherboards and BIOS settings (e.g. IOMMU).
+May cause crashes or corrupted outputs for some motherboards and BIOS settings (e.g. IOMMU); check the `P2P enabled` startup line to see which links are in use.
 
 ### Performance Tuning
 

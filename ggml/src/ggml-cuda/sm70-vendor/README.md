@@ -3,7 +3,7 @@
 ## cute/ + cutlass/ (152 headers)
 - Source: https://github.com/NVIDIA/cutlass
 - Commit: 62750a2b75c802660e4894434dc55e839f322277
-- License: Apache-2.0 (see LICENSE-cute-cutlass)
+- License: BSD-3-Clause (see LICENSE-cute-cutlass)
 - Why: the 1Cat SM70 D256 Split-D flash-attention kernel is written in CuTe
   (MMA_Atom<SM70_8x8x4> etc). llama.cpp does not vendor cute; this plugin
   needs the transitive include closure (152 headers, header-only).
@@ -19,9 +19,11 @@
   D256 patch builds against (see 1CatAI/1Cat-vLLM vllm_flash_attn.cmake).
 
 ## The kernel itself
-- fattn-sm70-d256.cu is adapted from the 1CatAI D256 Split-D kernel
-  (1Cat-vLLM v1.3.0, cmake/patches/sm70_flash_attn_d256_pipeline.patch),
-  (c) 1CatAI, BSD-3-Clause compatible; see the header of that file.
+- fattn-sm70-d256-kernel.cuh (host side: fattn-sm70-d256.cu) is adapted from
+  the 1CatAI D256 Split-D kernel (1Cat-vLLM csrc/attention/sm70_v37/tail.cu;
+  the same kernel ships as cmake/patches/sm70_flash_attn_d256_pipeline.patch),
+  (c) 1CatAI, BSD-3-Clause compatible; see the header of that file,
+  licenses/LICENSE-1Cat-vLLM and licenses/README.md.
 
 Nothing here is compiled beyond what fattn-sm70-d256.cu includes; all are
 header-only.

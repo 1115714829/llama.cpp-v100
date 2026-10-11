@@ -8952,12 +8952,16 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
         const bool mask_range = mask && mask->type == GGML_TYPE_I32;
         const ggml_fp16_t * mp = mask && !mask_range ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
-        int64_t r_lo = 0;
-        int64_t r_hi = INT64_MAX;
+        int64_t r_lo0 = 0;
+        int64_t r_hi0 = INT64_MAX;
+        int64_t r_lo1 = 0;
+        int64_t r_hi1 = 0;
         if (mask_range) {
             const int32_t * rp = (const int32_t *)((const char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
-            r_lo = rp[0];
-            r_hi = rp[1];
+            r_lo0 = rp[0];
+            r_hi0 = rp[1];
+            r_lo1 = rp[2];
+            r_hi1 = rp[3];
         }
 
         // k indices
@@ -8976,7 +8980,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            if (ic < r_lo || ic >= r_hi) {
+            if ((ic < r_lo0 || ic >= r_hi0) && (ic < r_lo1 || ic >= r_hi1)) {
                 continue;
             }
 
@@ -9249,18 +9253,22 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 bool can_skip = true;
                 for (int tq = 0; tq < tile_rows; tq++) {
                     const ggml_fp16_t * mp_row = mask_range ? NULL : (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
-                    int64_t r_lo = 0;
-                    int64_t r_hi = INT64_MAX;
+                    int64_t r_lo0 = 0;
+                    int64_t r_hi0 = INT64_MAX;
+                    int64_t r_lo1 = 0;
+                    int64_t r_hi1 = 0;
                     if (mask_range) {
                         const int32_t * rp = (const int32_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
-                        r_lo = rp[0];
-                        r_hi = rp[1];
+                        r_lo0 = rp[0];
+                        r_hi0 = rp[1];
+                        r_lo1 = rp[2];
+                        r_hi1 = rp[3];
                     }
                     for (int tk = 0; tk < kv_tile; tk++) {
                         float mv;
                         if (mask_range) {
                             const int64_t col = ic + tk;
-                            mv = (col >= r_lo && col < r_hi) ? 0.0f : -INFINITY;
+                            mv = ((col >= r_lo0 && col < r_hi0) || (col >= r_lo1 && col < r_hi1)) ? 0.0f : -INFINITY;
                         } else {
                             mv = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
                         }
@@ -12464,6 +12472,200 @@ void ggml_compute_forward_lightning_indexer(
                 // apply mask
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
+        }
+    }
+}
+
+// ggml_compute_forward_qsa_select
+
+void ggml_compute_forward_qsa_select(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1]; // key table
+    const ggml_tensor * pidx  = dst->src[2]; // member cells of each pool
+    const ggml_tensor * tidx  = dst->src[3]; // tail cells of each token
+    const ggml_tensor * prng  = dst->src[4]; // visible pools [lo, hi) of each token
+    const ggml_tensor * pcell = dst->src[5]; // row of k holding each pool's key
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(  q->type == GGML_TYPE_F32);
+
+    const int64_t n_embd     = q->ne[0];
+    const int64_t n_head     = q->ne[1];
+    const int64_t n_tokens   = q->ne[2];
+    const int64_t n_pool     = pcell->ne[0];
+    const int64_t n_rows     = k->ne[2];
+    const int64_t kpool      = pidx->ne[0];
+    const int64_t n_sel      = dst->ne[0];
+
+    const float   head_scale = ggml_get_op_params_f32(dst, 0);
+    const int32_t n_top      = ggml_get_op_params_i32(dst, 1);
+    const int32_t sentinel   = ggml_get_op_params_i32(dst, 2);
+
+    ggml_to_float_t const k_to_float = ggml_get_type_traits(k->type)->to_float;
+    GGML_ASSERT((k->type == GGML_TYPE_F32 || k_to_float) && "qsa select: unsupported K-type");
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // per thread: one widened key, the scores of the visible pools and their order
+    char    * wdata  = (char *) params->wdata + ith*((n_embd + 2*n_pool)*sizeof(float) + CACHE_LINE_SIZE);
+    float   * k_f32  = (float *) wdata;
+    float   * scores = k_f32 + n_embd;
+    int32_t * order  = (int32_t *) (scores + n_pool);
+
+    for (int64_t t = ith; t < n_tokens; t += nth) {
+        const int32_t * rng = (const int32_t *) ((const char *) prng->data + t*prng->nb[1]);
+        const int64_t lo = rng[0];
+        const int64_t hi = rng[1];
+        GGML_ASSERT(0 <= lo && lo <= hi && hi <= n_pool);
+
+        const int64_t nv = hi - lo;
+        for (int64_t p = lo; p < hi; ++p) {
+            const int32_t row = *(const int32_t *) ((const char *) pcell->data + p*pcell->nb[0]);
+            GGML_ASSERT(0 <= row && row < n_rows && "qsa select: a pool key outside the key table");
+            const char * k_row = (const char *) k->data + row*k->nb[2];
+            const float * kf = (const float *) k_row;
+            if (k_to_float) {
+                k_to_float(k_row, k_f32, n_embd);
+                kf = k_f32;
+            }
+            float score = 0.0f;
+            for (int64_t h = 0; h < n_head; ++h) {
+                const float * q_row = (const float *) ((const char *) q->data + h*q->nb[1] + t*q->nb[2]);
+                float qk = 0.0f;
+                ggml_vec_dot_f32(n_embd, &qk, 0, q_row, 0, kf, 0, 1);
+                score += MAX(qk, 0.0f) * head_scale;
+            }
+            scores[p - lo] = score;
+            order[p - lo]  = (int32_t) (p - lo);
+        }
+
+        // the n_top best, equal scores by ascending pool, then back into ascending pool order
+        const int64_t nk = std::min<int64_t>(nv, n_top);
+        std::partial_sort(order, order + nk, order + nv, [scores](int32_t a, int32_t b) {
+            return scores[a] != scores[b] ? scores[a] > scores[b] : a < b;
+        });
+        std::sort(order, order + nk);
+
+        // the kept pools, the tail, then -1: the valid ids form a prefix
+        int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
+        int64_t   n   = 0;
+        for (int64_t r = 0; r < nk; ++r) {
+            for (int64_t c = 0; c < kpool; ++c) {
+                const int32_t cell = *(const int32_t *) ((const char *) pidx->data + c*pidx->nb[0] + (lo + order[r])*pidx->nb[1]);
+                GGML_ASSERT(cell != sentinel && "qsa select: a visible pool has a padded member");
+                out[n++] = cell;
+            }
+        }
+        for (int64_t c = 0; c < kpool - 1; ++c) {
+            const int32_t cell = *(const int32_t *) ((const char *) tidx->data + c*tidx->nb[0] + t*tidx->nb[1]);
+            if (cell != sentinel) {
+                out[n++] = cell;
+            }
+        }
+        for (; n < n_sel; ++n) {
+            out[n] = -1;
+        }
+        GGML_ASSERT(n_top*kpool + kpool - 1 == n_sel);
+    }
+}
+
+// ggml_compute_forward_qsa_attn
+
+void ggml_compute_forward_qsa_attn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * q   = dst->src[0];
+    const ggml_tensor * k   = dst->src[1];
+    const ggml_tensor * v   = dst->src[2];
+    const ggml_tensor * ids = dst->src[3];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(  q->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+    const int64_t DK        = k->ne[0];
+    const int64_t DV        = v->ne[0];
+    const int64_t n_head    = q->ne[1];
+    const int64_t n_tokens  = q->ne[2];
+    const int64_t n_head_kv = k->ne[1];
+    const int64_t n_stream  = k->ne[3];
+    const int64_t n_sel     = ids->ne[0];
+    const int64_t gqa       = n_head/n_head_kv;
+    const int64_t n_tps     = n_tokens/n_stream;
+
+    const float scale = ggml_get_op_params_f32(dst, 0);
+
+    ggml_to_float_t const k_to_float = ggml_get_type_traits(k->type)->to_float;
+    ggml_to_float_t const v_to_float = ggml_get_type_traits(v->type)->to_float;
+    GGML_ASSERT((k->type == GGML_TYPE_F32 || k_to_float) && "qsa attn: unsupported K-type");
+    GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float) && "qsa attn: unsupported V-type");
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // per thread: one widened K row, one widened V row and the accumulator
+    float * wdata = (float *) params->wdata + ith*(DK + 2*DV + CACHE_LINE_SIZE_F32);
+    float * k_f32 = wdata;
+    float * v_f32 = k_f32 + DK;
+    float * acc   = v_f32 + DV;
+
+    for (int64_t ir = ith; ir < n_tokens*n_head; ir += nth) {
+        const int64_t t  = ir / n_head;
+        const int64_t h  = ir % n_head;
+        const int64_t hk = h / gqa;
+        const int64_t s  = t / n_tps;
+
+        const float   * q_row = (const float *)   ((const char *) q->data   + h*q->nb[1] + t*q->nb[2]);
+        const int32_t * sel   = (const int32_t *) ((const char *) ids->data + t*ids->nb[1]);
+
+        float M = -INFINITY;
+        float S = 0.0f;
+        std::fill(acc, acc + DV, 0.0f);
+
+        for (int64_t i = 0; i < n_sel; ++i) {
+            const int32_t cell = sel[i];
+            if (cell < 0) {
+                continue;
+            }
+            GGML_ASSERT(cell < k->ne[2]);
+
+            const char * k_row = (const char *) k->data + hk*k->nb[1] + cell*k->nb[2] + s*k->nb[3];
+            const float * kf = (const float *) k_row;
+            if (k_to_float) {
+                k_to_float(k_row, k_f32, DK);
+                kf = k_f32;
+            }
+            float qk = 0.0f;
+            ggml_vec_dot_f32(DK, &qk, 0, q_row, 0, kf, 0, 1);
+            qk *= scale;
+
+            const char * v_row = (const char *) v->data + hk*v->nb[1] + cell*v->nb[2] + s*v->nb[3];
+            const float * vf = (const float *) v_row;
+            if (v_to_float) {
+                v_to_float(v_row, v_f32, DV);
+                vf = v_f32;
+            }
+
+            // online softmax
+            const float M_new = MAX(M, qk);
+            const float ms = expf(M - M_new);
+            const float vs = expf(qk - M_new);
+            for (int64_t d = 0; d < DV; ++d) {
+                acc[d] = acc[d]*ms + vf[d]*vs;
+            }
+            S = S*ms + vs;
+            M = M_new;
+        }
+
+        float * out = (float *) ((char *) dst->data + h*dst->nb[1] + t*dst->nb[2]);
+        const float inv = S > 0.0f ? 1.0f/S : 0.0f;
+        for (int64_t d = 0; d < DV; ++d) {
+            out[d] = acc[d]*inv;
         }
     }
 }

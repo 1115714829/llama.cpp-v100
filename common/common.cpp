@@ -1237,39 +1237,69 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
         // the draft context is created from the same base params and follows the main context, fit both together
-        const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp  = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+        const bool has_draft  = params.speculative.has_dft();
+        const bool spec_mtp   = std::find(params.speculative.types.begin(), params.speculative.types.end(),
             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        const bool spec_dflash = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end();
 
         common_params params_dft = common_base_params_to_speculative(params);
 
         auto mparams_dft = common_model_params_to_llama(params_dft);
         auto cparams_dft = common_context_params_to_llama(params_dft);
+        // the draft experts stay plain device weights, same as in the real draft load
+        mparams_dft.no_expert_store = true;
         if (spec_mtp) {
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         }
         cparams_dft.n_rs_seq = 0;
+
+        // the MTP nextn sink reserves a second batch-column group (the prefill ring) plus n_seq
+        // pending columns and (n_max + 1) draft-step columns per sequence on top of n_batch; the
+        // fit needs the same columns to reserve the bytes
+        const uint32_t h_sink_rows = spec_mtp
+            ? (uint32_t) params.n_batch + (uint32_t) (params.n_parallel * (params.speculative.draft.n_max + 2)) : 0;
 
         const common_fit_extra_model extra = {
             /*.path_model   =*/ params_dft.model.path.c_str(),
             /*.mparams      =*/ &mparams_dft,
             /*.cparams      =*/ &cparams_dft,
             /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+            /*.dflash_sink  =*/ spec_dflash,
+            /*.h_sink_rows  =*/ h_sink_rows,
         };
 
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
-            params.tensor_split,
-            params.tensor_buft_overrides.data(),
-            params.fit_params_target.data(),
-            params.fit_params_min_ctx,
-            has_draft || spec_mtp ? &extra : nullptr,
-            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        // without -fitt the target holds the default margin plus what other loads reserve on the
+        // devices (mmproj); the fit gets only the latter and applies the default of its mode
+        std::vector<size_t> fit_margins = params.fit_params_target;
+        if (!params.fit_params_target_set) {
+            for (size_t & m : fit_margins) {
+                m -= std::min(m, COMMON_FIT_TARGET_DEFAULT);
+            }
+        }
+
+        if (common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+                params.tensor_split,
+                params.tensor_buft_overrides.data(),
+                fit_margins.data(),
+                params.fit_params_target_set,
+                params.fit_params_min_ctx,
+                has_draft || spec_mtp ? &extra : nullptr,
+                params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR)
+                == COMMON_PARAMS_FIT_STATUS_ERROR) {
+            // a fit error means a measurement could not run (e.g. the draft model failed to
+            // load): the parameters cannot be trusted for the real load, so fail the init
+            // instead of loading with parameters the fit never checked
+            return;
+        }
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
         return;
     }
+
+    common_fit_log_memory_stage(model, "model_loaded");
 
     pimpl->model.reset(model);
 
@@ -1363,6 +1393,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return;
     }
+
+    common_fit_log_memory_stage(model, "sched_reserve");
 
     pimpl->context.reset(lctx);
 
@@ -1511,6 +1543,8 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();
     }
+
+    common_fit_log_memory_stage(model, "warmup");
 
     return res;
 }
@@ -1716,6 +1750,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
+    cparams.n_swa_mtp         = params.speculative.draft.window > 0 ? (uint32_t) params.speculative.draft.window : 0u;
     cparams.kv_unified        = params.kv_unified;
 
     cparams.type_k = params.cache_type_k;

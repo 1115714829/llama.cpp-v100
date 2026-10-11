@@ -671,6 +671,111 @@ static void rms_norm_mul_silu_mul_f32_cuda(const float *  x,
     }
 }
 
+// RMS_NORM -> MUL -> act(gate) -> MUL: the arithmetic of rms_norm_f32<block_size, true> (same
+// reduction) times act(gate), as the unfused RMS_NORM+MUL kernel followed by the fused unary * mul
+// kernel computes it. act is the sigmoid (qwen4exp GDN output gate) or the silu. dst_f16, with
+// write_f16, receives the result rounded to F16 for the q8 skinny projection that reads it next
+// (bitwise the F32 -> F16 conversion of dst).
+template <int block_size, bool sigmoid, bool write_f16>
+static __global__ void rms_norm_mul_gate_mul_f32(const float * x,
+                                                 float *       dst,
+                                                 half *        dst_f16,
+                                                 const int     ncols,
+                                                 const int64_t stride_row,
+                                                 const int64_t stride_channel,
+                                                 const int64_t stride_sample,
+                                                 const float   eps,
+                                                 const float * mul,
+                                                 const int64_t mul_stride_row,
+                                                 const int64_t mul_stride_channel,
+                                                 const int64_t mul_stride_sample,
+                                                 const uint3   mul_ncols_packed,
+                                                 const uint3   mul_nrows_packed,
+                                                 const uint3   mul_nchannels_packed,
+                                                 const uint3   mul_nsamples_packed,
+                                                 const float * gate,
+                                                 const int64_t gate_stride_row,
+                                                 const int64_t gate_stride_channel,
+                                                 const int64_t gate_stride_sample) {
+    ggml_cuda_pdl_lc();
+    const int nrows     = gridDim.x;
+    const int nchannels = gridDim.y;
+
+    const int row     = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample  = blockIdx.z;
+    const int tid     = threadIdx.x;
+
+    x += sample*stride_sample + channel*stride_channel + row*stride_row;
+    const int64_t dst_offset = ((int64_t) (sample*nchannels + channel)*nrows + row)*ncols;
+    dst += dst_offset;
+
+    const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+    const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+    const uint32_t mul_sample  = fastmodulo(sample, mul_nsamples_packed);
+    mul += mul_sample * mul_stride_sample + mul_channel * mul_stride_channel + mul_row * mul_stride_row;
+
+    gate += sample*gate_stride_sample + channel*gate_stride_channel + row*gate_stride_row;
+
+    float tmp = 0.0f;
+
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < ncols; col += block_size) {
+        const float xi = x[col];
+        tmp += xi * xi;
+    }
+
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const int   mul_col = fastmodulo(col, mul_ncols_packed);
+        const float g       = sigmoid ? ggml_cuda_op_sigmoid_single(gate[col]) : ggml_cuda_op_silu_single(gate[col]);
+        // the multiplication order of the unfused path: scale * x * mul, then * act(gate)
+        const float value = scale * x[col] * mul[mul_col] * g;
+        dst[col] = value;
+        if constexpr (write_f16) {
+            dst_f16[dst_offset + col] = __float2half(value);
+        }
+    }
+}
+
+template <bool sigmoid, bool write_f16>
+static void rms_norm_mul_gate_mul_launch(const float * x, const float * mul, const float * gate, float * dst, half * dst_f16,
+                                         const int ncols, const int nrows, const int nchannels, const int nsamples,
+                                         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
+                                         const int64_t mul_stride_row, const int64_t mul_stride_channel,
+                                         const int64_t mul_stride_sample, const uint32_t mul_ncols,
+                                         const uint32_t mul_nrows, const uint32_t mul_nchannels,
+                                         const uint32_t mul_nsamples, const int64_t gate_stride_row,
+                                         const int64_t gate_stride_channel, const int64_t gate_stride_sample,
+                                         const float eps, cudaStream_t stream) {
+    const dim3 blocks_num(nrows, nchannels, nsamples);
+    const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+    const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);
+    const uint3 mul_nchannels_packed = init_fastdiv_values(mul_nchannels);
+    const uint3 mul_nsamples_packed  = init_fastdiv_values(mul_nsamples);
+    // the block size of rms_norm_mul_f32_cuda and rms_norm_mul_silu_mul_f32_cuda for this ncols
+    if (ncols < 1024) {
+        const dim3 block_dims(256, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32 * sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_mul_gate_mul_f32<256, sigmoid, write_f16>, launch_params,
+            x, dst, dst_f16, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row,
+            mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed,
+            mul_nsamples_packed, gate, gate_stride_row, gate_stride_channel, gate_stride_sample);
+    } else {
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32 * sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_mul_gate_mul_f32<1024, sigmoid, write_f16>, launch_params,
+            x, dst, dst_f16, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row,
+            mul_stride_channel, mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed,
+            mul_nsamples_packed, gate, gate_stride_row, gate_stride_channel, gate_stride_sample);
+    }
+}
+
 static void add_rms_norm_mul_f32_cuda(const float *  a,
                                       const float *  b,
                                       float *        sum_dst,
@@ -857,6 +962,190 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
     rms_norm_f32_cuda<true>(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream, scale);
 }
 
+// SCALE -> UNARY(SIGMOID) -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL: the hyper-connection
+// combine that closes a block (qwen4exp build_hc_combine, post = 2*sigmoid(inject/hc), identity
+// comb) and the grouped RMSNorm that opens the next mixer (build_hc_mix). One block per row of the
+// new residual (row = stream, channel = token), the grid and block of rms_norm_f32<1024, true>.
+// Each thread computes its residual values with the expressions of dsv4_hc_post_f32<false, true>
+// and stores them (the DSV4_HC_POST output), adds their squares over the columns tid, tid + 1024,
+// ... and reduces them like rms_norm_f32; the normalized values times the gamma are the MUL
+// output. Both outputs are bitwise those of the two kernels it replaces.
+template <int block_size, bool has_post>
+static __global__ void dsv4_hc_post_rms_norm_mul_f32(
+        const float * __restrict__ x,
+        const float * __restrict__ residual,
+        const float * __restrict__ post,
+        float * __restrict__       dst_post,
+        float * __restrict__       dst,
+        half * __restrict__        dst_f16,
+        const int     ncols,
+        const int64_t sx0,
+        const int64_t sx1,
+        const int64_t sr0,
+        const int64_t sr1,
+        const int64_t sr2,
+        const int64_t sp0,
+        const int64_t sp1,
+        const float   gate_inv_hc,
+        const float   gate_scale,
+        const float   eps,
+        const float * __restrict__ mul,
+        const int64_t mul_stride_row,
+        const int64_t mul_stride_channel,
+        const uint3   mul_ncols_packed,
+        const uint3   mul_nrows_packed,
+        const uint3   mul_nchannels_packed) {
+    const int nrows   = gridDim.x;
+    const int row     = blockIdx.x; // stream
+    const int channel = blockIdx.y; // token
+    const int tid     = threadIdx.x;
+
+    // without the post the RMS_NORM input is read from `residual` (its strides sr0..sr2)
+    const float * row_in = residual + row*sr1 + channel*sr2;
+    float * row_post = dst_post + ((int64_t) channel*nrows + row)*ncols;
+    dst += ((int64_t) channel*nrows + row)*ncols;
+    if (dst_f16 != nullptr) {
+        dst_f16 += ((int64_t) channel*nrows + row)*ncols;
+    }
+
+    const uint32_t mul_row     = fastmodulo(row, mul_nrows_packed);
+    const uint32_t mul_channel = fastmodulo(channel, mul_nchannels_packed);
+    mul += mul_channel*mul_stride_channel + mul_row*mul_stride_row;
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
+    if constexpr (has_post) {
+        // dsv4_hc_post_f32<false, true>
+        const float v = gate_inv_hc * post[row*sp0 + channel*sp1];
+        const float p = gate_scale * (1.0f / (1.0f + expf(-v)));
+
+        for (int col = tid; col < ncols; col += block_size) {
+            float sum = x[col*sx0 + channel*sx1] * p;
+            sum += row_in[col*sr0];
+            row_post[col] = sum;
+            tmp += sum * sum;
+        }
+    } else {
+        GGML_UNUSED_VARS(x, post, sx0, sx1, sp0, sp1, gate_inv_hc, gate_scale, row_post);
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = row_in[col*sr0];
+            tmp += xi * xi;
+        }
+    }
+
+    // rms_norm_f32<block_size, true>
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+    const float mean = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+
+    for (int col = tid; col < ncols; col += block_size) {
+        const int mul_col = fastmodulo(col, mul_ncols_packed);
+        const float xi = has_post ? row_post[col] : row_in[col*sr0];
+        const float value = scale * xi * mul[mul_col];
+        dst[col] = value;
+        if (dst_f16 != nullptr) {
+            // the F32 -> F16 conversion kernel rounds the same way
+            dst_f16[col] = __float2half(value);
+        }
+    }
+}
+
+// The RMS_NORM -> MUL shapes the fused kernel covers: those for which the unfused path takes
+// rms_norm_f32<1024, true> (at least 1024 columns, a gamma that is not a single row, so that
+// rms_norm_f32_rows_ok() does not pick the row kernel), with contiguous outputs.
+static bool hc_mix_norm_supported(const ggml_tensor * rms_in, const ggml_tensor * rms_norm, const ggml_tensor * mul,
+                                  const ggml_tensor * gamma) {
+    if (rms_in->type != GGML_TYPE_F32 || gamma->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            rms_norm->type != GGML_TYPE_F32 || rms_norm->src[0] != rms_in ||
+            !ggml_is_contiguous(mul) || !ggml_are_same_shape(rms_in, mul) ||
+            rms_in->nb[0] != sizeof(float) || gamma->nb[0] != sizeof(float) ||
+            rms_in->ne[3] != 1 || gamma->ne[3] != 1) {
+        return false;
+    }
+    const int64_t ncols = rms_in->ne[0];
+    const int64_t nrows = rms_in->ne[1];
+    return ncols >= 1024 && gamma->ne[0] == ncols && gamma->ne[1] != 1 && gamma->ne[2] == 1 &&
+           nrows % gamma->ne[1] == 0;
+}
+
+// hc_post == nullptr: plain RMS_NORM -> MUL (rms_norm->src[0] is the input); otherwise the gated
+// DSV4_HC_POST before it is computed too. mul_f16, if not nullptr, receives the F16 copy of the
+// MUL output.
+static void hc_mix_norm_launch(ggml_backend_cuda_context & ctx, ggml_tensor * hc_post, ggml_tensor * scale_inv_hc,
+                               ggml_tensor * scale_gate, ggml_tensor * rms_norm, ggml_tensor * mul, half * mul_f16) {
+    const ggml_tensor * rms_in = rms_norm->src[0];
+    const ggml_tensor * gamma  = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+
+    const ggml_tensor * x        = hc_post ? hc_post->src[0] : nullptr;
+    const ggml_tensor * residual = hc_post ? hc_post->src[1] : rms_in;
+    const ggml_tensor * post     = hc_post ? scale_inv_hc->src[0] : nullptr;
+
+    const int64_t ncols     = rms_in->ne[0];
+    const int64_t nrows     = rms_in->ne[1];
+    const int64_t nchannels = rms_in->ne[2];
+
+    float eps = 0.0f;
+    memcpy(&eps, rms_norm->op_params, sizeof(float));
+    const float inv_hc = hc_post ? ggml_get_op_params_f32(scale_inv_hc, 0) : 0.0f;
+    const float factor = hc_post ? ggml_get_op_params_f32(scale_gate,   0) : 0.0f;
+
+    const size_t ts = sizeof(float);
+    const dim3 blocks_num(nrows, nchannels, 1);
+    const dim3 block_dims(1024, 1, 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32 * sizeof(float), ctx.stream()};
+    auto kernel = hc_post ? dsv4_hc_post_rms_norm_mul_f32<1024, true> : dsv4_hc_post_rms_norm_mul_f32<1024, false>;
+    ggml_cuda_kernel_launch(kernel, launch_params,
+        x ? (const float *) x->data : nullptr, (const float *) residual->data, post ? (const float *) post->data : nullptr,
+        hc_post ? (float *) hc_post->data : nullptr, (float *) mul->data, mul_f16, (int) ncols,
+        x ? (int64_t) (x->nb[0] / ts) : 0, x ? (int64_t) (x->nb[1] / ts) : 0,
+        (int64_t) (residual->nb[0] / ts), (int64_t) (residual->nb[1] / ts), (int64_t) (residual->nb[2] / ts),
+        post ? (int64_t) (post->nb[0] / ts) : 0, post ? (int64_t) (post->nb[1] / ts) : 0,
+        inv_hc, factor, eps,
+        (const float *) gamma->data, (int64_t) (gamma->nb[1] / ts), (int64_t) (gamma->nb[2] / ts),
+        init_fastdiv_values((uint32_t) gamma->ne[0]), init_fastdiv_values((uint32_t) gamma->ne[1]),
+        init_fastdiv_values((uint32_t) gamma->ne[2]));
+}
+
+// Returns false when the nodes are not the shapes the fused kernel covers; the caller then runs
+// them unfused. hc_post is the DSV4_HC_POST node, scale_inv_hc and scale_gate the SCALE nodes of
+// its gate, rms_norm/mul the two nodes after it.
+bool ggml_cuda_op_dsv4_hc_post_rms_norm_mul_fused(ggml_backend_cuda_context & ctx,
+                                                  ggml_tensor *               hc_post,
+                                                  ggml_tensor *               scale_inv_hc,
+                                                  ggml_tensor *               scale_gate,
+                                                  ggml_tensor *               rms_norm,
+                                                  ggml_tensor *               mul) {
+    if (!ggml_cuda_hc_mix_norm_supported(hc_post, scale_inv_hc, rms_norm, mul)) {
+        return false;
+    }
+    hc_mix_norm_launch(ctx, hc_post, scale_inv_hc, scale_gate, rms_norm, mul, nullptr);
+    return true;
+}
+
+bool ggml_cuda_hc_mix_norm_supported(const ggml_tensor * hc_post, const ggml_tensor * scale_inv_hc,
+                                     const ggml_tensor * rms_norm, const ggml_tensor * mul) {
+    const ggml_tensor * gamma = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
+    if (hc_post != nullptr) {
+        const ggml_tensor * x        = hc_post->src[0];
+        const ggml_tensor * residual = hc_post->src[1];
+        const ggml_tensor * post     = scale_inv_hc->src[0];
+        if (rms_norm->src[0] != hc_post || hc_post->src[3] != nullptr || x->type != GGML_TYPE_F32 || residual->type != GGML_TYPE_F32 ||
+                post->type != GGML_TYPE_F32 || hc_post->type != GGML_TYPE_F32 || !ggml_is_contiguous(hc_post) ||
+                x->nb[0] != sizeof(float) || residual->nb[0] != sizeof(float) || hc_post->ne[3] != 1) {
+            return false;
+        }
+    }
+    return hc_mix_norm_supported(rms_norm->src[0], rms_norm, mul, gamma);
+}
+
+void ggml_cuda_op_hc_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * hc_post, ggml_tensor * scale_inv_hc,
+                              ggml_tensor * scale_gate, ggml_tensor * rms_norm, ggml_tensor * mul, half * mul_f16) {
+    GGML_ASSERT(ggml_cuda_hc_mix_norm_supported(hc_post, scale_inv_hc, rms_norm, mul));
+    hc_mix_norm_launch(ctx, hc_post, scale_inv_hc, scale_gate, rms_norm, mul, mul_f16);
+}
+
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {
     const ggml_tensor * rms_norm_src = (ggml_tensor *) dst->src[0];
     float eps = 0.0f;
@@ -921,7 +1210,8 @@ void ggml_cuda_op_rms_norm_mul_silu_mul_fused(ggml_backend_cuda_context & ctx,
                                               ggml_tensor *               rms_norm,
                                               ggml_tensor *               mul,
                                               ggml_tensor *               silu,
-                                              ggml_tensor *               mul2) {
+                                              ggml_tensor *               mul2,
+                                              half *                      dst_f16) {
     const ggml_tensor * x      = rms_norm->src[0];
     const ggml_tensor * gate   = silu->src[0];
     const ggml_tensor * weight = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
@@ -949,16 +1239,31 @@ void ggml_cuda_op_rms_norm_mul_silu_mul_fused(ggml_backend_cuda_context & ctx,
     const int64_t nchannels = mul2->ne[2];
     const int64_t nsamples  = mul2->ne[3];
 
-    rms_norm_mul_silu_mul_f32_cuda((const float *) x->data,
-                                   (const float *) weight->data,
-                                   (const float *) gate->data,
-                                   (float *) mul2->data,
-                                   ncols, nrows, nchannels, nsamples,
-                                   /*s00*/ x->nb[1] / ts, x->nb[2] / ts, x->nb[3] / ts,
-                                   /*mul_s00*/ weight->nb[1] / ts, weight->nb[2] / ts, weight->nb[3] / ts,
-                                   weight->ne[0], weight->ne[1], weight->ne[2], weight->ne[3],
-                                   /*gate_s00*/ gate->nb[1] / ts, gate->nb[2] / ts, gate->nb[3] / ts,
-                                   eps, stream);
+    const bool sigmoid = ggml_get_unary_op(silu) == GGML_UNARY_OP_SIGMOID;
+    GGML_ASSERT(sigmoid || ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU);
+    GGML_ASSERT(dst_f16 == nullptr || ggml_is_contiguous(mul2));
+    if (!sigmoid && dst_f16 == nullptr) {
+        rms_norm_mul_silu_mul_f32_cuda((const float *) x->data,
+                                       (const float *) weight->data,
+                                       (const float *) gate->data,
+                                       (float *) mul2->data,
+                                       ncols, nrows, nchannels, nsamples,
+                                       /*s00*/ x->nb[1] / ts, x->nb[2] / ts, x->nb[3] / ts,
+                                       /*mul_s00*/ weight->nb[1] / ts, weight->nb[2] / ts, weight->nb[3] / ts,
+                                       weight->ne[0], weight->ne[1], weight->ne[2], weight->ne[3],
+                                       /*gate_s00*/ gate->nb[1] / ts, gate->nb[2] / ts, gate->nb[3] / ts,
+                                       eps, stream);
+        return;
+    }
+    auto launch = sigmoid ? (dst_f16 ? rms_norm_mul_gate_mul_launch<true, true>  : rms_norm_mul_gate_mul_launch<true, false>)
+                          : (dst_f16 ? rms_norm_mul_gate_mul_launch<false, true> : rms_norm_mul_gate_mul_launch<false, false>);
+    launch((const float *) x->data, (const float *) weight->data, (const float *) gate->data, (float *) mul2->data, dst_f16,
+           ncols, nrows, nchannels, nsamples,
+           x->nb[1] / ts, x->nb[2] / ts, x->nb[3] / ts,
+           weight->nb[1] / ts, weight->nb[2] / ts, weight->nb[3] / ts,
+           weight->ne[0], weight->ne[1], weight->ne[2], weight->ne[3],
+           gate->nb[1] / ts, gate->nb[2] / ts, gate->nb[3] / ts,
+           eps, stream);
 }
 
 void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,

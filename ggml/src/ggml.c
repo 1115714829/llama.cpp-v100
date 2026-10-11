@@ -486,6 +486,25 @@ void ggml_bf16_to_fp32_row(const ggml_bf16_t * x, float * y, int64_t n) {
     }
 }
 
+int64_t ggml_bf16_to_fp16_row(const ggml_bf16_t * x, ggml_fp16_t * y, int64_t n) {
+    int64_t n_clamped = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        float f = GGML_BF16_TO_FP32(x[i]);
+        // the 7-bit mantissa of a BF16 fits in the 10 bits of an F16, so the conversion is exact
+        // for every value in the F16 range; finite values beyond it are clamped instead of
+        // rounding to Inf (same rule as Strata's bf16_to_f16_kernel)
+        if (f > 65504.0f && !isinf(f)) {
+            f = 65504.0f;
+            n_clamped++;
+        } else if (f < -65504.0f && !isinf(f)) {
+            f = -65504.0f;
+            n_clamped++;
+        }
+        y[i] = GGML_FP32_TO_FP16(f);
+    }
+    return n_clamped;
+}
+
 void ggml_fp32_to_bf16_row_ref(const float * x, ggml_bf16_t * y, int64_t n) {
     for (int i = 0; i < n; i++) {
         y[i] = ggml_compute_fp32_to_bf16(x[i]);
@@ -1081,6 +1100,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
+    "QSA_SELECT",
+    "QSA_ATTN",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
@@ -1101,7 +1122,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1196,6 +1217,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
+    "qsa_select(q, k, pool_cells, pool_idxs, tail_idxs, pool_rng)",
+    "qsa_attn(q, k, v, ids)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
@@ -1216,7 +1239,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3398,11 +3421,12 @@ void ggml_mul_mat_set_hint(
 
     c ~= as[:,:,i] @ b[:,i%r,t], i = ids[e,t] for all e,t in ids
 */
-struct ggml_tensor * ggml_mul_mat_id(
+static struct ggml_tensor * ggml_mul_mat_id_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * as,
         struct ggml_tensor  * b,
-        struct ggml_tensor  * ids) {
+        struct ggml_tensor  * ids,
+        enum ggml_mul_mat_id_epilogue epilogue) {
     GGML_ASSERT(!ggml_is_transposed(as));
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
 
@@ -3413,15 +3437,127 @@ struct ggml_tensor * ggml_mul_mat_id(
     GGML_ASSERT(as->ne[0] == b->ne[0]); // can_mul_mat
     GGML_ASSERT(ids->ne[0] % b->ne[1] == 0); // can broadcast
 
-    const int64_t ne[4] = { as->ne[1], ids->ne[0], b->ne[2], 1 };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    // the SwiGLU epilogue consumes the rows of as in pairs and writes one F16 row per pair
+    const bool swiglu = epilogue == GGML_MUL_MAT_ID_EPILOGUE_SWIGLU;
+    GGML_ASSERT(!swiglu || as->ne[1] % 2 == 0);
+
+    const int64_t ne[4] = { swiglu ? as->ne[1]/2 : as->ne[1], ids->ne[0], b->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, swiglu ? GGML_TYPE_F16 : GGML_TYPE_F32, 4, ne);
 
     result->op     = GGML_OP_MUL_MAT_ID;
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
 
+    if (swiglu) {
+        // op_params[3] is the src1 precision, [4] the expert offset, [5] the expert parallel flag
+        // and [6] the global expert count, so the epilogue takes the next free slot; [8], [9] and
+        // [10] are the layer, the device and the assignment table of the expert map
+        // (ggml_mul_mat_id_set_layer / _device / _assignment)
+        ggml_set_op_params_i32(result, 7, (int32_t) epilogue);
+    }
+
     return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids) {
+    return ggml_mul_mat_id_impl(ctx, as, b, ids, GGML_MUL_MAT_ID_EPILOGUE_NONE);
+}
+
+struct ggml_tensor * ggml_mul_mat_id_swiglu(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * as,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids) {
+    return ggml_mul_mat_id_impl(ctx, as, b, ids, GGML_MUL_MAT_ID_EPILOGUE_SWIGLU);
+}
+
+int32_t ggml_mul_mat_id_get_epilogue(const struct ggml_tensor * a) {
+    // the fused kernels read the epilogue from a downstream node, which has none
+    if (a->op != GGML_OP_MUL_MAT_ID) {
+        return GGML_MUL_MAT_ID_EPILOGUE_NONE;
+    }
+    return ggml_get_op_params_i32(a, 7);
+}
+
+void ggml_mul_mat_id_set_expert_parallel(struct ggml_tensor * a, bool enabled) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(a, 5, enabled ? 1 : 0);
+}
+
+bool ggml_mul_mat_id_is_expert_parallel(const struct ggml_tensor * a) {
+    // the fused kernels read the state from a downstream node, which has no expert parallel state
+    if (a->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    return ggml_get_op_params_i32(a, 5) != 0;
+}
+
+void ggml_mul_mat_id_set_expert_offset(struct ggml_tensor * a, int32_t expert_offset) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(a, 4, expert_offset);
+}
+
+int32_t ggml_mul_mat_id_get_expert_offset(const struct ggml_tensor * a) {
+    // the fused kernels read the offset from a downstream node, which has no expert offset
+    if (a->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+    return ggml_get_op_params_i32(a, 4);
+}
+
+void ggml_mul_mat_id_set_n_expert_total(struct ggml_tensor * a, int32_t n_expert_total) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(a, 6, n_expert_total);
+}
+
+int32_t ggml_mul_mat_id_get_n_expert_total(const struct ggml_tensor * a) {
+    // the fused kernels read the state from a downstream node, which has no expert parallel state
+    if (a->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+    return ggml_get_op_params_i32(a, 6);
+}
+
+// op_params[7] is the epilogue, so the expert map selectors take the two slots after it
+void ggml_mul_mat_id_set_layer(struct ggml_tensor * a, int32_t layer) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(a, 8, layer);
+}
+
+int32_t ggml_mul_mat_id_get_layer(const struct ggml_tensor * a) {
+    if (a->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+    return ggml_get_op_params_i32(a, 8);
+}
+
+void ggml_mul_mat_id_set_device(struct ggml_tensor * a, int32_t device) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(a, 9, device);
+}
+
+int32_t ggml_mul_mat_id_get_device(const struct ggml_tensor * a) {
+    if (a->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+    return ggml_get_op_params_i32(a, 9);
+}
+
+void ggml_mul_mat_id_set_assignment(struct ggml_tensor * a, int32_t assignment) {
+    GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
+    ggml_set_op_params_i32(a, 10, assignment);
+}
+
+int32_t ggml_mul_mat_id_get_assignment(const struct ggml_tensor * a) {
+    if (a->op != GGML_OP_MUL_MAT_ID) {
+        return 0;
+    }
+    return ggml_get_op_params_i32(a, 10);
 }
 
 // ggml_out_prod
@@ -5522,8 +5658,8 @@ struct ggml_tensor * ggml_flash_attn_ext(
         GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_is_contiguous(mask));
         if (mask->type == GGML_TYPE_I32) {
-            // range mask: one [lo, hi) pair of visible KV columns per query row
-            GGML_ASSERT(mask->ne[0] == 2);
+            // range mask: two [lo, hi) pairs of visible KV columns per query row
+            GGML_ASSERT(mask->ne[0] == 4);
             GGML_ASSERT(mask->ne[1] >= q->ne[1]);
             GGML_ASSERT(max_bias == 0.0f);
         }
@@ -6497,6 +6633,87 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_qsa_select
+
+struct ggml_tensor * ggml_qsa_select(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * pool_cells,
+        struct ggml_tensor  * pool_idxs,
+        struct ggml_tensor  * tail_idxs,
+        struct ggml_tensor  * pool_rng,
+        float                 head_scale,
+        int32_t               n_top_pool,
+        int32_t               sentinel) {
+
+    GGML_ASSERT(         q->type == GGML_TYPE_F32);
+    GGML_ASSERT(pool_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT( pool_idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT( tail_idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT(  pool_rng->type == GGML_TYPE_I32);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[1] == 1);
+    GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1);
+    GGML_ASSERT(ggml_is_vector(pool_cells));
+    GGML_ASSERT(pool_idxs->ne[1] == pool_cells->ne[0]);
+    GGML_ASSERT(tail_idxs->ne[0] == pool_idxs->ne[0] - 1);
+    GGML_ASSERT(tail_idxs->ne[1] == q->ne[2]);
+    GGML_ASSERT( pool_rng->ne[0] == 2 && pool_rng->ne[1] == q->ne[2]);
+    GGML_ASSERT(n_top_pool > 0 && n_top_pool <= pool_cells->ne[0]);
+
+    const int64_t kpool = pool_idxs->ne[0];
+    GGML_ASSERT(kpool >= 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool*n_top_pool + kpool - 1, q->ne[2]);
+
+    ggml_set_op_params_f32(result, 0, head_scale);
+    ggml_set_op_params_i32(result, 1, n_top_pool);
+    ggml_set_op_params_i32(result, 2, sentinel);
+
+    result->op     = GGML_OP_QSA_SELECT;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = pool_idxs;
+    result->src[3] = tail_idxs;
+    result->src[4] = pool_rng;
+    result->src[5] = pool_cells;
+
+    return result;
+}
+
+// ggml_qsa_attn
+
+struct ggml_tensor * ggml_qsa_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * ids,
+        float                 scale) {
+
+    GGML_ASSERT(  q->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[1] == v->ne[1] && k->ne[2] == v->ne[2] && k->ne[3] == v->ne[3]);
+    GGML_ASSERT(q->ne[1] % k->ne[1] == 0);
+    GGML_ASSERT(q->ne[3] == 1 && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ids->ne[1] == q->ne[2]);
+    GGML_ASSERT(q->ne[2] % k->ne[3] == 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, v->ne[0], q->ne[1], q->ne[2]);
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_QSA_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = ids;
 
     return result;
 }

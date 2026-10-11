@@ -274,6 +274,9 @@ struct server_slot {
     bool spec_is_replay = false;
     // sparse rejection sampling is enabled for this whole request (draft-dflash only)
     bool spec_use_rejection = false;
+    // dchain: greedy (T = 0) verification reads the top-k rows of the verified tokens instead of
+    // their full logits, which then stay on the device
+    bool spec_greedy_topk = false;
     std::mt19937 spec_synth_rng;
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
@@ -389,6 +392,7 @@ struct server_slot {
 
         spec_is_replay = false;
         spec_use_rejection = false;
+        spec_greedy_topk = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -1312,6 +1316,7 @@ private:
         llama_reserve(ctx_tgt);
         if (ctx_dft) {
             llama_reserve(ctx_dft);
+            common_fit_log_memory_stage(model_tgt, "spec_ready");
         }
 
         if (has_mmproj) {
@@ -1481,6 +1486,9 @@ private:
             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
 
             slot.callback_on_release = [this](int id_slot) {
+                // the device memory the runtime has grown to after a request: the expert slot
+                // budget of the fit has to leave room for it (common_fit_ep runtime reserve)
+                common_fit_log_memory_stage(model_tgt, "request_done");
                 queue_tasks.pop_deferred_task(id_slot);
             };
 
@@ -1875,7 +1883,6 @@ private:
     // look for another slot whose cached prompt shares a longer prefix with the incoming prompt
     // than this slot's own cache; if one is found together with a usable memory checkpoint, take
     // over its KV cache and state and return the new n_past; otherwise return n_past_self unchanged
-    // (see docs/design/v107-711-spec.md)
     size_t try_cross_slot_prefix_reuse(server_slot & slot, const server_tokens & input_tokens, size_t n_past_self) {
         if (slots.size() <= 1) {
             return n_past_self;
@@ -2166,21 +2173,53 @@ private:
                 slot.spec_synth_rng.seed(seed);
             }
 
-            // the rejection mode is fixed for the whole request
-            const bool spec_dflash2 = std::find(
+            // the rejection mode is fixed for the whole request; draft-dflash and draft-mtp can both
+            // verify on the sparse top-k rows
+            const bool spec_dflash = std::find(
                     params_base.speculative.types.begin(),
                     params_base.speculative.types.end(),
                     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
-            slot.spec_use_rejection = spec && spec_dflash2 && common_sampler_can_sparse_reject(slot.smpl.get());
+            const bool spec_mtp_draft = std::find(
+                    params_base.speculative.types.begin(),
+                    params_base.speculative.types.end(),
+                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+            const bool spec_sparse_draft = spec_dflash || spec_mtp_draft;
 
-            // the rejection reads only the top-k logits of the verified rows, so they do not have to leave
-            // the device; the context setting is shared by the slots, hence a single slot only
+            // the rejection verifier needs the proposal distribution q of every draft token: draft-dflash
+            // reports it (result_q_dflash), draft-mtp only when it samples probabilistically (a greedy draft
+            // reports no q, see the draft-mtp implementation). Without q the verification samples and
+            // matches on the full rows, so the top-k output must stay off: with it on, the full rows of the
+            // verification batch never reach the host and the full-row sampler aborts
+            const bool spec_draft_has_q = spec_dflash || (spec_mtp_draft && params_base.speculative.draft.probabilistic);
+            slot.spec_use_rejection = spec && spec_sparse_draft && spec_draft_has_q && common_sampler_can_sparse_reject(slot.smpl.get());
+
+            // dchain: at T = 0 the verification takes the argmax of every row from its top-k candidates
+            // on the host, so the full rows of the verified tokens stay on the device as well
+            slot.spec_greedy_topk = spec && spec_sparse_draft && !slot.spec_use_rejection && !use_backend_sampling &&
+                !need_pre_sample_logits && common_sampler_can_greedy_topk(slot.smpl.get());
+
+            // the rejection and the greedy top-k verification read only the top-k logits of the verified
+            // rows, so they do not have to leave the device; the context setting is shared by the slots,
+            // hence a single slot only
             if (params_base.n_parallel == 1) {
-                llama_set_logits_topk(ctx_tgt, slot.spec_use_rejection && !use_backend_sampling && !need_pre_sample_logits
-                        ? common_sampler_sparse_k(slot.smpl.get()) : 0);
+                int32_t k = 0;
+                if (slot.spec_use_rejection && !use_backend_sampling && !need_pre_sample_logits) {
+                    k = common_sampler_sparse_k(slot.smpl.get());
+                } else if (slot.spec_greedy_topk) {
+                    k = common_sampler_greedy_topk_k(slot.smpl.get());
+                }
+                llama_set_logits_topk(ctx_tgt, k);
+                SLT_DBG(slot, "verification top-k output: k = %d (rejection = %d, greedy top-k = %d)\n",
+                        k, (int) slot.spec_use_rejection, (int) slot.spec_greedy_topk);
             }
         } else {
             slot.smpl.reset();
+
+            // a task without sampling (decision, embedding, rerank) reads the full rows of its outputs, so
+            // the top-k output of a previous request must not stay on for it (k = 0 keeps the graph)
+            if (params_base.n_parallel == 1) {
+                llama_set_logits_topk(ctx_tgt, 0);
+            }
         }
 
         // the per-request limit takes priority over the global one
@@ -3512,6 +3551,7 @@ private:
 
                     // stale candidates: a replay never reads them, a new draft refills them
                     slot.spec_draft_q.clear();
+                    slot.spec_draft_q_dflash.clear();
 
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
@@ -3967,6 +4007,19 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // r-mtpskip: tell the MTP driver where the prompt ends, so it can skip the
+                        // draft catch-up of the positions its attention window can never read.
+                        // The last prompt position is the next position of the cached prefix plus
+                        // the remaining task tokens, minus one. Multimodal positions do not map to
+                        // token indices, so the skip stays off there (capability branch, not a
+                        // fallback: the draft has no mtmd support).
+                        if (spec) {
+                            const llama_pos pos_end = slot.prompt.tokens.has_mtmd
+                                ? -1
+                                : slot.prompt.tokens.pos_next() + (llama_pos) (slot.task->n_tokens() - slot.prompt.n_tokens()) - 1;
+                            common_speculative_set_prompt_end(spec.get(), slot.id, pos_end);
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -4339,6 +4392,24 @@ private:
             }
         });
 
+        // measure the free VRAM after the first prefill / first decode of the process: the
+        // CUDA runtime grows the device memory up to the first real use (kernel modules from
+        // lazy loading, cuBLAS workspaces, CUDA graph instances, staging buffers). The fit
+        // ran before that growth, so its expert slot budget must leave room for it.
+        if (ret == 0) {
+            static bool logged_prefill = false;
+            static bool logged_decode  = false;
+            const bool has_output_any = batch.size() > 0;
+            if (has_output_any && batch.size() > 1 && !logged_prefill) {
+                logged_prefill = true;
+                common_fit_log_memory_stage(model_tgt, "first_prefill");
+            }
+            if (has_output_any && batch.size() == 1 && !logged_decode) {
+                logged_decode = true;
+                common_fit_log_memory_stage(model_tgt, "first_decode");
+            }
+        }
+
         if (ret != 0) {
             {
                 std::string err;
@@ -4399,7 +4470,14 @@ private:
             bool ok = true;
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch.view);
-                if (ok && has_output) {
+                // the MTP draft reads the target h rows on the device through the sink, so it
+                // does not need the target context synchronized here; the logits are read at
+                // sampling time, which synchronizes only when it actually samples
+                const bool spec_mtp = std::find(
+                        params_base.speculative.types.begin(),
+                        params_base.speculative.types.end(),
+                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+                if (ok && has_output && !spec_mtp) {
                     llama_synchronize(ctx_tgt);
                 }
             });
@@ -4461,6 +4539,16 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        // MTP with the device h sink no longer synchronizes the target in process_batch: the
+        // draft read the sink rows on the device. The sampling below reads the host logits, so
+        // the target context must be idle right before the first sample of this call. Prefill
+        // chunks that only queue tokens do not sample and keep the pipeline in flight
+        const bool spec_mtp = std::find(
+                params_base.speculative.types.begin(),
+                params_base.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        bool tgt_synced = false;
+
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -4511,6 +4599,12 @@ private:
 
             if (slot.can_speculate() && !slot.spec_draft.empty()) {
                 return; // sample using speculative decoding
+            }
+
+            // MTP: the target must be idle before the first host logits read of this call
+            if (spec_mtp && !tgt_synced) {
+                tgt_synced = true;
+                llama_synchronize(ctx_tgt);
             }
 
             // shifted according to the current sub-batch
@@ -4567,6 +4661,12 @@ private:
                 return;
             }
 
+            // MTP: the target must be idle before the first host logits read of this call
+            if (spec_mtp && !tgt_synced) {
+                tgt_synced = true;
+                llama_synchronize(ctx_tgt);
+            }
+
             // save the original draft size
             const size_t n_draft = slot.spec_draft.size();
 
@@ -4600,6 +4700,9 @@ private:
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 } else if (use_rejection) {
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                } else if (slot.spec_greedy_topk) {
+                    // dchain: the argmax of every verified row from its top-k candidates, the full rows stayed on the device
+                    accepted = common_sampler_greedy_topk_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }

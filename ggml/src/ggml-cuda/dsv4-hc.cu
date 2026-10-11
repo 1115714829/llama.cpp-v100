@@ -1,3 +1,6 @@
+// DeepSeek-V4 hyper-connection ops. The gated post epilogue (2*sigmoid(inject/hc)) ports the
+// gate arithmetic of Strata's fused_gr kernels (MIT, https://github.com/Niko1221/Strata
+// src/kernels/cuda/fused_gr.cu, see licenses/LICENSE-strata).
 #include "common.cuh"
 #include "dsv4-hc.cuh"
 
@@ -100,7 +103,9 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
-template <bool gated>
+// write_f16: also store the result rounded to F16 (as the F32 -> F16 conversion does) into a
+// contiguous [n_embd, n_tokens] buffer, the input of the projections that follow the mixer.
+template <bool gated, bool write_f16 = false>
 static __global__ void dsv4_hc_pre_f32(
         const float * x,
         const float * weights,
@@ -116,7 +121,8 @@ static __global__ void dsv4_hc_pre_f32(
         int64_t sw2,
         int64_t sd0,
         int64_t sd1,
-        float   scale) {
+        float   scale,
+        half *  dst_f16) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * n_tokens;
@@ -142,10 +148,17 @@ static __global__ void dsv4_hc_pre_f32(
         sum += xv * wv;
     }
 
-    dst[i0*sd0 + it*sd1] = scale * sum;
+    const float value = scale * sum;
+    dst[i0*sd0 + it*sd1] = value;
+    if constexpr (write_f16) {
+        dst_f16[ir] = __float2half(value);
+    }
 }
 
-template <bool has_comb>
+// gated_post: `post` is the raw inject tensor; qwen4exp builds 2*sigmoid(inject/hc), and
+// folding those two scales and the sigmoid into this kernel is what the Strata fused_gr.cu
+// up epilogue does for `rv = fmaf(bo, 2*sigmoid(inj/HC), rv)` (Strata src/kernels/cuda/fused_gr.cu, gr_up_kernel).
+template <bool has_comb, bool gated_post = false>
 static __global__ void dsv4_hc_post_f32(
         const float * x,
         const float * residual,
@@ -167,7 +180,9 @@ static __global__ void dsv4_hc_post_f32(
         int64_t sc2,
         int64_t sd0,
         int64_t sd1,
-        int64_t sd2) {
+        int64_t sd2,
+        float   gate_inv_hc,
+        float   gate_scale) {
     ggml_cuda_pdl_lc();
     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int64_t nr = n_embd * hc * n_tokens;
@@ -182,7 +197,15 @@ static __global__ void dsv4_hc_post_f32(
     const int64_t idst = (ir / n_embd) % hc;
     const int64_t it   = ir / (n_embd * hc);
 
-    float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
+    float p;
+    if constexpr (gated_post) {
+        const float v = gate_inv_hc * post[idst*sp0 + it*sp1];
+        p = gate_scale * (1.0f / (1.0f + expf(-v)));
+    } else {
+        p = post[idst*sp0 + it*sp1];
+    }
+
+    float sum = x[i0*sx0 + it*sx1] * p;
     if constexpr (has_comb) {
         for (int64_t isrc = 0; isrc < hc; ++isrc) {
             sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
@@ -237,7 +260,7 @@ void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             eps, n_iter);
 }
 
-void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst, half * dst_f16) {
     const ggml_tensor * x       = dst->src[0];
     const ggml_tensor * weights = dst->src[1];
 
@@ -262,20 +285,26 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
+    auto kernel = dst_f16 != nullptr ? (gated ? dsv4_hc_pre_f32<true, true>  : dsv4_hc_pre_f32<false, true>)
+                                     : (gated ? dsv4_hc_pre_f32<true, false> : dsv4_hc_pre_f32<false, false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) weights->data, (float *) dst->data,
             n_embd, hc, n_tokens,
             nbx0 / sizeof(float), nbx1 / sizeof(float), nbx2 / sizeof(float),
             nbw0 / sizeof(float), nbw1 / sizeof(float), nbw2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float),
-            scale);
+            scale, dst_f16);
 }
 
-void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+static void dsv4_hc_post_launch(
+        ggml_backend_cuda_context & ctx,
+        ggml_tensor *               dst,
+        const ggml_tensor *         post,
+        float                       gate_inv_hc,
+        float                       gate_scale,
+        bool                        gated) {
     const ggml_tensor * x        = dst->src[0];
     const ggml_tensor * residual = dst->src[1];
-    const ggml_tensor * post     = dst->src[2];
     const ggml_tensor * comb     = dst->src[3];
 
     GGML_ASSERT(x->type == GGML_TYPE_F32);
@@ -303,7 +332,9 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
-    auto kernel = comb ? dsv4_hc_post_f32<true> : dsv4_hc_post_f32<false>;
+    auto kernel = gated
+            ? (comb ? dsv4_hc_post_f32<true, true> : dsv4_hc_post_f32<false, true>)
+            : (comb ? dsv4_hc_post_f32<true>       : dsv4_hc_post_f32<false>);
     ggml_cuda_kernel_launch(kernel, launch_params,
             (const float *) x->data, (const float *) residual->data,
             (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
@@ -312,5 +343,25 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
             nbp0 / sizeof(float), nbp1 / sizeof(float),
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
-            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
+            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
+            gate_inv_hc, gate_scale);
+}
+
+void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    dsv4_hc_post_launch(ctx, dst, dst->src[2], 0.0f, 0.0f, false);
+}
+
+// SCALE -> UNARY(SIGMOID) -> SCALE fused into the post kernel: the second scale node holds
+// the gate factor (2.0) and the first one the inverse stream count (1/hc); both are run here,
+// `dst` is the DSV4_HC_POST node.
+void ggml_cuda_op_dsv4_hc_post_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                     ggml_tensor * scale_inv_hc, ggml_tensor * scale_gate) {
+    GGML_ASSERT(scale_inv_hc->op == GGML_OP_SCALE);
+    GGML_ASSERT(scale_gate->op == GGML_OP_SCALE);
+    GGML_ASSERT(scale_inv_hc->src[0]->type == GGML_TYPE_F32);
+
+    const float inv_hc = ggml_get_op_params_f32(scale_inv_hc, 0);
+    const float factor = ggml_get_op_params_f32(scale_gate,   0);
+
+    dsv4_hc_post_launch(ctx, dst, scale_inv_hc->src[0], inv_hc, factor, true);
 }

@@ -127,8 +127,9 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
-// Expands a range mask (I32 [2, ne1, ne2, ne3], row i holds [lo, hi)) into the dense f16 mask it
-// describes: 0 for lo <= j < hi, -INF elsewhere. dst is contiguous [n_kv, ne1, ne2, ne3].
+// Expands a range mask (I32 [4, ne1, ne2, ne3], row i holds two [lo, hi) pairs) into the dense f16
+// mask it describes: 0 where a column lies in either pair, -INF elsewhere. dst is contiguous
+// [n_kv, ne1, ne2, ne3].
 static __global__ void flash_attn_range_to_dense_mask(
         const char * __restrict__ range, half * __restrict__ dst, const int64_t n_kv,
         const int64_t ne1, const int64_t ne2, const int64_t ne3,
@@ -146,9 +147,9 @@ static __global__ void flash_attn_range_to_dense_mask(
 
         for (int64_t i1 = (int64_t) blockIdx.y*blockDim.y + threadIdx.y; i1 < ne1; i1 += (int64_t) gridDim.y*blockDim.y) {
             const int32_t * rp = (const int32_t *)(range_plane + i1*nb1);
-            const int32_t lo = rp[0];
-            const int32_t hi = rp[1];
-            dst_plane[i1*n_kv] = (col >= lo && col < hi) ? __float2half(0.0f) : __float2half(-INFINITY);
+            const bool visible =
+                (col >= rp[0] && col < rp[1]) || (col >= rp[2] && col < rp[3]);
+            dst_plane[i1*n_kv] = visible ? __float2half(0.0f) : __float2half(-INFINITY);
         }
     }
 }

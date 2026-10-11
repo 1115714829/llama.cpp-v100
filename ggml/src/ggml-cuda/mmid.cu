@@ -28,14 +28,19 @@ template <>      struct mm_ids_pow2<0> { static constexpr int value = 1; };
 // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
 // ids_dst describes the same mapping but for the dst tensor.
 // The upper and lower bounds for the ith expert in the compact src1 tensor are stored in expert_bounds[i:i+1].
+// The experts of the compact layout are the local expert numbers of this device: block e collects
+// the ids whose local number (lut, see ggml_cuda_expert_lut) is e, the ids of the other devices map
+// to -1 and are skipped. The compact ranges are ordered by local number, which is the order of the
+// weight slice and of the expert store tables.
 template <int n_expert_used_template>
 __launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
+        const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse,
+        const ggml_cuda_expert_lut lut) {
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
-    const int expert = blockIdx.x;
+    const int expert = blockIdx.x; // local expert number of this block
 
     extern __shared__ char data_mm_ids_helper[];
     mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
@@ -48,8 +53,8 @@ static __global__ void mm_ids_helper(
         for (int it = 0; it < n_tokens; ++it) {
             int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
-                const int expert_used = ids[it*si1 + iex];
-                nex_prev += expert_used < expert;
+                const int expert_used = ggml_cuda_expert_local(lut, ids[it*si1 + iex]);
+                nex_prev += expert_used >= 0 && expert_used < expert;
                 if (expert_used == expert) {
                     iex_used = iex;
                 }
@@ -72,10 +77,11 @@ static __global__ void mm_ids_helper(
             const int it = it0 + threadIdx.x / neu_padded;
 
             const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
-            const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
-                ids[it*si1 + iex] : INT_MAX;
+            // a padding lane carries no id: the map turns the out-of-range INT_MAX into -1
+            const int expert_used = ggml_cuda_expert_local(lut,
+                (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ? ids[it*si1 + iex] : INT_MAX);
             const int iex_used = expert_used == expert ? iex : -1;
-            nex_prev += expert_used < expert;
+            nex_prev += expert_used >= 0 && expert_used < expert;
 
             // Whether the threads at this token position have used the expert:
             const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
@@ -118,19 +124,65 @@ static __global__ void mm_ids_helper(
         return;
     }
 
-    expert_bounds[expert] = nex_prev;
+    expert_bounds[blockIdx.x] = nex_prev;
 
-    if (expert < static_cast<int>(gridDim.x) - 1) {
+    if (blockIdx.x < gridDim.x - 1) {
         return;
     }
 
     expert_bounds[gridDim.x] = nex_prev + it_compact;
 }
 
+// Expert parallelism: the MMQ and grouped kernels only write the (token, slot) entries whose
+// expert is local, so the entries routed to other devices must be zeroed here. One block per
+// (token, slot) pair, the threads of the block cover the output row. T is the output element
+// type: the fused-expert SwiGLU epilogue produces F16 rows, every other path F32.
+template <typename T>
+__global__ void mmid_zero_nonlocal_kernel(
+        T * __restrict__ dst, const int32_t * __restrict__ ids,
+        const ggml_cuda_expert_lut lut, const int n_expert_used,
+        const int64_t ne0, const int64_t ids_stride,
+        const int64_t stride_slot, const int64_t stride_token) {
+    const int pair  = blockIdx.x;
+    const int token = pair / n_expert_used;
+    const int slot  = pair % n_expert_used;
+
+    // the same map as mm_ids_helper: a local expert keeps its (computed) entry
+    if (ggml_cuda_expert_local(lut, ids[token*ids_stride + slot]) >= 0) {
+        return;
+    }
+
+    T * dst_slot = dst + token*stride_token + slot*stride_slot;
+    for (int64_t r = threadIdx.x; r < ne0; r += blockDim.x) {
+        dst_slot[r] = (T) 0.0f;
+    }
+}
+
+void ggml_cuda_mmid_zero_nonlocal(
+        void * dst, const int32_t * ids, const ggml_cuda_expert_lut lut,
+        const int64_t n_tokens, const int n_expert_used, const int64_t ne0,
+        const int64_t ids_stride, const int64_t stride_slot, const int64_t stride_token,
+        cudaStream_t stream, const bool dst_f16) {
+    const int n_pairs = (int) (n_tokens * n_expert_used);
+    if (n_pairs == 0) {
+        return;
+    }
+    const dim3 num_blocks(n_pairs, 1, 1);
+    const dim3 block_size(256, 1, 1);
+    if (dst_f16) {
+        mmid_zero_nonlocal_kernel<half><<<num_blocks, block_size, 0, stream>>>(
+            (half *) dst, ids, lut, n_expert_used, ne0, ids_stride, stride_slot, stride_token);
+    } else {
+        mmid_zero_nonlocal_kernel<float><<<num_blocks, block_size, 0, stream>>>(
+            (float *) dst, ids, lut, n_expert_used, ne0, ids_stride, stride_slot, stride_token);
+    }
+}
+
 template <int n_expert_used_template>
 static void launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse,
+        const ggml_cuda_expert_lut lut, cudaStream_t stream) {
     GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
     GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mm_ids_helper_store");
 
@@ -144,36 +196,37 @@ static void launch_mm_ids_helper(
     const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
     GGML_ASSERT(nbytes_shared <= smpbo);
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
-        (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
+        (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse, lut);
 }
 
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse,
+        const ggml_cuda_expert_lut lut, cudaStream_t stream) {
     switch (n_expert_used) {
         case  2:
-            launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, lut, stream);
             break;
         case  4:
-            launch_mm_ids_helper< 4>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper< 4>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, lut, stream);
             break;
         case  6:
-            launch_mm_ids_helper< 6>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper< 6>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, lut, stream);
             break;
         case  8:
-            launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, lut, stream);
             break;
         case 10:
-            launch_mm_ids_helper<10>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper<10>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, lut, stream);
             break;
         case 16:
-            launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, lut, stream);
             break;
         case 32:
-            launch_mm_ids_helper<32>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper<32>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, lut, stream);
             break;
         default:
-            launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
+            launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, lut, stream);
             break;
     }
 }

@@ -19,6 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "ggml-expert-store.h" // the expert assignment the permuted expert store test plays the loader for
 
 #include <algorithm>
 #include <atomic>
@@ -42,6 +43,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 
@@ -216,21 +218,22 @@ static void init_tensor_kq_mask_causal(ggml_tensor * tensor) {
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
-// generate an I32 range mask: the row for query i1 holds [lo, hi), the visible KV columns
-// mode: 1 = causal, 2 = random, 3 = causal over the first half of the KV positions (a range
-// that ends well before the KV view the kernel is given), 4 = deterministic split coverage:
+// generate an I32 range mask: the row for query i1 holds two [lo, hi) pairs, the visible KV
+// columns. mode: 1 = causal, 2 = random, 3 = causal over the first half of the KV positions (a
+// range that ends well before the KV view the kernel is given), 4 = deterministic split coverage:
 // every third row sees only the first eighth of the KV view, the next one only the last
 // eighth, and the last one is fully masked (all -inf), 5 = whole q blocks whose range lies
-// inside the first two KV blocks, so a KV split segment comes back empty
+// inside the first two KV blocks, so a KV split segment comes back empty, 6 = ring wrap: the
+// first pair covers [a, n_kv), the second [0, b), so the visible set wraps the array end
 static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, int mode) {
     GGML_ASSERT(tensor->type == GGML_TYPE_I32);
-    GGML_ASSERT(tensor->ne[0] == 2);
+    GGML_ASSERT(tensor->ne[0] == 4);
 
     const int64_t ne1 = tensor->ne[1];
     const int64_t ne2 = tensor->ne[2];
     const int64_t ne3 = tensor->ne[3];
 
-    std::vector<int32_t> data(2*ne1*ne2*ne3);
+    std::vector<int32_t> data(4*ne1*ne2*ne3);
 
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -238,29 +241,31 @@ static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, int mode) {
     for (int64_t i3 = 0; i3 < ne3; i3++) {
         for (int64_t i2 = 0; i2 < ne2; i2++) {
             for (int64_t i1 = 0; i1 < ne1; i1++) {
-                int64_t lo;
-                int64_t hi;
+                int64_t lo0;
+                int64_t hi0;
+                int64_t lo1 = 0;
+                int64_t hi1 = 0;
                 if (mode == 1) {
-                    lo = 0;
-                    hi = n_kv - ne1 + i1 + 1;
-                    hi = std::max<int64_t>(1, std::min<int64_t>(hi, n_kv));
+                    lo0 = 0;
+                    hi0 = n_kv - ne1 + i1 + 1;
+                    hi0 = std::max<int64_t>(1, std::min<int64_t>(hi0, n_kv));
                 } else if (mode == 3) {
-                    lo = 0;
-                    hi = n_kv/2 - ne1 + i1 + 1;
-                    hi = std::max<int64_t>(1, std::min<int64_t>(hi, n_kv/2));
+                    lo0 = 0;
+                    hi0 = n_kv/2 - ne1 + i1 + 1;
+                    hi0 = std::max<int64_t>(1, std::min<int64_t>(hi0, n_kv/2));
                 } else if (mode == 4) {
                     switch (i1 % 3) {
                         case 0:
-                            lo = 0;
-                            hi = std::max<int64_t>(1, n_kv/8);
+                            lo0 = 0;
+                            hi0 = std::max<int64_t>(1, n_kv/8);
                             break;
                         case 1:
-                            lo = n_kv - n_kv/8;
-                            hi = n_kv;
+                            lo0 = n_kv - n_kv/8;
+                            hi0 = n_kv;
                             break;
                         default:
-                            lo = n_kv/2;
-                            hi = n_kv/2;
+                            lo0 = n_kv/2;
+                            hi0 = n_kv/2;
                             break;
                     }
                 } else if (mode == 5) {
@@ -271,32 +276,44 @@ static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, int mode) {
                     // masked (both KV splits are empty)
                     switch ((i1 / 64) % 3) {
                         case 0:
-                            lo = 0;
-                            hi = std::min<int64_t>(32, n_kv);
+                            lo0 = 0;
+                            hi0 = std::min<int64_t>(32, n_kv);
                             break;
                         case 1:
-                            lo = std::min<int64_t>(32, n_kv);
-                            hi = std::min<int64_t>(64, n_kv);
+                            lo0 = std::min<int64_t>(32, n_kv);
+                            hi0 = std::min<int64_t>(64, n_kv);
                             break;
                         default:
-                            lo = 0;
-                            hi = 0;
+                            // both windows are empty but their hi is not 0, so the bounds
+                            // kernel must still mark the whole q block as not visible
+                            lo0 = hi0 = std::min<int64_t>(48, n_kv);
+                            lo1 = hi1 = std::min<int64_t>(16, n_kv);
                             break;
                     }
+                } else if (mode == 6) {
+                    // a ring window that wraps the array end: [a, n_kv) plus [0, b), disjoint and
+                    // both non-empty. a and b advance per row so every wrap offset is covered
+                    const int64_t step = std::max<int64_t>(1, n_kv/4);
+                    lo0 = n_kv/2 + (i1 % step);
+                    hi0 = n_kv;
+                    lo1 = 0;
+                    hi1 = std::min<int64_t>(n_kv/4 + (i1 % step), n_kv/2);
                 } else {
-                    lo = std::uniform_int_distribution<int64_t>(0, n_kv - 1)(gen);
-                    hi = std::uniform_int_distribution<int64_t>(lo + 1, n_kv)(gen);
+                    lo0 = std::uniform_int_distribution<int64_t>(0, n_kv - 1)(gen);
+                    hi0 = std::uniform_int_distribution<int64_t>(lo0 + 1, n_kv)(gen);
                     if ((rd() & 3) == 0) {
-                        lo = 0;
+                        lo0 = 0;
                     }
                     if ((rd() & 3) == 0) {
-                        hi = n_kv;
+                        hi0 = n_kv;
                     }
                 }
 
-                const int64_t off = ((i3*ne2 + i2)*ne1 + i1)*2;
-                data[off + 0] = (int32_t) lo;
-                data[off + 1] = (int32_t) hi;
+                const int64_t off = ((i3*ne2 + i2)*ne1 + i1)*4;
+                data[off + 0] = (int32_t) lo0;
+                data[off + 1] = (int32_t) hi0;
+                data[off + 2] = (int32_t) lo1;
+                data[off + 3] = (int32_t) hi1;
             }
         }
     }
@@ -1268,6 +1285,9 @@ static std::unique_ptr<printer> create_printer(output_formats format) {
     GGML_ABORT("invalid output format");
 }
 
+// set with --show-err: print the error value also for passing comparisons
+static bool g_show_err = false;
+
 static std::mutex g_test_output_mutex;
 
 static void print_test_result_locked(printer * output_printer, const test_result & result) {
@@ -1419,6 +1439,37 @@ struct test_case {
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
+    // optional buffer type for the weight context; when null the backend default is used
+    virtual ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) {
+        GGML_UNUSED(backend);
+        return nullptr;
+    }
+
+    // when true, the test is skipped if weight_buffer_type() returns null for the backend
+    virtual bool requires_weight_buffer_type() { return false; }
+
+    // called after the weight buffer was allocated: tests that use a special weight buffer
+    // type can inspect the resulting allocation (e.g. the tier split of the expert store)
+    virtual void check_weight_alloc(ggml_backend_t backend) { GGML_UNUSED(backend); }
+
+    // called when eval() / eval_perf() leave, on every exit after build_graph(): a test that
+    // changes process-wide state for its run (the active expert assignment) restores it here
+    virtual void after_eval(ggml_backend_t backend) { GGML_UNUSED(backend); }
+
+    // relaunches after the reference compare: the graph is computed again on backend1 n_relaunch()
+    // times and the output compared with the reference result of the compare, relaunch_prepare()
+    // runs before each of them. For state that a backend creates at the first launch of a graph
+    // and keeps afterwards: the hook puts the backend back into the first-launch state, so every
+    // relaunch exercises it again.
+    virtual int n_relaunch() { return 0; }
+    virtual void relaunch_prepare(ggml_backend_t backend) { GGML_UNUSED(backend); }
+    // checked after the compare and after every relaunch, for state of the backend that the output
+    // compare alone does not cover; false fails the test
+    virtual bool relaunch_check(ggml_backend_t backend) { GGML_UNUSED(backend); return true; }
+
+    ggml_tensor * out_node = nullptr;   // the output of build_graph, for the relaunch compare
+    std::vector<float> out_ref;         // its reference result, captured by the compare callback
+
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
 
@@ -1533,6 +1584,13 @@ struct test_case {
         current_op_name   = op_desc(out);
         check_for_f16_tensor(ctx.get());
 
+        // after_eval() runs on every exit from here on
+        struct after_eval_guard {
+            test_case *    tc;
+            ggml_backend_t backend;
+            ~after_eval_guard() { tc->after_eval(backend); }
+        } after_eval_guard { this, backend1 };
+
         if (!matches_filter(out, op_names_filter)) {
             //printf("  %s: skipping\n", op_desc(out).c_str());
             return test_status_t::SKIPPED;
@@ -1569,14 +1627,25 @@ struct test_case {
             add_sentinel(ctx_weights.get());
         }
 
+        ggml_backend_buffer_type_t weight_buft = use_weights ? weight_buffer_type(backend1) : nullptr;
+        if (use_weights && requires_weight_buffer_type() && weight_buft == nullptr) {
+            test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test",
+                             false, false, "no weight buffer type");
+            print_test_result_locked(output_printer, result);
+            return test_status_t::SKIPPED;
+        }
+
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
+            buf_weights.reset(weight_buft != nullptr
+                ? ggml_backend_alloc_ctx_tensors_from_buft(ctx_weights.get(), weight_buft)
+                : ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors [%s] ", ggml_backend_name(backend1));
                 return test_status_t::FAIL;
             }
             ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            check_weight_alloc(backend1);
         }
 
         // allocate
@@ -1638,6 +1707,10 @@ struct test_case {
             std::vector<float> f1 = tensor_to_float(t1);
             std::vector<float> f2 = tensor_to_float(t2);
 
+            if (ud->tc->n_relaunch() > 0 && t1 == ud->tc->out_node) {
+                ud->tc->out_ref = f2;
+            }
+
             for (size_t i = 0; i < f1.size(); i++) {
                 // check for nans
                 if (std::isnan(f1[i]) || std::isnan(f2[i])) {
@@ -1670,6 +1743,8 @@ struct test_case {
                 //printf("\n");
                 //exit(1);
                 ud->ok = false;
+            } else if (g_show_err) {
+                printf("[%s] ERR = %.9f (max %.9f) ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
             }
             return true;
 
@@ -1680,6 +1755,7 @@ struct test_case {
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
+        out_node = out;
         const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
                                                                fused_nodes_to_verify.size());
@@ -1687,6 +1763,32 @@ struct test_case {
         // Create test result
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+
+        // relaunches against the reference result of the compare (see n_relaunch)
+        const int n_re = n_relaunch();
+        if (test_passed && n_re > 0) {
+            GGML_ASSERT(!out_ref.empty());
+            if (!relaunch_check(backend1)) {
+                printf("[launch 0/%d] check failed ", n_re);
+                test_passed = false;
+                error_msg   = "relaunch check failed";
+            }
+            for (int r = 0; r < n_re && test_passed; ++r) {
+                relaunch_prepare(backend1);
+                ggml_backend_graph_compute(backend1, gf);
+                std::vector<float> g = tensor_to_float(out);
+                const double e = err(g.data(), out_ref.data(), g.size());
+                if (e > max_err(backend1)) {
+                    printf("[relaunch %d/%d] ERR = %.9f > %.9f ", r + 1, n_re, e, max_err(backend1));
+                    test_passed = false;
+                    error_msg   = "relaunch failed";
+                } else if (!relaunch_check(backend1)) {
+                    printf("[relaunch %d/%d] check failed ", r + 1, n_re);
+                    test_passed = false;
+                    error_msg   = "relaunch check failed";
+                }
+            }
+        }
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
                            error_msg);
 
@@ -1714,6 +1816,11 @@ struct test_case {
 
         ggml_tensor * out             = build_graph(ctx.get(), ctx_weights.get());
         current_op_name               = op_desc(out);
+        struct after_eval_guard {
+            test_case *    tc;
+            ggml_backend_t backend;
+            ~after_eval_guard() { tc->after_eval(backend); }
+        } after_eval_guard { this, backend };
         if (!matches_filter(out, op_names_filter)) {
             //printf("  %s: skipping\n", op_desc(out).c_str());
             return true;
@@ -2110,6 +2217,9 @@ struct test_case {
                 output_printer->print_operation(info);
                 ok = false;
                 break;
+            }
+            if (g_show_err) {
+                printf("[%s] MAA = %.9f (max %.9f) ", op_desc(out).c_str(), err, max_maa_err());
             }
             if (!ok) {
                 break;
@@ -4707,6 +4817,44 @@ struct test_unary_mul : public test_case {
     }
 };
 
+// GGML_OP_SCALE + GGML_OP_UNARY(SILU): silu(x*s), the hyper-connection mixer activation
+// (qwen4exp builds silu(scale(lo, 1/hc))). The backend may fold the scale of the first
+// node into the silu kernel; both nodes must then match the unfused chain.
+struct test_scale_silu : public test_case {
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const float scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SCALE_SILU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR3(type, ne, scale);
+    }
+
+    test_scale_silu(ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = { 320, 1, 1, 1 },
+            float scale = 0.25f)
+        : type(type), ne(ne), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        ggml_tensor * scaled = ggml_scale(ctx, a, scale);
+        ggml_set_name(scaled, "scaled");
+
+        ggml_tensor * out = ggml_silu(ctx, scaled);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
@@ -4958,6 +5106,325 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+
+// DSV4_HC_POST with the qwen4exp gate followed by the RMS_NORM -> MUL of the next mixer, which
+// backends can fuse; the output adds the normalized mixer input to the new residual so that both
+// fused outputs are checked
+struct test_dsv4_hc_post_norm : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_POST_NORM";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_dsv4_hc_post_norm(int64_t n_embd = 2560, int64_t n_tokens = 4)
+        : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(post, "post");
+        post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+
+        ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(gamma, "gamma");
+
+        ggml_tensor * res = ggml_dsv4_hc_post(ctx, x, residual, post, nullptr);
+        ggml_tensor * xn  = ggml_mul(ctx, ggml_rms_norm(ctx, res, 1e-6f), gamma);
+
+        out = ggml_add(ctx, xn, res);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// The opening of a qwen4exp hyper-connection mixer on Q8_0 projections (sm_70 repacks them):
+// [gated DSV4_HC_POST ->] RMS_NORM -> MUL -> MUL_MAT(down) -> SCALE -> SILU -> MUL_MAT(up), which
+// backends can run as one norm kernel and two projections that exchange F16 activations. The output
+// adds the gate, the normed input and the new residual so that every output of the group is checked.
+struct test_hc_mix_q8 : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_lr;
+    const int64_t n_tokens;
+    const bool    with_post;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_MIX_Q8";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, n_lr, n_tokens, with_post);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_hc_mix_q8(int64_t n_embd = 2560, int64_t n_lr = 320, int64_t n_tokens = 4, bool with_post = true)
+        : n_embd(n_embd), n_lr(n_lr), n_tokens(n_tokens), with_post(with_post) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * res = residual;
+        if (with_post) {
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(x, "x");
+            ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+            ggml_set_name(post, "post");
+            post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+            res = ggml_dsv4_hc_post(ctx, x, residual, post, nullptr);
+        }
+
+        ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
+        ggml_set_name(gamma, "gamma");
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd*hc, n_lr);
+        ggml_set_name(w_down, "w_down");
+        ggml_tensor * w_up = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_lr, n_embd*hc);
+        ggml_set_name(w_up, "w_up");
+
+        ggml_tensor * xn = ggml_mul(ctx, ggml_rms_norm(ctx, res, 1e-6f), gamma);
+        xn = ggml_reshape_2d(ctx, xn, n_embd*hc, n_tokens);
+        ggml_tensor * lo = ggml_mul_mat(ctx, w_down, xn);
+        lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float) hc));
+        ggml_tensor * gate = ggml_mul_mat(ctx, w_up, lo);
+
+        out = ggml_add(ctx, ggml_add(ctx, gate, xn), ggml_reshape_2d(ctx, res, n_embd*hc, n_tokens));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// The hyper-connection mixer output feeding the Q8_0 projections that open a block, expanded right
+// after it (qwen4exp build_qkvz: wqkv and wqkv_gate). sm_70 hands the mixer result to the multi-weight
+// kernel as F16; the F32 mixer result is kept and checked too.
+struct test_hc_pre_mm_q8 : public test_dsv4_hc {
+    const int64_t n_embd;
+    const std::array<int64_t, 3> n_out;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_PRE_MM_Q8";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_out, n_tokens);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_hc_pre_mm_q8(int64_t n_embd = 2560, std::array<int64_t, 3> n_out = { 1920, 1152, 0 }, int64_t n_tokens = 4)
+        : n_embd(n_embd), n_out(n_out), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * mixed = ggml_dsv4_hc_pre_gated(ctx, x, gate, 1.0f / (float) hc);
+
+        ggml_tensor * cat = nullptr;
+        for (int64_t n : n_out) {
+            if (n == 0) {
+                continue;
+            }
+            ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, n);
+            ggml_tensor * y = ggml_mul_mat(ctx, w, mixed);
+            cat = cat == nullptr ? y : ggml_concat(ctx, cat, y, 0);
+        }
+        out = ggml_concat(ctx, cat, mixed, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// RMS_NORM -> MUL -> UNARY(SIGMOID or SILU) -> MUL, the gated norm of the GDN output, read by the Q8_0
+// output projection (qwen4exp ssm_out). sm_70 fuses the norm chain and hands it to the projection as F16;
+// the F32 gated norm is kept and checked too.
+struct test_gated_norm_q8 : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const bool    sigmoid;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_NORM_Q8";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(head_dim, n_head, n_embd, n_tokens, sigmoid);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_gated_norm_q8(int64_t head_dim = 128, int64_t n_head = 8, int64_t n_embd = 2560, int64_t n_tokens = 4, bool sigmoid = true)
+        : head_dim(head_dim), n_head(n_head), n_embd(n_embd), n_tokens(n_tokens), sigmoid(sigmoid) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        ggml_set_name(w, "w");
+        ggml_tensor * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, n_head, n_tokens);
+        ggml_set_name(z, "z");
+        ggml_tensor * w_out = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, head_dim*n_head, n_embd);
+        ggml_set_name(w_out, "w_out");
+
+        ggml_tensor * normed = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        ggml_tensor * gated  = sigmoid ? ggml_sigmoid(ctx, z) : ggml_silu(ctx, z);
+        ggml_tensor * y      = ggml_reshape_2d(ctx, ggml_mul(ctx, normed, gated), head_dim*n_head, n_tokens);
+        ggml_tensor * o      = ggml_mul_mat(ctx, w_out, y);
+        ggml_tensor * out    = ggml_concat(ctx, o, y, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// CONT -> UNARY(SIGMOID) -> MUL, the attention output gate (a strided view of the Q projection), read
+// by the Q8_0 output projection (qwen4exp wo). sm_70 hands the gated output to the projection as F16;
+// the F32 gated output is kept and checked too.
+struct test_attn_gate_q8 : public test_case {
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ATTN_GATE_Q8";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(head_dim, n_head, n_embd, n_tokens);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_attn_gate_q8(int64_t head_dim = 256, int64_t n_head = 4, int64_t n_embd = 2560, int64_t n_tokens = 4)
+        : head_dim(head_dim), n_head(n_head), n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q_full = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim*2*n_head, n_tokens);
+        ggml_set_name(q_full, "q_full");
+        ggml_tensor * attn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim*n_head, n_tokens);
+        ggml_set_name(attn, "attn");
+        ggml_tensor * wo = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, head_dim*n_head, n_embd);
+        ggml_set_name(wo, "wo");
+
+        ggml_tensor * gate = ggml_view_3d(ctx, q_full, head_dim, n_head, n_tokens,
+                ggml_element_size(q_full)*head_dim*2, ggml_element_size(q_full)*head_dim*2*n_head,
+                ggml_element_size(q_full)*head_dim);
+        gate = ggml_cont_2d(ctx, gate, head_dim*n_head, n_tokens);
+        ggml_tensor * y   = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
+        ggml_tensor * o   = ggml_mul_mat(ctx, wo, y);
+        ggml_tensor * out = ggml_concat(ctx, o, y, 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// The qwen4exp shared expert tail: ffn_out = moe_out + ffn_shexp * sigmoid(shared_gate), the gate one
+// value per token (sm_70 fuses the sigmoid, the broadcast mul and the add)
+struct test_shexp_tail : public test_case {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SHEXP_TAIL";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_shexp_tail(int64_t n_embd = 2560, int64_t n_tokens = 4)
+        : n_embd(n_embd), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * moe   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_tensor * gate  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
+        ggml_set_name(moe, "moe");
+        ggml_set_name(shexp, "shexp");
+        ggml_set_name(gate, "gate");
+        ggml_tensor * out = ggml_add(ctx, moe, ggml_mul(ctx, shexp, ggml_sigmoid(ctx, gate)));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// A gated Q8_0 FFN, down(swiglu(gate(x), up(x))), as the qwen4exp shared expert (sm_70 repacks the
+// weights; a narrow pair hands silu(gate) * up to the down projection as F16)
+struct test_ffn_q8 : public test_case {
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const int64_t n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "FFN_Q8";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_ff, n_tokens);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_ffn_q8(int64_t n_embd = 2560, int64_t n_ff = 640, int64_t n_tokens = 4)
+        : n_embd(n_embd), n_ff(n_ff), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x      = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,  n_embd, n_tokens);
+        ggml_tensor * w_gate = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, n_ff);
+        ggml_tensor * w_up   = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd, n_ff);
+        ggml_tensor * w_down = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_ff, n_embd);
+        ggml_set_name(x, "x");
+        ggml_tensor * act = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, w_gate, x), ggml_mul_mat(ctx, w_up, x));
+        ggml_tensor * out = ggml_mul_mat(ctx, w_down, act);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -5760,6 +6227,105 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// Check the BF16 -> F16 conversion that llama_model_loader applies to BF16 weights on devices
+// without native BF16 support, and the MUL_MAT of the resulting F16 weight: exact inside the
+// F16 range, finite values beyond it clamp to +-65504 instead of becoming Inf (as in Strata's
+// bf16_to_f16_kernel).
+static void test_bf16_to_f16_exact() {
+    static bool done = false;
+    if (done) {
+        return;
+    }
+    done = true;
+
+    const ggml_bf16_t src[] = {
+        ggml_fp32_to_bf16( 1.0f + 1.0f/128.0f),
+        ggml_fp32_to_bf16( 65504.0f), // rounds up to 65536 in BF16 (7-bit mantissa), so it is clamped as well
+        ggml_fp32_to_bf16( 1e6f),
+        ggml_fp32_to_bf16( 65536.0f),
+        ggml_fp32_to_bf16(-1e30f),
+        ggml_fp32_to_bf16( INFINITY),
+    };
+    const int64_t n = sizeof(src)/sizeof(src[0]);
+
+    ggml_fp16_t dst[6];
+    const int64_t n_clamped = ggml_bf16_to_fp16_row(src, dst, n);
+
+    GGML_ASSERT(n_clamped == 4);
+    GGML_ASSERT(dst[0] == ggml_fp32_to_fp16(1.0f + 1.0f/128.0f)); // exact inside the F16 range
+    GGML_ASSERT(dst[1] == ggml_fp32_to_fp16(65504.0f));
+    GGML_ASSERT(dst[2] == ggml_fp32_to_fp16(65504.0f));           // clamped, not Inf
+    GGML_ASSERT(dst[3] == ggml_fp32_to_fp16(65504.0f));           // clamped, not Inf
+    GGML_ASSERT(dst[4] == ggml_fp32_to_fp16(-65504.0f));          // clamped, not Inf
+    GGML_ASSERT(dst[5] == ggml_fp32_to_fp16(INFINITY));           // Inf stays Inf
+}
+
+struct test_mul_mat_bf16_to_f16 : public test_case {
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR3(m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_mul_mat_bf16_to_f16(int64_t m = 160, int64_t n = 1, int64_t k = 256) : m(m), n(n), k(k) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, m); // the converted weight
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_F16) {
+                init_tensor_uniform(t);
+                continue;
+            }
+
+            // as if the weight were BF16 in the file, with values beyond the F16 range in every row
+            const int64_t ne = ggml_nelements(t);
+            std::vector<ggml_bf16_t> data_bf16(ne);
+            for (int64_t i = 0; i < ne; i++) {
+                data_bf16[i] = ggml_fp32_to_bf16(
+                        i % k == 0 ?  1e6f :
+                        i % 16 == 0 ? -1e30f :
+                        (float) ((i % 7) - 3) / 8.0f);
+            }
+
+            std::vector<ggml_fp16_t> data_f16(ne);
+            const int64_t n_clamped = ggml_bf16_to_fp16_row(data_bf16.data(), data_f16.data(), ne);
+
+            GGML_ASSERT(n_clamped > 0);
+            for (int64_t i = 0; i < ne; i++) {
+                if (i % k == 0) {
+                    GGML_ASSERT(data_f16[i] == ggml_fp32_to_fp16( 65504.0f));
+                } else if (i % 16 == 0) {
+                    GGML_ASSERT(data_f16[i] == ggml_fp32_to_fp16(-65504.0f));
+                }
+            }
+
+            ggml_backend_tensor_set(t, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+        }
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_BF16_TO_F16";
+    }
+};
+
 // Multiple matmuls that share one input, run by one multi-weight kernel (small M) or by
 // sharing one input conversion across cuBLAS calls (large M)
 struct test_mul_mat_multi : public test_case {
@@ -5943,6 +6509,40 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax =
     init_mul_mat_id_ids(ctx, n_mats);
 }
 
+// Skewed routing: a few hot experts take most of the slots, so one expert receives far more
+// columns than the average (512 experts, top-10, n=2048 gives 40 on average but the hot ones
+// take hundreds). The grouped kernel must stay correct when an expert's column count exceeds
+// its staged-entry capacity. A token picks distinct experts like real top-k routing: every
+// expert draws a score, hot experts draw in a smaller range and so are picked first. The
+// routing tensor is the full (n_mats, n_rows) ids, the caller views its first n_used columns.
+static void init_mul_mat_id_ids_skew(ggml_context * ctx, int n_mats, int n_used, int n_hot) {
+    std::random_device rd;
+    std::default_random_engine rng(rd());
+    std::uniform_real_distribution<float> score(0.0f, 1.0f);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+        if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+            continue;
+        }
+        for (int64_t r = 0; r < ggml_nrows(t); r++) {
+            std::vector<std::pair<float, int32_t>> ranked(n_mats);
+            for (int32_t e = 0; e < n_mats; e++) {
+                // hot experts draw in [0, 1), the others in [0, 8): a hot one wins most slots
+                ranked[e] = { score(rng) * (e < n_hot ? 1.0f : 8.0f), e };
+            }
+            std::partial_sort(ranked.begin(), ranked.begin() + n_used, ranked.end());
+            std::vector<int32_t> data(t->ne[0]);
+            for (int i = 0; i < n_used; i++) {
+                data[i] = ranked[i].second;
+            }
+            for (int64_t i = n_used; i < t->ne[0]; i++) {
+                data[i] = (int32_t) i;
+            }
+            std::shuffle(data.begin(), data.begin() + n_used, rng);
+            ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+        }
+    }
+}
+
 // GGML_OP_MUL_MAT_ID
 struct test_mul_mat_id : public test_case {
     const ggml_type type_a;
@@ -6027,6 +6627,67 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// The fused SwiGLU expert matmul: the rows of src0 come in gate/up pairs (row 2r = gate row r,
+// row 2r+1 = up row r, the order the model loader writes them) and the epilogue applies
+// silu(gate)*up in FP32 and writes it as F16, which is what the down projection reads. Same
+// routing, shapes and tolerance as test_mul_mat_id, with src0 twice as tall.
+struct test_mul_mat_id_swiglu : public test_mul_mat_id {
+    test_mul_mat_id_swiglu(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 512, int n_used = 10, bool b = false,
+            int64_t m = 1280, int64_t n = 32, int64_t k = 2560)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_SWIGLU";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // the result is F16, so the src1 precision hint of the plain case does not apply
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, this->b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id_swiglu(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// Skewed routing: a few hot experts take most of the slots. At n=2048 the average expert
+// receives 40 columns, but a hot expert receives hundreds, far more than the grouped kernel's
+// staged-entry capacity, so this exercises the per-expert column loop.
+struct test_mul_mat_id_skew : public test_mul_mat_id {
+    const int n_hot;
+
+    test_mul_mat_id_skew(ggml_type type_a = GGML_TYPE_Q4_K, int n_mats = 512, int n_used = 10,
+            int64_t m = 640, int64_t n = 2048, int64_t k = 2560, int n_hot = 8)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, false, m, n, k), n_hot(n_hot) {}
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + "," + std::to_string(n_hot);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+        init_mul_mat_id_ids_skew(ctx, n_mats, n_used, n_hot);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids_skew(ctx, n_mats, n_used, n_hot);
+    }
+};
+
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -6058,6 +6719,1811 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_W4A4";
     }
+};
+
+// MUL_MAT_ID with the expert weights in a device-readable host buffer type (e.g. the CUDA mapped
+// host buffer). The kernel reads the weights through the device pointer, so the result must match
+// the same weights in the device buffer, which the plain test_mul_mat_id covers against the CPU.
+struct test_mul_mat_id_mapped : public test_mul_mat_id {
+    test_mul_mat_id_mapped(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 32, int n_used = 4, int64_t m = 640, int64_t n = 8, int64_t k = 2560)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_MAPPED";
+    }
+
+    bool use_weight_context() override { return true; }
+    bool requires_weight_buffer_type() override { return true; }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            return nullptr;
+        }
+        auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra == nullptr) {
+            return nullptr;
+        }
+        for (ggml_backend_buffer_type_t * extra = get_extra(dev); extra && *extra; ++extra) {
+            const std::string name = ggml_backend_buft_name(*extra);
+            if (name.size() >= 7 && name.compare(name.size() - 7, 7, "_Mapped") == 0) {
+                return *extra;
+            }
+        }
+        return nullptr;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        // C^T = A * B^T: (k, m) * (k, n) => (m, n)
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// mark a tensor as an expert weight through the backend proc address, like the llama loader
+// does: the store then does not have to rely on the tensor name to recognize it
+static void mark_expert_tensor(ggml_backend_reg_t reg, ggml_backend_buffer_type_t buft, ggml_tensor * t) {
+    auto mark = (void (*)(ggml_backend_buffer_type_t, ggml_tensor *))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_expert_store_mark_tensor");
+    if (mark != nullptr) {
+        mark(buft, t);
+    }
+}
+
+// per-expert span the expert store uses: the data bytes, the trailing row padding the MMQ
+// loaders read past the last row (the same rule as the CUDA buffer get_alloc_size) and the
+// alignment of the next expert, which is lcm(256, type block size) so the pitch is a whole
+// number of blocks. The budgets below use it as the expert pitch.
+static size_t expert_store_stride(ggml_type type, int64_t k, int64_t m) {
+    const size_t blob = (size_t) ggml_row_size(type, k) * (size_t) m;
+    const size_t pad  = ggml_is_quantized(type) && k % 512 != 0
+        ? ggml_row_size(type, 512 - k % 512) : 0;
+    const size_t ts   = ggml_type_size(type);
+    size_t align = 256;
+    size_t b = ts;
+    while (b != 0) {
+        const size_t t = align % b;
+        align = b;
+        b = t;
+    }
+    align = 256 / align * ts;
+    // no power of two in general: round with a division
+    return (blob + pad + align - 1) / align * align;
+}
+
+// ask the backend for the placement plan of the given expert tensors under the budget that
+// was set, and hand it back as the plan the real allocation must reproduce. The allocation
+// aborts when the two differ, so a test that records a plan covers the fit/allocation
+// invariant without loading a real model. specs are (layer, n_expert, blob_bytes, type, ne0).
+struct expert_plan_spec {
+    int     layer;
+    int64_t n_expert;
+    size_t  blob_bytes;
+    int     type;
+    int64_t ne0;
+};
+
+static void record_expert_plan(ggml_backend_reg_t reg, ggml_backend_buffer_type_t buft,
+        const std::vector<expert_plan_spec> & specs, size_t slot_budget) {
+    auto plan = (void (*)(ggml_backend_buffer_type_t, const int *, const int64_t *, const int64_t *,
+            const size_t *, const int *, const int64_t *, size_t, size_t,
+            size_t *, size_t *, size_t *, size_t *))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_plan");
+    auto record = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_record_plan");
+    if (plan == nullptr || record == nullptr) {
+        return;
+    }
+
+    std::vector<int>     layers;
+    std::vector<int64_t> n_experts;
+    std::vector<size_t>  blobs;
+    std::vector<int>     types;
+    std::vector<int64_t> ne0s;
+    for (const expert_plan_spec & s : specs) {
+        layers.push_back(s.layer);
+        n_experts.push_back(s.n_expert);
+        blobs.push_back(s.blob_bytes);
+        types.push_back(s.type);
+        ne0s.push_back(s.ne0);
+    }
+
+    size_t slot = 0;
+    size_t host = 0;
+    size_t peak = 0;
+    // expert_base is null: without expert parallelism every local expert 0 is global expert 0
+    plan(buft, layers.data(), nullptr, n_experts.data(), blobs.data(), types.data(), ne0s.data(), specs.size(),
+        slot_budget, &slot, &host, &peak, nullptr);
+    record(buft, slot, host);
+}
+
+// the expert store must place part of the experts in VRAM slots and the rest in the host
+// arena, and it must have room to stage the routed host experts during prefill. With
+// all_slot every expert is in a VRAM slot: no host arena, no staging area.
+static void check_expert_tiers(ggml_backend_reg_t reg, ggml_backend_buffer_type_t buft, bool all_slot) {
+    GGML_ASSERT(buft != nullptr);
+    auto get_alloc = (bool (*)(ggml_backend_buffer_type_t, size_t *, size_t *, size_t *))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_get_allocation");
+    size_t slot  = 0;
+    size_t host  = 0;
+    size_t stage = 0;
+    GGML_ASSERT(get_alloc != nullptr);
+    GGML_ASSERT(get_alloc(buft, &slot, &host, &stage));
+    if (all_slot) {
+        GGML_ASSERT(slot > 0 && host == 0 && stage == 0);
+    } else {
+        GGML_ASSERT(slot > 0 && host > 0 && stage > 0);
+    }
+}
+
+// expert store: the experts of one tensor are split between VRAM slots and the
+// device-readable host arena, and the kernels read them through a device pointer table.
+// On Volta n covers every dispatch path: MMVQ mmid (1..16), the grouped kernel (17..64),
+// MMQ prefill (65..504, where the host experts are staged into VRAM first) and the large
+// batches (512) that take the expert-wise fallback. The weight tensor is marked explicitly,
+// its name does not match the llama pattern. The staging area covers the whole host
+// complement of the tensor, which is what fit sizes it for; all_slot is the other extreme:
+// every expert is in a VRAM slot, so the tensor has no host complement and no staging.
+struct test_mul_mat_id_expert : public test_mul_mat_id {
+    test_mul_mat_id_expert(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 32, int n_used = 4, int64_t m = 640, int64_t n = 8, int64_t k = 2560,
+            bool all_slot = false, int n_host = -1, size_t stage_bytes_min = 0)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k), all_slot(all_slot),
+          n_host(n_host < 0 ? n_mats - 2 : n_host), stage_bytes_min(stage_bytes_min) {
+        // the parameter shadows the member: check the member, the parameter is -1 by default
+        GGML_ASSERT(all_slot || this->n_host > 0);
+    }
+
+    const bool all_slot;   // every expert in a VRAM slot: no host complement, no staging
+    // how many experts go to the host arena. The staging area is sized for exactly that many, so
+    // a small value puts only a few experts in the staging area and every launch has to fill it
+    // again; the rest of the complement would not fit and the store refuses the budget.
+    const int n_host;
+    // lower bound of the staging budget in bytes (0 = exactly the host complement). A staging
+    // area far larger than the complement makes its clearing at the first launch take long, which
+    // is what test_mul_mat_id_expert_first_launch needs.
+    const size_t stage_bytes_min;
+
+    ggml_tensor * expert_weight = nullptr; // the weight tensor, marked in weight_buffer_type()
+    ggml_backend_buffer_type_t expert_buft = nullptr;
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + (all_slot ? " all_slot" : "") +
+            (n_host == n_mats - 2 ? "" : " n_host=" + std::to_string(n_host)) +
+            (stage_bytes_min == 0 ? "" : " stage_min=" + std::to_string(stage_bytes_min >> 20) + "MiB");
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT";
+    }
+
+    bool use_weight_context() override { return true; }
+    bool requires_weight_buffer_type() override { return true; }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            return nullptr;
+        }
+        auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra == nullptr) {
+            return nullptr;
+        }
+        for (ggml_backend_buffer_type_t * extra = get_extra(dev); extra && *extra; ++extra) {
+            const std::string name = ggml_backend_buft_name(*extra);
+            if (name.size() >= 8 && name.compare(name.size() - 8, 8, "_Experts") == 0) {
+                // keep two experts in the VRAM slots so both tiers are exercised. The staging
+                // area covers the whole host complement of the tensor, like fit sizes it; a
+                // smaller one is refused by the store. The budgets use the expert pitch of
+                // the store (data + row padding, 256-aligned). The all-slot mode gives the
+                // slot budget room for every expert and no staging.
+                const size_t blob_bytes   = expert_store_stride(type_a, k, m);
+                const size_t expert_bytes = blob_bytes * (size_t) n_mats;
+                const size_t slot_bytes   = all_slot ? expert_bytes : (size_t) (n_mats - n_host) * blob_bytes;
+                // a staging area above the complement (stage_bytes_min) takes what the device can
+                // spare: at most half of its free memory, so the case runs on smaller devices too
+                size_t stage_min = stage_bytes_min;
+                if (stage_min > 0) {
+                    size_t free_mem = 0, total_mem = 0;
+                    ggml_backend_dev_memory(dev, &free_mem, &total_mem);
+                    stage_min = std::min(stage_min, free_mem / 2);
+                }
+                const size_t stage_bytes  = all_slot ? 0 : std::max((size_t) n_host * blob_bytes, stage_min);
+                auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
+                if (set_budget != nullptr) {
+                    set_budget(*extra, slot_bytes, stage_bytes);
+                }
+                // record the plan of this budget, so the allocation must reproduce it exactly
+                record_expert_plan(reg, *extra, {{ 0, n_mats, (size_t) ggml_row_size(type_a, k) * (size_t) m, (int) type_a, k }}, slot_bytes);
+                // explicit mark; the name of the tensor does not match the llama pattern
+                mark_expert_tensor(reg, *extra, expert_weight);
+                expert_buft = *extra;
+                return *extra;
+            }
+        }
+        return nullptr;
+    }
+
+    void check_weight_alloc(ggml_backend_t backend) override {
+        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, all_slot);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(as, "blk.0.ffn_gate_expert.weight");
+        expert_weight = as;
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// Two mul_mat_id on the same expert tensor in one graph, with different routing: the staging
+// pointer table and the staging slots of the second launch are written while the first launch
+// already consumed them, so the first result is wrong if a launch reads the table or the slots
+// of another one. The two ids are drawn independently, so the two launches route to different
+// host experts and reuse the same slots. Both results are compared against the reference, the
+// sum only makes the second one part of the graph the framework computes.
+struct test_mul_mat_id_expert_two_ids : public test_mul_mat_id_expert {
+    test_mul_mat_id_expert_two_ids(ggml_type type_a, ggml_type type_b, int n_mats, int n_used,
+            int64_t m, int64_t n, int64_t k, int n_host)
+        : test_mul_mat_id_expert(type_a, type_b, n_mats, n_used, m, n, k, /*all_slot=*/false, n_host) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_TWO_IDS";
+    }
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + " two_ids" +
+            (n_host == n_mats - 2 ? "" : " n_host=" + std::to_string(n_host));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(as, "blk.0.ffn_gate_expert.weight");
+        expert_weight = as;
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < 2; ++i) {
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+            ggml_set_name(ids, i == 0 ? "ids0" : "ids1");
+            if (n_used != n_mats) {
+                ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+                ggml_set_name(ids, i == 0 ? "view_of_ids0" : "view_of_ids1");
+            }
+            ggml_tensor * o = ggml_mul_mat_id(ctx, as, b, ids);
+            ggml_set_name(o, i == 0 ? "out0" : "out1");
+            out = out == nullptr ? o : ggml_add(ctx, out, o);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// The first launch of a (buffer, stream) creates the staging state of the stream
+// (ggml_backend_cuda_expert_buffer_context::get_stream): the staging area, the plan buffers and the
+// pointer tables are allocated and cleared, and the first routing/plan/copy kernels follow right
+// after. The clearing has to be ordered before those kernels on the stream: a clear that runs
+// unordered (on the legacy default stream) lands while the staging area is being cleared and the
+// plan kernel has already counted the routed host experts, zeroes the count, and the copy kernel
+// copies nothing - the consumer then reads zeroed staging slots and the rows of every routed host
+// expert come out as zero. The staging budget is set far above the host complement (stage_bytes_min)
+// so that its clearing takes milliseconds, longer than the host needs to issue the kernels; with an
+// unordered clear this fails on every launch instead of once in a few hundred. After the reference
+// compare the case releases the stream state through the backend proc and computes again, n_relaunch
+// times, so every compute goes through the first-launch path again.
+struct test_mul_mat_id_expert_first_launch : public test_mul_mat_id_expert {
+    const int n_re;
+
+    test_mul_mat_id_expert_first_launch(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k,
+            int n_re, size_t stage_bytes_min)
+        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, n_mats, n_used, m, n, k, /*all_slot=*/false, /*n_host=*/-1, stage_bytes_min),
+          n_re(n_re) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_FIRST_LAUNCH";
+    }
+
+    std::string vars() override {
+        return test_mul_mat_id_expert::vars() + " relaunch=" + std::to_string(n_re);
+    }
+
+    int n_relaunch() override { return n_re; }
+
+    void relaunch_prepare(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        auto reset = (void (*)(ggml_backend_buffer_type_t))
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_reset_streams");
+        GGML_ASSERT(reset != nullptr);
+        reset(expert_buft);
+    }
+
+    // The plan of the launch must have staged every routed host expert. A clear of the plan
+    // counters or of the routing bitmap that lands after the routing kernel leaves the count short:
+    // the launch then either reads the host arena in place (correct output, no staging) or reads
+    // slots that were never filled (wrong output). The output compare catches only the second, this
+    // catches both. Without a routing profile the store puts experts 0 .. n_slot-1 into the slots
+    // (ggml_expert_store_plan sorts the slot experts), so the host experts are the ids >= n_mats - n_host.
+    bool relaunch_check(ggml_backend_t backend) override {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        auto hits = (bool (*)(ggml_backend_buffer_type_t, size_t *))
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_last_stage_hits");
+        GGML_ASSERT(hits != nullptr);
+        size_t n_hit = 0;
+        if (!hits(expert_buft, &n_hit)) {
+            printf("no staging launch recorded ");
+            return false;
+        }
+
+        const ggml_tensor * ids = out_node->src[2];
+        const int64_t stride = ids->nb[1] / sizeof(int32_t);
+        std::vector<int32_t> data((size_t) ((ids->ne[1] - 1) * stride + ids->ne[0]));
+        ggml_backend_tensor_get(ids, data.data(), 0, data.size() * sizeof(int32_t));
+        std::vector<bool> routed((size_t) n_mats, false);
+        for (int64_t t = 0; t < ids->ne[1]; ++t) {
+            for (int64_t s = 0; s < ids->ne[0]; ++s) {
+                routed[(size_t) data[(size_t) (t * stride + s)]] = true;
+            }
+        }
+        size_t expected = 0;
+        for (int e = n_mats - n_host; e < n_mats; ++e) {
+            expected += routed[(size_t) e];
+        }
+        if (n_hit != expected) {
+            printf("staged %zu host experts, the launch routed to %zu ", n_hit, expected);
+            return false;
+        }
+        return true;
+    }
+};
+
+// Expert store with K not a multiple of MATRIX_ROW_PADDING: every expert needs trailing row
+// padding. The all-slot store puts the LAST expert right at the end of the slot allocation,
+// so a read past data + padding leaves the allocation (compute-sanitizer reports it). The
+// allocation check here is deterministic: the reported slot bytes must cover data + padding
+// for every expert, the span the MMQ loaders may read.
+struct test_mul_mat_id_expert_pad : public test_mul_mat_id_expert {
+    test_mul_mat_id_expert_pad(ggml_type type_a, int n_mats, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, n_mats, 4, m, n, k, /*all_slot=*/true) {
+        GGML_ASSERT(ggml_is_quantized(type_a));
+        GGML_ASSERT(k % 512 != 0);
+    }
+
+    void check_weight_alloc(ggml_backend_t backend) override {
+        test_mul_mat_id_expert::check_weight_alloc(backend);
+
+        const size_t stride = expert_store_stride(type_a, k, m);
+        GGML_ASSERT(stride > (size_t) ggml_row_size(type_a, k) * (size_t) m);
+
+        auto get_alloc = (bool (*)(ggml_backend_buffer_type_t, size_t *, size_t *, size_t *))
+            ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)),
+                "ggml_backend_cuda_expert_get_allocation");
+        size_t slot = 0;
+        size_t host = 0;
+        size_t stage = 0;
+        GGML_ASSERT(get_alloc != nullptr && get_alloc(expert_buft, &slot, &host, &stage));
+        GGML_ASSERT(slot >= (size_t) n_mats * stride);
+    }
+};
+
+// A view of a fully resident expert store tensor: the view starts at expert n_skip, so the
+// kernels must reach the experts through the store base of the view (slot array base +
+// n_skip * expert pitch). The store pitch is larger than the tensor's own expert stride when
+// the weights need trailing row padding (k not a multiple of MATRIX_ROW_PADDING), so a kernel
+// that used the view's data pointer instead of the store pitch would read the wrong experts.
+// The ids stay inside the view so the CPU reference reads the same experts.
+struct test_mul_mat_id_expert_view : public test_mul_mat_id_expert {
+    test_mul_mat_id_expert_view(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, int n_skip)
+        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, n_mats, n_used, m, n, k, /*all_slot=*/true), n_skip(n_skip) {
+        GGML_ASSERT(n_skip > 0 && n_skip < n_mats);
+    }
+
+    const int n_skip;
+
+    std::string vars() override {
+        return test_mul_mat_id_expert::vars() + " n_skip=" + std::to_string(n_skip);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(as, "blk.0.ffn_gate_expert.weight");
+        expert_weight = as;
+
+        ggml_tensor * as_v = ggml_view_3d(ctx_weights, as, k, m, n_mats - n_skip,
+            as->nb[1], as->nb[2], n_skip*as->nb[2]);
+        ggml_set_name(as_v, "blk.0.ffn_gate_expert.weight_view");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as_v, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    // ids of the view range only, deterministic so that both graphs read the same rows
+    // ids are view-local expert numbers covering every expert of the view, as ggml requires
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            if (ggml_is_view_op(t->op)) { continue; }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = i % (n_mats - n_skip);
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+};
+
+// MUL_MAT_ID with the expert weights in the plain device buffer, as model loading allocates
+// them. The skinny prepass scans such buffers and repacks eligible Q8_0/Q4_K weights in place,
+// so this verifies that the 3D expert tensors pass the repack admission untouched (the
+// MUL_MAT_ID kernels read the original layout) and still match the CPU. Regression guard for
+// reading a repacked tensor with the original layout, which yields garbage or NaN.
+struct test_mul_mat_id_wctx : public test_mul_mat_id {
+    test_mul_mat_id_wctx(ggml_type type_a = GGML_TYPE_Q8_0, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 512, int n_used = 1, int64_t m = 640, int64_t n = 1, int64_t k = 2560)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k) {}
+
+    bool use_weight_context() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_WCTX";
+    }
+};
+
+// GLM-style shared expert next to a routed MUL_MAT_ID MoE: the routed gate/up pair plus GLU is
+// fused with the shared expert gate/up pair plus GLU into one mul_mat_vec_q launch. The shared
+// weights are 2D and meet the Q8_0 repack admission, so the prepass repacks them before the
+// fusion decision; the fused kernel reads the original layout, so a repacked shared weight must
+// disqualify the fusion instead of being read as garbage.
+struct test_mul_mat_id_shared_expert : public test_case {
+    const ggml_type type_w;
+    const int n_mats;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_w, n_mats, n_used, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * (n_used + 1);
+    }
+
+    test_mul_mat_id_shared_expert(ggml_type type_w = GGML_TYPE_Q8_0,
+            int n_mats = 8, int n_used = 8, int64_t m = 640, int64_t n = 1, int64_t k = 2560)
+        : type_w(type_w), n_mats(n_mats), n_used(n_used), m(m), n(n), k(k) {
+        GGML_ASSERT(n_used <= n_mats);
+    }
+
+    bool use_weight_context() override { return true; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_SHARED_EXPERT";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        // node order matters: [MUL_MAT_ID, MUL_MAT_ID, GLU, MUL_MAT, MUL_MAT, GLU] is the
+        // pattern match_shared_expert() looks for, the shared MUL_MAT pair must sit at
+        // routed_idx + 3
+        ggml_tensor * gate_exps  = ggml_new_tensor_3d(ctx_weights, type_w, k, m, n_mats);
+        ggml_set_name(gate_exps, "gate_exps");
+        ggml_tensor * up_exps    = ggml_new_tensor_3d(ctx_weights, type_w, k, m, n_mats);
+        ggml_set_name(up_exps, "up_exps");
+        ggml_tensor * gate_shexp = ggml_new_tensor_2d(ctx_weights, type_w, k, m);
+        ggml_set_name(gate_shexp, "gate_shexp");
+        ggml_tensor * up_shexp   = ggml_new_tensor_2d(ctx_weights, type_w, k, m);
+        ggml_set_name(up_shexp, "up_shexp");
+
+        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_set_name(cur, "cur");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        ggml_tensor * cur_r = ggml_reshape_3d(ctx, cur, k, 1, n);
+        ggml_set_name(cur_r, "cur_reshaped");
+
+        ggml_tensor * up_id = ggml_mul_mat_id(ctx, up_exps, cur_r, ids);
+        ggml_set_name(up_id, "ffn_moe_up");
+        ggml_tensor * gate_id = ggml_mul_mat_id(ctx, gate_exps, cur_r, ids);
+        ggml_set_name(gate_id, "ffn_moe_gate");
+        ggml_tensor * glu_r = ggml_swiglu_split(ctx, gate_id, up_id);
+        ggml_set_name(glu_r, "ffn_moe_swiglu");
+
+        ggml_tensor * up_s = ggml_mul_mat(ctx, up_shexp, cur);
+        ggml_set_name(up_s, "ffn_shexp_up");
+        ggml_tensor * gate_s = ggml_mul_mat(ctx, gate_shexp, cur);
+        ggml_set_name(gate_s, "ffn_shexp_gate");
+        ggml_tensor * glu_s = ggml_swiglu_split(ctx, gate_s, up_s);
+        ggml_set_name(glu_s, "ffn_shexp_swiglu");
+
+        // keep both GLU nodes alive in one output: the fused kernel writes them directly
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_2d(ctx, glu_r, m, n_used * n), glu_s, 1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+};
+
+// expert parallelism: the same weights are split along the expert dim and each part is
+// computed with its own expert_offset. The per-shard outputs cover disjoint slots (the other
+// devices' slots are zero) and their sum must equal the full computation.
+struct test_mul_mat_id_ep : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_b;
+    const int n_mats;
+    const int n_used;
+    const int n_shards;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool broadcast_b; // gate/up activations are broadcast across the experts
+    const bool check_full;  // output the difference against the full mul_mat_id
+    ggml_tensor * out_diff = nullptr; // the SUB node of the shard sum and the full result
+
+    std::string vars() override {
+        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, n_shards, m, n, k, broadcast_b, check_full);
+    }
+
+    // the full comparison is an absolute check: both sides are zero when correct
+    double err(const float * a, const float * b, size_t n) override {
+        if (!check_full) {
+            return test_case::err(a, b, n);
+        }
+        double result = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            result = std::max(result, (double) fabsf(a[i] - b[i]));
+        }
+        return result;
+    }
+
+    // With check_full only the SUB node is compared: it must be exactly zero on every backend,
+    // which is what "the shards sum to the full result" means. Comparing every intermediate node
+    // with the absolute tolerance of err() would instead flag the normal difference between the
+    // CPU Q8_K and the CUDA Q8_1 activation quantization, which reaches a few 0.1 at K = 2560.
+    bool run_whole_graph() override { return check_full; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return check_full ? std::vector<ggml_tensor *>{ out_diff } : std::vector<ggml_tensor *>{};
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        if (!check_full) {
+            return test_case::max_err(backend);
+        }
+        GGML_UNUSED(backend);
+        return 1e-2;
+    }
+
+    double max_nmse_err() override {
+        // the per-node comparison of the shard outputs against the CPU reference needs the
+        // same tolerance as the plain MUL_MAT_ID cases: Q4_K/Q8_0 weights against the CPU
+        // reference reach a few 1e-5 nMSE with the Q8_1 activation quantization
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * n_used;
+    }
+
+    // the output node is the SUB of the shard sum and the full result, filter with -o MUL_MAT_ID_EP
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EP";
+    }
+
+    test_mul_mat_id_ep(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 512, int n_used = 10, int n_shards = 6,
+            int64_t m = 640, int64_t n = 1, int64_t k = 2560, bool broadcast_b = true, bool check_full = true)
+        : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), n_shards(n_shards),
+            m(m), n(n), k(k), broadcast_b(broadcast_b), check_full(check_full) {
+            GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(n_shards > 0 && n_shards <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // C^T = A * B^T: (k, m) * (k, n) => (m, n)
+        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(as, "as");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+
+        // gate/up broadcasts one activation row per token, down has one row per (token, slot)
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, broadcast_b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+
+        // uneven contiguous slices along the expert dim, as the real per-device split gives
+        ggml_tensor * out = nullptr;
+        for (int s = 0; s < n_shards; ++s) {
+            const int64_t start = (int64_t) n_mats * s / n_shards;
+            const int64_t end   = (int64_t) n_mats * (s + 1) / n_shards;
+            if (end == start) {
+                continue;
+            }
+            ggml_tensor * as_s = ggml_view_3d(ctx, as, k, m, end - start, as->nb[1], as->nb[2], start*as->nb[2]);
+            ggml_tensor * out_s = ggml_mul_mat_id(ctx, as_s, b, ids);
+            ggml_mul_mat_id_set_expert_parallel(out_s, true);
+            ggml_mul_mat_id_set_expert_offset(out_s, (int32_t) start);
+            ggml_mul_mat_id_set_n_expert_total(out_s, n_mats);
+            ggml_set_name(out_s, "out_s");
+            out = out == nullptr ? out_s : ggml_add(ctx, out, out_s);
+        }
+        ggml_set_name(out, "out");
+
+        if (check_full) {
+            // the full computation in the same graph; the difference must be zero on both backends
+            ggml_tensor * full = ggml_mul_mat_id(ctx, as, b, ids);
+            ggml_set_name(full, "full");
+            out = ggml_sub(ctx, out, full);
+            ggml_set_name(out, "out_diff");
+            out_diff = out;
+        }
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        // weights and activations uniformly, then ids spread over the whole expert range so
+        // that every shard (offset > 0 as well) actually gets matches. The n_used experts of
+        // a token are drawn without replacement, as in the top-k routing that MUL_MAT_ID models.
+        init_mul_mat_id_tensors(ctx, n_mats, 1.0f);
+
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            std::vector<int32_t> data(n_mats);
+            for (int i = 0; i < n_mats; i++) {
+                data[i] = i;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+};
+
+// expert store with expert parallelism: every shard is its own expert tensor holding a
+// contiguous expert range, dispatched with its own expert_offset. The pointer table of a
+// shard is indexed by the local expert number (id - expert_offset).
+struct test_mul_mat_id_expert_ep : public test_mul_mat_id_ep {
+    test_mul_mat_id_expert_ep(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
+            int n_mats = 48, int n_used = 4, int n_shards = 3,
+            int64_t m = 640, int64_t n = 8, int64_t k = 2560, bool broadcast_b = true)
+        : test_mul_mat_id_ep(type_a, type_b, n_mats, n_used, n_shards, m, n, k, broadcast_b, /*check_full =*/ false) {}
+
+    std::vector<ggml_tensor *> expert_weights; // the shard tensors, marked in weight_buffer_type()
+    ggml_backend_buffer_type_t expert_buft = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_EP";
+    }
+
+    bool use_weight_context() override { return true; }
+    bool requires_weight_buffer_type() override { return true; }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            return nullptr;
+        }
+        auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra == nullptr) {
+            return nullptr;
+        }
+        for (ggml_backend_buffer_type_t * extra = get_extra(dev); extra && *extra; ++extra) {
+            const std::string name = ggml_backend_buft_name(*extra);
+            if (name.size() >= 8 && name.compare(name.size() - 8, 8, "_Experts") == 0) {
+                // one slot per shard tensor, the rest of each shard goes to the host arena;
+                // the staging area covers the host complement of the largest shard, the
+                // budgets use the 256-byte expert pitch of the store
+                const int64_t shard_max  = (n_mats + n_shards - 1) / n_shards;
+                const size_t  blob_bytes = expert_store_stride(type_a, k, m);
+                auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
+                if (set_budget != nullptr) {
+                    set_budget(*extra, n_shards*blob_bytes, (size_t) (shard_max - 1)*blob_bytes);
+                }
+                // explicit mark of every shard tensor; the names mimic the llama tensors but
+                // play no part in the recognition
+                for (ggml_tensor * t : expert_weights) {
+                    mark_expert_tensor(reg, *extra, t);
+                }
+                expert_buft = *extra;
+                return *extra;
+            }
+        }
+        return nullptr;
+    }
+
+    void check_weight_alloc(ggml_backend_t backend) override {
+        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, /*all_slot=*/false);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, broadcast_b ? 1 : n_used, n);
+        ggml_set_name(b, "b");
+
+        // uneven contiguous slices along the expert dim, one expert tensor per shard
+        ggml_tensor * out = nullptr;
+        for (int s = 0; s < n_shards; ++s) {
+            const int64_t start = (int64_t) n_mats * s / n_shards;
+            const int64_t end   = (int64_t) n_mats * (s + 1) / n_shards;
+            if (end == start) {
+                continue;
+            }
+            char name[64];
+            snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", s);
+            ggml_tensor * as_s = ggml_new_tensor_3d(ctx_weights, type_a, k, m, end - start);
+            ggml_set_name(as_s, name);
+            expert_weights.push_back(as_s);
+
+            ggml_tensor * out_s = ggml_mul_mat_id(ctx, as_s, b, ids);
+            ggml_mul_mat_id_set_expert_parallel(out_s, true);
+            ggml_mul_mat_id_set_expert_offset(out_s, (int32_t) start);
+            ggml_mul_mat_id_set_n_expert_total(out_s, n_mats);
+            ggml_set_name(out_s, "out_s");
+            out = out == nullptr ? out_s : ggml_add(ctx, out, out_s);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// MoE FFN built from the expert store: gate and up are separate store tensors that share the
+// routing of one batch, the GLU joins them and down runs on the gated activation. This is the
+// layout of a real MoE block, so the three MUL_MAT_ID launches of a layer run one after another
+// on the same stream and reuse the one per-stream staging area: a slot, table or lifetime
+// mistake between the tensors has to show up as a mismatch against the CPU reference. The
+// n = 2048 batch reaches the batched MMQ path and stages the host experts of every tensor;
+// n = 16 reaches the fused MMVQ gate/up kernel instead, which reads the two main tables.
+struct test_mul_mat_id_expert_ffn : public test_case {
+    const ggml_type type_a;    // gate/up type
+    const ggml_type type_down; // down type: k = m = 640 is not a multiple of QK_K for the K-quants
+    const int n_mats;
+    const int n_used;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    ggml_tensor * gate_w = nullptr;
+    ggml_tensor * up_w   = nullptr;
+    ggml_tensor * down_w = nullptr;
+    ggml_backend_buffer_type_t expert_buft = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, type_down, n_mats, n_used, m, n, k);
+    }
+
+    double max_nmse_err() override {
+        // two quantized projections in series (gate/up, then down)
+        return 1e-3;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        // gate + up + down
+        return 6 * m * k * n * n_used;
+    }
+
+    test_mul_mat_id_expert_ffn(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_down = GGML_TYPE_Q8_0,
+            int n_mats = 512, int n_used = 10,
+            int64_t m = 640, int64_t n = 2048, int64_t k = 2560)
+        : type_a(type_a), type_down(type_down), n_mats(n_mats), n_used(n_used),
+            m(m), n(n), k(k) {
+            GGML_ASSERT(n_used <= n_mats);
+        }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_FFN";
+    }
+
+    bool use_weight_context() override { return true; }
+    bool requires_weight_buffer_type() override { return true; }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            return nullptr;
+        }
+        auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra == nullptr) {
+            return nullptr;
+        }
+        for (ggml_backend_buffer_type_t * extra = get_extra(dev); extra && *extra; ++extra) {
+            const std::string name = ggml_backend_buft_name(*extra);
+            if (name.size() >= 8 && name.compare(name.size() - 8, 8, "_Experts") == 0) {
+                // three experts of every tensor in the VRAM slots, the complements in the host
+                // arena; the staging area covers the host complement of the largest tensor.
+                // The budgets use the expert pitch of the store (data + row padding, aligned).
+                const size_t blob_gate = expert_store_stride(type_a, k, m);
+                const size_t blob_down = expert_store_stride(type_down, m, k);
+                const size_t slot_bytes  = 3 * (2 * blob_gate + blob_down);
+                const size_t stage_bytes = std::max(blob_gate, blob_down) * (size_t) n_mats;
+                auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
+                if (set_budget != nullptr) {
+                    set_budget(*extra, slot_bytes, stage_bytes);
+                }
+                // explicit mark of every weight tensor; the names mimic the llama tensors but
+                // play no part in the recognition
+                mark_expert_tensor(reg, *extra, gate_w);
+                mark_expert_tensor(reg, *extra, up_w);
+                mark_expert_tensor(reg, *extra, down_w);
+                expert_buft = *extra;
+                return *extra;
+            }
+        }
+        return nullptr;
+    }
+
+    void check_weight_alloc(ggml_backend_t backend) override {
+        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, /*all_slot=*/false);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        // gate/up: (k, m) x (k, 1, n) -> (m, n_used, n); down: (m, k) x (m, n_used, n) -> (k, n_used, n)
+        gate_w = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(gate_w, "blk.0.ffn_gate_exps.weight");
+        up_w = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(up_w, "blk.0.ffn_up_exps.weight");
+        down_w = ggml_new_tensor_3d(ctx_weights, type_down, m, k, n_mats);
+        ggml_set_name(down_w, "blk.0.ffn_down_exps.weight");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+
+        // gate/up broadcast one activation row per token, like the real pre-FFN activation
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_w, b, ids);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * up = ggml_mul_mat_id(ctx, up_w, b, ids);
+        ggml_set_name(up, "up");
+
+        ggml_tensor * gated = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(gated, "gated");
+
+        // the same ids drive the down projection of the gated activation
+        ggml_tensor * out = ggml_mul_mat_id(ctx, down_w, gated, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+
+    bool run_whole_graph() override { return true; }
+};
+
+// index of the device of a backend in its registry: the CUDA registry lists its devices in CUDA
+// device order, which is the device number the expert store and the expert maps are keyed by
+static int backend_device_index(ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return -1;
+    }
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+        if (ggml_backend_reg_dev_get(reg, i) == dev) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
+
+// Expert store under a permuted expert assignment. The loader of a model places the experts of a
+// device by its table, a snapshot of the LPT proposal computed from the routing profile (local
+// expert k of device d holds global expert global_of(d, layer, k), see
+// ggml_expert_store_compute_assignment), and activates the table; from then on every consumer of
+// the routing ids of a node of that model goes through the row of (device, layer) of the table
+// (ggml_expert_store_node_lut) instead of a contiguous range test. This test plays the loader: it
+// computes a proposal from an artificial profile, takes its table, activates it, writes the experts
+// of its device into the store tensors in that order and marks the MUL_MAT_ID nodes with the layer,
+// the device and the table like the meta backend does. The ids are global ids over all n_mats
+// experts, one store tensor per layer.
+//   check_naive == false: the permuted node against the CPU reference, which reads the same row;
+//   check_naive == true:  the difference between the permuted node and the naive computation on the
+//                         full unpermuted weight (the slots of the other devices zeroed by a mask),
+//                         which has to be zero on both backends - a table error that both backends
+//                         share shows up here, the plain comparison would not see it.
+// The device of the test is the device of the backend; devices without a row in the n_dev
+// assignment skip the test. after_eval() releases the table.
+struct test_mul_mat_id_expert_permute : public test_case {
+    const ggml_type type_a;
+    const int n_mats;    // global experts
+    const int n_used;
+    const int n_dev;     // devices of the assignment, n_mats is a multiple so every device holds n_local
+    const int n_layer;   // rows of the assignment used, one store tensor each
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool all_slot;
+    const bool check_naive;
+
+    const int n_local;   // experts of the device of the test
+
+    int      dev   = -1; // device of the backend, set in weight_buffer_type()
+    uint32_t table = 0;  // the activated table of the permutation, 0 in perf mode
+
+    std::vector<ggml_tensor *> as_perm; // per layer: the store tensor of the device, n_local experts in local order
+    std::vector<ggml_tensor *> as_full; // per layer: the full unpermuted weight the store tensor is cut from
+    std::vector<ggml_tensor *> ids_l;   // per layer: global ids
+    std::vector<ggml_tensor *> mask_l;  // per layer: 1 for a slot of a local expert, 0 otherwise (check_naive)
+    std::vector<ggml_tensor *> mm_perm; // per layer: the MUL_MAT_ID node of the store tensor
+    ggml_tensor * out_diff = nullptr;
+    ggml_backend_buffer_type_t expert_buft = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR10(type_a, n_mats, n_used, n_dev, n_layer, m, n, k, all_slot, check_naive);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_PERMUTE";
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * n_used * n_layer;
+    }
+
+    // the naive comparison is an absolute check: the difference has to be zero on both backends,
+    // so the error is the largest value either backend produced
+    double err(const float * a, const float * b, size_t n) override {
+        if (!check_naive) {
+            return test_case::err(a, b, n);
+        }
+        double result = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            result = std::max(result, (double) std::max(fabsf(a[i]), fabsf(b[i])));
+        }
+        return result;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        if (!check_naive) {
+            return test_case::max_err(backend);
+        }
+        GGML_UNUSED(backend);
+        return 1e-2;
+    }
+
+    double max_nmse_err() override {
+        // Q4_K/Q8_0 weights against the CPU reference with the Q8_1 activation quantization
+        return 5e-4;
+    }
+
+    // with check_naive only the difference node is compared, the intermediate nodes carry the normal
+    // CPU/CUDA activation quantization difference
+    bool run_whole_graph() override { return check_naive; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return check_naive ? std::vector<ggml_tensor *>{ out_diff } : std::vector<ggml_tensor *>{};
+    }
+
+    test_mul_mat_id_expert_permute(ggml_type type_a = GGML_TYPE_Q4_K,
+            int n_mats = 48, int n_used = 4, int n_dev = 3, int n_layer = 2,
+            int64_t m = 640, int64_t n = 8, int64_t k = 2560, bool all_slot = false, bool check_naive = false)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), n_dev(n_dev), n_layer(n_layer),
+            m(m), n(n), k(k), all_slot(all_slot), check_naive(check_naive), n_local(n_mats / n_dev) {
+            GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(n_dev > 0 && n_mats % n_dev == 0 && n_local >= 2);
+            GGML_ASSERT(n_layer > 0);
+        }
+
+    bool use_weight_context() override { return true; }
+    bool requires_weight_buffer_type() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    // the routing counts the assignment is computed from: pseudo-random per (layer, expert), so the
+    // LPT split scatters the experts of a device over the whole numbering
+    static int64_t profile_count(int layer, int expert) {
+        return (int64_t) ((expert * 7919 + layer * 104729 + 17) % 101) + 1;
+    }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        ggml_backend_dev_t bdev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg  = ggml_backend_dev_backend_reg(bdev);
+        if (reg == nullptr) {
+            return nullptr;
+        }
+        auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra == nullptr) {
+            return nullptr;
+        }
+        dev = backend_device_index(backend);
+        if (dev < 0 || dev >= n_dev) {
+            // no row of the n_dev assignment belongs to this device
+            return nullptr;
+        }
+        for (ggml_backend_buffer_type_t * extra = get_extra(bdev); extra && *extra; ++extra) {
+            const std::string name = ggml_backend_buft_name(*extra);
+            if (name.size() < 8 || name.compare(name.size() - 8, 8, "_Experts") != 0) {
+                continue;
+            }
+
+            // the loader's part: the proposal from the profile, its table, activated. The plan of
+            // the store allocation recomputes the proposal without a profile afterwards, which leaves
+            // the table alone (a table never changes).
+            ggml_expert_store_profile profile;
+            profile.n_layer  = n_layer;
+            profile.n_expert = n_mats;
+            profile.count.assign((size_t) n_layer * n_mats, 0);
+            for (int l = 0; l < n_layer; ++l) {
+                for (int e = 0; e < n_mats; ++e) {
+                    profile.count[(size_t) l * n_mats + e] = profile_count(l, e);
+                }
+            }
+            ggml_expert_store_compute_assignment("test-backend-ops permute", &profile, n_dev, n_layer, n_mats);
+            table = ggml_expert_assignment_from_proposal(n_dev, n_layer, n_mats);
+            GGML_ASSERT(table != 0);
+            ggml_expert_assignment_activate(table, nullptr, 0);
+
+            // the permutation must be a real one for the test to mean anything: the row of the
+            // device differs from its contiguous segment
+            bool permuted = false;
+            for (int l = 0; l < n_layer && !permuted; ++l) {
+                const int16_t * row = ggml_expert_assignment_local_of(table, dev, l);
+                GGML_ASSERT(row != nullptr);
+                int held = 0;
+                for (int e = 0; e < n_mats; ++e) {
+                    const int seg = e >= dev * n_local && e < (dev + 1) * n_local ? e - dev * n_local : -1;
+                    permuted = permuted || row[e] != seg;
+                    held += row[e] >= 0;
+                }
+                GGML_ASSERT(held == n_local);
+            }
+            GGML_ASSERT(permuted);
+
+            // the meta backend marks every per-device MUL_MAT_ID node with its device, the start of
+            // the segment of the device and the table of its weight; the layer was set at build
+            for (ggml_tensor * mm : mm_perm) {
+                ggml_mul_mat_id_set_device(mm, dev);
+                ggml_mul_mat_id_set_expert_offset(mm, dev * n_local);
+                ggml_mul_mat_id_set_assignment(mm, (int32_t) table);
+            }
+
+            // budgets: every expert in a slot, or two experts per tensor in the slots and the
+            // complement in the host arena with a staging area for the whole complement
+            const size_t blob_bytes   = expert_store_stride(type_a, k, m);
+            const size_t expert_bytes = blob_bytes * (size_t) n_local * (size_t) n_layer;
+            const size_t slot_bytes   = all_slot ? expert_bytes : 2 * blob_bytes * (size_t) n_layer;
+            const size_t stage_bytes  = all_slot ? 0 : blob_bytes * (size_t) n_local;
+            auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
+            if (set_budget != nullptr) {
+                set_budget(*extra, slot_bytes, stage_bytes);
+            }
+            for (ggml_tensor * t : as_perm) {
+                mark_expert_tensor(reg, *extra, t);
+            }
+            expert_buft = *extra;
+            return *extra;
+        }
+        return nullptr;
+    }
+
+    void check_weight_alloc(ggml_backend_t backend) override {
+        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, all_slot);
+    }
+
+    void after_eval(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        ggml_expert_assignment_release(table);
+        table = 0;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        // gate/up broadcast one activation row per token
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out  = nullptr;
+        ggml_tensor * diff = nullptr;
+        for (int l = 0; l < n_layer; ++l) {
+            char name[64];
+
+            // the store tensor of the device: n_local experts, filled in local order by initialize_tensors
+            snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", l);
+            ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_local);
+            ggml_set_name(as, name);
+            as_perm.push_back(as);
+
+            // the full weight it is cut from, for the naive computation
+            snprintf(name, sizeof(name), "as_full_%d", l);
+            ggml_tensor * full = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+            ggml_set_name(full, name);
+            as_full.push_back(full);
+
+            snprintf(name, sizeof(name), "ids_%d", l);
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+            ggml_set_name(ids, name);
+            ids_l.push_back(ids);
+
+            ggml_tensor * mm = ggml_mul_mat_id(ctx, as, b, ids);
+            ggml_mul_mat_id_set_expert_parallel(mm, true);
+            ggml_mul_mat_id_set_n_expert_total(mm, n_mats);
+            ggml_mul_mat_id_set_layer(mm, l);
+            // the device and the segment start follow in weight_buffer_type(), when the device is known
+            snprintf(name, sizeof(name), "out_perm_%d", l);
+            ggml_set_name(mm, name);
+            mm_perm.push_back(mm);
+
+            out = out == nullptr ? mm : ggml_concat(ctx, out, mm, 2);
+
+            if (check_naive) {
+                snprintf(name, sizeof(name), "mask_%d", l);
+                ggml_tensor * mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+                ggml_set_name(mask, name);
+                mask_l.push_back(mask);
+
+                ggml_tensor * naive = ggml_mul(ctx, ggml_mul_mat_id(ctx, full, b, ids), mask);
+                snprintf(name, sizeof(name), "naive_%d", l);
+                ggml_set_name(naive, name);
+
+                ggml_tensor * d = ggml_sub(ctx, mm, naive);
+                diff = diff == nullptr ? d : ggml_concat(ctx, diff, d, 2);
+            }
+        }
+        if (check_naive) {
+            ggml_set_name(diff, "out_diff");
+            out_diff = diff;
+            return diff;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = t->name;
+            if (name.compare(0, 4, "ids_") == 0) {
+                // the n_used experts of a token are drawn without replacement over all experts, like
+                // the top-k routing: every device, hence this one, gets matches and misses
+                std::vector<int32_t> data(n_mats);
+                for (int i = 0; i < n_mats; i++) {
+                    data[i] = i;
+                }
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    std::shuffle(data.begin(), data.end(), rng);
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else if (name.compare(0, 5, "mask_") == 0 || name.compare(0, 4, "blk.") == 0) {
+                // filled below from the ids / the full weight
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+
+        // the mask of a layer: 1 for the slots routed to an expert of this device
+        for (size_t l = 0; l < mask_l.size(); ++l) {
+            if (!in_context(ctx, mask_l[l])) {
+                continue;
+            }
+            const int16_t * row = table != 0 ? ggml_expert_assignment_local_of(table, dev, (int) l) : nullptr;
+            std::vector<int32_t> ids((size_t) n_used * n);
+            ggml_backend_tensor_get(ids_l[l], ids.data(), 0, ids.size() * sizeof(int32_t));
+            std::vector<float> mask(ids.size());
+            for (size_t i = 0; i < ids.size(); ++i) {
+                // without an activated assignment (perf mode) the node is the contiguous segment [0, n_local)
+                const bool local = row != nullptr ? row[ids[i]] >= 0 : ids[i] < n_local;
+                mask[i] = local ? 1.0f : 0.0f;
+            }
+            ggml_backend_tensor_set(mask_l[l], mask.data(), 0, mask.size() * sizeof(float));
+        }
+
+        // the store tensor of a layer: local expert k is global expert global_of(dev, l, k) of the
+        // full weight, exactly what the loader writes under a permuted assignment. The compute
+        // context (the full weights) is initialized before the weight context, see test_case::eval.
+        for (size_t l = 0; l < as_perm.size(); ++l) {
+            if (!in_context(ctx, as_perm[l])) {
+                continue;
+            }
+            const size_t expert_bytes = as_full[l]->nb[2];
+            GGML_ASSERT(as_perm[l]->nb[2] == expert_bytes);
+            std::vector<uint8_t> full(ggml_nbytes(as_full[l]));
+            ggml_backend_tensor_get(as_full[l], full.data(), 0, full.size());
+            for (int kk = 0; kk < n_local; ++kk) {
+                // perf mode has no activated assignment: the tensor is the contiguous segment then
+                const int g = table != 0 ? ggml_expert_assignment_global_of(table, dev, (int) l, kk) : kk;
+                GGML_ASSERT(g >= 0 && g < n_mats);
+                ggml_backend_tensor_set(as_perm[l], full.data() + (size_t) g * expert_bytes, (size_t) kk * expert_bytes, expert_bytes);
+            }
+        }
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+
+    static bool in_context(ggml_context * ctx, const ggml_tensor * t) {
+        for (ggml_tensor * c = ggml_get_first_tensor(ctx); c != NULL; c = ggml_get_next_tensor(ctx, c)) {
+            if (c == t) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+// Two models on one device, each with its own expert assignment table, in one graph: the target's
+// experts are laid out by the permutation of its routing profile (table A, layer 0 only), the
+// draft's by its own table (table B, layers 0 and 1: a different permutation, or the contiguous split
+// of its slices). The draft has the layer number the target has (0) and one the target does not have
+// (1, like the MTP layer after the last layer of the target). Every MUL_MAT_ID node reads the table of
+// its own weight (op param assignment, which the meta backend writes from the binding of the weight):
+// the draft's node of layer 0 reads B and not A, the draft's node of layer 1 finds its row in B. A
+// node that read the other model's table would compute other experts than its weight holds, which
+// the naive variant catches; with one table for the process the draft's layer 1 had no row at all.
+// The target's weight is a store tensor; the draft's weights are store tensors too (b_in_store) or
+// plain device tensors of the same buffer, as the MTP draft keeps its experts (no_expert_store).
+//   check_naive == false: against the CPU reference, which reads the same rows;
+//   check_naive == true:  the difference to the naive computation on the full unpermuted weights
+//                         masked to the experts of this device, zero on both backends.
+struct test_mul_mat_id_expert_two_tables : public test_case {
+    const ggml_type type_a;
+    const int n_mats;    // global experts of every weight
+    const int n_used;
+    const int n_dev;     // devices of both tables, n_mats is a multiple
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+    const bool b_permuted;
+    const bool b_in_store;
+    const bool check_naive;
+
+    const int n_local;   // experts of the device of the test
+
+    int      dev     = -1;
+    uint32_t table_a = 0;
+    uint32_t table_b = 0;
+
+    // the three weights: [0] target layer 0 (table A), [1] draft layer 0 (table B), [2] draft layer 1 (table B)
+    static constexpr int N_W = 3;
+    ggml_tensor * as_w[N_W]   = {};
+    ggml_tensor * as_full[N_W] = {};
+    ggml_tensor * ids_w[N_W]  = {};
+    ggml_tensor * mask_w[N_W] = {};
+    ggml_tensor * mm_w[N_W]   = {};
+    ggml_tensor * out_diff = nullptr;
+    ggml_backend_buffer_type_t expert_buft = nullptr;
+
+    static int w_layer(int w) { return w == 2 ? 1 : 0; }
+    uint32_t w_table(int w) const { return w == 0 ? table_a : table_b; }
+
+    std::string vars() override {
+        return VARS_TO_STR10(type_a, n_mats, n_used, n_dev, m, n, k, b_permuted, b_in_store, check_naive);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_TWO_TABLES";
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * m * k * n * n_used * N_W;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (!check_naive) {
+            return test_case::err(a, b, n);
+        }
+        double result = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            result = std::max(result, (double) std::max(fabsf(a[i]), fabsf(b[i])));
+        }
+        return result;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        if (!check_naive) {
+            return test_case::max_err(backend);
+        }
+        GGML_UNUSED(backend);
+        return 1e-2;
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    bool run_whole_graph() override { return check_naive; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return check_naive ? std::vector<ggml_tensor *>{ out_diff } : std::vector<ggml_tensor *>{};
+    }
+
+    test_mul_mat_id_expert_two_tables(ggml_type type_a = GGML_TYPE_Q4_K,
+            int n_mats = 48, int n_used = 4, int n_dev = 3,
+            int64_t m = 640, int64_t n = 8, int64_t k = 2560,
+            bool b_permuted = false, bool b_in_store = false, bool check_naive = false)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), n_dev(n_dev), m(m), n(n), k(k),
+            b_permuted(b_permuted), b_in_store(b_in_store), check_naive(check_naive), n_local(n_mats / n_dev) {
+            GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(n_dev > 0 && n_mats % n_dev == 0 && n_local >= 2);
+        }
+
+    bool use_weight_context() override { return true; }
+    bool requires_weight_buffer_type() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    // routing counts of the two models: pseudo-random and different, so the two permutations differ
+    static int64_t profile_count(int model, int layer, int expert) {
+        return model == 0
+            ? (int64_t) ((expert * 7919 + layer * 104729 + 17) % 101) + 1
+            : (int64_t) ((expert * 6007 + layer * 3571 + 71) % 97) + 1;
+    }
+
+    // a permutation table of n_layer layers from the counts of model `model`, activated
+    uint32_t permuted_table(int model, int n_layer) const {
+        ggml_expert_store_profile profile;
+        profile.n_layer  = n_layer;
+        profile.n_expert = n_mats;
+        profile.count.assign((size_t) n_layer * n_mats, 0);
+        for (int l = 0; l < n_layer; ++l) {
+            for (int e = 0; e < n_mats; ++e) {
+                profile.count[(size_t) l * n_mats + e] = profile_count(model, l, e);
+            }
+        }
+        ggml_expert_store_compute_assignment(model == 0 ? "test-backend-ops two tables A" : "test-backend-ops two tables B",
+            &profile, n_dev, n_layer, n_mats);
+        const uint32_t t = ggml_expert_assignment_from_proposal(n_dev, n_layer, n_mats);
+        GGML_ASSERT(t != 0);
+        return t;
+    }
+
+    ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) override {
+        ggml_backend_dev_t bdev = ggml_backend_get_device(backend);
+        ggml_backend_reg_t reg  = ggml_backend_dev_backend_reg(bdev);
+        if (reg == nullptr) {
+            return nullptr;
+        }
+        auto get_extra = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts");
+        if (get_extra == nullptr) {
+            return nullptr;
+        }
+        dev = backend_device_index(backend);
+        if (dev < 0 || dev >= n_dev) {
+            return nullptr;
+        }
+        for (ggml_backend_buffer_type_t * extra = get_extra(bdev); extra && *extra; ++extra) {
+            const std::string name = ggml_backend_buft_name(*extra);
+            if (name.size() < 8 || name.compare(name.size() - 8, 8, "_Experts") != 0) {
+                continue;
+            }
+
+            // the two loaders: the target's table from its profile, the draft's from its own
+            // profile or the contiguous split of its slices; both activated, neither replaces the other
+            table_a = permuted_table(0, 1);
+            if (b_permuted) {
+                table_b = permuted_table(1, 2);
+            } else {
+                std::vector<int64_t> caps((size_t) n_dev, n_local);
+                table_b = ggml_expert_assignment_contiguous(n_dev, 2, n_mats, caps.data());
+                GGML_ASSERT(table_b != 0);
+            }
+            ggml_expert_assignment_activate(table_a, nullptr, 0);
+            ggml_expert_assignment_activate(table_b, nullptr, 0);
+
+            // the test only means something if the two tables give the nodes of layer 0 of this
+            // device different rows, and the target's row is not the contiguous segment
+            const int16_t * ra = ggml_expert_assignment_local_of(table_a, dev, 0);
+            const int16_t * rb = ggml_expert_assignment_local_of(table_b, dev, 0);
+            GGML_ASSERT(ra != nullptr && rb != nullptr && ggml_expert_assignment_local_of(table_b, dev, 1) != nullptr);
+            GGML_ASSERT(ggml_expert_assignment_local_of(table_a, dev, 1) == nullptr); // the target has no layer 1
+            bool differ = false;
+            bool a_permuted = false;
+            for (int e = 0; e < n_mats; ++e) {
+                differ = differ || ra[e] != rb[e];
+                const int seg = e >= dev * n_local && e < (dev + 1) * n_local ? e - dev * n_local : -1;
+                a_permuted = a_permuted || ra[e] != seg;
+            }
+            GGML_ASSERT(differ && a_permuted);
+
+            // the meta backend marks every per-device node with its device, segment start and the
+            // table of its weight; the layers were set at build
+            for (int w = 0; w < N_W; ++w) {
+                ggml_mul_mat_id_set_device(mm_w[w], dev);
+                ggml_mul_mat_id_set_expert_offset(mm_w[w], dev * n_local);
+                ggml_mul_mat_id_set_assignment(mm_w[w], (int32_t) w_table(w));
+            }
+
+            // budgets: two experts per store tensor in the slots, the complement in the host arena
+            // with a staging area for the whole complement of one tensor
+            const int n_store = b_in_store ? N_W : 1;
+            const size_t blob_bytes  = expert_store_stride(type_a, k, m);
+            const size_t slot_bytes  = 2 * blob_bytes * (size_t) n_store;
+            const size_t stage_bytes = blob_bytes * (size_t) n_local;
+            auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
+            if (set_budget != nullptr) {
+                set_budget(*extra, slot_bytes, stage_bytes);
+            }
+            mark_expert_tensor(reg, *extra, as_w[0]);
+            if (b_in_store) {
+                mark_expert_tensor(reg, *extra, as_w[1]);
+                mark_expert_tensor(reg, *extra, as_w[2]);
+            }
+            expert_buft = *extra;
+            return *extra;
+        }
+        return nullptr;
+    }
+
+    void check_weight_alloc(ggml_backend_t backend) override {
+        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, /*all_slot =*/ false);
+    }
+
+    void after_eval(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        ggml_expert_assignment_release(table_a);
+        ggml_expert_assignment_release(table_b);
+        table_a = 0;
+        table_b = 0;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(b, "b");
+
+        // the target's gate weight of layer 0, the draft's gate weights of layers 0 and 1
+        static const char * const names[N_W] = {
+            "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.1.ffn_gate_exps.weight",
+        };
+
+        ggml_tensor * out  = nullptr;
+        ggml_tensor * diff = nullptr;
+        for (int w = 0; w < N_W; ++w) {
+            char name[64];
+
+            ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_local);
+            ggml_set_name(as, names[w]);
+            as_w[w] = as;
+
+            snprintf(name, sizeof(name), "as_full_%d", w);
+            as_full[w] = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+            ggml_set_name(as_full[w], name);
+
+            snprintf(name, sizeof(name), "ids_%d", w);
+            ids_w[w] = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+            ggml_set_name(ids_w[w], name);
+
+            ggml_tensor * mm = ggml_mul_mat_id(ctx, as, b, ids_w[w]);
+            ggml_mul_mat_id_set_expert_parallel(mm, true);
+            ggml_mul_mat_id_set_n_expert_total(mm, n_mats);
+            ggml_mul_mat_id_set_layer(mm, w_layer(w));
+            // the device, the segment start and the table follow in weight_buffer_type()
+            snprintf(name, sizeof(name), "out_w%d", w);
+            ggml_set_name(mm, name);
+            mm_w[w] = mm;
+
+            out = out == nullptr ? mm : ggml_concat(ctx, out, mm, 2);
+
+            if (check_naive) {
+                snprintf(name, sizeof(name), "mask_%d", w);
+                mask_w[w] = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n);
+                ggml_set_name(mask_w[w], name);
+
+                ggml_tensor * naive = ggml_mul(ctx, ggml_mul_mat_id(ctx, as_full[w], b, ids_w[w]), mask_w[w]);
+                snprintf(name, sizeof(name), "naive_%d", w);
+                ggml_set_name(naive, name);
+
+                ggml_tensor * d = ggml_sub(ctx, mm, naive);
+                diff = diff == nullptr ? d : ggml_concat(ctx, diff, d, 2);
+            }
+        }
+        if (check_naive) {
+            ggml_set_name(diff, "out_diff");
+            out_diff = diff;
+            return diff;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = t->name;
+            if (name.compare(0, 4, "ids_") == 0) {
+                // top-k like: n_used distinct experts per token over the whole numbering
+                std::vector<int32_t> data(n_mats);
+                for (int i = 0; i < n_mats; i++) {
+                    data[i] = i;
+                }
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    std::shuffle(data.begin(), data.end(), rng);
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else if (name.compare(0, 5, "mask_") == 0 || name.compare(0, 4, "blk.") == 0) {
+                // filled below from the ids / the full weights
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+
+        // the mask of a weight: 1 for the slots routed to an expert this device holds of it
+        for (int w = 0; w < N_W; ++w) {
+            if (mask_w[w] == nullptr || !in_context(ctx, mask_w[w])) {
+                continue;
+            }
+            const uint32_t tab = w_table(w);
+            const int16_t * row = tab != 0 ? ggml_expert_assignment_local_of(tab, dev, w_layer(w)) : nullptr;
+            std::vector<int32_t> ids((size_t) n_used * n);
+            ggml_backend_tensor_get(ids_w[w], ids.data(), 0, ids.size() * sizeof(int32_t));
+            std::vector<float> mask(ids.size());
+            for (size_t i = 0; i < ids.size(); ++i) {
+                // perf mode has no table: the node is the contiguous segment [0, n_local)
+                const bool local = row != nullptr ? row[ids[i]] >= 0 : ids[i] < n_local;
+                mask[i] = local ? 1.0f : 0.0f;
+            }
+            ggml_backend_tensor_set(mask_w[w], mask.data(), 0, mask.size() * sizeof(float));
+        }
+
+        // the weight of the device: local expert kk is the global expert its own table names, what
+        // its loader writes. The compute context (the full weights) is initialized first.
+        for (int w = 0; w < N_W; ++w) {
+            if (!in_context(ctx, as_w[w])) {
+                continue;
+            }
+            const uint32_t tab = w_table(w);
+            const size_t expert_bytes = as_full[w]->nb[2];
+            GGML_ASSERT(as_w[w]->nb[2] == expert_bytes);
+            std::vector<uint8_t> full(ggml_nbytes(as_full[w]));
+            ggml_backend_tensor_get(as_full[w], full.data(), 0, full.size());
+            for (int kk = 0; kk < n_local; ++kk) {
+                const int g = tab != 0 ? ggml_expert_assignment_global_of(tab, dev, w_layer(w), kk) : kk;
+                GGML_ASSERT(g >= 0 && g < n_mats);
+                ggml_backend_tensor_set(as_w[w], full.data() + (size_t) g * expert_bytes, (size_t) kk * expert_bytes, expert_bytes);
+            }
+        }
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_mul_mat_id_ids(ctx, n_mats);
+    }
+
+    static bool in_context(ggml_context * ctx, const ggml_tensor * t) {
+        for (ggml_tensor * c = ggml_get_first_tensor(ctx); c != NULL; c = ggml_get_next_tensor(ctx, c)) {
+            if (c == t) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+// expert parallelism with the gate/up GLU fusion: gate and up are each split along the expert
+// dim, fused with swiglu per shard, and the shard results sum to the full fused result.
+struct test_mul_mat_id_ep_fusion : public test_case {
+    const ggml_type type_a;
+    const int n_mats;
+    const int n_used;
+    const int n_shards;
+    const int64_t m;
+    const int64_t n;
+    const int64_t k;
+
+    std::string vars() override {
+        return VARS_TO_STR7(type_a, n_mats, n_used, n_shards, m, n, k);
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double result = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            result = std::max(result, (double) fabsf(a[i] - b[i]));
+        }
+        return result;
+    }
+
+    double max_err(ggml_backend_t backend) override {
+        GGML_UNUSED(backend);
+        return 1e-2;
+    }
+
+    // filter with -o MUL_MAT_ID_EP_FUSION
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EP_FUSION";
+    }
+
+    test_mul_mat_id_ep_fusion(ggml_type type_a = GGML_TYPE_Q4_K,
+            int n_mats = 512, int n_used = 10, int n_shards = 6,
+            int64_t m = 640, int64_t n = 1, int64_t k = 2560)
+        : type_a(type_a), n_mats(n_mats), n_used(n_used), n_shards(n_shards), m(m), n(n), k(k) {
+            GGML_ASSERT(n_used <= n_mats);
+            GGML_ASSERT(n_shards > 0 && n_shards <= n_mats);
+        }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(gate, "gate");
+        ggml_tensor * up = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_set_name(up, "up");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+
+        // gate/up broadcast one activation row per token
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = nullptr;
+        for (int s = 0; s < n_shards; ++s) {
+            const int64_t start = (int64_t) n_mats * s / n_shards;
+            const int64_t end   = (int64_t) n_mats * (s + 1) / n_shards;
+            if (end == start) {
+                continue;
+            }
+            ggml_tensor * gate_s = ggml_view_3d(ctx, gate, k, m, end - start, gate->nb[1], gate->nb[2], start*gate->nb[2]);
+            ggml_tensor * up_s   = ggml_view_3d(ctx, up,   k, m, end - start, up->nb[1],   up->nb[2],   start*up->nb[2]);
+            ggml_tensor * gate_mm = ggml_mul_mat_id(ctx, gate_s, b, ids);
+            ggml_mul_mat_id_set_expert_parallel(gate_mm, true);
+            ggml_mul_mat_id_set_expert_offset(gate_mm, (int32_t) start);
+            ggml_mul_mat_id_set_n_expert_total(gate_mm, n_mats);
+            ggml_tensor * up_mm = ggml_mul_mat_id(ctx, up_s, b, ids);
+            ggml_mul_mat_id_set_expert_parallel(up_mm, true);
+            ggml_mul_mat_id_set_expert_offset(up_mm, (int32_t) start);
+            ggml_mul_mat_id_set_n_expert_total(up_mm, n_mats);
+            ggml_tensor * glu_s = ggml_swiglu_split(ctx, gate_mm, up_mm);
+            out = out == nullptr ? glu_s : ggml_add(ctx, out, glu_s);
+        }
+        ggml_set_name(out, "out_ep");
+
+        // full fused reference in the same graph
+        ggml_tensor * gate_full = ggml_mul_mat_id(ctx, gate, b, ids);
+        ggml_tensor * up_full   = ggml_mul_mat_id(ctx, up,   b, ids);
+        ggml_tensor * glu_full  = ggml_swiglu_split(ctx, gate_full, up_full);
+        ggml_set_name(glu_full, "glu_full");
+
+        ggml_tensor * diff = ggml_sub(ctx, out, glu_full);
+        ggml_set_name(diff, "out_diff");
+        out_diff = diff;
+        return diff;
+    }
+
+    // the fusion only triggers when the whole graph is computed, and only the difference is checked
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out_diff }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats, 1.0f);
+
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        std::uniform_int_distribution<int32_t> dist(0, n_mats - 1);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = dist(rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+
+    ggml_tensor * out_diff = nullptr;
 };
 
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
@@ -8803,7 +11269,7 @@ struct test_flash_attn_ext : public test_case {
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
     const bool causal; // use a causal mask instead of a random mask
-    const int range; // 0: dense f16 mask, 1: causal range mask (I32), 2: random range mask (I32), 3-5: deterministic range masks
+    const int range; // 0: dense f16 mask, 1: causal range mask (I32), 2: random range mask (I32), 3-5: deterministic range masks, 6: ring-wrap two-interval mask
 
     std::string vars() override {
         return VARS_TO_STR19(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, causal, range);
@@ -8873,7 +11339,7 @@ struct test_flash_attn_ext : public test_case {
 
         ggml_tensor * m = nullptr;
         if (mask) {
-            m = range != 0 ? ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, nb, 1, nr23[1])
+            m = range != 0 ? ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 4, nb, 1, nr23[1])
                            : ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nr23[1]);
             ggml_set_name(m, "m");
         }
@@ -8973,7 +11439,7 @@ struct test_flash_attn_ext_window : public test_case {
         v = ggml_permute(ctx, v, 0, 2, 1, 3);
         ggml_set_name(v, "v");
 
-        ggml_tensor * m = range_mask ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, n_q)
+        ggml_tensor * m = range_mask ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 4, n_q)
                                      : ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n_kv, n_q);
         ggml_set_name(m, "m");
 
@@ -9508,6 +11974,214 @@ struct test_lightning_indexer : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_QSA_SELECT
+// integer-valued q and keys keep every score exact on every backend, so the selection, equal scores included, must
+// match the CPU id for id. The keys are read in place through pool_cells from a cache-like table: rows of raw key |
+// pooled key (the selection reads the second half, rows are strided), more rows than pools, the pools in shuffled rows.
+// real: uniform q and keys for the perf cases (a realistic spread of the scores for the top-k), not exact
+struct test_qsa_select : public test_case {
+    const int64_t n_pool;  // pools, the last n_pad of them padded
+    const int64_t n_pad;
+    const int64_t nb;      // tokens
+    const int64_t kpool;
+    const int64_t n_top;
+    const ggml_type type_K;
+    const bool    real;
+
+    std::string vars() override {
+        return VARS_TO_STR7(n_pool, n_pad, nb, kpool, n_top, type_K, real);
+    }
+
+    // the ids are exact, so any wrong id fails, however close its cell number
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
+    test_qsa_select(int64_t n_pool = 512, int64_t n_pad = 8, int64_t nb = 16, int64_t kpool = 4, int64_t n_top = 64,
+            ggml_type type_K = GGML_TYPE_F16, bool real = false)
+        : n_pool(n_pool), n_pad(n_pad), nb(nb), kpool(kpool), n_top(n_top), type_K(type_K), real(real) {}
+
+    int64_t n_rows() const {
+        return n_pool*kpool + 5;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, 4, nb);
+        ggml_set_name(q, "q");
+        ggml_tensor * kt = ggml_new_tensor_3d(ctx, type_K, 256, 1, n_rows());
+        ggml_set_name(kt, "k");
+        ggml_tensor * k = ggml_view_3d(ctx, kt, 128, 1, n_rows(), ggml_row_size(type_K, 128), kt->nb[2],
+                                       ggml_row_size(type_K, 128));
+        ggml_set_name(k, "k_pooled");
+        ggml_tensor * pcell = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_pool);
+        ggml_set_name(pcell, "pcell");
+        ggml_tensor * pidx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool, n_pool);
+        ggml_set_name(pidx, "pidx");
+        ggml_tensor * tidx = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool - 1, nb);
+        ggml_set_name(tidx, "tidx");
+        ggml_tensor * prng = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 2, nb);
+        ggml_set_name(prng, "prng");
+
+        ggml_tensor * out = ggml_qsa_select(ctx, q, k, pcell, pidx, tidx, prng, 0.25f, (int32_t) n_top, -1);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x51ec7);
+        const int64_t n_real = n_pool - n_pad;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr) {
+                continue; // k_pooled is a window of k
+            }
+            if (real && (strcmp(t->name, "q") == 0 || strcmp(t->name, "k") == 0)) {
+                init_tensor_uniform(t);
+            } else if (strcmp(t->name, "q") == 0 || strcmp(t->name, "k") == 0) {
+                if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
+                    // small integers: exact in half, and many equal scores to exercise the tie order
+                    std::uniform_int_distribution<int> dist(-2, 2);
+                    std::vector<float> v(ggml_nelements(t));
+                    for (float & x : v) {
+                        x = (float) dist(gen);
+                    }
+                    if (t->type == GGML_TYPE_F32) {
+                        ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+                    } else {
+                        std::vector<ggml_fp16_t> h(v.size());
+                        ggml_fp32_to_fp16_row(v.data(), h.data(), (int64_t) v.size());
+                        ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+                    }
+                } else {
+                    // Q8_0 keys on the 1/128 grid with an exact amax of 127/128 in every block: the quantizer
+                    // picks d = 1/128, so the dequantized keys are exact in half and the CPU and the CUDA
+                    // scorer see the same values
+                    GGML_ASSERT(t->type == GGML_TYPE_Q8_0);
+                    std::uniform_int_distribution<int> dist(-127, 127);
+                    std::vector<float> v(ggml_nelements(t));
+                    for (float & x : v) {
+                        x = (float) dist(gen) / 128.0f;
+                    }
+                    const size_t blck = (size_t) ggml_blck_size(t->type);
+                    for (size_t i = 0; i < v.size(); i += blck) {
+                        v[i] = 127.0f / 128.0f;
+                    }
+                    std::vector<uint8_t> dataq(ggml_row_size(t->type, v.size()));
+                    ggml_quantize_chunk(t->type, v.data(), dataq.data(), 0, (int64_t) (v.size()/blck), (int64_t) blck, nullptr);
+                    ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
+                }
+            } else if (strcmp(t->name, "pcell") == 0) {
+                // the real pools in distinct shuffled rows of the table, the padded ones on the first of them
+                std::vector<int32_t> rows(n_rows());
+                for (size_t i = 0; i < rows.size(); ++i) {
+                    rows[i] = (int32_t) i;
+                }
+                std::shuffle(rows.begin(), rows.end(), gen);
+                std::vector<int32_t> v(n_pool, rows[0]);
+                std::copy(rows.begin(), rows.begin() + n_real, v.begin());
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "pidx") == 0) {
+                // the real pools address distinct cells in a shuffled order, the padded ones are -1
+                std::vector<int32_t> cells(n_real*kpool);
+                for (size_t i = 0; i < cells.size(); ++i) {
+                    cells[i] = (int32_t) i;
+                }
+                std::shuffle(cells.begin(), cells.end(), gen);
+                std::vector<int32_t> v(n_pool*kpool, -1);
+                std::copy(cells.begin(), cells.end(), v.begin());
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "tidx") == 0) {
+                std::uniform_int_distribution<int> dist(-1, 1000);
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (int32_t & x : v) {
+                    const int c = dist(gen);
+                    x = c < 100 ? -1 : (int32_t) (n_real*kpool + c);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "prng") == 0) {
+                // visible ranges inside the real pools: empty, shorter and longer than n_top (perf: all of them, as a
+                // decode step sees)
+                std::uniform_int_distribution<int64_t> dist(0, n_real);
+                std::vector<int32_t> v(2*nb);
+                for (int64_t i = 0; i < nb; ++i) {
+                    int64_t a = dist(gen);
+                    int64_t b = dist(gen);
+                    if (real || i % 4 == 0) {
+                        a = 0;
+                        b = n_real;
+                    } else if (i % 4 == 1) {
+                        b = a;
+                    }
+                    v[2*i + 0] = (int32_t) std::min(a, b);
+                    v[2*i + 1] = (int32_t) std::max(a, b);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_QSA_ATTN
+struct test_qsa_attn : public test_case {
+    const int64_t n_head_kv;
+    const int64_t n_kv;
+    const int64_t nb;      // tokens over all streams
+    const int64_t ns;      // streams
+    const int64_t n_sel;
+    const int64_t n_valid; // valid ids per token, a prefix of the row
+    const ggml_type type_KV;
+
+    std::string vars() override {
+        return VARS_TO_STR7(n_head_kv, n_kv, nb, ns, n_sel, n_valid, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_qsa_attn(int64_t n_head_kv = 2, int64_t n_kv = 4096, int64_t nb = 4, int64_t ns = 1, int64_t n_sel = 2051,
+            int64_t n_valid = 2051, ggml_type type_KV = GGML_TYPE_Q8_0)
+        : n_head_kv(n_head_kv), n_kv(n_kv), nb(nb), ns(ns), n_sel(n_sel), n_valid(n_valid), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 12*n_head_kv, nb);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_KV, 256, n_head_kv, n_kv, ns);
+        ggml_set_name(k, "k");
+        ggml_tensor * v = ggml_new_tensor_4d(ctx, type_KV, 256, n_head_kv, n_kv, ns);
+        ggml_set_name(v, "v");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_sel, nb);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * out = ggml_qsa_attn(ctx, q, k, v, ids, 1.0f/16.0f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x9a77);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "ids") == 0) {
+                // distinct cells per token, the first n_valid of a row, then -1; a few tokens see fewer
+                std::vector<int32_t> cells(n_kv);
+                for (int64_t i = 0; i < n_kv; ++i) {
+                    cells[i] = (int32_t) i;
+                }
+                std::vector<int32_t> v(n_sel*nb, -1);
+                for (int64_t i = 0; i < nb; ++i) {
+                    std::shuffle(cells.begin(), cells.end(), gen);
+                    const int64_t n = i % 3 == 2 ? std::min<int64_t>(n_valid, 37 + i) : n_valid;
+                    std::copy(cells.begin(), cells.begin() + n, v.begin() + i*n_sel);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
             } else {
                 init_tensor_uniform(t);
             }
@@ -10196,6 +12870,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
 
+    test_bf16_to_f16_exact();
+
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int v : {0, 1}) {
@@ -10280,6 +12956,49 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
+    // production width: decode (n_tokens=1) and prefill (2048), the DSV4_HC_POST gate fused
+    // into the post kernel; identity comb, as qwen4exp builds the hyper-connection combine
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 2048, true, true));
+    // the post followed by the next mixer's RMS_NORM -> MUL: fused at the decode and verify widths,
+    // unfused below 1024 columns
+    for (int64_t n_tokens : {1, 4, 8, 17}) {
+        test_cases.emplace_back(new test_dsv4_hc_post_norm(2560, n_tokens));
+    }
+    test_cases.emplace_back(new test_dsv4_hc_post_norm(1280, 4));
+    test_cases.emplace_back(new test_dsv4_hc_post_norm(512, 4));
+    // the mixer opening on Q8_0 projections: fused at M <= 16 (with and without the post before
+    // it), unfused at M = 17
+    for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
+        test_cases.emplace_back(new test_hc_mix_q8(2560, 320, n_tokens, true));
+    }
+    test_cases.emplace_back(new test_hc_mix_q8(2560, 320, 4, false));
+    test_cases.emplace_back(new test_hc_mix_q8(1024, 128, 4, true));
+    // the mixer result handed to the projections that open the block as F16 (M <= 16; 17 unfused):
+    // GDN qkv + z on a 3-head and a 2-head card, QSA q/k/v, and a single projection
+    for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
+        test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {1920, 1152, 0}, n_tokens));
+    }
+    test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {1280, 768, 0}, 4));
+    test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {2048, 256, 256}, 4));
+    test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {1024, 0, 0}, 4));
+    // the GDN gated norm (sigmoid: qwen4exp, silu: Qwen3.5) handed to ssm_out as F16 (M <= 16)
+    for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
+        test_cases.emplace_back(new test_gated_norm_q8(128, 9, 2560, n_tokens, true));
+    }
+    test_cases.emplace_back(new test_gated_norm_q8(128, 6, 2560, 4, true));
+    test_cases.emplace_back(new test_gated_norm_q8(128, 8, 2560, 4, false));
+    test_cases.emplace_back(new test_gated_norm_q8(64, 4, 1024, 3, true));
+    // the attention output gate handed to wo as F16 (M <= 16)
+    for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
+        test_cases.emplace_back(new test_attn_gate_q8(256, 4, 2560, n_tokens));
+    }
+    test_cases.emplace_back(new test_attn_gate_q8(128, 3, 1024, 4));
+
+    // scale + unary(silu): decode and prefill shapes of the hyper-connection mixer activation
+    test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 320, 1, 1, 1 }));
+    test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 320, 2048, 1, 1 }));
+    test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 128, 2, 2, 2 }, -1.5f));
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
@@ -10340,6 +13059,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+    // the token embedding table of the shipped Q8_0 models has a 2560-wide row
+    for (int b : {1, 7}) {
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 2560, 5, 4, b, 1, false, false));
+    }
+    // IQ4_NL rows that are a multiple of the 32-value sub-block but not of QK_K
+    for (int n : {32, 96, 160, 224}) {
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, n, 5, 4, 1, 1, false, false));
+        test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, n, 5, 4, 7, 1, false, false));
+    }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
@@ -11298,6 +14026,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, 5120, {1, 1}, {1, 1}));
 
+    // Q8_0 skinny GEMM on the narrow Qwen3.8-Flash-Next decode shapes (6-card tensor split): the
+    // hyper-connection down projection (N = 320, 10 tiles) splits K over several CTAs per tile
+    // for M <= 16; the up projection (K = 320) and the shared expert down (K = 640) keep one CTA
+    for (int64_t n_tokens : {1, 2, 4, 7, 8, 9, 16, 17, 32}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320, n_tokens, 10240, {1, 1}, {1, 1}));
+    }
+    for (int64_t n_tokens : {1, 4, 8, 16}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, n_tokens, 320, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, n_tokens, 640, {1, 1}, {1, 1}));
+    }
+
+    // narrow F32/BF16 GEMV of the Qwen3.8-Flash-Next decode graph: few long rows (the
+    // hyper-connection inject [10240, 4], a GDN beta/alpha slice [2560, 8], the shared expert
+    // gate [2560, 1]) split each row over 8 CTAs; many rows at M > 1 (the router [2560, 512], the
+    // indexer projection, BF16) run 4 rows per block
+    for (int64_t n_tokens : {1, 2, 4, 7, 8}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 4,   n_tokens, 10240, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 8,   n_tokens, 2560,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 1,   n_tokens, 2560,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 512, n_tokens, 2560,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 512, n_tokens, 2560,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 128, n_tokens, 2560,  {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  n_tokens, 2048,  {1, 1}, {1, 1}));
+    }
+
     // Q2_K/Q3_K/Q4_K/Q5_K/Q6_K skinny GEMM (repacked codes + raw super-block meta, sm_70):
     // M <= 16 runs the single-stage kernel, M = 17..64 the two-phase M=32 kernel (split-16
     // shapes), M > 64 expands the repacked weights to F16 and uses the regular dense path. The
@@ -11358,6 +14111,36 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n_tokens : {1, 8, 16, 24, 32, 48, 64}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n_tokens, 4352, 5120,
             false, 1, 1, false, false, true, false, {1, 1}));
+    }
+    // the Qwen3.8-Flash-Next shared expert gate/up (N = 640, 20 tiles): K split over several CTAs
+    for (int64_t n_tokens : {1, 2, 4, 8, 9, 16}) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n_tokens, 640, 2560,
+            false, 1, 1, false, false, true, false, {1, 1}));
+    }
+    // the shared expert tail, decode and prefill widths
+    for (int64_t n_tokens : {1, 4, 17, 512}) {
+        test_cases.emplace_back(new test_shexp_tail(2560, n_tokens));
+    }
+    test_cases.emplace_back(new test_shexp_tail(96, 3));
+    // the shared expert with its down projection: the gated pair hands F16 activations to the
+    // down projection (M <= 16), a wide pair keeps the F32 GLU output (N = 4352)
+    for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
+        test_cases.emplace_back(new test_ffn_q8(2560, 640, n_tokens));
+    }
+    test_cases.emplace_back(new test_ffn_q8(5120, 4352, 4));
+    // the shared expert split over the devices under expert parallelism (64-row units of the 640
+    // rows): gate/up rows and down columns per device on 6 (64/128), 4 (128/192), 3 (192/256) and
+    // 2 (320) devices, the fused decode/verify path and the plain matmuls of decode and prefill
+    for (int64_t n_ff : {64, 128, 192, 256, 320}) {
+        for (int64_t n_tokens : {1, 4, 16, 17}) {
+            test_cases.emplace_back(new test_ffn_q8(2560, n_ff, n_tokens));
+        }
+    }
+    for (int64_t n_ff : {64, 128, 192, 320}) {
+        for (int64_t n_tokens : {1, 4, 17, 512}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, n_ff, n_tokens, 2560, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, n_tokens, n_ff, {1, 1}, {1, 1}));
+        }
     }
 
     // multiple repacked Q2_K~Q6_K matmuls sharing one input: the multi-weight kernel for
@@ -11525,6 +14308,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 1, 256, {3, 2}, {2, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 8, 256, {1, 1}, {1, 1}));
 
+    // BF16 weights in the decode (n = 1 and up to the MMVF batch limit of 8) and prefill
+    // (n = 16 and up) shapes of the hyper-connection and router weights (m = 160/256)
+    for (int64_t m : {160, 256}) {
+        for (int64_t n : {1, 8, 16, 512}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, m, n, 256, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 8, 8, false, m,  1, 256));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 8, 8, false, m, 16, 256));
+    }
+
+    // the same weight after the load-time BF16 -> F16 conversion, with BF16 data beyond the F16 range
+    test_cases.emplace_back(new test_mul_mat_bf16_to_f16(160,  1, 256));
+    test_cases.emplace_back(new test_mul_mat_bf16_to_f16(160,  8, 256));
+    test_cases.emplace_back(new test_mul_mat_bf16_to_f16(160, 16, 256));
+    test_cases.emplace_back(new test_mul_mat_bf16_to_f16(256,  1, 256));
+    test_cases.emplace_back(new test_mul_mat_bf16_to_f16(256, 16, 256));
+
     // token-tile boundary coverage. With n_used == n_mats every token routes to every expert, so
     // each expert receives exactly n rows, with no dependence on the random draw. mul_mm_id is used
     // from 32 tokens up: n = 32, 33, 47, 48, 49 reach it, leaving a last tile of 32, 1, 15, 16 and
@@ -11687,7 +14487,256 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 1024, 10, false, 128, n, 512));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,   GGML_TYPE_F32, 1024, 10, false, 256, n, 128));
     }
+
+    // Qwen3.8-Flash-Next expert projections: Q2_0 weights, 512 experts, top-10,
+    // gate/up (m = 640, k = 2560) and down (m = 2560, k = 640)
+    for (int n : {1, 8, 64}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
+    }
+
+    // expert parallelism: split the experts along the expert dim and compare the sum of the
+    // per-shard results against the full computation. n covers the MMVQ single-token path,
+    // the MMVQ mmid path (n = 9..16), the grouped kernel (n = 9..64), the MMQ path and the
+    // 2048 prefill batch whose per-expert column count is estimated from the global expert count.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_Q2_0}) {
+        for (int n : {1, 8, 12, 16, 24, 64, 128, 512, 2048}) {
+            // gate/up shape, broadcast activation (this is what the model graph uses)
+            test_cases.emplace_back(new test_mul_mat_id_ep(type_a, GGML_TYPE_F32, 512, 10, 6,  640, n, 2560, true));
+            if (640 % ggml_blck_size(type_a) == 0) {
+                // down shape, one activation row per (token, slot)
+                test_cases.emplace_back(new test_mul_mat_id_ep(type_a, GGML_TYPE_F32, 512, 10, 6, 2560, n,  640, false));
+            }
+        }
+    }
+
+    // Q5_1 as in UD-Q4_K_XL (the down projection uses Q5_1/Q8_0): the gate/up and down shapes at
+    // the grouped, MMQ and prefill batch sizes.
+    for (int n : {64, 512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_id_ep(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, 6,  640, n, 2560, true));
+        test_cases.emplace_back(new test_mul_mat_id_ep(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, 6, 2560, n,  640, false));
+    }
+
+    // expert parallelism with the gate/up GLU fusion: the shards must sum to the full fused result.
+    // The MMVQ fusion only handles up to 16 tokens per block on Volta.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 8, 12, 16}) {
+            test_cases.emplace_back(new test_mul_mat_id_ep_fusion(type_a, 512, 10, 6, 640, n, 2560));
+        }
+    }
+
+    // expert weights in a device-readable host buffer type (CUDA mapped host memory).
+    // n covers every dispatch path: MMVQ (1, 8), the grouped kernel (9..64), MMQ prefill (65+)
+    // and the large prefill batches (512, 2048). On a mapped weight none of these may allocate
+    // a full expert tensor in device memory; the mapped-MMQ path reads the weights in place.
+    // The framework does not expose the CUDA pool high-water mark, so on a machine verify with
+    // the CUDA pool peak logged at exit or by watching nvidia-smi during a 16K prefill: the
+    // mapped weight must not add an expert-sized allocation.
+    for (int n : {1, 8, 16, 64, 512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_id_mapped(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 4, 640, n, 2560));
+    }
+
+    // expert store weights: a few experts in VRAM slots, the complement in the
+    // device-readable host arena, both read through a device pointer table. Prefill batches
+    // (64 and up) stage the host experts into VRAM before the MMQ kernel runs.
+    // The Q4_K/Q8_0 types cover the expert types of the target model.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 8, 16, 64, 128, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 32, 4, 640, n, 2560));
+        }
+        // expert parallelism: each shard is a separate expert tensor with its own offset
+        for (int n : {1, 4, 8, 64, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id_expert_ep(type_a, GGML_TYPE_F32, 48, 4, 3, 640, n, 2560, true));
+        }
+    }
+
+    // Flash-Next expert store at the prefill batch sizes that reach the MMQ path on Volta:
+    // 512 experts, top-10, gate/up shape. n=512 and n=2048 give a per-expert column count of
+    // 10 and 40 (< 64), so the batched MMQ path runs. The all-slot budget keeps every expert
+    // in a VRAM slot (no host complement, no staging area at all); the part-host budget
+    // keeps two experts in the slots and stages the whole host complement. Q4_K/Q5_1/Q8_0
+    // are the types the model uses for its expert tensors.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        for (int n : {512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 512, 10, 640, n, 2560, /*all_slot=*/true));
+            test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 512, 10, 640, n, 2560, /*all_slot=*/false));
+        }
+    }
+
+    // The staging area of the cases above holds the whole host complement (510 experts), so a
+    // launch rarely fills it and rarely reuses a slot. These put a single host expert in the
+    // arena and size the staging area for exactly that one: every launch has to assign slot 0,
+    // copy the expert in and rewrite the whole staging table, and a plan that kept an entry or
+    // a slot of an earlier launch shows up in the result instead of in a log line.
+    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640,  512, 2560, /*all_slot=*/false, /*n_host=*/1));
+    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, 640, 2048, 2560, /*all_slot=*/false, /*n_host=*/1));
+    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q4_K, GGML_TYPE_F32,  32,  4, 640,  512, 2560, /*all_slot=*/false, /*n_host=*/1));
+    // two launches of the same shape with different routing in one graph: the staging table and
+    // the slots are reused between them, so this is the consecutive-launch case of one staging
+    // area on one stream. Both node results are compared against the reference.
+    test_cases.emplace_back(new test_mul_mat_id_expert_two_ids(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640,  512, 2560, /*n_host=*/1));
+    test_cases.emplace_back(new test_mul_mat_id_expert_two_ids(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640, 2048, 2560, /*n_host=*/4));
+    // the first launch of a stream, repeated: the staging state is created, cleared and staged into
+    // on every relaunch, with a 6 GiB staging area so that its clearing outlasts the kernel issue
+    // (see the class). The two shapes cover the 32-value (Q8_0) and the 256-value (Q4_K) weight paths.
+    test_cases.emplace_back(new test_mul_mat_id_expert_first_launch(GGML_TYPE_Q8_0,  32,  4, 640, 128, 2560, /*n_re=*/8, /*stage_bytes_min=*/6144ull << 20));
+    test_cases.emplace_back(new test_mul_mat_id_expert_first_launch(GGML_TYPE_Q4_K, 512, 10, 640, 512, 2560, /*n_re=*/8, /*stage_bytes_min=*/6144ull << 20));
+
+    // K not a multiple of MATRIX_ROW_PADDING (512): the MMQ loaders read the last row up to a
+    // 512-element boundary, so every expert needs trailing bytes past its data. With all_slot
+    // every expert is in the slots with the 256-byte pitch of the store and the LAST expert
+    // ends at the end of the slot allocation: a kernel that reads past data + row padding
+    // runs off the allocation (compute-sanitizer reports it). n=2048 takes the batched MMQ
+    // path. k=640 is the Flash-Next down projection (Q5_1/Q8_0; the K-quants need a multiple
+    // of 256, so Q4_K uses k=768).
+    for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id_expert_pad(type_a, 32, 2560, 2048, 640));
+    }
+    test_cases.emplace_back(new test_mul_mat_id_expert_pad(GGML_TYPE_Q4_K, 32, 640, 2048, 768));
+
+    // A fully resident store addresses an expert as base + expert * pitch in units of
+    // quantization blocks, so the pitch must be a whole number of blocks. These shapes have
+    // an expert span whose 256-byte aligned pitch the block size does not divide (Q2_0 blocks
+    // are 18 bytes): without the type size in the alignment the read of expert e starts
+    // e * (pitch mod 18) bytes too early. n=2048 reaches the batched MMQ path, n=16 the
+    // MMVQ one, both of which divide the pitch by the block size.
+    test_cases.emplace_back(new test_mul_mat_id_expert_pad(GGML_TYPE_Q2_0, 32, 2560, 2048, 640));
+    test_cases.emplace_back(new test_mul_mat_id_expert_pad(GGML_TYPE_Q2_0, 32, 2560, 16, 640));
+
+    // The same trailing-padding case through a view of the fully resident tensor: the view
+    // starts at expert n_skip and the store pitch (data + padding) differs from the tensor's own
+    // expert stride, so the kernels must use the store base and pitch of the view.
+    test_cases.emplace_back(new test_mul_mat_id_expert_view(GGML_TYPE_Q5_1, 32, 4, 2560, 2048, 640, 7));
+    test_cases.emplace_back(new test_mul_mat_id_expert_view(GGML_TYPE_Q4_K, 32, 4, 640, 2048, 768, 7));
+    test_cases.emplace_back(new test_mul_mat_id_expert_view(GGML_TYPE_Q5_1, 32, 4, 640, 16, 2560, 3));
+
+    // MoE FFN of the expert store: gate/up/down as separate store tensors, one shared ids, the
+    // GLU between them. The MMQ prefill (n = 2048) stages the host experts of all three tensors
+    // through the one per-stream staging area, so the consecutive launches must not read a slot
+    // that a later prepare has overwritten; n = 16 checks the fused MMVQ gate/up path instead.
+    // down uses Q8_0: k = m = 640 is not a multiple of QK_K for the K-quants.
+    test_cases.emplace_back(new test_mul_mat_id_expert_ffn(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 512, 10, 640, 2048, 2560));
+    test_cases.emplace_back(new test_mul_mat_id_expert_ffn(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, 512, 10, 640, 2048, 2560));
+    test_cases.emplace_back(new test_mul_mat_id_expert_ffn(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 512, 10, 640, 16,   2560));
+
+    // Expert store under a permuted expert assignment: the experts of the device are not a
+    // contiguous range of the numbering, every consumer of the ids goes through the row of the
+    // assignment (ggml_expert_store_node_lut). n covers the MMVQ paths (1, 8, 16), the grouped
+    // kernel (64), the fused-expert / MMQ prefill (128, with host experts staged) and the large
+    // batch (512). The naive variant checks the result against the full unpermuted weight in the
+    // same graph; the all-slot cases have no host tier. The device of the test is the device of
+    // the backend, so with 3 (2) devices in the assignment the test runs on CUDA0..2 (0..1).
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 8, 16, 64, 128, 512}) {
+            for (bool check_naive : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id_expert_permute(type_a, 48, 4, 3, 2, 640, n, 2560, /*all_slot=*/false, check_naive));
+            }
+        }
+        test_cases.emplace_back(new test_mul_mat_id_expert_permute(type_a, 48, 4, 2, 1, 640, 16,  2560, /*all_slot=*/true, true));
+        test_cases.emplace_back(new test_mul_mat_id_expert_permute(type_a, 48, 4, 2, 1, 640, 512, 2560, /*all_slot=*/true, true));
+    }
+
+    // Two models with two expert assignment tables in one graph, the target and its MTP draft: every
+    // node reads the table of its own weight, the draft's layer after the target's last one has its
+    // row in the draft's table. The draft's weights are plain device tensors laid out by the
+    // contiguous split (what the MTP draft is), or store tensors under another permutation. n covers
+    // the MMVQ path with decode staging (1, 16) and the prefill path with the staging area (128).
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (int n : {1, 16, 128}) {
+            for (bool check_naive : {false, true}) {
+                test_cases.emplace_back(new test_mul_mat_id_expert_two_tables(type_a, 48, 4, 3, 640, n, 2560,
+                    /*b_permuted=*/false, /*b_in_store=*/false, check_naive));
+                test_cases.emplace_back(new test_mul_mat_id_expert_two_tables(type_a, 48, 4, 3, 640, n, 2560,
+                    /*b_permuted=*/true,  /*b_in_store=*/true,  check_naive));
+            }
+        }
+    }
+
+    // the expert weights in a plain device weight buffer, exactly as model loading leaves them:
+    // the skinny prepass repacks eligible 2D Q8_0 weights in that buffer, so the 3D expert
+    // tensors must pass the repack admission untouched. n covers the MMVQ mmid paths (1, 2, 4, 8).
+    for (int n : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id_wctx(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10,  640, n, 2560)); // gate/up
+        test_cases.emplace_back(new test_mul_mat_id_wctx(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, 2560, n,  640)); // down
+    }
+
+    // the shared-expert fusion must reject a repacked shared weight: the prepass repacks the
+    // 2D Q8_0 shexp pair before the fusion decision, and the fused kernel reads the original
+    // layout. Real Flash-Next shapes: m = 640, k = 2560, 512 experts rounded down to keep the
+    // weights small.
+    for (int n : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id_shared_expert(GGML_TYPE_Q8_0, 8, 8, 640, n, 2560));
+    }
+
+    // Unsloth Qwen3.8-Flash-Next UD-Q4_K_XL expert projections: 512 experts, top-10,
+    // gate/up (m = 640, k = 2560) and fused gate/up (m = 1280, k = 2560) with the K-quant types,
+    // down (m = 2560, k = 640) with the types the model actually uses there (K = 640 is not a
+    // multiple of QK_K, so Q4_K/Q5_K/Q6_K cannot be used for down).
+    // n = 8/16 are the MMVQ mmid limits, 17/65 sit just past the J = 16/64 grouped tile edges.
+    for (int n : {1, 8, 9, 12, 16, 17, 24, 32, 48, 64, 65, 128}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // gate/up
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560)); // fused gate/up
+        }
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640)); // down
+        }
+    }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+
+    // Decode and verify windows (T = 1..8) take the Volta grouped expert kernel: every entry
+    // routed to one expert is staged once and the weight row is read once, instead of one warp
+    // per token re-reading it (the MMVQ MoE kernel). Real UD-Q4_K_XL shapes and types.
+    for (int n : {1, 2, 4, 8}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, n, 2560)); // gate/up
+        }
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, n, 2560)); // gate/up
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n, 640)); // down
+        }
+        // merged gate_up: one MUL_MAT_ID over the (k, 2*n_ff) tensor, split into gate/up views
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560));
+    }
+
+    // Prefill (n = 2048) takes the grouped kernel too: the real UD-Q4_K_XL shapes, 512 experts
+    // top-10. The average expert receives 40 columns; a skewed routing with hot experts takes
+    // far more, which exercises the per-expert column loop.
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, 2048, 2560)); // gate/up
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, 2048, 2560)); // merged gate_up
+
+    // the same merged gate_up tensor read with the fused SwiGLU epilogue: one MUL_MAT_ID over the
+    // (k, 2*n_ff) interleaved weight, F16 activation for the down projection instead of a separate
+    // swiglu_split pass. The real UD-Q4_K_XL expert shapes (512 experts, top-10, n_ff = 640,
+    // k = 2560) with the K-quant types the model uses there, F32 and F16 activations, and the
+    // decode/verify windows (T = 1..8, the MMVQ mmid kernel), the grouped-tile edge (n = 16, which
+    // is still inside the mmid batch on Volta) and the prefill widths (the fused-expert kernel).
+    for (int n : {1, 2, 4, 8, 16, 64, 512, 2048}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
+            for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+                test_cases.emplace_back(new test_mul_mat_id_swiglu(type_a, type_b, 512, 10, false, 1280, n, 2560));
+            }
+        }
+    }
+    // the down projection reads the F16 H the SwiGLU epilogue writes: a plain MUL_MAT_ID with an F16
+    // activation, which the decode/verify widths take on the MMVQ mmid kernel after one conversion
+    for (int n : {1, 8, 16, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F16, 512, 10, false, 2560, n, 640));
+        }
+    }
+    for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, 2048, 640)); // down
+    }
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        test_cases.emplace_back(new test_mul_mat_id_skew(type_a, 512, 10, 640, 2048, 2560, 8)); // skewed gate/up
+    }
+    test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q4_K, 512, 10, 1280, 2048, 2560, 8)); // skewed merged gate_up
+    for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id_skew(type_a, 512, 10, 2560, 2048, 640, 8)); // skewed down
+    }
 
     // multiple blocks per row: exercises the block-stride loop and the
     // per-expert base offset, which k == 256 alone leaves untested
@@ -12466,6 +15515,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 4096, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, 0, false, 3));
 
+    // ring wrap (mode 6): the visible columns are [a, n_kv) plus [0, b), so the two-interval
+    // mask covers a window that crosses the array end. Split-D prefill, grouped verify and the
+    // dense expansion must all union the two intervals
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 4096, 2048, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 0, false, 6));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 32768, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, 6));
+    // the sliding-window ring of the online MTP draft: same shape, ring size and batch
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 34816, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 6));
+    // q = 8 with GQA 6 reaches the grouped sm_70 verify kernel
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 1025, 8, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, false, 6));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 1024, 7, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, 6));
+
     // grouped decode / verify shapes with range masks
     for (int nh : { 1, 4 }) {
         for (int kv : { 113, 1025, 4096 }) {
@@ -12919,6 +15983,59 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int kv : { 1, 7, 8, 63, 64, 65 }) {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
+        }
+    }
+
+    // qsa_select: the tile scorer (>= 8 tokens) and the vector scorer, ranges shorter and longer than n_top,
+    // more tokens than one scoring pass (64)
+    for (ggml_type type_K : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int64_t nb : { 1, 3, 8, 16, 70, 130 }) {
+            test_cases.emplace_back(new test_qsa_select(512, 8, nb, 4, 64, type_K));
+        }
+        test_cases.emplace_back(new test_qsa_select(4096, 3, 20, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(100, 0, 9, 4, 100, type_K));
+        // the top-k kernels: the register kernel at each of its sizes (up to 4096, 8192, 16384 and 24576 pools), past
+        // them the multi-block kernels for passes of up to 16 tokens and the wide kernel for larger passes (20 tokens;
+        // 70 tokens: a 64-token pass and a 6-token pass, both on the wide kernel)
+        test_cases.emplace_back(new test_qsa_select(6000, 8, 4, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(12000, 8, 4, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(20000, 8, 4, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(33792, 8, 4, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(40000, 8, 4, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(50000, 8, 4, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(30000, 8, 20, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(30000, 8, 70, 4, 512, type_K));
+        // a pool count of the 65536 order (not the full 200K context) that is not a multiple of the 256-key
+        // block of the Volta wmma scorer: the last block scores only its first keys
+        test_cases.emplace_back(new test_qsa_select(8192 + 7, 7, 70, 4, 512, type_K));
+        // the pool counts qwen4exp takes (llama_memory_hybrid_idx::kpool_n_pool): the pools of the used cells padded
+        // to the n_kv grain plus one, so up to a grain of padded pools after the real ones. A short context, decode
+        // and prompt; 16K; past 16K and past 128K the count picks a larger register kernel and the multi-block kernel
+        // while the real pools still fit the smaller ones; 200K; the whole 256K cache
+        test_cases.emplace_back(new test_qsa_select(513,   497,  4,  4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(513,   497,  66, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(4097,  81,   4,  4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(4609,  497,  4,  4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(4609,  497,  70, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(34817, 1817, 4,  4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(51201, 1951, 4,  4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(65537, 1,    4,  4, 512, type_K));
+    }
+
+    // qsa_attn: the chunked kernel (<= 16 tokens) and the prompt kernel, partial chunks, streams, both cache types
+    for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+        for (int64_t nb : { 1, 4, 8, 16, 17, 64 }) {
+            test_cases.emplace_back(new test_qsa_attn(2, 4096, nb, 1, 2051, 2051, type_KV));
+        }
+        test_cases.emplace_back(new test_qsa_attn(2, 4096, 24, 1, 2051, 1000, type_KV));
+        test_cases.emplace_back(new test_qsa_attn(1, 4096, 8, 2, 2051, 2051, type_KV));
+        test_cases.emplace_back(new test_qsa_attn(1, 4096, 40, 2, 2051, 2051, type_KV));
+        test_cases.emplace_back(new test_qsa_attn(2, 300, 5, 1, 67, 67, type_KV));
+        test_cases.emplace_back(new test_qsa_attn(2, 300, 33, 1, 67, 50, type_KV));
+        // a short context under the n_kv-grain pool count: the full 2051 slots with a few valid ones, the rest
+        // empty chunks of the chunked kernel or skipped steps of the prompt kernel
+        for (int64_t nb : { 1, 4, 33 }) {
+            test_cases.emplace_back(new test_qsa_attn(2, 300, nb, 1, 2051, 67, type_KV));
         }
     }
 
@@ -13468,6 +16585,55 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // qsa_select top-k dispatch: the 256-thread kernel, the 1024-thread register kernel (at and below its
+    // 1024*33-pool bound) and the wide kernel, so the three can be timed against each other.
+    // production prefill shape: 2048 tokens per batch
+    for (ggml_type type_K : { GGML_TYPE_F16 }) {
+        for (int64_t n_pool : { 512, 6000, 33792, 46080, 65536 }) {
+            test_cases.emplace_back(new test_qsa_select(n_pool, 8, 2048, 4, 512, type_K));
+        }
+    }
+
+    // qwen4exp decode/verify shapes at 16K and 200K context: 16384 and 204800 cells, kpool 4 so 4096 and 51200
+    // pools, indexer_top_k 2048 cells = 512 pools, so n_sel = 4*512 + 3 = 2051 cells. nb covers the decode (1) and
+    // the MTP verify (2/4/8) token counts.
+    for (int64_t nb : { 1, 2, 4, 8 }) {
+        // qsa_select over the pooled keys, 8 padded pools at the end
+        for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
+            test_cases.emplace_back(new test_qsa_select(4104,  8, nb, 4, 512, type_K)); // 16K context
+            test_cases.emplace_back(new test_qsa_select(51208, 8, nb, 4, 512, type_K)); // 200K context
+        }
+        // qsa_attn over the 2051 selected cells, both cache types of the production run
+        for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
+            test_cases.emplace_back(new test_qsa_attn(2, 16384,  nb, 1, 2051, 2051, type_KV)); // 16K context
+            test_cases.emplace_back(new test_qsa_attn(2, 204800, nb, 1, 2051, 2051, type_KV)); // 200K context
+        }
+    }
+    // the same selection on uniform data (a realistic spread of the scores for the top-k), Q8_0 keys as with -ctk q8_0:
+    // decode (1) and MTP verify (4) at 16K, 128K and 200K (kpool_pad: 64 above the real pools), one prefill pass (64)
+    // and a whole prefill batch (2048)
+    for (int64_t nb : { 1, 4, 64 }) {
+        for (int64_t n_pool : { 4032, 32832, 52288 }) {
+            test_cases.emplace_back(new test_qsa_select(n_pool, 40, nb, 4, 512, GGML_TYPE_Q8_0, true));
+        }
+    }
+    for (int64_t n_pool : { 16448, 52288 }) {
+        test_cases.emplace_back(new test_qsa_select(n_pool, 40, 2048, 4, 512, GGML_TYPE_Q8_0, true));
+    }
+
+    // the cost of the padded pools: the same real pools under a count padded to 64 pools and under the n_kv-grain
+    // count (llama_memory_hybrid_idx::kpool_n_pool), F32 keys read through pool_cells. MTP verify at 16K, at the
+    // start of the n_kv bucket (3584 real) and late in it (4016 real); at 200K at the start of the bucket (49152 real);
+    // a prompt batch past 64K, where the grain is 4096 cells (16896 real)
+    for (int64_t n_real : { 3584, 4016 }) {
+        test_cases.emplace_back(new test_qsa_select(GGML_PAD(n_real + 1, 64), GGML_PAD(n_real + 1, 64) - n_real, 4, 4, 512, GGML_TYPE_F32));
+        test_cases.emplace_back(new test_qsa_select(4097, 4097 - n_real, 4, 4, 512, GGML_TYPE_F32));
+    }
+    test_cases.emplace_back(new test_qsa_select(49216, 64,   4,    4, 512, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_qsa_select(51201, 2049, 4,    4, 512, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_qsa_select(16960, 64,   2048, 4, 512, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_qsa_select(17409, 513,  2048, 4, 512, GGML_TYPE_F32));
+
     // launch-overhead isolation: single L2_NORM launch vs batched siblings at the GDN
     // production shape (strided qkv views) -- perf-mode only, the eval list has its own
     // 2/4-wide coverage
@@ -13477,6 +16643,88 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+    // Qwen3.8-Flash-Next expert projections: 512 experts, top-10, Q2_0/Q8_0 weights.
+    // gate/up: m = 640, k = 2560; down: m = 2560, k = 640.
+    for (ggml_type type_a : {GGML_TYPE_Q2_0, GGML_TYPE_Q8_0}) {
+        for (int64_t n : {1, 2, 4, 8, 16, 64, 512, 2048}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // Qwen3.8-Flash-Next
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640)); // Qwen3.8-Flash-Next
+        }
+    }
+
+    // Unsloth Qwen3.8-Flash-Next UD-Q4_K_XL expert projections: 512 experts, top-10,
+    // Q4_K/Q5_K gate/up and Q5_1/Q8_0 down (K = 640 is not a multiple of QK_K, so the K-quant
+    // types cannot be used for down). n covers the grouped decode/verify window (1/2/4/8),
+    // the MMVQ -> grouped-kernel boundary (16/32/64) and the prefill path (128/512/2048).
+    for (int64_t n : {1, 2, 4, 8, 16, 32, 64, 128, 512, 2048}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // gate/up
+        }
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // gate/up
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640)); // down
+        }
+    }
+
+    // the merged gate_up tensor (k = 2560, m = 1280) at the verify window width: one grouped
+    // MUL_MAT_ID, then the graph splits the result into gate and up views
+    for (int64_t n : {1, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560));
+    }
+
+    // the merged gate_up tensor at the prefill width (n = 2048), and a skewed routing where a
+    // few hot experts take most of the slots (the average expert column count is 40, a hot one
+    // is far past the grouped kernel's staged-entry capacity)
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, 2048, 2560));
+    test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q4_K, 512, 10, 640, 2048, 2560, 8));
+    test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q4_K, 512, 10, 1280, 2048, 2560, 8));
+
+    // the fused SwiGLU gate_up at the prefill width, the same shapes as the merged gate_up line
+    // above: the epilogue saves the swiglu_split pass and halves the activation traffic
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
+        for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+            test_cases.emplace_back(new test_mul_mat_id_swiglu(type_a, type_b, 512, 10, false, 1280, 2048, 2560));
+        }
+    }
+
+    // the decode windows of the epilogue against the same shapes without it: both run on MMVQ
+    // there, so the difference is the fused pair plus the halved activation traffic
+    for (int64_t n : {1, 4, 8}) {
+        test_cases.emplace_back(new test_mul_mat_id_swiglu(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560));
+    }
+
+    // prefill blocks wider than -ub 2048: how the per-expert column count (n*10/512 = 40 at
+    // n = 2048) drives the efficiency of the grouped expert kernels (TM = 64 token tiles)
+    for (int64_t n : {3072, 4096, 6144, 8192}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // gate/up
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560)); // merged gate_up
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, n,  640)); // down
+    }
+
+    // the same expert projections cut along the expert ff dimension for a 6-way tensor split
+    // (640 = 20 Q5_1 blocks -> 128/128/96/96/96/96 rows per device): every device runs all the
+    // routed experts at a sixth of the width, against a sixth of the routed entries at full
+    // width when the experts are split across the devices instead
+    for (int64_t n : {1, 4, 8, 512, 2048}) {
+        for (int64_t m : {128, 96}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false,   m, n, 2560)); // gate/up slice
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 2*m, n, 2560)); // merged gate_up slice
+            for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n, m)); // down slice
+            }
+        }
+    }
+
+    // the fused-expert kernel keeps its X tile in F16, so it takes an F16 src1 as it is: the X
+    // traffic of the main kernel is halved against the F32 lines above (which the kernel
+    // converts once per launch, same halves). n <= 8 is left out, that window goes to MMVQ and
+    // reads the F32 activation.
+    for (int64_t n : {16, 64, 512, 2048}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K,  GGML_TYPE_F16, 512, 10, false, 1280, n, 2560)); // merged gate_up
+        for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F16, 512, 10, false, 2560, n, 640)); // down
+        }
+    }
 
     return test_cases;
 }
@@ -13939,6 +17187,7 @@ static void usage(char ** argv) {
     printf("  --output <console|sql|csv>  output format (default: console)\n");
     printf("  --list-ops                  list all available GGML operations\n");
     printf("  --show-coverage             show test coverage\n");
+    printf("  --show-err                  print the error values of passing test and grad comparisons\n");
     printf("  --test-file <path>          read test operators from a test file generated by test-export-graph-ops\n");
     printf("  -j <n>                      run tests using <n> parallel worker threads (default: 1, test mode only)\n\n");
     printf("Examples:\n");
@@ -14005,6 +17254,8 @@ int main(int argc, char ** argv) {
         } else if (strcmp(argv[i], "--show-coverage") == 0) {
             show_test_coverage();
             return 0;
+        } else if (strcmp(argv[i], "--show-err") == 0) {
+            g_show_err = true;
         } else if (strcmp(argv[i], "--test-file") == 0) {
             if (i + 1 < argc) {
                 test_file_path = argv[++i];

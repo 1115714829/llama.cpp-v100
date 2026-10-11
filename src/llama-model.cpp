@@ -407,6 +407,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const std::string tensor_name = tensor->name;
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
+    // expert parallelism: split the routed experts along the expert dim instead of the intermediate dim
+    const bool is_ep = llm_arch_uses_expert_parallel(ud->model->arch) &&
+        ud->model->split_mode() == LLAMA_SPLIT_MODE_TENSOR;
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
@@ -417,7 +420,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_qk_norm         ("blk\\.\\d*\\.attn_(q|k)_norm\\.weight");
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
     static const std::regex pattern_kv_rot          ("cache_(k|v)_rot");
-    static const std::regex pattern_layer_inp_sink  ("embd_(layer_inp|src)_sink");
+    static const std::regex pattern_layer_inp_sink  ("(embd_(layer_inp|src)_sink|h_nextn_sink)");
     static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
     static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
@@ -463,6 +466,34 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         size_t   rotation; // when assigning tensor slices, rotate how the rounding is done for more even allocation
     };
 
+    // per-device share of ne elements, cut at multiples of g, with the device order rotated by `rotation`:
+    // the slices of every split tensor below, and what the MTP block compares to pick its rotation
+    auto split_units = [&](const int64_t ne, const int64_t g, const size_t rotation) -> std::vector<int64_t> {
+        const float * tensor_split = ud->model->tensor_split();
+        std::vector<float> tensor_split_scan;
+        tensor_split_scan.reserve(ud->n_devices);
+        for (size_t j = 0; j < ud->n_devices; j++) {
+            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + rotation) % ud->n_devices]);
+            if (j > 0) {
+                tensor_split_scan[j] += tensor_split_scan[j - 1];
+            }
+        }
+        std::vector<int64_t> ne_dev(ud->n_devices, 0);
+        int64_t low = 0;
+        size_t j = 0;
+        for (; j < ud->n_devices - 1; j++) {
+            int64_t high = tensor_split_scan.back() == 0.0f ?
+                ne * (j+1)/ud->n_devices : ne * tensor_split_scan[j]/tensor_split_scan.back();
+            if (high % g != 0) {
+                high -= high % g;
+            }
+            ne_dev[(j + rotation) % ud->n_devices] = high - low;
+            low = high;
+        }
+        ne_dev[(j + rotation) % ud->n_devices] = ne - low;
+        return ne_dev;
+    };
+
     auto get_tensor_config_impl = [&](
                 const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "") -> tensor_config {
         // the layers in a tensor can be inhomogeneous, if the pattern is cleanly divided by the number of GPUs there can be aliasing effects,
@@ -477,6 +508,55 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return ret;
         };
 
+        // The MTP block (the layers after the trunk) runs next to the trunk on every step and has fewer KV heads
+        // than there are devices, so its rotation decides which devices hold its attention weights and KV cache.
+        // Continuing the round robin of the trunk's attention layers keeps the KV heads spread evenly, but when
+        // the trunk already holds the same number of heads on every device, any rotation is as even, and the
+        // continuation can land on the devices that the expert split (rotation 0, an expert count the device
+        // count does not divide) gives one expert more in every layer: with 6 devices the 2 KV heads and the
+        // 2 extra experts both land on devices 2 and 5. So the block takes the rotation that first keeps the most
+        // KV heads on any device lowest and then puts its heads on the devices with the fewest experts, the
+        // round robin continuation on a tie. A head is computed the same way on any device, only its place changes.
+        auto get_rotation = [&](const uint32_t il) -> size_t {
+            const size_t rotation_rr = get_il_eff(il) % ud->n_devices;
+            if (!is_ep || il < hparams.n_layer() || hparams.is_recr(il) || hparams.n_expert == 0) {
+                return rotation_rr;
+            }
+            // KV heads per device of the trunk's layers of the same kind, with their round robin rotations
+            std::vector<int64_t> n_head_kv_trunk(ud->n_devices, 0);
+            for (uint32_t il_prev = 0; il_prev < hparams.n_layer(); il_prev++) {
+                if (hparams.is_recr(il_prev) != hparams.is_recr(il) || hparams.is_swa(il_prev) != hparams.is_swa(il)) {
+                    continue;
+                }
+                const std::vector<int64_t> n_head_kv_dev = split_units(hparams.n_head_kv(il_prev), 1, get_il_eff(il_prev) % ud->n_devices);
+                for (size_t j = 0; j < ud->n_devices; j++) {
+                    n_head_kv_trunk[j] += n_head_kv_dev[j];
+                }
+            }
+            const std::vector<int64_t> n_expert_dev = split_units(hparams.n_expert, 1, 0);
+            // (most KV heads on a device, experts on the devices that hold the block's heads): lower is better
+            auto score = [&](const size_t rotation) -> std::pair<int64_t, int64_t> {
+                const std::vector<int64_t> n_head_kv_dev = split_units(hparams.n_head_kv(il), 1, rotation);
+                int64_t max_heads = 0;
+                int64_t n_expert_at_heads = 0;
+                for (size_t j = 0; j < ud->n_devices; j++) {
+                    max_heads = std::max(max_heads, n_head_kv_trunk[j] + n_head_kv_dev[j]);
+                    n_expert_at_heads += n_head_kv_dev[j] * n_expert_dev[j];
+                }
+                return {max_heads, n_expert_at_heads};
+            };
+            size_t best = rotation_rr;
+            std::pair<int64_t, int64_t> best_score = score(rotation_rr);
+            for (size_t r = 0; r < ud->n_devices; r++) {
+                const std::pair<int64_t, int64_t> s = score(r);
+                if (s < best_score) {
+                    best       = r;
+                    best_score = s;
+                }
+            }
+            return best;
+        };
+
         uint32_t il;
         std::string prefix;
         size_t rotation;
@@ -485,13 +565,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             GGML_ASSERT(length_prefix != std::string::npos);
             prefix = tensor_name.substr(0, length_prefix + 1);
             il = std::stoull(tensor_name.substr(4, length_prefix));
-            rotation = get_il_eff(il) % ud->n_devices;
+            rotation = get_rotation(il);
         } else if (tensor_name.substr(0, 6) == "cache_") {
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
             prefix = "blk." + std::to_string(il) + ".";
-            rotation = get_il_eff(il) % ud->n_devices;
+            rotation = get_rotation(il);
         } else {
             il = 0;
             rotation = hparams.n_layer() % ud->n_devices;
@@ -551,7 +631,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
         }
 
-        // the DFlash2 feature sinks are written and read by every device in full
+        // the DFlash2 feature sinks and the nextn h sink are written and read by every device in full
         if (std::regex_match(tensor_name, pattern_layer_inp_sink)) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
         }
@@ -607,6 +687,29 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
+        if (is_ep && tensor_name.find("_exps") != std::string::npos &&
+                (std::regex_match(tensor_name, pattern_ffn_up_weight) ||
+                 std::regex_match(tensor_name, pattern_ffn_gate_weight) ||
+                 std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
+                 std::regex_match(tensor_name, pattern_ffn_down_weight))) {
+            // expert parallelism: each device holds a contiguous slice of the routed experts.
+            // Keep the device order unrotated so the slices line up with the source order and
+            // the per-device expert offset is the plain prefix sum of the slice lengths.
+            tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
+            tc.rotation = 0;
+            return tc;
+        }
+        if (is_ep && (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
+                      std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight))) {
+            // expert parallelism: the shared expert is split like a dense FFN, gate/up by rows and
+            // down by columns. Its down projection is a partial sum next to the partial sum of the
+            // routed experts, and the meta backend delays the routed experts' all-reduce to the sum
+            // of the two (ffn_out), so the layer keeps a single all-reduce.
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
+        }
+        if (is_ep && std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+        }
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
@@ -702,7 +805,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
 
             // the FFN is the same for Qwen 3 Next and Qwen 3.5:
-            if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
+            if (axis != GGML_BACKEND_SPLIT_AXIS_2 && std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
                 const int64_t n_ff_exp = hparams.n_ff_exp(il);
                 GGML_ASSERT(tensor->ne[axis] == 2*n_ff_exp);
                 return {{n_ff_exp, 2}};
@@ -878,6 +981,18 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+            if (is_ep && tensor_name.find("_exps") != std::string::npos) {
+                // expert parallelism splits along the expert dim, so the granularity is one whole expert
+                return std::vector<int64_t>(segments.size(), 1);
+            }
+            if (is_ep && tensor_name.find("_shexp") != std::string::npos) {
+                // the shared expert is narrow (640 rows on Flash-Next): units of 128 rows would leave
+                // one of 6 devices without a slice, and a partial branch that a device skips cannot
+                // share the routed experts' all-reduce. Units of 64 rows give each of 6 devices a
+                // slice and keep the q8 skinny split-K of the down projection (K = slice, k % 64 == 0).
+                GGML_ASSERT(segments.size() == 1);
+                return {std::lcm(blck_size, (int64_t) 64)};
+            }
             const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
             return {blck_size_perf};
@@ -901,15 +1016,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
-        const float * tensor_split = ud->model->tensor_split();
-        std::vector<float> tensor_split_scan;
-        tensor_split_scan.reserve(ud->n_devices);
-        for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
-            if (j > 0) {
-                tensor_split_scan[j] += tensor_split_scan[j - 1];
-            }
-        }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
         const bool attn_3card = attn_kv_overlap_3card(hparams, *ud->model, tc.il);
@@ -978,18 +1084,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
             const int64_t  g_s  = granularity[is];
-            int64_t low = 0;
-            size_t j = 0;
-            for (; j < ud->n_devices - 1; j++) {
-                int64_t high = tensor_split_scan.back() == 0.0f ?
-                    ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
-                if (high % g_s != 0) {
-                    high -= high % g_s;
-                }
-                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
-                low = high;
+            const std::vector<int64_t> ne_dev = split_units(ne_s, g_s, tc.rotation);
+            for (size_t j = 0; j < ud->n_devices; j++) {
+                split_state.ne[is*ud->n_devices + j] = ne_dev[j];
             }
-            split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
             split_state.nr[is] = nr_s;
         }
         split_state.n_segments = segments.size();
@@ -1330,6 +1428,20 @@ struct llama_model::impl {
     impl() = default;
     ~impl() = default;
 
+    // the expert assignment table the expert weights of the model are laid out by (see
+    // ggml_expert_assignment_activate), released with the model. Declared first so that it goes
+    // last, after the buffers of the weights it describes.
+    struct expert_assignment_holder {
+        uint32_t id = 0;
+        expert_assignment_holder() = default;
+        expert_assignment_holder(const expert_assignment_holder &) = delete;
+        expert_assignment_holder & operator=(const expert_assignment_holder &) = delete;
+        ~expert_assignment_holder() {
+            ggml_expert_assignment_release(id);
+        }
+    };
+    expert_assignment_holder expert_assignment;
+
     uint64_t n_elements = 0;
 
     size_t n_bytes = 0;
@@ -1361,6 +1473,7 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+    bool has_host_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
 };
@@ -1415,6 +1528,54 @@ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model)
     }
 }
 
+static bool buft_is_device_expert(ggml_backend_buffer_type_t buft) {
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+    if (dev == nullptr) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return false;
+    }
+    typedef bool (*ggml_backend_buft_is_expert_t)(ggml_backend_buffer_type_t);
+    auto is_expert = (ggml_backend_buft_is_expert_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_expert");
+    return is_expert != nullptr && is_expert(buft);
+}
+
+// true if an override keeps the weight on the GPU for the pipeline: a GPU buffer type that is
+// neither a host buffer nor device-readable host memory. the expert store buffer type is
+// allowed - it belongs to the GPU of its layer, and its host complement lives inside the
+// expert buffer, not in a separate override. a null buft is not a host placement: the loader
+// ignores it and selects the default buffer. a buffer type with no device is a host buffer
+// type (ggml_backend_cpu_buffer_type has device == NULL), so it counts as non-GPU.
+static bool tensor_override_is_on_gpu(const llama_model_tensor_buft_override & over) {
+    if (over.buft == nullptr) {
+        return false;
+    }
+    if (ggml_backend_buft_is_host(over.buft)) {
+        return false;
+    }
+    if (buft_is_device_expert(over.buft)) {
+        return true;
+    }
+    if (ggml_backend_buft_is_device_mapped(over.buft)) {
+        return false;
+    }
+    ggml_backend_dev_t dev = ggml_backend_buft_get_device(over.buft);
+    if (dev == nullptr) {
+        return false;
+    }
+    switch (ggml_backend_dev_type(dev)) {
+        case GGML_BACKEND_DEVICE_TYPE_GPU:
+        case GGML_BACKEND_DEVICE_TYPE_IGPU:
+        case GGML_BACKEND_DEVICE_TYPE_META:
+            return true;
+        default:
+            return false;
+    }
+}
+
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
     if (params.tensor_split != nullptr) {
         // llama_model_params stores tensor_split as a borrowed pointer, but the model
@@ -1423,6 +1584,18 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         this->params.tensor_split = pimpl->tensor_split_owned.data();
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+    pimpl->has_host_tensor_overrides = false;
+    if (params.tensor_buft_overrides != nullptr) {
+        for (const auto * over = params.tensor_buft_overrides; over->pattern != nullptr; ++over) {
+            if (over->buft == nullptr) {
+                continue;
+            }
+            if (!tensor_override_is_on_gpu(*over)) {
+                pimpl->has_host_tensor_overrides = true;
+                break;
+            }
+        }
+    }
 }
 
 llama_model::~llama_model() {
@@ -1754,6 +1927,34 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
+    // the lazy PLE table is consumed by the device that holds the PLE layer: load it into
+    // device-readable mapped host memory and read it there. this is a capability branch (only
+    // CUDA offers a mapped weights buffer); without it the table stays in a CPU mmap buffer
+    // and GET_ROWS runs on the CPU
+    if (hparams.ple_n_heads > 0) {
+        for (uint32_t il = 0; il < (uint32_t) n_layer_all; ++il) {
+            if (hparams.is_ple(il)) {
+                ml.lazy.dev = pimpl->dev_layer[il].dev;
+                LLAMA_LOG_INFO("%s: lazy PLE table assigned to device %s\n", __func__, ggml_backend_dev_name(ml.lazy.dev));
+                break;
+            }
+        }
+    }
+
+    // the token embedding table is read by the device that holds layer 0: load it into
+    // device-readable mapped host memory and run the input layer GET_ROWS there. this is a
+    // capability branch (only CUDA offers a mapped weights buffer); without it the table keeps
+    // the regular input layer path (a CPU buffer) and GET_ROWS runs on the CPU. the memory-fit
+    // pass keeps the regular accounting (no_alloc)
+    if (!ml.no_alloc && n_layer_all > 0) {
+        ml.embd.dev = pimpl->dev_layer[0].dev;
+        if (ml.embd.buft() == nullptr) {
+            ml.embd.dev = nullptr;
+        } else {
+            LLAMA_LOG_INFO("%s: token embedding table assigned to device %s\n", __func__, ggml_backend_dev_name(ml.embd.dev));
+        }
+    }
+
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
     // create tensors for the weights
@@ -1992,7 +2193,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        // BF16 weights converted to F16 are rewritten while loading, they cannot point into the mapping
+        bool ctx_has_bf16_as_f16 = false;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ml.is_bf16_as_f16(t)) {
+                ctx_has_bf16_as_f16 = true;
+                break;
+            }
+        }
+
+        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && !ctx_has_bf16_as_f16 && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -2085,12 +2295,103 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         });
     }
 
+    // The expert weights that are split over the devices along the expert dim: hand the loader the
+    // number of experts every device holds (the same split the meta buffer applies) and the expert
+    // assignment table of the model, it lays the experts of these tensors out by that table
+    // (llama_expert_layout). The weights are those this loader created, in the expert store or
+    // plain device weights (a draft): borrowed tensors of another model keep that model's table.
+    for (const ggml_tensor * t : ml.expert_weights) {
+        if (t->ne[2] <= 1 || t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
+            continue;
+        }
+        const ggml_backend_meta_split_state ss = llama_model_tensor_split_state(model, t);
+        if (ss.axis != GGML_BACKEND_SPLIT_AXIS_2) {
+            continue;
+        }
+        // the slices are per simple device of the meta device the buffer belongs to (the model's
+        // own device list holds the meta device as one entry)
+        ggml_backend_dev_t meta_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+        GGML_ASSERT(meta_dev != nullptr && ggml_backend_dev_is_meta(meta_dev));
+        const size_t nd = ggml_backend_meta_dev_n_devs(meta_dev);
+        std::vector<int64_t> slices(nd, 0);
+        for (size_t j = 0; j < nd; j++) {
+            for (size_t s = 0; s < ss.n_segments; s++) {
+                slices[j] += ss.ne[s*nd + j] * ss.nr[s];
+            }
+        }
+        ml.expert_dev_slices.emplace(t, std::move(slices));
+    }
+
+    // The table: one per model, for all its split expert weights, which therefore have to be split
+    // alike (the experts of a layer, gate/up and down, live on one device). Experts in the expert
+    // stores are laid out by the proposal the stores were planned with (the profile's permutation),
+    // plain device weights by the contiguous split the meta buffer applies to them; either way the
+    // table is placed by the loader, activated after the load and checked before the first graph.
+    if (!ml.expert_dev_slices.empty()) {
+        const ggml_tensor *          first    = ml.expert_dev_slices.begin()->first;
+        const std::vector<int64_t> & slices   = ml.expert_dev_slices.begin()->second;
+        const int64_t                n_expert = first->ne[2];
+        int  n_layer  = 0;
+        bool in_store = false;
+        bool plain    = false;
+        for (const auto & [t, sl] : ml.expert_dev_slices) {
+            int layer = -1;
+            if (sscanf(ggml_get_name(t), "blk.%d.", &layer) != 1 || layer < 0) {
+                throw std::runtime_error(format("%s: expert tensor '%s' has no layer number in its name", __func__, ggml_get_name(t)));
+            }
+            if (sl != slices || t->ne[2] != n_expert) {
+                throw std::runtime_error(format("%s: expert tensors '%s' and '%s' are split over the devices differently; "
+                    "the experts of a model need one assignment", __func__, ggml_get_name(first), ggml_get_name(t)));
+            }
+            n_layer = std::max(n_layer, layer + 1);
+            ((t->flags & GGML_TENSOR_FLAG_EXPERT) != 0 ? in_store : plain) = true;
+        }
+        if (in_store && plain) {
+            throw std::runtime_error(format("%s: the split expert tensors of the model are partly in the expert store and partly plain", __func__));
+        }
+        const uint32_t table = in_store
+            ? ggml_expert_assignment_from_proposal((int) slices.size(), n_layer, (int) n_expert)
+            : ggml_expert_assignment_contiguous((int) slices.size(), n_layer, (int) n_expert, slices.data());
+        if (table == 0) {
+            throw std::runtime_error(format("%s: no expert assignment table for %d layers of %lld experts over %zu devices%s",
+                __func__, n_layer, (long long) n_expert, slices.size(), in_store ? " (the expert buffers were planned with other sizes or not at all)" : ""));
+        }
+        // released with the model
+        pimpl->expert_assignment.id = table;
+        ml.expert_assignment = table;
+    }
+
     // load tensor data
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
+
+    // every expert tensor that is split over the devices is written in the layout of the table
+    // now: activate it for them, before the placement check below and before the first graph
+    // addresses the experts
+    if (ml.expert_assignment != 0) {
+        ggml_expert_assignment_activate(ml.expert_assignment, ml.expert_tensors_by_table.data(), ml.expert_tensors_by_table.size());
+        LLAMA_LOG_INFO("%s: %zu expert tensors laid out by the expert assignment (version %u)\n",
+            __func__, ml.expert_tensors_by_table.size(), ml.expert_assignment);
+    }
+
+    // The expert store buffer types need all tensor data written before they can check their
+    // byte-level placement. The check runs now, after the loader and before any graph, for
+    // every backend that provides the "model loaded" hook.
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        typedef void (*ggml_backend_expert_store_model_loaded_t)(void);
+        auto model_loaded = (ggml_backend_expert_store_model_loaded_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_expert_store_model_loaded");
+        if (model_loaded != nullptr) {
+            model_loaded();
+        }
+    }
+
+    // the source hashes of the placement check were consumed by the hooks above
+    ggml_expert_store_clear_source_hashes();
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
@@ -2101,7 +2402,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     return true;
 }
 
-ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        const LLM_TN_IMPL * tn_src_gate, const LLM_TN_IMPL * tn_src_up) {
     const buft_list_t * buft_list_layer = nullptr;
     if (tn.bid != -1) {
         // blocks that are not model layers (e.g. the blocks of a head) go with the output
@@ -2109,7 +2411,7 @@ ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM
     }
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
-        tn, ne, flags);
+        tn, ne, flags, tn_src_gate, tn_src_up);
 }
 
 std::string llama_model::arch_name() const {
@@ -2459,6 +2761,10 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+bool llama_model::has_host_tensor_overrides() const {
+    return pimpl->has_host_tensor_overrides;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {
@@ -2495,8 +2801,9 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 bool llama_model::kq_range_mask_supported() const {
-    // these architectures feed the attention mask to ggml_flash_attn_ext only
-    return arch == LLM_ARCH_QWEN35;
+    // these architectures feed the attention mask to ggml_flash_attn_ext only (qwen4exp: its QSA layers attend
+    // through ggml_qsa_select ids, the mask serves the dense blocks)
+    return arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN4EXP;
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
@@ -2865,8 +3172,16 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         if (arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
                             filter_recr = [&](uint32_t)    { return false; };
-                            if (filter_idx) {
+                            // the indexer cache only serves QSA blocks (compress ratio > 0): a dense MTP block keeps
+                            // no indexer cache and no k-pool, which a windowed (ring) attention cache could not track
+                            bool mtp_qsa = false;
+                            for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
+                                mtp_qsa = mtp_qsa || hparams.dsv4_compress_ratios[il] > 0;
+                            }
+                            if (filter_idx && mtp_qsa) {
                                 filter_idx = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                            } else {
+                                filter_idx = nullptr;
                             }
                         }
                     }
@@ -2892,16 +3207,32 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else if (needs_mem_idx) {
+                        // a dense MTP draft layer only proposes tokens that the target then verifies, so it can
+                        // attend a bounded window of recently written cells; the caches are sized to that window
+                        const bool mtp_window = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && cparams.n_swa_mtp > 0;
+
+                        uint32_t       attn_kv_size = cparams.n_ctx_seq;
+                        uint32_t       attn_n_swa   = hparams.n_swa;
+                        llama_swa_type attn_swa     = hparams.swa_type;
+
+                        if (mtp_window) {
+                            attn_n_swa = cparams.n_swa_mtp;
+                            attn_swa   = LLAMA_SWA_TYPE_STANDARD;
+                            // same bound as the SWA cache of llama_kv_cache_iswa: the window plus one ubatch of slack
+                            attn_kv_size = GGML_PAD(std::min(cparams.n_ctx_seq,
+                                    attn_n_swa*(cparams.kv_unified ? cparams.n_seq_max : 1) + cparams.n_ubatch), 256);
+                        }
+
                         // sparse attention over a per-token indexer cache, in its own memory type
-                        res = new llama_memory_hybrid_idx(
+                        auto * mem = new llama_memory_hybrid_idx(
                             /* model             */ *this,
                             /* attn_type_k       */ params.type_k,
                             /* attn_type_v       */ params.type_v,
                             /* attn_v_trans      */ !cparams.flash_attn,
-                            /* attn_kv_size      */ cparams.n_ctx_seq,
+                            /* attn_kv_size      */ attn_kv_size,
                             /* attn_n_pad        */ 1,
-                            /* attn_n_swa        */ hparams.n_swa,
-                            /* attn_swa_type     */ hparams.swa_type,
+                            /* attn_n_swa        */ attn_n_swa,
+                            /* attn_swa_type     */ attn_swa,
                             /* recurrent_type_k  */ GGML_TYPE_F32,
                             /* recurrent_type_v  */ GGML_TYPE_F32,
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
@@ -2912,6 +3243,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));
+
+                        if (mtp_window) {
+                            // a bounded cache views the whole cache for 2+ token ubatches: the window mask hides the
+                            // out-of-window cells and the graph no longer depends on the used length
+                            mem->get_mem_attn()->set_view_full(true);
+
+                            if (llama_kv_cache * mem_idx = mem->get_mem_idx()) {
+                                // the indexer cache tracks the attention cache cell for cell
+                                mem_idx->set_view_full(true);
+                            }
+                        }
+
+                        res = mem;
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,
@@ -3062,6 +3406,9 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // DFlash2: copy the extracted layer inputs into the device sink (if enabled)
     llm->build_layer_inp_sink();
 
+    // r-mtpdev: copy the nextn hidden state into the device sink (if enabled)
+    llm->build_h_nextn_sink();
+
     llm->res->set_outputs(params);
 
     return llm->res->get_gf();
@@ -3085,12 +3432,14 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.model_shared                =*/ nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.no_expert_store             =*/ false,
     };
 
     return result;
@@ -3526,6 +3875,11 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
     return model->devices[i].dev;
 }
 
+ggml_backend_meta_split_state llama_model_tensor_split_state(const struct llama_model * model, const struct ggml_tensor * tensor) {
+    return llama_meta_device_get_split_state(
+        tensor, const_cast<llama_meta_device_get_split_state_userdata *>(&model->get_split_state_ud));
+}
+
 //
 // llama_model_base
 //
@@ -3536,14 +3890,16 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
-    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY) {}
+    TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY),
+    TENSOR_GATE_UP_INTERLEAVE(llama_model_loader::TENSOR_GATE_UP_INTERLEAVE) {}
 
-ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        const LLM_TN_IMPL * tn_src_gate, const LLM_TN_IMPL * tn_src_up) {
     GGML_ASSERT(ml != nullptr);
-    return create_tensor(*ml, tn, ne, flags);
+    return create_tensor(*ml, tn, ne, flags, tn_src_gate, tn_src_up);
 }
 
-void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
+void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags, int flags_extra) {
     if (flags & TENSOR_SKIP) {
         const int skip = TENSOR_NOT_REQUIRED | TENSOR_SKIP;
 
@@ -3553,7 +3909,37 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
         return;
     }
 
-    layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
+    layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED | flags_extra);
+    if (layer.ffn_gate_up_exps == nullptr && (flags_extra & TENSOR_GATE_UP_INTERLEAVE)) {
+        // the file ships the gate and the up weight separately and the model wants the fused
+        // SwiGLU path, which reads them as pairs from one tensor: let the loader merge them while
+        // loading. their rows can only be interleaved when both weights have the same type and
+        // shape, otherwise the loader loads them as two separate tensors
+        const LLM_TN_IMPL tn_gate = tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid);
+        const LLM_TN_IMPL tn_up   = tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid);
+
+        const ggml_tensor * t_gate = ml->get_tensor_meta(tn_gate.str().c_str());
+        const ggml_tensor * t_up   = ml->get_tensor_meta(tn_up.str().c_str());
+
+        if (t_gate && t_up && t_gate->type == t_up->type &&
+            t_gate->ne[0] == t_up->ne[0] && t_gate->ne[1] == t_up->ne[1] && t_gate->ne[2] == t_up->ne[2]) {
+            const LLM_TN_IMPL tn_merged = tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid);
+            layer.ffn_gate_up_exps = create_tensor(tn_merged, {n_embd_, n_ff_ * 2, n_expert_}, flags, &tn_gate, &tn_up);
+            if (layer.ffn_gate_up_exps != nullptr) {
+                LLAMA_LOG_INFO("%s: merging '%s' and '%s' into '%s' while loading\n", __func__,
+                        tn_gate.str().c_str(), tn_up.str().c_str(), tn_merged.str().c_str());
+                return;
+            }
+        } else if (!(flags & TENSOR_NOT_REQUIRED)) {
+            // the model asked for the fused path and cannot get it: a warning, not an info line,
+            // because the common log drops INFO unless -lv 4 is given and a silent fallback to the
+            // two separate weights is exactly what must not go unnoticed
+            LLAMA_LOG_WARN("%s: '%s' and '%s' cannot be merged (%s / %s), loading them separately\n", __func__,
+                    tn_gate.str().c_str(), tn_up.str().c_str(),
+                    t_gate ? llama_format_tensor_shape(t_gate).c_str() : "missing",
+                    t_up   ? llama_format_tensor_shape(t_up).c_str()   : "missing");
+        }
+    }
     if (layer.ffn_gate_up_exps == nullptr) {
         layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);
         layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid), {n_embd_, n_ff_, n_expert_}, flags);

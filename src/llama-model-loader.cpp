@@ -12,7 +12,9 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <new>
 #include <regex>
+#include <vector>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -540,6 +542,7 @@ llama_model_loader::llama_model_loader(
         bool check_tensors,
         bool no_alloc,
         bool load_mtp,
+        bool no_expert_store,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
@@ -558,6 +561,7 @@ llama_model_loader::llama_model_loader(
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK || load_mode == LLAMA_LOAD_MODE_AUTO;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+    this->no_expert_store = no_expert_store;
 
     if (!fname.empty()) {
         // Load the main GGUF
@@ -713,6 +717,8 @@ llama_model_loader::llama_model_loader(
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
+
+    get_key(llm_kv(LLM_KV_NEXTN_SHARED_TARGET_TENSORS), nextn_shared_target_tensors, false);
 
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
@@ -923,6 +929,32 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(
     return cur;
 }
 
+// BF16 weights are stored as F16 on devices without native BF16 support: the conversion is
+// exact for values in the F16 range, finite values beyond it are clamped to +-65504, and the
+// weights then use the F16 tensor cores for prefill and the F16 kernels for decode.
+bool llama_model_loader::bf16_weights_as_f16(const buft_list_t * buft_list) {
+    if (buft_list == nullptr) {
+        return false;
+    }
+
+    for (const auto & entry : *buft_list) {
+        if (!ggml_backend_dev_supports_bf16(entry.first)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool llama_model_loader::is_bf16_as_f16(const struct ggml_tensor * tensor) const {
+    if (tensor->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    const auto * weight = get_weight(ggml_get_name(tensor));
+    return weight != nullptr && weight->tensor->type == GGML_TYPE_BF16;
+}
+
 // checks if the weight tensor can be used with the specified buffer type and device
 static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
     GGML_ASSERT(w != nullptr);
@@ -1077,12 +1109,41 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
-ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
+// the mapped weights buffer type of a device, or nullptr when the device (or its backend)
+// does not offer one. this is a capability query, not a fallback: only CUDA exposes it, and a
+// meta device asks its devices for the buffer type it puts on top of them
+static ggml_backend_buffer_type_t llama_buft_device_mapped_weights(ggml_backend_dev_t dev) {
+    if (dev == nullptr) {
+        return nullptr;
+    }
+    if (ggml_backend_dev_is_meta(dev)) {
+        return ggml_backend_meta_mapped_weights_buffer_type(dev);
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        return nullptr;
+    }
+    typedef ggml_backend_buffer_type_t (*get_buft_t)(ggml_backend_dev_t);
+    auto get_buft = (get_buft_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_mapped_weights_buft");
+    return get_buft != nullptr ? get_buft(dev) : nullptr;
+}
+
+ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() const {
+    if (ggml_backend_buffer_type_t mapped = llama_buft_device_mapped_weights(dev)) {
+        return mapped;
+    }
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
         throw std::runtime_error("no CPU backend found");
     }
     return ggml_backend_dev_buffer_type(cpu_dev);
+}
+
+// unlike a lazy table, the token embedding table is always read as a whole: when the device
+// does not offer a mapped weights buffer there is no buffer type for it here, and the table
+// keeps the buffer type of the input layer (a CPU buffer), see load_tensors()
+ggml_backend_buffer_type_t llama_model_loader::embd_read::buft() const {
+    return llama_buft_device_mapped_weights(dev);
 }
 
 bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
@@ -1113,11 +1174,121 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     return true;
 }
 
+// the merged expert weight itself, one expert per ne[2] slice: the tensors the expert store
+// places. The list is explicit, not a name pattern; the per-expert scale tensors share the
+// tensor id but not the "weight" suffix.
+static bool llm_tensor_is_expert_weight(const LLM_TN_IMPL & tn) {
+    if (tn.suffix == nullptr || strcmp(tn.suffix, "weight") != 0) {
+        return false;
+    }
+    switch (tn.tensor) {
+        case LLM_TENSOR_FFN_DOWN_EXPS:
+        case LLM_TENSOR_FFN_GATE_EXPS:
+        case LLM_TENSOR_FFN_UP_EXPS:
+        case LLM_TENSOR_FFN_GATE_UP_EXPS:
+        case LLM_TENSOR_FFN_DOWN_CHEXPS:
+        case LLM_TENSOR_FFN_GATE_CHEXPS:
+        case LLM_TENSOR_FFN_UP_CHEXPS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// declared in llama-model.h, which this file does not include
+const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
+
+// from unsloth PR #142
+struct ggml_tensor * llama_model_loader::borrow_shared_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne) {
+    // only the tensors a draft head is allowed to leave out, checked first so no other
+    // tensor in any model costs a metadata lookup
+    if (tn.tensor != LLM_TENSOR_TOKEN_EMBD && tn.tensor != LLM_TENSOR_OUTPUT && tn.tensor != LLM_TENSOR_OUTPUT_NORM) {
+        return nullptr;
+    }
+
+    // a file that ships the tensor keeps its own copy
+    const std::string name = tn.str();
+    if (get_weight(name.c_str()) != nullptr) {
+        return nullptr;
+    }
+
+    // a file that left the shared tensors to the target says so in its metadata; without that
+    // key a missing token_embd means the arch takes it from ctx_other at graph time (dflash,
+    // eagle3), so borrowing here would take that branch away and point the draft at a tensor
+    // on the wrong device
+    if (!nextn_shared_target_tensors) {
+        return nullptr;
+    }
+
+    // a draft that left out its embeddings left out the whole set, so the missing token_embd is
+    // what marks one. without this an arch that ties the head to its own token_embd when
+    // output.weight is absent (qwen3.5, qwen3-next) would borrow the target's head instead
+    if (get_weight("token_embd.weight") != nullptr) {
+        return nullptr;
+    }
+
+    if (model_shared == nullptr) {
+        throw std::runtime_error(format("%s: missing tensor '%s'; if this is a draft head that shares "
+                    "the target's embeddings, load it as a draft of its target model, not on its own",
+                    __func__, name.c_str()));
+    }
+
+    ggml_tensor * src = nullptr;
+    for (const auto & [n, t] : llama_internal_get_tensor_map(model_shared)) {
+        if (n == name) {
+            src = t;
+            break;
+        }
+    }
+    if (src == nullptr) {
+        throw std::runtime_error(format("%s: draft needs tensor '%s' from the target, which does not have it",
+                    __func__, name.c_str()));
+    }
+
+    // the draft uses the tensor directly, so the shapes must agree exactly
+    size_t dim = 0;
+    for (const int64_t n : ne) {
+        if (dim >= GGML_MAX_DIMS || src->ne[dim] != n) {
+            throw std::runtime_error(format("%s: draft and target disagree on '%s': target has %s, draft wants %s",
+                        __func__, name.c_str(), llama_format_tensor_shape(src).c_str(), llama_format_tensor_shape(ne).c_str()));
+        }
+        dim++;
+    }
+    for (; dim < GGML_MAX_DIMS; dim++) {
+        if (src->ne[dim] != 1) {
+            throw std::runtime_error(format("%s: draft and target disagree on '%s': target has %s, draft wants %s",
+                        __func__, name.c_str(), llama_format_tensor_shape(src).c_str(), llama_format_tensor_shape(ne).c_str()));
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: tensor %s taken from the target model\n", __func__, name.c_str());
+
+    // not counted in n_created or size_data: the tensor is not in this file and is neither
+    // allocated nor freed here
+    return src;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        const LLM_TN_IMPL * tn_src_gate, const LLM_TN_IMPL * tn_src_up) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
+    bool bf16_as_f16 = false;
+
+    // Mark the MoE expert weights explicitly while the tensor is created, so the expert store
+    // identifies them by the flag and never by the name. The flag is set for every load
+    // (device, host, and the no-alloc fit trials); the store decides from its own buffer type
+    // and the layout whether it can place the tensor. Without the store (no_expert_store) they
+    // stay plain device weights; they are still expert weights for their layout over the devices.
+    auto mark_expert_tensor = [&](ggml_tensor * tensor) {
+        if (llm_tensor_is_expert_weight(tn)) {
+            expert_weights.insert(tensor);
+            if (!no_expert_store) {
+                tensor->flags |= GGML_TENSOR_FLAG_EXPERT;
+            }
+        }
+    };
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         const ctx_key key { buft, is_lazy };
@@ -1197,6 +1368,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             op = info.op;
         }
 
+        // only weights of matmuls take the F16 copy: they are the ones the F16 tensor cores and
+        // GEMV kernels are for, and the CUDA binary ops do not accept an F32 src0 with an F16 src1.
+        // the type change must happen before the buffer type is selected: the F16 copy of a weight
+        // is supported by a different set of devices and ops than the BF16 one
+        if (bf16_as_f16 && (op == GGML_OP_MUL_MAT || op == GGML_OP_MUL_MAT_ID)) {
+            t_meta->type = GGML_TYPE_F16;
+        }
+
         // sanity checks
         if (info.layer == LLM_TENSOR_LAYER_INPUT || info.layer == LLM_TENSOR_LAYER_OUTPUT) {
             if (tn.bid != -1) {
@@ -1209,7 +1388,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (is_lazy) {
-            return lazy_read::buft();
+            return lazy.buft();
+        }
+
+        // the token embedding table is loaded into mapped host memory read by the device that
+        // consumes it. a converted BF16 table is rewritten while loading and needs a writable
+        // buffer; load_tensors() only sets embd.dev after checking that the device offers the
+        // buffer type
+        if (!bf16_as_f16 && tn.tensor == LLM_TENSOR_TOKEN_EMBD && !(flags & TENSOR_DUPLICATED) && embd.dev != nullptr) {
+            ggml_backend_buffer_type_t mapped = embd.buft();
+            GGML_ASSERT(mapped != nullptr);
+            return mapped;
         }
 
         // select the buffer type for this tensor
@@ -1330,7 +1519,92 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        mark_expert_tensor(ret);
         return ret;
+    }
+
+    // must run before check_tensor_dims: the tensor is absent from this file by design, and for
+    // the lm head it must also win over the arch fallback that ties the head to token_embd
+    // from unsloth PR #142
+    if (ggml_tensor * shared = borrow_shared_tensor(tn, ne)) {
+        return shared;
+    }
+
+    // the fused SwiGLU path reads the gate and up rows of an expert as pairs from one tensor, so
+    // the model asks for a gate/up expert weight that the file does not ship: it is synthesized
+    // here from the gate and the up weight of the file, and its rows are interleaved while
+    // loading (see TENSOR_GATE_UP_INTERLEAVE and llama_load_merged_gate_up)
+    if (tn_src_gate != nullptr && tn_src_up != nullptr) {
+        const std::string name = tn.str();
+
+        const ggml_tensor * src_gate = get_tensor_meta(tn_src_gate->str().c_str());
+        const ggml_tensor * src_up   = get_tensor_meta(tn_src_up->str().c_str());
+
+        // a layer that does not need the weight (TENSOR_NOT_REQUIRED) has no sources to merge
+        if (src_gate == nullptr || src_up == nullptr) {
+            return nullptr;
+        }
+
+        // the merged dimensions are the gate dimensions with twice the rows: the file tensor must
+        // have exactly these rows per expert, otherwise its rows cannot be paired up
+        const std::vector<int64_t> ne_merged(ne.begin(), ne.end());
+        if (ne_merged.size() != 3 || ne_merged[0] != src_gate->ne[0] ||
+            ne_merged[1] != 2*src_gate->ne[1] || ne_merged[2] != src_gate->ne[2] ||
+            src_gate->ne[1] != src_up->ne[1]) {
+            throw std::runtime_error(
+                    format("%s: tensor '%s' cannot be merged from '%s' (%s) and '%s' (%s)",
+                        __func__, name.c_str(), tn_src_gate->str().c_str(), llama_format_tensor_shape(src_gate).c_str(),
+                        tn_src_up->str().c_str(), llama_format_tensor_shape(src_up).c_str()));
+        }
+
+        bf16_as_f16 = src_gate->type == GGML_TYPE_BF16 &&
+            (bf16_weights_as_f16(buft_list_input) || bf16_weights_as_f16(buft_list_output) || bf16_weights_as_f16(buft_list_layer));
+
+        ggml_tensor t_meta;
+        memset(&t_meta, 0, sizeof(ggml_tensor));
+        t_meta.type = bf16_as_f16 ? GGML_TYPE_F16 : src_gate->type;
+        for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
+            t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+            if (dim == 0) {
+                t_meta.nb[dim] = ggml_type_size(t_meta.type);
+            } else if (dim == 1) {
+                t_meta.nb[dim] = ggml_row_size(t_meta.type, t_meta.ne[dim-1]);
+            } else {
+                t_meta.nb[dim] = t_meta.nb[dim-1]*t_meta.ne[dim-1];
+            }
+        }
+        ggml_set_name(&t_meta, name.c_str());
+
+        ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+        GGML_ASSERT(buft != nullptr);
+
+        ggml_context * ctx = ctx_for_buft(buft);
+
+        ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+        ggml_set_name(tensor, name.c_str());
+        mark_expert_tensor(tensor);
+
+        // the two file tensors are not created and not loaded on their own: their rows are read
+        // into this tensor and interleaved, so they are accounted for as merged sources here
+        llama_tensor_merged merged;
+        merged.bf16_as_f16 = bf16_as_f16;
+        const LLM_TN_IMPL * tn_src[2] = { tn_src_gate, tn_src_up };
+        for (int i = 0; i < 2; i++) {
+            const llama_tensor_weight & w = require_weight(tn_src[i]->str().c_str());
+            llama_tensor_weight_src src = { w.idx, w.offs, ggml_nbytes(w.tensor) };
+            GGML_ASSERT(src.size == (size_t) t_meta.ne[2]*t_meta.ne[1]/2*ggml_row_size(t_meta.type, t_meta.ne[0]));
+            if (i == 0) {
+                merged.gate = src;
+            } else {
+                merged.up = src;
+            }
+            n_merged_sources++;
+        }
+        merged_tensors[name] = merged;
+
+        n_created++;
+
+        return tensor;
     }
 
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
@@ -1339,9 +1613,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
+    // the matmul weights of this tensor are loaded as F16 when any target device lacks native
+    // BF16 support; buft_for_tensor() switches the type once it knows the op
+    bf16_as_f16 = cur->type == GGML_TYPE_BF16 &&
+        (bf16_weights_as_f16(buft_list_input) || bf16_weights_as_f16(buft_list_output) || bf16_weights_as_f16(buft_list_layer));
+
     if (flags & TENSOR_READ_LAZY) {
+        // a converted tensor is rewritten while loading, so it cannot stay in the mapping
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+        is_lazy = !bf16_as_f16 && lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
     }
 
     ggml_tensor t_meta = *cur;
@@ -1379,6 +1659,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
     struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
     ggml_set_name(tensor, ggml_get_name(&t_meta));
+    mark_expert_tensor(tensor);
+
+    if (flags & TENSOR_GATE_UP_INTERLEAVE) {
+        // the rows are reordered while loading, so load_all_data() reads them from the file into a
+        // private buffer instead of pointing the tensor into the mapping
+        auto it = weights_map.find(tn.str());
+        GGML_ASSERT(it != weights_map.end());
+        it->second.interleave_gate_up = true;
+    }
 
     if (duplicated) {
         size_data += ggml_nbytes(&t_meta);
@@ -1390,12 +1679,17 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {
-    if (n_created > n_tensors) {
-        throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
+    // the file tensors that were merged into a synthesized tensor are not created, so they are
+    // taken off the count of tensors the file has
+    // a merged tensor absorbs two file tensors but is created as one, so the expected count drops by
+    // one per merged tensor (n_merged_sources counts the absorbed sources, two per merged tensor)
+    const int n_expected = n_tensors - n_merged_sources/2;
+    if (n_created > n_expected) {
+        throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_expected, n_created));
     }
-    if (n_created < n_tensors) {
+    if (n_created < n_expected) {
         if (!partial) {
-            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
+            throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_expected, n_created));
         }
         LLAMA_LOG_INFO("%s: partial load — used %d of %d tensors in the file (rest belong to a sibling model on the same .gguf)\n",
                 __func__, n_created, n_tensors);
@@ -1488,6 +1782,258 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
     }
 
     return data;
+}
+
+// Layout of the experts of one expert tensor in the host buffer the loader writes. A tensor that is
+// split over the devices along the expert dim takes its experts at the positions of the expert
+// assignment table of the model: the buffer is the concatenation of the device segments (the meta
+// buffer hands segment j to device j), segment j holds the experts of device j in local order, so
+// global expert e sits at sum(experts of the devices before owner(e)) + local(e)
+// (ggml_expert_assignment_load_position). A tensor that holds the whole expert dim keeps the file
+// order. The table of a model whose experts live in the expert stores is the profile's proposal;
+// without a profile, and for plain device weights, it is the contiguous split and the position of
+// every expert is its own number: that is the capability branch of those cases, not another code
+// path - the same formula, the same activation and the same checks run.
+struct llama_expert_layout {
+    bool by_table = false;       // the experts are laid out by the expert assignment table
+    bool identity = true;        // position(e) == e for every expert
+    // the experts go into expert stores whose devices receive whole experts (a tensor on one
+    // device, or split along the expert dim), so the loader registers the hash of every expert for
+    // the placement check of the backend. A tensor the meta buffer splits along another axis hands
+    // every device a part of every expert; its bytes are not comparable per expert and the check
+    // skips it. Plain device weights have no store that could compare them.
+    bool check    = false;
+    int  layer    = -1;
+    std::vector<int64_t> pos_of; // [n_expert] position of global expert e (by_table only)
+
+    int64_t position(int64_t e) const {
+        return by_table ? pos_of[(size_t) e] : e;
+    }
+};
+
+// dev_slices: the experts every device holds of this tensor, nullptr when the tensor is not split
+// over the devices; table: the expert assignment table of the model. The table must describe
+// exactly the split the meta buffer applies (as many devices, the quota of every device equal to
+// its slice), otherwise the positions and the device segments would disagree, which nothing
+// downstream could repair: that is an error of the run.
+static llama_expert_layout llama_expert_layout_of(const ggml_tensor * cur, const std::vector<int64_t> * dev_slices, uint32_t table) {
+    llama_expert_layout layout;
+    const bool in_store = (cur->flags & GGML_TENSOR_FLAG_EXPERT) != 0;
+    if (dev_slices == nullptr) {
+        layout.check = in_store && (cur->buffer == nullptr || !ggml_backend_buffer_is_meta(cur->buffer));
+        return layout;
+    }
+    const char *  name     = ggml_get_name(cur);
+    const int64_t n_expert = cur->ne[2];
+
+    int layer = -1;
+    if (sscanf(name, "blk.%d.", &layer) != 1 || layer < 0) {
+        throw std::runtime_error(format("%s: expert tensor '%s' has no layer number in its name", __func__, name));
+    }
+    if (!ggml_is_contiguous(cur)) {
+        throw std::runtime_error(format("%s: expert tensor '%s' is not contiguous, its experts cannot be laid out", __func__, name));
+    }
+
+    int n_dev = 0;
+    int n_layer = 0;
+    int n_expert_table = 0;
+    if (table == 0 || !ggml_expert_assignment_dims(table, &n_dev, &n_layer, &n_expert_table)) {
+        throw std::runtime_error(format("%s: tensor '%s' is split over the devices along the expert dim, "
+            "but the model has no expert assignment table", __func__, name));
+    }
+    if ((size_t) n_dev != dev_slices->size() || n_expert_table != n_expert || layer >= n_layer) {
+        throw std::runtime_error(format("%s: tensor '%s' (layer %d, %" PRId64 " experts over %zu devices) does not match the "
+            "expert assignment (%d layers, %d experts over %d devices)", __func__, name, layer, n_expert, dev_slices->size(),
+            n_layer, n_expert_table, n_dev));
+    }
+    for (int j = 0; j < n_dev; j++) {
+        const int cap = ggml_expert_assignment_cap(table, j);
+        if ((int64_t) cap != (*dev_slices)[(size_t) j]) {
+            throw std::runtime_error(format("%s: tensor '%s': device %d holds %" PRId64 " experts but the expert assignment "
+                "gives it %d; the tensor split is not the even expert split the assignment is built for", __func__, name, j,
+                (*dev_slices)[(size_t) j], cap));
+        }
+    }
+
+    layout.by_table = true;
+    layout.check    = in_store;
+    layout.layer    = layer;
+    layout.pos_of.resize((size_t) n_expert);
+    std::vector<uint8_t> taken((size_t) n_expert, 0);
+    for (int64_t e = 0; e < n_expert; e++) {
+        const int64_t pos = ggml_expert_assignment_load_position(table, layer, (int) e);
+        GGML_ASSERT(pos >= 0 && pos < n_expert && !taken[(size_t) pos]);
+        taken[(size_t) pos]      = 1;
+        layout.pos_of[(size_t) e] = pos;
+        layout.identity = layout.identity && pos == e;
+    }
+    return layout;
+}
+
+// the hash of the bytes of global expert e of an expert tensor as they go into the device buffers,
+// for the placement check the backend runs after the load (ggml_expert_store_verify_placement)
+static void llama_expert_note_source(const ggml_tensor * cur, int64_t e, const void * data, size_t expert_size) {
+    ggml_expert_store_set_source_hash(ggml_get_name(cur), e, ggml_expert_store_hash_expert(data, expert_size));
+}
+
+// Move the experts of a host buffer from file order to the layout: expert e goes to position
+// pos_of[e]. In place along the cycles of the permutation with one expert of scratch, so the
+// buffer of the tensor is the only one of its size.
+static void llama_permute_experts(uint8_t * data, size_t expert_size, const std::vector<int64_t> & pos_of) {
+    const int64_t n = (int64_t) pos_of.size();
+    std::vector<uint8_t> hold(expert_size);
+    std::vector<uint8_t> next(expert_size);
+    std::vector<uint8_t> placed((size_t) n, 0);
+    for (int64_t e0 = 0; e0 < n; e0++) {
+        if (placed[(size_t) e0] || pos_of[(size_t) e0] == e0) {
+            placed[(size_t) e0] = 1;
+            continue;
+        }
+        // hold is the expert that still has to be placed: in[e0] first, then the expert its slot
+        // displaced, until the cycle closes at e0
+        memcpy(hold.data(), data + (size_t) e0*expert_size, expert_size);
+        int64_t cur = e0;
+        while (true) {
+            const int64_t nxt = pos_of[(size_t) cur];
+            if (nxt == e0) {
+                memcpy(data + (size_t) nxt*expert_size, hold.data(), expert_size);
+                placed[(size_t) nxt] = 1;
+                break;
+            }
+            memcpy(next.data(), data + (size_t) nxt*expert_size, expert_size);
+            memcpy(data + (size_t) nxt*expert_size, hold.data(), expert_size);
+            std::swap(hold, next);
+            placed[(size_t) nxt] = 1;
+            cur = nxt;
+        }
+    }
+}
+
+// an expert tensor that is complete in host memory in file order: register the hash of every expert
+// for the placement check, then move the experts to their positions
+static void llama_expert_layout_apply(const ggml_tensor * cur, const llama_expert_layout & layout, uint8_t * data) {
+    const size_t expert_size = cur->nb[2];
+    if (layout.check) {
+        for (int64_t e = 0; e < cur->ne[2]; e++) {
+            llama_expert_note_source(cur, e, data + (size_t) e*expert_size, expert_size);
+        }
+    }
+    if (layout.by_table && !layout.identity) {
+        llama_permute_experts(data, expert_size, layout.pos_of);
+    }
+}
+
+// The file stores the merged gate/up expert weight per expert as the n_ff rows of gate followed by
+// the n_ff rows of up. ggml_mul_mat_id_swiglu reads them as pairs, row 2r = gate row r and
+// row 2r+1 = up row r, so the rows are reordered here while the weight is loaded, which keeps the
+// reordering out of the run time entirely.
+//
+// data holds the tensor as it is in the file: n_expert experts of 2*n_ff contiguous rows of
+// ggml_row_size(type, ne0) bytes each. The rows are copied into a scratch buffer of the same size
+// and then moved back in the interleaved order, so the source is never read and written at once.
+// data must be writable and must not alias the file mapping.
+static void llama_interleave_gate_up_rows(uint8_t * data, ggml_type type, int64_t ne0, int64_t n_ff, int64_t n_expert) {
+    GGML_ASSERT(n_ff > 0 && n_expert > 0);
+
+    const size_t row_size = ggml_row_size(type, ne0);
+    const size_t expert_size = 2*n_ff*row_size;
+
+    std::vector<uint8_t> scratch(expert_size);
+
+    for (int64_t e = 0; e < n_expert; e++) {
+        uint8_t * dst_expert = data + e*expert_size;
+
+        // gate rows into the even positions of the scratch buffer
+        for (int64_t r = 0; r < n_ff; r++) {
+            memcpy(scratch.data() + (2*r)*row_size, dst_expert + r*row_size, row_size);
+        }
+        // up rows into the odd positions, then move the whole expert over
+        for (int64_t r = 0; r < n_ff; r++) {
+            memcpy(scratch.data() + (2*r + 1)*row_size, dst_expert + (n_ff + r)*row_size, row_size);
+        }
+        memcpy(dst_expert, scratch.data(), expert_size);
+    }
+}
+
+// A gate/up expert weight that the file does not have is synthesized from the gate and the up
+// weight of the file: for every expert the n_ff rows of the gate weight and the n_ff rows of the
+// up weight are written to the even and the odd rows of the merged tensor, which is the order
+// ggml_mul_mat_id_swiglu reads. The file mapping and the destination buffer are both written
+// while loading, so the rows come from the file into private buffers and are interleaved there.
+//
+// The whole tensor is written with one tensor_set(): the expert weights are split along the expert
+// axis, and a buffer that holds such a split tensor takes the whole tensor in one call (the split
+// chunks are contiguous in it), so a partial write would not be a valid write.
+//
+// Every expert goes straight to its position of the layout (llama_expert_layout), so the buffer is
+// written once and nothing is moved afterwards.
+static void llama_load_merged_gate_up(
+        const llama_files & files, ggml_tensor * cur,
+        const llama_model_loader::llama_tensor_weight_src & gate,
+        const llama_model_loader::llama_tensor_weight_src & up,
+        bool bf16_as_f16, bool check_tensors, const llama_expert_layout & layout) {
+    const size_t n_size = ggml_nbytes(cur);
+
+    const int64_t n_ff    = cur->ne[1] / 2;
+    const size_t row_size = ggml_row_size(cur->type, cur->ne[0]);
+
+    // BF16 weights are loaded as F16 on devices without native BF16 support, see create_tensor()
+    const ggml_type  type_src    = bf16_as_f16 ? GGML_TYPE_F16 : cur->type;
+    const size_t     src_rows    = n_ff*ggml_row_size(type_src, cur->ne[0]);
+    const size_t     expert_size = 2*src_rows;
+
+    const llama_model_loader::llama_tensor_weight_src * src[2] = { &gate, &up };
+    GGML_ASSERT(n_size == (size_t) cur->ne[2]*expert_size);
+    GGML_ASSERT(gate.size == (size_t) cur->ne[2]*src_rows && up.size == (size_t) cur->ne[2]*src_rows);
+
+    std::vector<no_init<uint8_t>> buf_merged;
+
+    // the whole tensor is staged in host memory, so report how much is needed when it does not fit
+    try {
+        buf_merged.resize(n_size);
+    } catch (const std::bad_alloc &) {
+        throw std::runtime_error(format("%s: not enough host memory to load '%s' (%.2f GiB)",
+                    __func__, ggml_get_name(cur), n_size/(1024.0*1024.0*1024.0)));
+    }
+
+    // one expert of each source at a time, the merged rows go straight into the tensor buffer
+    std::vector<no_init<uint8_t>> buf_gate(src_rows);
+    std::vector<no_init<uint8_t>> buf_up(src_rows);
+
+    // the BF16 to F16 conversion keeps the row width, so a source row is a row of the tensor
+    std::vector<no_init<uint8_t>> * buf_src[2] = { &buf_gate, &buf_up };
+
+    for (int64_t e = 0; e < cur->ne[2]; e++) {
+        for (int s = 0; s < 2; s++) {
+            llama_file * file = files.at(src[s]->idx).get();
+
+            file->seek(src[s]->offs + e*src_rows, SEEK_SET);
+            file->read_raw(buf_src[s]->data(), src_rows);
+
+            if (bf16_as_f16) {
+                ggml_bf16_to_fp16_row((const ggml_bf16_t *) buf_src[s]->data(),
+                                      (ggml_fp16_t *) buf_src[s]->data(), src_rows/sizeof(ggml_bf16_t));
+            }
+        }
+
+        no_init<uint8_t> * dst_expert = buf_merged.data() + layout.position(e)*expert_size;
+
+        for (int64_t r = 0; r < n_ff; r++) {
+            memcpy(dst_expert + (2*r    )*row_size, buf_gate.data() + r*row_size, row_size);
+            memcpy(dst_expert + (2*r + 1)*row_size, buf_up  .data() + r*row_size, row_size);
+        }
+
+        // the bytes of global expert e as the device buffers receive them, for the placement check
+        if (layout.check) {
+            llama_expert_note_source(cur, e, dst_expert, expert_size);
+        }
+    }
+
+    if (check_tensors && !ggml_validate_row_data(cur->type, buf_merged.data(), n_size)) {
+        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+    }
+
+    ggml_backend_tensor_set(cur, buf_merged.data(), 0, n_size);
 }
 
 bool llama_model_loader::load_all_data(
@@ -1608,6 +2154,28 @@ bool llama_model_loader::load_all_data(
         tensors.push_back(cur);
     }
 
+    // a device-readable host buffer (the CUDA mapped host buffers) is copied into, so the page
+    // cache of the source file range can be dropped right after each tensor to avoid keeping a
+    // second copy of the weights in host memory
+    auto is_device_readable_buft = [](ggml_backend_buffer_type_t buft) -> bool {
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+        if (dev == nullptr) {
+            return false;
+        }
+        // a meta device puts its devices' mapped weights buffers into one shared buffer
+        if (ggml_backend_dev_is_meta(dev)) {
+            return buft == llama_buft_device_mapped_weights(dev);
+        }
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (reg == nullptr) {
+            return false;
+        }
+        typedef bool (*ggml_backend_buft_is_mapped_t)(ggml_backend_buffer_type_t);
+        auto is_mapped = (ggml_backend_buft_is_mapped_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_mapped");
+        return is_mapped != nullptr && is_mapped(buft);
+    };
+
     // without mmap, tensors in non-host buffers are staged through a temporary buffer sized like the tensor
     // load them biggest-first so the largest staging buffer is allocated while the fewest weights are resident
     if (!use_mmap) {
@@ -1621,8 +2189,52 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    // bytes copied into the device-readable host buffers (the n-gram table, the token embedding
+    // table) and the time that took, reported at the end of the load
+    size_t n_devread_bytes = 0;
+    int64_t ms_devread = 0;
+
     for (struct ggml_tensor * cur : tensors) {
-        const auto * weight = get_weight(ggml_get_name(cur));
+        const std::string cur_name = ggml_get_name(cur);
+
+        // a routed expert weight (one expert per ne[2] slice; in the expert store or a plain device
+        // weight): where every expert goes in the buffer that is written, see llama_expert_layout
+        const bool is_expert = expert_weights.count(cur) != 0 && cur->ne[2] > 1;
+        llama_expert_layout layout;
+        if (is_expert) {
+            const auto sit = expert_dev_slices.find(cur);
+            layout = llama_expert_layout_of(cur, sit != expert_dev_slices.end() ? &sit->second : nullptr, expert_assignment);
+            if (layout.by_table) {
+                expert_tensors_by_table.push_back(cur);
+            }
+        }
+
+        // a gate/up expert weight that is synthesized from the gate and the up weight of the file:
+        // it is not in the file, so it never goes through the mapping below
+        if (auto mit = merged_tensors.find(cur_name); mit != merged_tensors.end()) {
+            if (progress_callback) {
+                if (!progress_callback((float) size_done / size_data, progress_callback_user_data)) {
+                    return false;
+                }
+            }
+
+            const auto & merged = mit->second;
+
+            llama_load_merged_gate_up(files, cur, merged.gate, merged.up, merged.bf16_as_f16, check_tensors, layout);
+
+            // the weights are now in a buffer the device reads directly, drop the page cache of
+            // the two source ranges, they are not mapped into a buffer
+            if (use_mmap && cur->buffer != nullptr && is_device_readable_buft(ggml_backend_buffer_get_type(cur->buffer))) {
+                for (const auto * src : { &merged.gate, &merged.up }) {
+                    mappings.at(src->idx)->drop_page_cache(src->offs, src->offs + src->size);
+                }
+            }
+
+            size_done += ggml_nbytes(cur);
+            continue;
+        }
+
+        const auto * weight = get_weight(cur_name.c_str());
         if (weight == nullptr) {
             // this can happen with split experts models
             continue;
@@ -1635,6 +2247,68 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        // a gate/up weight is rewritten into the interleaved row order while loading: its rows come
+        // from the file into a private buffer, because neither the file mapping nor the destination
+        // buffer may be read and written in place
+        if (weight->interleave_gate_up) {
+            LLAMA_LOG_INFO("%s: tensor %s: interleaving the gate and up rows of the merged expert weight\n",
+                    __func__, ggml_get_name(cur));
+
+            const auto & file = files.at(weight->idx);
+
+            std::vector<no_init<uint8_t>> read_buf(n_size);
+            file->seek(weight->offs, SEEK_SET);
+            file->read_raw(read_buf.data(), n_size);
+
+            llama_interleave_gate_up_rows((uint8_t *) read_buf.data(), cur->type, cur->ne[0], cur->ne[1]/2, cur->ne[2]);
+
+            if (is_expert) {
+                llama_expert_layout_apply(cur, layout, (uint8_t *) read_buf.data());
+            }
+
+            if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+
+            ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+
+            size_done += n_size;
+            continue;
+        }
+
+        // BF16 weights loaded as F16 are converted here: the file holds BF16 but the tensor that
+        // was created is F16 and the model expects F16 from this point on
+        if (weight->tensor->type == GGML_TYPE_BF16 && cur->type == GGML_TYPE_F16) {
+            std::vector<no_init<uint8_t>> read_buf(n_size);
+
+            const void * data = load_data_range(*weight, 0, n_size, read_buf.data());
+            if (data != read_buf.data()) {
+                memcpy(read_buf.data(), data, n_size);
+            }
+
+            const int64_t n = n_size / sizeof(ggml_bf16_t);
+            n_bf16_clamped += ggml_bf16_to_fp16_row((const ggml_bf16_t *) read_buf.data(), (ggml_fp16_t *) read_buf.data(), n);
+            n_bf16_converted += n;
+
+            if (is_expert) {
+                llama_expert_layout_apply(cur, layout, (uint8_t *) read_buf.data());
+            }
+
+            if (check_tensors && !ggml_validate_row_data(GGML_TYPE_F16, read_buf.data(), n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+
+            ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+
+            // the weights are now in a buffer the device reads directly, drop the page cache
+            if ((use_mmap || lazy.has(cur)) && cur->buffer != nullptr && is_device_readable_buft(ggml_backend_buffer_get_type(cur->buffer))) {
+                mappings.at(weight->idx)->drop_page_cache(weight->offs, weight->offs + n_size);
+            }
+
+            size_done += n_size;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 
@@ -1654,7 +2328,13 @@ bool llama_model_loader::load_all_data(
 
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
-                ggml_backend_tensor_alloc(buf_mmap, cur, data);
+                // a tensor bound to the mapping keeps the file order; a tensor laid out by the
+                // expert assignment is never bound (it lives in the device buffers), see above
+                GGML_ASSERT(!(is_expert && layout.by_table));
+                if (ggml_backend_tensor_alloc(buf_mmap, cur, data) != GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error(format("%s: failed to bind tensor '%s' to %s",
+                            __func__, ggml_get_name(cur), ggml_backend_buffer_name(buf_mmap)));
+                }
 
                 // locking a lazy tensor would fault all of it in, which is what lazy avoids
                 if (lmlocks && !lazy.has(cur)) {
@@ -1666,7 +2346,38 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
-                ggml_backend_tensor_set(cur, data, 0, n_size);
+                const bool devread = cur->buffer != nullptr && is_device_readable_buft(ggml_backend_buffer_get_type(cur->buffer));
+                const int64_t t0 = devread ? ggml_time_us() : 0;
+
+                if (is_expert && layout.check) {
+                    const size_t expert_size = cur->nb[2];
+                    for (int64_t e = 0; e < cur->ne[2]; e++) {
+                        llama_expert_note_source(cur, e, data + (size_t) e*expert_size, expert_size);
+                    }
+                }
+                if (is_expert && layout.by_table && !layout.identity) {
+                    // the mapping is read only, so the experts are copied to their positions in a
+                    // buffer of the tensor size and that buffer is written: still one copy to the
+                    // device, the buffer lives for this tensor only
+                    const size_t expert_size = cur->nb[2];
+                    std::vector<no_init<uint8_t>> perm_buf(n_size);
+                    for (int64_t e = 0; e < cur->ne[2]; e++) {
+                        memcpy(perm_buf.data() + (size_t) layout.pos_of[(size_t) e]*expert_size, data + (size_t) e*expert_size, expert_size);
+                    }
+                    ggml_backend_tensor_set(cur, perm_buf.data(), 0, n_size);
+                } else {
+                    ggml_backend_tensor_set(cur, data, 0, n_size);
+                }
+
+                if (devread) {
+                    ms_devread += ggml_time_us() - t0;
+                    n_devread_bytes += n_size;
+                }
+
+                // the weights are now in a buffer the device reads directly, drop the page cache
+                if (devread) {
+                    mapping->drop_page_cache(weight->offs, weight->offs + n_size);
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
@@ -1674,6 +2385,9 @@ bool llama_model_loader::load_all_data(
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
+                if (is_expert) {
+                    llama_expert_layout_apply(cur, layout, (uint8_t *) cur->data);
+                }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
@@ -1681,7 +2395,11 @@ bool llama_model_loader::load_all_data(
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                // An expert tensor of the store or one laid out by the assignment table is read whole
+                // below instead: its experts are hashed for the placement check and laid out by the
+                // table, which needs the whole tensor.
+                const bool expert_whole = is_expert && ((cur->flags & GGML_TENSOR_FLAG_EXPERT) != 0 || layout.by_table);
+                if (upload_backend && !expert_whole) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
@@ -1738,6 +2456,9 @@ bool llama_model_loader::load_all_data(
                     std::vector<no_init<uint8_t>> read_buf(n_size);
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
+                    if (is_expert) {
+                        llama_expert_layout_apply(cur, layout, (uint8_t *) read_buf.data());
+                    }
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
                     if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
@@ -1774,6 +2495,16 @@ bool llama_model_loader::load_all_data(
 
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
+        if (n_bf16_converted > 0) {
+            LLAMA_LOG_INFO("%s: converted %zu BF16 weight values to F16 (%zu clamped to +-65504)\n",
+                    __func__, n_bf16_converted, n_bf16_clamped);
+        }
+        if (n_devread_bytes > 0) {
+            const double t_s = std::max<int64_t>(ms_devread, 1)/1e6;
+            LLAMA_LOG_INFO("%s: copied %.2f GiB into the device-readable host buffers in %.1f s (%.1f GiB/s)\n",
+                    __func__, n_devread_bytes/1024.0/1024.0/1024.0, t_s, n_devread_bytes/1024.0/1024.0/1024.0/t_s);
+        }
+
         // unmap offloaded tensors and metadata
         if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {

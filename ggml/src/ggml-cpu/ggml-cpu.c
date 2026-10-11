@@ -1494,7 +1494,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     const struct mmid_row_mapping * matrix_rows,
     const size_t row_size,
     const bool src1_cont,
-    const void * wdata) {
+    const void * wdata,
+    const int32_t epilogue) {
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1502,6 +1503,11 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
 
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+
+    // the SwiGLU epilogue reads the rows of src0 in pairs (2r = gate r, 2r+1 = up r) and writes
+    // one F16 row per pair, so its row blocks must start on an even row and have an even length
+    const bool swiglu = epilogue == GGML_MUL_MAT_ID_EPILOGUE_SWIGLU;
+    GGML_ASSERT(!swiglu || (ir0_start % 2 == 0 && ir0_end % 2 == 0));
 
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -1531,13 +1537,22 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                     ? (i11      + i12*ne11)*row_size
                     : (i11*nb11 + i12*nb12));
 
-                float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
+                char * dst_col = (char *) dst->data + (i1*nb1 + i2*nb2);
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
                 }
 
-                memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
+                const int64_t n_rows = MIN(iir0 + blck_0, ir0_end) - iir0;
+
+                if (swiglu) {
+                    ggml_fp16_t * dst_col_h = (ggml_fp16_t *) dst_col;
+                    for (int64_t r = 0; r < n_rows; r += 2) {
+                        dst_col_h[(iir0 + r)/2] = GGML_FP32_TO_FP16(ggml_silu_f32(tmp[r])*tmp[r + 1]);
+                    }
+                } else {
+                    memcpy(dst_col + iir0*sizeof(float), tmp, n_rows*sizeof(float));
+                }
             }
         }
     }
@@ -1571,24 +1586,45 @@ static void ggml_compute_forward_mul_mat_id(
     enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
     ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
 
+    // GGML_MUL_MAT_ID_EPILOGUE_SWIGLU: the rows of src0 come in gate/up pairs, dst is F16
+    const int32_t epilogue = ggml_mul_mat_id_get_epilogue(dst);
+    const bool    swiglu   = epilogue == GGML_MUL_MAT_ID_EPILOGUE_SWIGLU;
+
     // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(type));
     GGML_ASSERT(nb10 == ggml_type_size(src1->type));
 
     // dst cannot be transposed or permuted
-    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(nb0 == ggml_type_size(dst->type));
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
+
+    // the row blocks of the SwiGLU epilogue pair the gate and up rows, so they need an even length
+    GGML_ASSERT(!swiglu || (ne01 % 2 == 0 && dst->type == GGML_TYPE_F16));
 
     // row groups
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 
+    // expert parallelism: the local weights only cover the experts the expert map of the node
+    // names (ggml_expert_store_node_lut, read below), the other ids are not computed and their
+    // output slots are zeroed
+    const bool    expert_parallel = ggml_mul_mat_id_is_expert_parallel(dst);
+    const int32_t n_expert_total  = expert_parallel ? ggml_mul_mat_id_get_n_expert_total(dst) : n_as;
+    GGML_ASSERT(n_expert_total >= n_as);
+
     void * wdata_cur = params->wdata;
 
     if (src1->type != vec_dot_type) {
         incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
+    }
+
+    // an F16 src1 is widened into this F32 staging buffer before it is quantized into vec_dot_type
+    float * wdata_wide = NULL;
+    if (src1->type != vec_dot_type && src1->type != GGML_TYPE_F32) {
+        GGML_ASSERT(src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
+        wdata_wide = (float *) incr_ptr_aligned(&wdata_cur, ggml_row_size(GGML_TYPE_F32, ggml_nelements(src1)), sizeof(int64_t));
     }
 
     int64_t * matrix_row_counts = // [n_as]
@@ -1615,7 +1651,7 @@ static void ggml_compute_forward_mul_mat_id(
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
+        GGML_ASSERT(src1->type == GGML_TYPE_F32 || src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
 
 #if 0
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
@@ -1634,9 +1670,24 @@ static void ggml_compute_forward_mul_mat_id(
                     size_t bs = ggml_blck_size(vec_dot_type);
                     int64_t ne10_block_start = (ith * ne10/bs) / nth;
                     int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+                    const int64_t n_block = (ne10_block_end - ne10_block_start) * bs;
+                    const char * src1_row = (const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10;
+                    void * wdata_row       =                  wdata  + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0;
+
+                    if (wdata_wide == NULL) {
+                        from_float((const float *) src1_row, wdata_row, n_block);
+                        continue;
+                    }
+
+                    // the widened copy is a compact F32 [ne10, ne11, ne12, ne13] array: element strides, and the block
+                    // start is in blocks of vec_dot_type
+                    float * wide_row = wdata_wide + ((i13*ne12 + i12)*ne11 + i11)*ne10 + ne10_block_start*bs;
+                    if (src1->type == GGML_TYPE_F16) {
+                        ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row, wide_row, n_block);
+                    } else {
+                        ggml_cpu_bf16_to_fp32((const ggml_bf16_t *) src1_row, wide_row, n_block);
+                    }
+                    from_float(wide_row, wdata_row, n_block);
                 }
             }
         }
@@ -1647,15 +1698,38 @@ static void ggml_compute_forward_mul_mat_id(
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
+        // the expert map of the node: local expert number of every routing id, -1 for the experts
+        // of the other devices. It is the same row the CUDA kernels read (through a device copy):
+        // identity without expert parallelism, otherwise the row of (device, layer) of the expert
+        // assignment table the weight of the node was laid out by (ggml-impl.h).
+        const int16_t * expert_lut = ggml_expert_store_node_lut(dst);
+        GGML_ASSERT(expert_lut != NULL);
+
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
-                assert(i02 >= 0 && i02 < n_as);
+                assert(i02 >= 0);
+                // expert parallelism: ids of the other devices are valid and their output slots are zeroed below
+                assert(expert_parallel || i02 < n_as);
+                const int32_t local = i02 >= 0 && i02 < n_expert_total ? (int32_t) expert_lut[i02] : -1;
+                if (local < 0) {
+                    // this id belongs to another device, zero its output slot
+                    char * dst_slot = (char *) dst->data + (iid1*nb2 + id*nb1);
+                    for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                        if (swiglu) {
+                            ((ggml_fp16_t *) dst_slot)[i0] = GGML_FP32_TO_FP16(0.0f);
+                        } else {
+                            ((float *) dst_slot)[i0] = 0.0f;
+                        }
+                    }
+                    continue;
+                }
+                GGML_ASSERT(local < n_as);
 
-                MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = (struct mmid_row_mapping) {id, iid1};
-                matrix_row_counts[i02] += 1;
+                MMID_MATRIX_ROW(local, matrix_row_counts[local]) = (struct mmid_row_mapping) {id, iid1};
+                matrix_row_counts[local] += 1;
             }
         }
     }
@@ -1675,8 +1749,9 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        // tiled takes over if profitable for this expert (see tiled.h)
-        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
+        // tiled takes over if profitable for this expert (see tiled.h). it is a plain F32 matmul
+        // without an epilogue, so a fused epilogue stays on the row-block loop below
+        if (!swiglu && ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
 
@@ -1703,7 +1778,8 @@ static void ggml_compute_forward_mul_mat_id(
             nchunk1 = nr0 > nr1 ? 1 : nth;
         }
 
-        const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+        // an epilogue that pairs rows needs each row block to hold whole pairs
+        const int64_t dr0 = GGML_PAD((nr0 + nchunk0 - 1) / nchunk0, swiglu ? 2 : 1);
         const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
         int current_chunk = ith;
@@ -1723,7 +1799,7 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_compute_forward_mul_mat_id_one_chunk(
                 dst, src0, src1, ids, cur_a,
                 ir0_start, ir0_end, ir1_start, ir1_end,
-                src0_cur, matrix_rows, row_size, src1_cont, wdata
+                src0_cur, matrix_rows, row_size, src1_cont, wdata, epilogue
             );
 
             if (nth >= nchunk0 * nchunk1) {
@@ -2093,6 +2169,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
             } break;
+        case GGML_OP_QSA_SELECT:
+            {
+                ggml_compute_forward_qsa_select(params, tensor);
+            } break;
+        case GGML_OP_QSA_ATTN:
+            {
+                ggml_compute_forward_qsa_attn(params, tensor);
+            } break;
         case GGML_OP_DSV4_HC_COMB:
             {
                 ggml_compute_forward_dsv4_hc_comb(params, tensor);
@@ -2430,6 +2514,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
+        case GGML_OP_QSA_SELECT:
+        case GGML_OP_QSA_ATTN:
             {
                 n_tasks = n_threads;
             } break;
@@ -2901,6 +2987,10 @@ struct ggml_cplan ggml_graph_plan(
                         // src1
                         if (src1->type != vec_dot_type) {
                             cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
+                            // an F16/BF16 src1 is widened into a F32 staging buffer first
+                            if (src1->type != GGML_TYPE_F32) {
+                                cur += ggml_row_size(GGML_TYPE_F32, ggml_nelements(src1)) + sizeof(int64_t);
+                            }
                         }
                         // matrix_row_counts
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
@@ -3038,6 +3128,20 @@ struct ggml_cplan ggml_graph_plan(
                         // temp buffer for dequantizing lightning indexer keys
                         const int64_t ne10 = node->src[1]->ne[0];
                         cur += sizeof(float)*ne10*n_tasks;
+                    } break;
+                case GGML_OP_QSA_SELECT:
+                    {
+                        // one widened key, the scores of the visible pools and their order, see ops.cpp
+                        const int64_t n_embd = node->src[1]->ne[0];
+                        const int64_t n_pool = node->src[5]->ne[0];
+                        cur += ((n_embd + 2*n_pool)*sizeof(float) + CACHE_LINE_SIZE)*n_tasks;
+                    } break;
+                case GGML_OP_QSA_ATTN:
+                    {
+                        // one widened K row, one widened V row and the accumulator, see ops.cpp
+                        const int64_t DK = node->src[1]->ne[0];
+                        const int64_t DV = node->src[2]->ne[0];
+                        cur += sizeof(float)*(DK + 2*DV + CACHE_LINE_SIZE_F32)*n_tasks;
                     } break;
                 default:
                     break;

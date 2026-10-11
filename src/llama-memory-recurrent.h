@@ -54,6 +54,8 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    void collect_tensors(std::vector<std::pair<std::string, ggml_tensor *>> & out) const override;
+
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 
     // find a contiguous slot of memory cells and emplace the ubatch there

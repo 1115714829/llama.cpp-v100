@@ -15,6 +15,7 @@
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 using llama_buf_map = std::unordered_map<uint32_t, ggml_backend_buffer_t>;
 
@@ -37,6 +38,10 @@ struct llama_model_loader {
 
         ggml_tensor * tensor;
 
+        // the rows of the tensor are rewritten from the concatenated gate/up order of the file
+        // into the interleaved order read by ggml_mul_mat_id_swiglu, see TENSOR_GATE_UP_INTERLEAVE
+        bool interleave_gate_up = false;
+
         llama_tensor_weight(const llama_file * file, uint16_t idx, const struct gguf_context * gguf_ctx, ggml_tensor * tensor) : idx(idx), tensor(tensor) {
             const int tensor_idx = gguf_find_tensor(gguf_ctx,  ggml_get_name(tensor));
             if (tensor_idx < 0) {
@@ -48,6 +53,23 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
+    };
+
+    // one file tensor whose bytes go into a synthesized tensor, see llama_tensor_merged
+    struct llama_tensor_weight_src {
+        uint16_t idx; // source file index
+        size_t   offs; // tensor data offset in the original file
+        size_t   size; // size of the source tensor data in the file
+    };
+
+    // a tensor that the file does not have, synthesized while loading from the gate and the up
+    // weight of the file: their rows are interleaved into it (row 2r = gate row r, row 2r+1 = up
+    // row r), see TENSOR_GATE_UP_INTERLEAVE and llama_load_merged_gate_up
+    struct llama_tensor_merged {
+        llama_tensor_weight_src gate;
+        llama_tensor_weight_src up;
+        // the sources are BF16 in the file and the tensor is F16 (bf16_weights_as_f16)
+        bool bf16_as_f16 = false;
     };
 
     // custom comparator to sort weights more nicely by layer
@@ -70,6 +92,10 @@ struct llama_model_loader {
     static const int TENSOR_SKIP_IF_VIRTUAL = 1 << 3;
     static const int TENSOR_ALLOW_RESHAPE   = 1 << 4;
     static const int TENSOR_READ_LAZY       = 1 << 5; // read rows on demand instead of loading whole tensor; requires mmap for now
+    // the tensor holds the rows of a gate and an up projection concatenated (n_ff gate rows followed
+    // by n_ff up rows per expert) and is rewritten into the interleaved order (row 2r = gate row r,
+    // row 2r+1 = up row r) that ggml_mul_mat_id_swiglu reads; see llama_interleave_gate_up_rows
+    static const int TENSOR_GATE_UP_INTERLEAVE = 1 << 6;
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -83,6 +109,9 @@ struct llama_model_loader {
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
+    // do not mark the routed experts: they stay plain device weights instead of going into
+    // the expert store (draft models, which use every expert every step)
+    bool no_expert_store = false;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
@@ -109,13 +138,41 @@ struct llama_model_loader {
             return it == ranges.end() ? none : it->second;
         }
 
-        // lazy tensors are gathered on the host, so no offload setting applies to them
-        static ggml_backend_buffer_type_t buft();
+        // device that consumes the lazy tensors, set by the model before the tensors are created.
+        // when it is a CUDA device the lazy table is loaded into device-readable mapped host
+        // memory (mapped weights buffer); otherwise it stays in a CPU mmap buffer
+        ggml_backend_dev_t dev = nullptr;
+
+        // buffer type of a lazy tensor: a device-readable mapped weights buffer when the
+        // consuming device offers one, otherwise the CPU buffer type
+        ggml_backend_buffer_type_t buft() const;
 
     private:
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
     } lazy;
+
+    // handle the token embedding table of the input layer: the input layer stays on the CPU,
+    // but the table is loaded into device-readable mapped host memory and read on the device
+    // that holds layer 0, so that GET_ROWS runs there instead of splitting the graph back to
+    // the CPU for it
+    struct embd_read {
+        // set by the model before the create_tensor() calls
+        ggml_backend_dev_t dev = nullptr;
+
+        // buffer type of the token embedding table: the mapped weights buffer of dev, or
+        // nullptr when the device does not offer one
+        ggml_backend_buffer_type_t buft() const;
+    } embd;
+
+    // target model a draft head borrows the shared tensors from, see borrow_shared_tensor()
+    // from unsloth PR #142
+    const struct llama_model * model_shared = nullptr;
+
+    // true when the file's metadata says it left the shared tensors to the target
+    // (nextn_shared_target_tensors). a draft that ships its own tokens or does not set the
+    // key keeps its own tensors, see borrow_shared_tensor()
+    bool nextn_shared_target_tensors = false;
 
     llama_files files;
     llama_ftype ftype;
@@ -124,6 +181,12 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+    // tensors that the file does not have and that are synthesized from the gate and up weights
+    // of this file while loading, keyed by tensor name
+    std::map<std::string, llama_tensor_merged> merged_tensors;
+    // file tensors consumed by a synthesized tensor: they are neither created nor loaded on their
+    // own, their bytes are read into the synthesized tensor instead
+    int n_merged_sources = 0;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
@@ -139,6 +202,28 @@ struct llama_model_loader {
     size_t size_done = 0;
     size_t size_data = 0;
     std::vector<std::pair<size_t, size_t>> mmaps_used;
+
+    // BF16 weights loaded as F16 on devices without native BF16 support
+    size_t n_bf16_converted = 0; // elements
+    size_t n_bf16_clamped   = 0; // elements clamped to +-65504
+
+    // The routed expert weights this loader created (by their role), whether they go into the
+    // expert store or stay plain device weights (no_expert_store): both are laid out by the expert
+    // assignment table of the model when they are split over the devices along the expert dim.
+    std::set<const ggml_tensor *> expert_weights;
+
+    // Expert tensors that are split over the devices along the expert dim, with the number of
+    // experts every device holds (the slice lengths of the meta split, in device order). The
+    // model fills this before load_all_data(), together with expert_assignment: the loader lays
+    // every expert of these tensors out at the position of that table
+    // (ggml_expert_assignment_load_position), the backend checks the placement after the load. A
+    // tensor that is not in the map holds the whole expert dim and keeps the file order.
+    std::map<const ggml_tensor *, std::vector<int64_t>> expert_dev_slices;
+    // the expert assignment table of the model (0: no tensor is split along the expert dim)
+    uint32_t expert_assignment = 0;
+    // expert tensors laid out by the table in this load; the model activates the table for them
+    // once they are all written
+    std::vector<const ggml_tensor *> expert_tensors_by_table;
 
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
@@ -182,6 +267,7 @@ struct llama_model_loader {
         bool check_tensors,
         bool no_alloc,
         bool load_mtp,
+        bool no_expert_store,
         const llama_model_kv_override * param_overrides_p,
         const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
 
@@ -234,9 +320,24 @@ struct llama_model_loader {
             bool required,
             bool allow_reshape) const;
 
+    // true if the devices in the list have no native BF16 support, so BF16 weights should be loaded as F16
+    static bool bf16_weights_as_f16(const buft_list_t * buft_list);
+
+    // true if the tensor is a BF16 weight that is loaded as F16
+    bool is_bf16_as_f16(const struct ggml_tensor * tensor) const;
+
+    // tn_src_gate and tn_src_up name the two file tensors a gate/up tensor is synthesized from,
+    // instead of looking the tensor up in the file. only valid when they are set
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
-        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+        const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
+        const LLM_TN_IMPL * tn_src_gate = nullptr, const LLM_TN_IMPL * tn_src_up = nullptr);
+
+    // a draft head that shares the target's embeddings does not carry its own token_embd,
+    // output or output_norm; take them from the target model instead. returns null unless the
+    // file is missing token_embd, so a model that ships its own tensors is never affected
+    // from unsloth PR #142
+    struct ggml_tensor * borrow_shared_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne);
 
     void done_getting_tensors(bool partial = false) const;
 

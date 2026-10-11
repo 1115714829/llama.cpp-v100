@@ -1,0 +1,41 @@
+Parts of the following files are ported from Strata (https://github.com/Niko1221/Strata) or from
+its IBM Power AC922 fork Strata-AC922 (https://github.com/eelgaev/Strata-AC922, branch ac922),
+which carry the same license below. Each file names its source in its header; licenses/README.md
+lists every third-party source of this repository.
+
+  ggml/src/ggml-cuda/fused-expert.cu, fused-expert.cuh
+      Strata-AC922 src/kernels/cuda/fused_expert.cu (W4A16 fused-expert kernel)
+  ggml/src/ggml-cuda/lightning-indexer.cu
+      Strata-AC922 src/kernels/cuda/qsa_select.cu (scores_volta_kernel)
+  ggml/src/ggml-cuda/qsa.cu
+      Strata src/kernels/cuda/qsa_select.cu (block_topk_kernel, block_topk_reg_kernel,
+      block_topk_wide_kernel), src/kernels/cuda/qsa_decode_attn.cu (attn_chunk_kernel_pre75,
+      attn_merge_kernel), src/kernels/cuda/qsa_prompt_attn.cu (prompt_attn_v70_kernel)
+  ggml/src/ggml-cuda/moe-grouped.cu, moe-grouped.cuh
+      Strata src/kernels/cuda/s2_expert_grouped.cu (kernel structure)
+  ggml/src/ggml-cuda/dsv4-hc.cu
+      Strata src/kernels/cuda/fused_gr.cu (gate arithmetic of the gated post epilogue)
+  ggml/src/ggml-cuda/unary.cu
+      Strata src/kernels/cuda/fused_gr.cu (scaled SiLU epilogue)
+
+MIT License
+
+Copyright (c) 2026 Niko1221 and the Strata contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

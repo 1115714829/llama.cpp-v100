@@ -346,6 +346,11 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // already loaded model to take the shared embeddings and lm head from, for a draft
+        // head that ships neither. must outlive the model being loaded
+        // from unsloth PR #142
+        const struct llama_model * model_shared;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -353,6 +358,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool no_expert_store; // keep the routed experts as plain device weights instead of the expert store (draft models: small and used every step)
     };
 
     struct llama_sampler_seq_config {
@@ -387,6 +393,8 @@ extern "C" {
         float    yarn_beta_fast;   // YaRN low correction dim
         float    yarn_beta_slow;   // YaRN high correction dim
         uint32_t yarn_orig_ctx;    // YaRN original context size
+        uint32_t n_swa_mtp;        // SWA window of the MTP draft context, in tokens (0 = attend the whole context) [EXPERIMENTAL]
+        uint32_t n_h_sink_rows;    // MTP draft context: extra nextn h sink columns on top of n_batch: second batch group + pending/step rows (0 = no sink) [EXPERIMENTAL]
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
 
         ggml_backend_sched_eval_callback cb_eval;

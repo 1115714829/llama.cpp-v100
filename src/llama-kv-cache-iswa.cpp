@@ -152,6 +152,11 @@ llama_pos llama_kv_cache_iswa::seq_pos_max(llama_seq_id seq_id) const {
     return kv_swa->seq_pos_max(seq_id);
 }
 
+void llama_kv_cache_iswa::collect_tensors(std::vector<std::pair<std::string, ggml_tensor *>> & out) const {
+    kv_base->collect_tensors(out);
+    kv_swa->collect_tensors(out);
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_iswa::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> mb = kv_base->memory_breakdown();
     for (const auto & buft_size : kv_swa->memory_breakdown()) {

@@ -230,6 +230,7 @@ enum llm_kv {
     LLM_KV_MOE_EVERY_N_LAYERS,
     LLM_KV_MOE_LATENT_SIZE,
     LLM_KV_NEXTN_PREDICT_LAYERS,
+    LLM_KV_NEXTN_SHARED_TARGET_TENSORS,
     LLM_KV_NUM_DEEPSTACK_LAYERS,
     LLM_KV_DEEPSTACK_MAPPING,
     LLM_KV_HIDDEN_ACT,
@@ -824,5 +825,7 @@ bool llm_arch_is_recurrent      (const llm_arch & arch);
 bool llm_arch_is_hybrid         (const llm_arch & arch);
 bool llm_arch_is_diffusion      (const llm_arch & arch);
 bool llm_arch_supports_sm_tensor(const llm_arch & arch);
+// MoE expert parallelism: the routed experts are split along the expert dim (axis 2) across devices
+bool llm_arch_uses_expert_parallel(const llm_arch & arch);
 bool llm_arch_supports_rs_rollback(const llm_arch & arch);
 bool llm_arch_supports_mixed_batch(const llm_arch & arch);

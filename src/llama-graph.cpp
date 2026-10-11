@@ -37,8 +37,9 @@ static ggml_tensor * build_attn_inp_kq_mask(
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
     if (allow_range && mctx->get_kq_range()) {
-        // a range mask: one I32 [lo, hi) pair of visible KV columns per token
-        ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, n_tokens/n_stream, 1, n_stream);
+        // a range mask: two I32 [lo, hi) pairs of visible KV columns per token. the second pair is
+        // empty (hi1 <= lo1) unless the visible columns wrap around the end of a ring cache
+        ggml_tensor * res = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 4, n_tokens/n_stream, 1, n_stream);
         ggml_set_input(res);
         ggml_set_name(res, "attn_inp_kq_mask");
 
@@ -76,7 +77,7 @@ static bool can_reuse_kq_mask(
 
     if (range) {
         // the range mask shape does not carry n_kv: compare the K/V view width the graph was built with
-        res &= (kq_mask->ne[0] == 2);
+        res &= (kq_mask->ne[0] == 4);
         res &= (n_kv_graph == n_kv);
     } else {
         res &= (kq_mask->ne[0] == n_kv);
@@ -167,7 +168,10 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     const int64_t n_tokens = ubatch->n_tokens;
 
     if (ubatch->token) {
-        ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        // dchain: the tokens of a draft step live in the device ring (written by the previous step)
+        if (!tokens_device) {
+            ggml_backend_tensor_set(tokens, ubatch->token, 0, n_tokens*ggml_element_size(tokens));
+        }
     } else {
         // note: mtmd embedding input goes through here
         GGML_ASSERT(ubatch->embd);
@@ -179,10 +183,16 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
     // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
     //       for now, we assume that the hidden state is always provided as an embedding
     //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
-    if (ubatch->embd) {
-        GGML_ASSERT(n_embd == h->ne[0]);
+    if (h != nullptr) {
+        if (ubatch->embd) {
+            GGML_ASSERT(n_embd == h->ne[0]);
 
-        ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+            ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd*ggml_element_size(h));
+        }
+    } else if (h_cols != nullptr && h_cols_src != nullptr) {
+        // r-mtpdev device path: the h rows are gathered from the target sink in the graph, only
+        // the column of each row is copied from the host
+        ggml_backend_tensor_set(h_cols, h_cols_src, 0, n_tokens*ggml_element_size(h_cols));
     }
 }
 
@@ -190,8 +200,14 @@ bool llm_graph_input_embd_h::can_reuse(const llm_graph_params & params) {
     bool res = true;
 
     res &= (!params.ubatch.token) || (tokens && tokens->ne[0] == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (embd   && embd->ne[1]   == params.ubatch.n_tokens);
-    res &= (!params.ubatch.embd)  || (h      && h->ne[1]      == params.ubatch.n_tokens);
+
+    if (params.t_embd_h_src != nullptr) {
+        // r-mtpdev device path
+        res &= h_cols != nullptr && h_cols->ne[0] == params.ubatch.n_tokens;
+    } else {
+        res &= (!params.ubatch.embd) || (embd && embd->ne[1] == params.ubatch.n_tokens);
+        res &= (!params.ubatch.embd) || (h    && h->ne[1]    == params.ubatch.n_tokens);
+    }
 
     return res;
 }
@@ -1139,7 +1155,11 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    // the mask is left unallocated when no layer reads it (qwen4exp: the QSA layers attend through
+    // ggml_qsa_select ids), as in llm_graph_input_attn_kv::set_input
+    if (inp_attn->self_kq_mask->buffer) {
+        mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -1352,6 +1372,9 @@ void llm_graph_result::reset() {
     t_logits_topk     = nullptr;
     t_logits_topk_ids = nullptr;
 
+    t_draft_top1 = nullptr;
+    t_draft_ptop = nullptr;
+
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
 
@@ -1406,7 +1429,7 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
             }
         }
     }
-    for (auto * tensor : { t_logits_topk, t_logits_topk_ids }) {
+    for (auto * tensor : { t_logits_topk, t_logits_topk_ids, t_draft_top1, t_draft_ptop }) {
         if (tensor != nullptr) {
             ggml_set_output(tensor);
         }
@@ -1527,7 +1550,16 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     t_embd_src       (params.t_embd_src),
     layer_inp_sink_layers(params.layer_inp_sink_layers),
     token_offset     (params.token_offset),
+    t_h_sink         (params.t_h_sink),
+    t_embd_h_src     (params.t_embd_h_src),
+    h_src_cols       (params.h_src_cols),
+    h_token_offset   (params.h_token_offset),
+    h_sink_is_target (params.h_sink_is_target),
+    h_sink_write     (params.h_sink_write),
     fa_assist        (params.fa_assist),
+    mtp_kv_only      (params.mtp_kv_only),
+    t_draft_ring     (params.t_draft_ring),
+    draft_ring_ptop  (params.draft_ring_ptop),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);
@@ -2024,7 +2056,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         bool gate_up_swiglu) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2045,7 +2078,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         up_exps_s,
         gate_exps_s,
         down_exps_s,
-        selected_experts_in
+        selected_experts_in,
+        gate_up_swiglu
     );
 }
 
@@ -2073,7 +2107,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s,
-         ggml_tensor * selected_experts_in) const {
+         ggml_tensor * selected_experts_in,
+         bool gate_up_swiglu) const {
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
@@ -2225,7 +2260,27 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
-    if (gate_up_exps) {
+    // the merged gate_up weight is loaded with its rows interleaved when the model asks for the
+    // fused SwiGLU matmul, see TENSOR_GATE_UP_INTERLEAVE. the matmul then reads the gate and up row
+    // of a pair out of one matmul and applies the activation, so no split views and no separate
+    // SwiGLU node are needed
+    const bool gate_up_fused = gate_up_exps != nullptr && gate_up_swiglu;
+
+    if (gate_up_fused) {
+        GGML_ASSERT(type_op == LLM_FFN_SILU);
+        GGML_ASSERT(gate_up_exps_b == nullptr && up_exps_s == nullptr);
+
+        // the epilogue replaces the split views the LoRA factors and the scale and bias multiply
+        // into, a weight with an adapter cannot be read this way
+        for (const auto & lora : *loras) {
+            if (lora.first->get_weight(gate_up_exps) != nullptr) {
+                GGML_ABORT("fused SwiGLU gate_up expert weight has a LoRA adapter");
+            }
+        }
+
+        cur = ggml_mul_mat_id_swiglu(ctx0, gate_up_exps, cur, selected_experts);
+        cb(cur, "ffn_moe_gate_up_swiglu", il);
+    } else if (gate_up_exps) {
         // merged gate_up path: one mul_mat_id, then split into gate and up views
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
@@ -2299,6 +2354,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                         break;
                     }
                 }
+            }
+
+            if (gate_up_fused) {
+                // the SwiGLU epilogue is already applied by the matmul above
+                break;
             }
 
             if (has_gate) {
@@ -2410,6 +2470,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (n_expert_used_il == 1) {
         // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
+    }
+
+    if (llm_arch_uses_expert_parallel(arch)) {
+        // expert parallelism: each device holds a partial sum of the MoE output, the meta backend
+        // turns this marker into the single all-reduce of the layer (no tensor names involved)
+        moe_out->flags |= GGML_TENSOR_FLAG_EXPERT_PARALLEL_PARTIAL;
     }
 
     cb(moe_out, "ffn_moe_out", il);
@@ -3011,6 +3077,14 @@ ggml_tensor * llm_graph_context::build_attn(
 
             ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
             ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        }
+
+        // MTP catch-up: the K/V cache write is the only consumer of this layer. Stop here so the
+        // attention, the v_rot undo and wo stay out of the graph. The K/V nodes and their expand
+        // order are unchanged, so the cached K/V is bit-identical to the full-layer graph. This is
+        // true only for the MTP context; every other context leaves mtp_kv_only false
+        if (mtp_kv_only) {
+            return nullptr;
         }
 
         k = mctx_cur->get_k(ctx0, il);
@@ -3824,6 +3898,30 @@ void llm_graph_context::build_layer_inp_sink() const {
     }
 }
 
+void llm_graph_context::build_h_nextn_sink() const {
+    if (t_h_sink == nullptr || !h_sink_write) {
+        return;
+    }
+
+    ggml_tensor * cur = res->get_h_nextn();
+    if (cur == nullptr) {
+        return;
+    }
+
+    const size_t col0 = token_offset + (size_t) h_token_offset;
+
+    GGML_ASSERT(cur->type == GGML_TYPE_F32);
+    GGML_ASSERT(cur->ne[0] == t_h_sink->ne[0]);
+    GGML_ASSERT(col0 + (size_t) cur->ne[1] <= (size_t) t_h_sink->ne[1]);
+
+    // the column offset is part of the graph parameters, so a reused graph writes the same columns
+    ggml_tensor * dst = ggml_view_2d(ctx0, t_h_sink, cur->ne[0], cur->ne[1],
+            t_h_sink->nb[1], col0 * t_h_sink->nb[1]);
+    ggml_tensor * cpy = ggml_cpy(ctx0, cur, dst);
+    ggml_set_name(cpy, "h_nextn_sink_cpy");
+    ggml_build_forward_expand(gf, cpy);
+}
+
 
 void llm_graph_context::build_pooling(
         ggml_tensor * cls,
@@ -3929,10 +4027,15 @@ void llm_graph_context::build_logits_topk() const {
     const int32_t k        = cparams.logits_topk;
     const int32_t n_shards = cparams.logits_topk_shards;
 
-    if (k <= 0 || !res->t_logits || res->t_logits->ne[1] == 0) {
+    if (k <= 0 || !res->t_logits) {
         return;
     }
 
+    // a ubatch without output rows (a prefill chunk whose outputs come later) still gets the top-k
+    // nodes, on the empty logits: the graph topology must not depend on the number of outputs, or it
+    // differs from the reserved worst case (which has outputs and the top-k) and the allocator
+    // re-reserves on every such ubatch (a device synchronization plus a full re-plan each time, see
+    // ggml_backend_sched_alloc_splits). The empty nodes compute nothing, like the lm head on no rows
     ggml_tensor * logits = res->t_logits; // [n_vocab, n_outputs]
 
     const int64_t n_vocab = logits->ne[0];

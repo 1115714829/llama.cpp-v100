@@ -225,6 +225,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_MOE_EVERY_N_LAYERS,                "%s.moe_every_n_layers"                },
     { LLM_KV_MOE_LATENT_SIZE,                   "%s.moe_latent_size"                   },
     { LLM_KV_NEXTN_PREDICT_LAYERS,              "%s.nextn_predict_layers"              },
+    { LLM_KV_NEXTN_SHARED_TARGET_TENSORS,       "%s.nextn_shared_target_tensors"       },
     { LLM_KV_NUM_DEEPSTACK_LAYERS,              "%s.n_deepstack_layers"                },
     { LLM_KV_DEEPSTACK_MAPPING,                 "%s.deepstack_mapping"                 },
     { LLM_KV_HIDDEN_ACT,                        "%s.hidden_activation"                 },
@@ -1190,6 +1191,16 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
             return false;
         default:
             return true;
+    }
+}
+
+bool llm_arch_uses_expert_parallel(const llm_arch & arch) {
+    // Qwen3.8-Flash-Next splits its routed experts along the expert dim instead of the intermediate dim
+    switch (arch) {
+        case LLM_ARCH_QWEN4EXP:
+            return true;
+        default:
+            return false;
     }
 }
 

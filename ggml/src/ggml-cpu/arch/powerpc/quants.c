@@ -2014,13 +2014,12 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
     const int nb = n / QK_K;
 
 #if defined(__POWER9_VECTOR__)
-    const vector unsigned char v0 = vec_splats((unsigned char)0x0);
-    const vector unsigned short vsign = vec_splats((unsigned short)0x8000);
-
     vector float vsumf0 = vec_splats(0.0f);
     vector float vsumf1 = vec_splats(0.0f);
     vector float vsumf2 = vec_splats(0.0f);
     vector float vsumf3 = vec_splats(0.0f);
+
+    float sumf_delta = 0.0f;
 
     for (int i = 0; i < nb; ++i) {
         vector float vxd = vec_splats(GGML_CPU_FP16_TO_FP32(x[i].d));
@@ -2031,7 +2030,8 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
         vector signed int vsumi1 = vec_splats((int32_t)0);
         vector signed int vsumi2 = vec_splats((int32_t)0);
         vector signed int vsumi3 = vec_splats((int32_t)0);
-        vector signed int vsumi8 = vec_splats((int32_t)0);
+
+        int sumi1 = 0;
 
         const uint8_t  * GGML_RESTRICT q1 = x[i].qs;
         const uint16_t * GGML_RESTRICT qh = x[i].qh;
@@ -2070,24 +2070,17 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
             vector signed short vscales01 = (vector signed short)vec_splats((uint16_t)(2*ls0+1));
             vector signed short vscales23 = (vector signed short)vec_splats((uint16_t)(2*ls1+1));
-            vector signed short vscales = vec_sld(vscales23, vscales01, 8);
 
             vsumi0 = vec_msum(qv0, vscales01, vsumi0);
             vsumi1 = vec_msum(qv1, vscales01, vsumi1);
             vsumi2 = vec_msum(qv2, vscales23, vsumi2);
             vsumi3 = vec_msum(qv3, vscales23, vsumi3);
 
-            vector signed short q8ysums = vec_xl_len(qs, 8);
+            // delta term, same as the generic implementation (per 32-element block scale and sign)
+            sumi1 += (2*ls0 + 1) * (qh[0] & 0x8000 ? -1 : 1) * (qs[0] + qs[1]);
+            sumi1 += (2*ls1 + 1) * (qh[1] & 0x8000 ? -1 : 1) * (qs[2] + qs[3]);
             qs += 4;
-            q8ysums = vec_mergeh(q8ysums, (vector signed short)v0);
-
-            vector signed short qxh = (vector signed short)vec_sld(vec_splats(qh[1]), vec_splats(qh[0]), 8);
             qh += 2;
-            vector __bool short vsel = vec_cmpge(qxh, (vector signed short)v0);
-
-            vector signed short q8ysum = vec_sel((vector signed short)vec_xor((vector unsigned short)q8ysums, vsign), q8ysums, vsel);
-
-            vsumi8 = vec_add(vec_mule(q8ysum, vscales), vsumi8);
         }
 
         vsumf0 = vec_madd(vec_ctf(vsumi0, 0), vd, vsumf0);
@@ -2095,7 +2088,7 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
         vsumf2 = vec_madd(vec_ctf(vsumi2, 0), vd, vsumf2);
         vsumf3 = vec_madd(vec_ctf(vsumi3, 0), vd, vsumf3);
 
-        vsumf0 = vec_madd(vec_ctf(vsumi8, 0), vec_mul(vd, vec_splats(IQ1S_DELTA)), vsumf0);
+        sumf_delta += GGML_CPU_FP16_TO_FP32(x[i].d) * y[i].d * IQ1S_DELTA * (float) sumi1;
     }
 
     vsumf0 = vec_add(vsumf0, vsumf2);
@@ -2106,7 +2099,7 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
     vsumf0 = vec_add(vsumf0, vec_sld(vsumf0, vsumf0, 4));
     vsumf0 = vec_add(vsumf0, vec_sld(vsumf0, vsumf0, 8));
 
-    *s = vec_extract(vsumf0, 0);
+    *s = vec_extract(vsumf0, 0) + sumf_delta;
 
 #else
     UNUSED(x);

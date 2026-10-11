@@ -93,7 +93,16 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
-void ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * sigmoid, ggml_tensor * mul);
+// dst_f16, if not null, also receives the result rounded to F16 (contiguous like mul), bitwise the
+// F32 -> F16 conversion of it
+void ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * sigmoid, ggml_tensor * mul,
+                                   half * dst_f16 = nullptr);
+
+void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * silu_node);
+
+// UNARY(SIGMOID) on a per-row gate [1, rows] -> MUL with x [ncols, rows] -> ADD with a [ncols, rows] in one
+// kernel, bitwise the unfused kernels (the qwen4exp shared expert tail)
+void ggml_cuda_op_sigmoid_mul_add_rows(ggml_backend_cuda_context & ctx, ggml_tensor * sigmoid, ggml_tensor * mul, ggml_tensor * add);
 
 void ggml_cuda_op_gdn_gating(ggml_backend_cuda_context & ctx,
         const ggml_tensor * beta_in, ggml_tensor * beta_out,
@@ -104,6 +113,10 @@ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_n
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
     return x / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ float ggml_cuda_op_sigmoid_single(float x) {
+    return 1.0f / (1.0f + expf(-x));
 }
 
 __device__ __forceinline__ float ggml_cuda_op_gelu_single(float x) {

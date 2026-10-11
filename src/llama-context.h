@@ -50,9 +50,22 @@ struct llama_embd_link {
     ggml_tensor * t_layer_inp_sink = nullptr;    // target sink, [n_embd * n_layers, n_batch]
     ggml_tensor * t_embd_src_sink  = nullptr;    // draft staging sink, [n_embd_inp, n_ubatch]
 
+    // r-mtpdev: device link for the nextn hidden state (see llama_context_link_h_nextn). The
+    // batch columns of the h sink are split into two groups; every event that guards them exists
+    // once per group and is indexed by the group of the write or read it orders. The pending
+    // columns need no event: only the draft stream reads and writes them
+    ggml_backend_event_t ev_h_tgt_done[2]  = { nullptr, nullptr }; // target finished writing the group
+    ggml_backend_event_t ev_h_read_done[2] = { nullptr, nullptr }; // draft finished reading the group
+    ggml_tensor * t_h_sink_tgt = nullptr;          // target h sink, read by the draft graph
+    int32_t h_sink_group_last = 0;                 // group written by the most recent target graph
+
     ~llama_embd_link() {
         ggml_backend_event_free(ev_tgt_done);
         ggml_backend_event_free(ev_copy_done);
+        for (int i = 0; i < 2; ++i) {
+            ggml_backend_event_free(ev_h_tgt_done[i]);
+            ggml_backend_event_free(ev_h_read_done[i]);
+        }
     }
 };
 
@@ -73,6 +86,21 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
+
+    // wait only for the host output buffers of the last decode (the device-to-host copies that
+    // extract_outputs posted), not for the whole context: the device streams keep running whatever
+    // was queued after them. Valid after a decode that did not go through the prefill pipeline
+    // (the pipeline posts its copies to the submission workers and records no single event); the
+    // perf counters are updated like synchronize() does
+    void synchronize_outputs();
+
+    // synchronize() unless the host output buffers of the last decode are already complete
+    // (synchronize_outputs() or synchronize() ran after it), see outputs_ready
+    void wait_outputs();
+
+    // wait for all in-flight prefill pipeline ubatches without touching the scheduler copy index
+    // or the perf counters. callers use it before mutating state the pipeline may still be writing
+    void pipeline_drain();
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
@@ -99,6 +127,7 @@ struct llama_context {
     float * get_logits_ith(int32_t i);
 
     void    set_logits_topk(int32_t k);
+    void    set_logits_topk_only(bool only);
     void    reserve_if_needed();
     int32_t get_logits_topk_ith(int32_t i, const llama_token ** ids, const float ** logits);
 
@@ -154,6 +183,56 @@ struct llama_context {
     // batch, or -1 if the token is not in the sink
     int32_t layer_inp_sink_col(llama_seq_id seq_id, llama_pos pos) const;
 
+    // r-mtpdev: keep the nextn hidden state in a device sink. The target writes its t_h_nextn rows
+    // there; the draft reads them as its graph input. is_target selects the role of the context.
+    // n_h_rows is the number of extra sink columns on top of n_batch: the second batch-column
+    // group followed by the pending rows and the draft-step rows; the target allocates them, the
+    // draft only reserves the role and is bound to the target sink by link_h_nextn
+    bool enable_h_nextn_sink(bool is_target, uint32_t n_h_rows);
+
+    // dchain: MTP draft token ring, see llama_draft_ring_enable / llama_draft_ring_begin
+    bool enable_draft_ring(int32_t n_max, bool with_p);
+    void draft_ring_begin(const llama_token * ids, size_t n);
+    const llama_token * draft_ring_tokens(int32_t step) const;
+    const float       * draft_ring_p     (int32_t step) const;
+    // r-mtpdev: link a draft context to this target context, so that the draft reads and writes
+    // the target h sink in place and the two sides are ordered by per-group CUDA events
+    bool link_h_nextn(llama_context * ctx_dft);
+    // r-mtpdev: select the h source of the next draft batch: true gathers the h in the graph from
+    // the sink columns [cols, cols + n_cols), false disables the device gather
+    void set_h_source(bool enable, const int32_t * cols, size_t n_cols);
+    // r-mtpdev draft: the sink group that the next draft graph reads. The driver sets it to the
+    // group of the last target write before a catch-up and to -1 before the draft steps, so that
+    // only the catch-up records the group as read
+    void set_h_src_group(int32_t group);
+    // r-mtpdev: the sink group written by the most recent target graph (0 or 1)
+    int32_t h_nextn_sink_group() const;
+    // r-mtpdev draft: column offset of the next sink write (the chained-head draft step index
+    // times n_seq_max). target writes get the group base from their own rotation
+    void set_h_sink_offset(int32_t offset);
+    // r-mtpdev draft: enable/disable the sink write of the next draft graph (catch-up decodes
+    // keep it off so that they do not overwrite the target batch columns)
+    void set_h_sink_write(bool write);
+    // r-mtpskip target: skip the sink write and the cross-context ordering of a ubatch whose
+    // positions all lie below pos_first (0 = write every position). Set per sequence before a
+    // prompt starts and cleared once the prompt is done
+    void set_h_sink_first_pos(llama_seq_id seq_id, llama_pos pos_first);
+    // r-mtpskip: true when every token of the ubatch lies below the sink boundary of all of its
+    // sequences, so the target writes no sink rows for it
+    bool h_sink_ubatch_skip(const llama_ubatch & ubatch) const;
+    // r-mtpdev draft: copy the sink rows src_cols into the reserved pending columns
+    // [2*n_batch, 2*n_batch + n_cols). Runs on the draft's output-device stream, ordered after
+    // the target write and after the draft graph, and before the next draft read
+    bool h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols);
+    // r-mtpdev: read back the sink rows [group*n_batch + token_offset, ... + n_tokens) into dst
+    bool h_nextn_sink_get(int32_t group, size_t token_offset, size_t n_tokens, float * dst);
+    // r-mtpdev: the h-sink column of token (seq_id, pos) of the last decoded batch, -1 if absent
+    int32_t h_nextn_sink_col(llama_seq_id seq_id, llama_pos pos) const;
+    // r-mtpdev: wait for one in-flight prefill pipeline ubatch without draining the rest of the
+    // pipeline. A negative id waits for the most recent one. Returns false when no prefill
+    // pipeline ubatch has been submitted (decode-sized batches are not tracked there)
+    bool synchronize_ubatch(int64_t ubatch_id);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -169,12 +248,16 @@ struct llama_context {
     // if memory_context is provided, it will be applied first to the context's memory
     // ret contains the status of the graph computation
     // returns nullptr only if ret != GGML_STATUS_SUCCESS
+    // pipeline: submit the ubatch to the prefill pipeline instead of computing it synchronously.
+    // ubatch_id orders the submission and is used later to wait for this ubatch's outputs
     llm_graph_result * process_ubatch(
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
             llama_memory_context_i * mctx,
                        ggml_status & ret,
-                         size_t     token_offset = 0);
+                         size_t     token_offset = 0,
+                           bool     pipeline = false,
+                        int64_t     ubatch_id = 0);
 
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
@@ -228,6 +311,8 @@ struct llama_context {
     void perf_reset();
 
     llama_memory_breakdown memory_breakdown() const;
+
+    const std::vector<std::pair<std::string, ggml_tensor *>> & get_memory_tensors() const;
 
     //
     // training
@@ -298,6 +383,9 @@ public:
 private:
     llm_graph_result * get_gf_res_prev(int slot);
 
+    // graph result of one pipeline stage, see gf_res_pipe
+    llm_graph_result * get_gf_res_pipe(int stage);
+
     // slot of the previous-graph cache for this ubatch
     int gf_res_slot(const llama_ubatch & ubatch) const;
 
@@ -315,6 +403,18 @@ private:
     llm_graph_cb graph_get_cb(ggml_backend_sched_t sched) const;
 
     ggml_status graph_compute_impl(ggml_backend_sched_t sched, ggml_cgraph * gf, bool batched);
+
+    // wait until the submission threads of the schedulers of this context have enqueued the work
+    // already posted for the given backend on its stream. no-op for schedulers without submission
+    // threads, or when the backend is not part of them
+    void wait_submitted(ggml_backend_t backend);
+
+    // set the threadpool and thread counts for the given batch type
+    void graph_set_threads(bool batched);
+
+    // account the queued tokens of the last decode to the perf counters and reset the queue
+    // (shared by synchronize() and synchronize_outputs())
+    void perf_eval_update();
 
     // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
     // that differs from the layer it belongs to (usually due to missing backend support)
@@ -341,6 +441,9 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+
+    // the cache tensors of memory, collected once after the memory module is built
+    std::vector<std::pair<std::string, ggml_tensor *>> memory_tensors;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
@@ -375,6 +478,49 @@ private:
     ggml_backend_buffer_ptr buf_embd_src;
     ggml_tensor *           t_embd_src_sink = nullptr;
 
+    // r-mtpdev: device-side sink for the nextn hidden state, [n_embd_out, 2*n_batch + n_h_rows].
+    // The target writes its t_h_nextn rows and the MTP bookkeeping rows; a linked draft context
+    // shares this tensor (t_h_sink points at the target sink) and reads/writes its columns
+    ggml_context_ptr        ctx_h_sink; // declared before buf_h_sink so that the buffer is freed first
+    ggml_backend_buffer_ptr buf_h_sink;
+    ggml_tensor *           t_h_sink = nullptr;
+    bool                    h_sink_is_target = false; // true: this sink holds the target h rows
+    // non-owning: this context's own backend, its stream queues the h sink event waits/records and
+    // the pending capture copy. The target backend owns the sink buffer; the draft queues on its
+    // own stream so the cross-context events order the two streams
+    ggml_backend_t          backend_h_sink = nullptr;
+    uint32_t                h_sink_extra = 0;         // target: extra columns after n_batch (second group + bookkeeping)
+
+    // r-mtpdev: the (seq_id, pos) of each h-sink column written by the last batch, in column order
+    std::vector<std::pair<llama_seq_id, llama_pos>> h_sink_cols;
+    // r-mtpdev: per-sequence (pos, column) index into h_sink_cols; positions grow within a batch
+    std::unordered_map<llama_seq_id, std::vector<std::pair<llama_pos, int32_t>>> h_sink_cols_by_seq;
+
+    // r-mtpdev draft: the next draft graph gathers its h from the sink at these columns.
+    // The vector only grows, so the graph input pointer stays valid across batches
+    bool                 h_src_enable = false;
+    std::vector<int32_t> h_src_cols;
+
+    // r-mtpdev draft: sink column offset of the next write (see set_h_sink_offset). The target
+    // stores the group base [0, n_batch) or [n_batch, 2*n_batch) of its next sink write here
+    int32_t h_sink_offset = 0;
+    // r-mtpdev: write the nextn rows of the next graph into the sink (draft catch-up turns it off)
+    bool    h_sink_write = true;
+    // r-mtpdev target: the group that the next sink-writing graph uses. Only the pipelined
+    // prefill rotates between the groups; every other target graph writes group 0
+    int32_t h_sink_group = 0;
+    // r-mtpdev draft: the group that the next draft graph reads, -1 when it reads no group
+    // columns (draft steps only touch the pending and step columns)
+    int32_t h_src_group = -1;
+
+    // r-mtpskip target: per-sequence first position of the MTP draft KV window. A prefill ubatch
+    // whose positions all lie below this value writes no sink rows and does no cross-context
+    // ordering; 0 means the sequence writes every position (no skip)
+    std::vector<llama_pos> h_sink_first_pos;
+
+    // r-mtpdev: the id of the most recent ubatch submitted through the prefill pipeline, -1 if none
+    int64_t pipeline_ubatch_last = -1;
+
     // producer/consumer link, shared with the linked context
     std::shared_ptr<llama_embd_link> embd_link;
     bool    embd_src_enable = false; // draft: the next embd batch reads the staging sink
@@ -389,6 +535,42 @@ private:
 
     // false when the last batch only copied its top-k logits
     bool logits_full = true;
+
+    // dchain: MTP draft token ring (llama_draft_ring_enable). The MTP graph reads the input token of
+    // every draft step from t_draft_ring and writes the argmax of its logits back into it, so the
+    // steps of a chain need no host round trip; the host writes the first token at the chain start
+    // (pinned staging) and reads the drafted tokens once at the end from the pinned readback rows
+    // (one row of n_seq_max slots per step)
+    ggml_context_ptr        ctx_draft_ring;      // declared before the buffers so that they are freed first
+    ggml_context_ptr        ctx_draft_ring_host;
+    ggml_backend_buffer_ptr buf_draft_ring;      // device: t_draft_ring
+    ggml_backend_buffer_ptr buf_draft_ring_host; // pinned host: staging and readback
+    ggml_tensor *           t_draft_ring       = nullptr; // I32 [n_seq_max], MIRRORED on a meta device
+    ggml_tensor *           t_draft_ring_stage = nullptr; // I32 [n_seq_max], host staging of the chain start
+    ggml_tensor *           t_draft_ring_tok   = nullptr; // I32 [n_seq_max, n_max], host readback, one row per step
+    ggml_tensor *           t_draft_ring_p     = nullptr; // F32 [n_seq_max, n_max], host readback of the argmax probability
+    ggml_backend_t          backend_draft_ring = nullptr; // non-owning: the device backend whose streams run the draft
+    bool                    draft_ring_ptop    = false;
+    int32_t                 draft_ring_n_max   = 0;
+    int32_t                 draft_ring_i       = 0;       // readback row of the next draft step
+
+    // dchain: recorded by the decode scheduler right after it handed the host inputs of a graph to
+    // the device stream (ggml_backend_sched_set_inputs_event); process_ubatch waits for it instead
+    // of synchronizing the whole scheduler, so the next draft step is prepared while the previous
+    // one still computes. Only created with the draft ring
+    ggml_backend_event_t    ev_inputs_dec      = nullptr;
+
+    // true once the host output buffers of the last decode are complete (synchronize() or
+    // synchronize_outputs() ran after it); decode()/encode() clear it. The top-k getter only
+    // synchronizes when it is false, so a caller that waited for the outputs pays no second wait
+    bool outputs_ready = true;
+
+    // event recorded on the output backend right after the device-to-host output copies of a
+    // non-pipelined decode (see synchronize_outputs). Created on first use, on the device of the
+    // backend that holds the outputs; ev_outputs_recorded is false after a pipelined decode
+    ggml_backend_event_t ev_outputs          = nullptr;
+    ggml_backend_t       ev_outputs_backend  = nullptr;
+    bool                 ev_outputs_recorded = false;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active
@@ -441,6 +623,10 @@ private:
     // max tokens of a batch that sched_dec accepts and is reserved for, set once in the constructor
     uint32_t n_dec_max = 0;
 
+    // monotonic id of the prefill ubatches submitted to the pipeline. it spans decode() calls so
+    // the pipeline can stay in flight across the n_batch-sized chunks of one prompt
+    int64_t pipeline_ubatch_id = 0;
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
@@ -467,6 +653,11 @@ private:
     // slot 2 for decode batches when sched_dec is enabled
     std::array<llm_graph_result_ptr, 3> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
+
+    // one graph result per pipeline stage: a ubatch's graph result must stay alive while its
+    // submission workers still read its nodes, so it is reset only when the stage is reused.
+    // indexed by the stage returned by ggml_backend_sched_pipeline_next_stage
+    std::vector<llm_graph_result_ptr> gf_res_pipe;
 
     std::array<llm_graph_result *, 3> gf_res_prev_active = { nullptr, nullptr, nullptr };
 

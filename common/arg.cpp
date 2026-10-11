@@ -259,6 +259,17 @@ static void parse_tensor_buffer_overrides(const std::string & value, std::vector
         if (buft) {
             buft_list[ggml_backend_buft_name(buft)] = buft;
         }
+        // also expose the extra buffer types of the device (e.g. the CUDA mapped host buffer)
+        auto * reg = ggml_backend_dev_backend_reg(dev);
+        auto get_extra_bufts = reg ? (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_get_extra_bufts") : nullptr;
+        if (get_extra_bufts) {
+            ggml_backend_buffer_type_t * extra = get_extra_bufts(dev);
+            while (extra && *extra) {
+                buft_list[ggml_backend_buft_name(*extra)] = *extra;
+                ++extra;
+            }
+        }
     }
 
     for (const auto & override : string_split<std::string>(value, ',')) {
@@ -2799,6 +2810,49 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_DENSE_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_FFN"));
+    add_opt(common_arg(
+        {"--expert-profile"}, "FILE",
+        "expert routing profile for tiered expert weights: lines of 'layer expert count [launches]'\n"
+        "(the launches field, written by --dump-expert-routing, ranks the device slots by the mul_mat_id\n"
+        "launches that route to an expert; the count balances the experts over the devices),\n"
+        "the experts with the most hits keep a device memory slot (default: uniform placement)",
+        [](common_params & params, const std::string & value) {
+            params.expert_profile = value;
+            ggml_expert_store_set_profile(params.expert_profile.c_str());
+        }
+    ));
+    add_opt(common_arg(
+        {"--dump-expert-routing"}, "FILE",
+        "write the observed per-layer per-expert routing counts and launch counts to this file\n"
+        "when the model unloads; the file has the same format as --expert-profile, so one run profiles the next.\n"
+        "With more than one GPU every device writes FILE.devN with its own experts; concatenate\n"
+        "these files to get one profile",
+        [](common_params & params, const std::string & value) {
+            params.dump_expert_routing = value;
+            ggml_expert_store_set_dump_path(params.dump_expert_routing.c_str());
+        }
+    ));
+    add_opt(common_arg(
+        {"--dump-routing-trace"}, "FILE",
+        "record the per-token top-k routing of every mul_mat_id (expert store and plain expert\n"
+        "tensors) to this binary trace for offline analysis of the routing; with more than one GPU\n"
+        "every device writes FILE.devN (record layout: ggml/src/ggml-cuda/ggml-cuda-routing-trace.cu)",
+        [](common_params & params, const std::string & value) {
+            params.dump_routing_trace = value;
+            ggml_expert_store_set_trace_path(params.dump_routing_trace.c_str(), params.dump_routing_trace_size);
+        }
+    ));
+    add_opt(common_arg(
+        {"--dump-routing-trace-size"}, "N",
+        "device ring size per device for --dump-routing-trace, in MiB (default: 4)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.dump_routing_trace_size = value;
+            ggml_expert_store_set_trace_path(params.dump_routing_trace.c_str(), params.dump_routing_trace_size);
+        }
+    ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",
@@ -2910,7 +2964,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         { "-fitt", "--fit-target" }, "MiB0,MiB1,MiB2,...",
         string_format("target margin per device for --fit, comma-separated list of values, "
-            "single value is broadcast across all devices, default: %zu", params.fit_params_target[0]/(1024*1024)),
+            "single value is broadcast across all devices, default: %zu (the expert parallel fit of a tensor split "
+            "budgets the communication buffers and page tables itself and defaults to %zu)",
+            COMMON_FIT_TARGET_DEFAULT/(1024*1024), COMMON_FIT_EP_MARGIN_DEFAULT/(1024*1024)),
         [](common_params & params, const std::string & value) {
             std::string arg_next = value;
 
@@ -2923,6 +2979,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                     string_format("got %zu input configs, but system only has %zu devices", split_arg.size(), llama_max_devices())
                 );
             }
+            params.fit_params_target_set = true;
             if (split_arg.size() == 1) {
                 std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), std::stoull(split_arg[0]) * 1024*1024);
                 return;
@@ -4175,6 +4232,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-window"}, "N",
+        string_format("the MTP draft layer attends to the last N positions; 0 = attend every position (default: %d)", params.speculative.draft.window),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.window = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_WINDOW"));
+    add_opt(common_arg(
+        {"--spec-draft-ubatch"}, "N",
+        "physical batch size of the draft context (default: inherit the target -ub; the MTP draft only needs a small one)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH"));
     add_opt(common_arg(
         {"--spec-synth-len"}, "L",
         "target mean synthetic acceptance length, including the target token (benchmarking only)",

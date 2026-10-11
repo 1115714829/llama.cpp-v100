@@ -3,6 +3,7 @@
 #pragma once
 
 #include "llama-cpp.h"
+#include "fit.h"
 
 #include "ggml-opt.h"
 #include "ggml.h"
@@ -336,6 +337,10 @@ struct common_params_speculative_draft {
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
+    int32_t window = 32768; // the MTP draft layer attends to the last N positions (0 = attend every position)
+
+    int32_t n_ubatch = 0;   // physical batch size of the draft context (catch-up replays the target window in batches of this size); 0 = inherit the target -ub
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;
@@ -482,8 +487,12 @@ struct common_params {
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
-    // margin per device in bytes for fitting parameters to free memory:
-    std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
+    // margin per device in bytes for fitting parameters to free memory. Without -fitt the value
+    // is the default (COMMON_FIT_TARGET_DEFAULT) plus what other loads reserve on the device (the
+    // multimodal projector); each fit mode then applies its own default instead of the 1024 MiB
+    // (the expert parallel fit budgets the runtime growth itself, see common_fit_params)
+    std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), COMMON_FIT_TARGET_DEFAULT);
+    bool fit_params_target_set = false; // -fitt given: every fit mode leaves exactly these margins
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
@@ -530,6 +539,11 @@ struct common_params {
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+
+    std::string expert_profile      = ""; // expert routing profile: decides which experts stay in device memory // NOLINT
+    std::string dump_expert_routing = ""; // write the observed expert routing to this file when the model unloads // NOLINT
+    std::string dump_routing_trace  = ""; // per-token routing trace (RTRC) written by the CUDA backend // NOLINT
+    int dump_routing_trace_size     = 4;  // device ring size per device for the trace, MiB
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
