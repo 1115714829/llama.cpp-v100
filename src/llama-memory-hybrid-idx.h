@@ -99,6 +99,18 @@ public:
     const kpool_layout & kpool_layout_update();
     const kpool_layout & kpool_layout_get() const;
 
+    // The graph's pool count for a layout of n_pool_real pools over the cells in use now: padded like the n_kv of a
+    // ubatch that does not view the whole cache, so a decode step changes it only where its n_kv changes. Always
+    // above n_pool_real: the last padded pool is unused.
+    uint32_t kpool_n_pool(uint32_t n_pool_real) const;
+
+    // For tests: kpool_n_pool for the current layout.
+    uint32_t kpool_n_pool_layout() const;
+
+    // For tests: the first way the current layout's pool count breaks its bounds (no padded pool after the real ones,
+    // more pools than the reserved graph holds), empty if none. Call it where kpool_layout_diff is called.
+    std::string kpool_n_pool_check() const;
+
     // For tests: the first difference between the layout as the last update left it and one rebuilt from scratch
     // over the cache as it is now, empty if none. Call it after a decode, before the next sequence edit.
     std::string kpool_layout_diff() const;
@@ -211,7 +223,7 @@ public:
     uint32_t get_n_stream() const;
 
     // glm5-next and qwen4exp, complete pools of kpool cells per sequence, scored as whole pools.
-    uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
+    uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused, see kpool_n_pool.
     uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
     ggml_tensor * gather_mla_rows(ggml_context * ctx, ggml_tensor * idxs, int64_t n_rows, int64_t n_embd, int32_t il) const;

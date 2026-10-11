@@ -11269,6 +11269,11 @@ struct test_qsa_select : public test_case {
         return VARS_TO_STR6(n_pool, n_pad, nb, kpool, n_top, type_K);
     }
 
+    // the ids are exact, so any wrong id fails, however close its cell number
+    double max_nmse_err() override {
+        return 0.0;
+    }
+
     test_qsa_select(int64_t n_pool = 512, int64_t n_pad = 8, int64_t nb = 16, int64_t kpool = 4, int64_t n_top = 64,
             ggml_type type_K = GGML_TYPE_F16)
         : n_pool(n_pool), n_pad(n_pad), nb(nb), kpool(kpool), n_top(n_top), type_K(type_K) {}
@@ -15195,6 +15200,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // a pool count of the 65536 order (not the full 200K context) that is not a multiple of the 256-key
         // block of the Volta wmma scorer: the last block scores only its first keys
         test_cases.emplace_back(new test_qsa_select(8192 + 7, 7, 70, 4, 512, type_K));
+        // the pool counts qwen4exp takes (llama_memory_hybrid_idx::kpool_n_pool): the pools of the used cells padded
+        // to the n_kv grain plus one, so up to a grain of padded pools after the real ones. A short context, decode
+        // and prompt; 16K; past 16K and past 128K the count picks the register and the wide kernel while the real
+        // pools still fit the 256-thread and the register kernel; 200K; the whole 256K cache
+        test_cases.emplace_back(new test_qsa_select(513,   497,  4,  4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(513,   497,  66, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(4097,  81,   4,  4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(4609,  497,  4,  4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(4609,  497,  70, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(34817, 1817, 4,  4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(51201, 1951, 4,  4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(65537, 1,    4,  4, 512, type_K));
     }
 
     // qsa_attn: the chunked kernel (<= 16 tokens) and the prompt kernel, partial chunks, streams, both cache types
@@ -15207,6 +15224,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_attn(1, 4096, 40, 2, 2051, 2051, type_KV));
         test_cases.emplace_back(new test_qsa_attn(2, 300, 5, 1, 67, 67, type_KV));
         test_cases.emplace_back(new test_qsa_attn(2, 300, 33, 1, 67, 50, type_KV));
+        // a short context under the n_kv-grain pool count: the full 2051 slots with a few valid ones, the rest
+        // empty chunks of the chunked kernel or skipped steps of the prompt kernel
+        for (int64_t nb : { 1, 4, 33 }) {
+            test_cases.emplace_back(new test_qsa_attn(2, 300, nb, 1, 2051, 67, type_KV));
+        }
     }
 
     return test_cases;
@@ -15779,6 +15801,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_qsa_attn(2, 204800, nb, 1, 2051, 2051, type_KV)); // 200K context
         }
     }
+
+    // the cost of the padded pools: the same real pools under a count padded to 64 pools and under the n_kv-grain
+    // count (llama_memory_hybrid_idx::kpool_n_pool), F32 keys as gathered from the cache. MTP verify at 16K, at the
+    // start of the n_kv bucket (3584 real) and late in it (4016 real); at 200K at the start of the bucket (49152 real);
+    // a prompt batch past 64K, where the grain is 4096 cells (16896 real)
+    for (int64_t n_real : { 3584, 4016 }) {
+        test_cases.emplace_back(new test_qsa_select(GGML_PAD(n_real + 1, 64), GGML_PAD(n_real + 1, 64) - n_real, 4, 4, 512, GGML_TYPE_F32));
+        test_cases.emplace_back(new test_qsa_select(4097, 4097 - n_real, 4, 4, 512, GGML_TYPE_F32));
+    }
+    test_cases.emplace_back(new test_qsa_select(49216, 64,   4,    4, 512, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_qsa_select(51201, 2049, 4,    4, 512, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_qsa_select(16960, 64,   2048, 4, 512, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_qsa_select(17409, 513,  2048, 4, 512, GGML_TYPE_F32));
 
     // launch-overhead isolation: single L2_NORM launch vs batched siblings at the GDN
     // production shape (strided qkv views) -- perf-mode only, the eval list has its own

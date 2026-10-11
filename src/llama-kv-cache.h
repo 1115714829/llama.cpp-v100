@@ -196,6 +196,10 @@ public:
     // ubatches with range masks share the same n_kv
     uint32_t get_n_kv(const slot_info & sinfo, bool full = false) const;
 
+    // the n_kv of a ubatch over these cells (one stream of this cache) that does not view the whole cache: the used
+    // cells padded to a grain that grows with them, see get_n_kv
+    uint32_t get_n_kv_used(const llama_kv_cells & cells) const;
+
     // allow I32 [lo, hi) range masks for eligible ubatches (see get_kq_range_ok)
     void set_kq_range_allowed(bool allowed) override;
 

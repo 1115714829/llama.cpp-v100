@@ -5587,6 +5587,40 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph, bool * has_s
     return use_cuda_graph;
 }
 
+// The ubatches a CUDA graph is for: up to 64 token columns, the bound of the skinny GEMMs that take
+// the weight matmuls of decode (above it prefill runs MMQ/cuBLAS, see ggml_cuda_mul_mat_q4k_skinny)
+// and of every decode/verify ubatch (llama_context caps n_dec_max at 64).
+static constexpr int64_t GGML_CUDA_GRAPH_MAX_TOKENS = 64;
+
+// Whether cgraph computes a prefill-sized ubatch: a weight matmul over more than
+// GGML_CUDA_GRAPH_MAX_TOKENS activation columns (a 2D activation, the token count in ne[1]) or a
+// MUL_MAT_ID over more tokens (dst = [rows, n_expert_used, n_tokens]). Such a graph is compute bound,
+// so recording it saves nothing, while the instantiated executable stays in the cache, and in VRAM,
+// until the cache evicts it; and a prefill graph is replayed a few times at most, when consecutive
+// ubatches share it. It is neither recorded nor cached: graph_compute evaluates it directly.
+// The Hadamard rotation of q/k/v folds the heads into its columns, so its width is no token count.
+static bool ggml_cuda_graph_prefill_sized(const ggml_cgraph * cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+
+        if (node->op == GGML_OP_MUL_MAT) {
+            const ggml_tensor * src1 = node->src[1];
+            if (ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+                continue;
+            }
+            if (src1->ne[2] == 1 && src1->ne[3] == 1 && src1->ne[1] > GGML_CUDA_GRAPH_MAX_TOKENS) {
+                return true;
+            }
+        } else if (node->op == GGML_OP_MUL_MAT_ID) {
+            if (node->ne[2] > GGML_CUDA_GRAPH_MAX_TOKENS) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     return cgraph->nodes[0];
 }
@@ -9060,12 +9094,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     const void * graph_key = nullptr;
 
 #ifdef USE_CUDA_GRAPH
-    graph_key = ggml_cuda_graph_get_key(cgraph);
+    // a prefill-sized graph takes no cache entry at all, see ggml_cuda_graph_prefill_sized
+    ggml_cuda_graph * graph = nullptr;
+    if (!ggml_cuda_graph_prefill_sized(cgraph)) {
+        graph_key = ggml_cuda_graph_get_key(cgraph);
 
-    ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+        ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
-    ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+        graph = cuda_ctx->cuda_graph(graph_key);
+    }
+    if (graph != nullptr && graph->is_enabled()) {
         bool has_staging = false;
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph, &has_staging);
         if (graph_compatible) {
@@ -9324,8 +9362,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     }
 
 #ifdef USE_CUDA_GRAPH
-    const void * graph_key = ggml_cuda_graph_get_key(cgraph);
-    const bool use_cuda_graph = ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
+    // a prefill-sized graph is never recorded and takes no cache entry, see ggml_cuda_graph_prefill_sized
+    const bool use_cuda_graph = !ggml_cuda_graph_prefill_sized(cgraph) &&
+        ggml_cuda_graph_set_enabled(cuda_ctx, ggml_cuda_graph_get_key(cgraph));
 #else
     const bool use_cuda_graph = false;
     GGML_UNUSED(cuda_ctx);

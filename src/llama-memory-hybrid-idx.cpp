@@ -391,6 +391,7 @@ struct llama_memory_hybrid_idx_context::kpool_state {
     uint32_t generation = 0;
 
     uint32_t n_pool_real = 0;
+    uint32_t n_pool_pad  = 1; // graph size of the pool list, see llama_memory_hybrid_idx::kpool_n_pool
     uint32_t n_new       = 0;
     uint32_t n_new_g     = 1; // graph size of the new pool list, stable across decode steps
     bool     cache_safe  = true;
@@ -398,9 +399,13 @@ struct llama_memory_hybrid_idx_context::kpool_state {
 
 namespace {
 
+// The graph's pool count for n_pool_real pools over n_cells padded cells, see llama_memory_hybrid_idx::kpool_n_pool.
 // The last padded pool is always unused.
-uint32_t kpool_pad(uint32_t n_pool) {
-    return std::max<uint32_t>(64u, GGML_PAD(n_pool + 1, 64u));
+uint32_t kpool_pad(uint32_t n_pool_real, uint64_t n_cells, uint32_t kpool) {
+    const uint64_t n_pool = std::max<uint64_t>(n_cells/kpool, n_pool_real) + 1;
+    GGML_ASSERT(n_pool <= UINT32_MAX);
+
+    return (uint32_t) n_pool;
 }
 
 // Rank of (pos, cell) in a sequence's cells sorted by position then cell, or -1 when absent.
@@ -571,6 +576,60 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
 
 bool llama_memory_hybrid_idx::kpool_layout_shared() const {
     return kpool_lay && !kpool_lay->cache_safe;
+}
+
+// A new pool count rebuilds the graph, and with tensor parallelism re-records its CUDA graphs (about 0.3 s for the
+// decode graph of a big MoE). A count padded to 64 pools moved every 256 tokens of decode, so the count is padded like
+// the n_kv of a ubatch that does not view the whole cache instead: the pools the used cells of each stream can form,
+// with the cells padded to the n_kv grain (2048 cells, doubling beyond 64K), so a decode step moves it only where its
+// own n_kv moves. The padded pools lie outside every token's visible range, see set_input_kpool.
+// Without shared cells a stream's pools are at most its cells / kpool. A layout sharing cells can have more; it
+// re-pools every pool each ubatch, so its graph follows the pool count anyway (n_new_g), and it takes the count itself.
+uint32_t llama_memory_hybrid_idx::kpool_n_pool(uint32_t n_pool_real) const {
+    GGML_ASSERT(mem_idx != nullptr);
+
+    uint64_t n_cells = 0;
+    for (uint32_t s = 0; s < mem_idx->get_n_stream(); ++s) {
+        // a non unified cache keeps one stream per sequence, see kpool_layout_build
+        const auto & cells = mem_idx->get_cells((llama_seq_id) s);
+        if (cells.used_max_p1() > 0) {
+            n_cells += mem_idx->get_n_kv_used(cells);
+        }
+    }
+
+    return kpool_pad(n_pool_real, n_cells, get_kpool());
+}
+
+uint32_t llama_memory_hybrid_idx::kpool_n_pool_layout() const {
+    GGML_ASSERT(kpool_lay != nullptr);
+
+    return kpool_n_pool(kpool_lay->n_pool_real);
+}
+
+std::string llama_memory_hybrid_idx::kpool_n_pool_check() const {
+    GGML_ASSERT(mem_idx != nullptr);
+
+    if (!kpool_lay) {
+        return "no layout yet";
+    }
+
+    const uint32_t n_pool_real = kpool_lay->n_pool_real;
+    const uint32_t n_pool      = kpool_n_pool(n_pool_real);
+
+    // set_input_kpool lays the real pools out first and needs one padded pool after them
+    if (n_pool <= n_pool_real) {
+        return format("%u pools in the graph for %u real ones", n_pool, n_pool_real);
+    }
+
+    // the reserved graph holds every count a decode can take, see the full-cache context
+    const uint64_t n_pool_max = uint64_t(mem_idx->get_size()/get_kpool())*mem_idx->get_n_seq_max();
+    const uint32_t n_pool_rsv = kpool_pad((uint32_t) std::max<uint64_t>(n_pool_max, n_pool_real),
+            uint64_t(mem_idx->get_size())*mem_idx->get_n_stream(), get_kpool());
+    if (n_pool > n_pool_rsv) {
+        return format("%u pools in the graph, %u reserved", n_pool, n_pool_rsv);
+    }
+
+    return "";
 }
 
 void llama_memory_hybrid_idx::kpool_layout_build(kpool_layout & lay, const stale_pos_t & stale) const {
@@ -744,6 +803,8 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
         const uint64_t n_pool_max = uint64_t(idx->get_size() / mem->get_kpool()) * idx->get_n_seq_max();
         GGML_ASSERT(n_pool_max <= UINT32_MAX - 64);
         st.n_pool_real = std::max(st.n_pool_real, uint32_t(n_pool_max));
+        // the most pools a graph can take: every pool the cache can hold, over every cell of every stream
+        st.n_pool_pad = kpool_pad(st.n_pool_real, uint64_t(idx->get_size())*idx->get_n_stream(), mem->get_kpool());
         st.n_new   = st.n_pool_real;
         st.n_new_g = std::max(st.n_new, 1u);
         kpool_st = std::make_unique<kpool_state>(std::move(st));
@@ -897,6 +958,7 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     auto & st = *kpool_st;
 
     st.n_pool_real = lay.n_pool_real;
+    st.n_pool_pad  = mem->kpool_n_pool(lay.n_pool_real);
     st.cache_safe  = lay.cache_safe;
     st.n_new       = 0;
     if (++st.generation == 0) {
@@ -981,7 +1043,7 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
     const auto *   idx        = mem->get_mem_idx();
     const uint32_t n_pool_max = idx->get_size() / kpool * idx->get_n_seq_max();
     const uint32_t bound = ubatch.n_tokens/kpool + ubatch.n_seqs_unq;
-    st.n_new_g = std::max({st.n_new, 1u, std::min({bound, kpool_pad(st.n_pool_real) - 1, n_pool_max})});
+    st.n_new_g = std::max({st.n_new, 1u, std::min({bound, st.n_pool_pad - 1, n_pool_max})});
 }
 
 const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_context::kpool_cur() const {
@@ -991,7 +1053,7 @@ const llama_memory_hybrid_idx_context::kpool_state & llama_memory_hybrid_idx_con
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool() const {
-    return kpool_pad(kpool_cur().n_pool_real);
+    return kpool_cur().n_pool_pad;
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
@@ -1023,7 +1085,7 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     const bool by_order = mem->get_kpool_by_order();
 
-    GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
+    GGML_ASSERT(n_pool == st.n_pool_pad && n_pool > st.n_pool_real);
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
     GGML_ASSERT(pool_mask == nullptr || (pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens));
     GGML_ASSERT(pool_rng  == nullptr || (pool_rng->type == GGML_TYPE_I32 && pool_rng->ne[0] == 2 && pool_rng->ne[1] == (int64_t) n_tokens));
