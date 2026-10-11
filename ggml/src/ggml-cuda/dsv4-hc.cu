@@ -1,5 +1,6 @@
 // DeepSeek-V4 hyper-connection ops. The gated post epilogue (2*sigmoid(inject/hc)) ports the
-// gate arithmetic of Strata's fused_gr kernels (MIT, refs/strata/src/kernels/cuda/fused_gr.cu).
+// gate arithmetic of Strata's fused_gr kernels (MIT, https://github.com/Niko1221/Strata
+// src/kernels/cuda/fused_gr.cu, see licenses/LICENSE-strata).
 #include "common.cuh"
 #include "dsv4-hc.cuh"
 
@@ -156,7 +157,7 @@ static __global__ void dsv4_hc_pre_f32(
 
 // gated_post: `post` is the raw inject tensor; qwen4exp builds 2*sigmoid(inject/hc), and
 // folding those two scales and the sigmoid into this kernel is what the Strata fused_gr.cu
-// up epilogue does for `rv = fmaf(bo, 2*sigmoid(inj/HC), rv)` (refs/strata/src/kernels/cuda/fused_gr.cu:124).
+// up epilogue does for `rv = fmaf(bo, 2*sigmoid(inj/HC), rv)` (Strata src/kernels/cuda/fused_gr.cu, gr_up_kernel).
 template <bool has_comb, bool gated_post = false>
 static __global__ void dsv4_hc_post_f32(
         const float * x,

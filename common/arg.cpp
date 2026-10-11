@@ -2822,7 +2822,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--dump-expert-routing"}, "FILE",
         "write the observed per-layer per-expert routing counts to this file when the model\n"
-        "unloads; the file has the same format as --expert-profile, so one run profiles the next",
+        "unloads; the file has the same format as --expert-profile, so one run profiles the next.\n"
+        "With more than one GPU every device writes FILE.devN with its own experts; concatenate\n"
+        "these files to get one profile",
         [](common_params & params, const std::string & value) {
             params.dump_expert_routing = value;
             ggml_expert_store_set_dump_path(params.dump_expert_routing.c_str());
@@ -2831,8 +2833,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--dump-routing-trace"}, "FILE",
         "record the per-token top-k routing of every mul_mat_id (expert store and plain expert\n"
-        "tensors) to this binary trace, readable by mimo-runs/tools/expert-replay.py and\n"
-        "mimo-runs/tools/expert-replay.py --make-profile",
+        "tensors) to this binary trace for offline analysis of the routing; with more than one GPU\n"
+        "every device writes FILE.devN (record layout: ggml/src/ggml-cuda/ggml-cuda-routing-trace.cu)",
         [](common_params & params, const std::string & value) {
             params.dump_routing_trace = value;
             ggml_expert_store_set_trace_path(params.dump_routing_trace.c_str(), params.dump_routing_trace_size);

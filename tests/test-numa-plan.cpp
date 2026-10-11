@@ -29,7 +29,7 @@ bool expect(const char * what, const std::vector<int> & got, const std::vector<i
     return true;
 }
 
-// read time matrix of the 6 card AC922 measurement (t123), one GiB per device, 128 MiB probe
+// read time matrix of a 6 card AC922 measurement, one GiB per device, 128 MiB probe
 // buffer, in ms. The measured step times were: 0,0,8,0,0,8 -> 90 ms (best), page interleaved
 // -> 119, all on node 0 -> 128, 8,8,8,0,0,0 -> 134, slot local 0,0,0,8,8,8 -> 146, all on node 8
 // -> 233. The times are per (device, node) under concurrent load, which is why the placement

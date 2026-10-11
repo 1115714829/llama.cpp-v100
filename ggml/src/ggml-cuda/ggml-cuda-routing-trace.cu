@@ -29,8 +29,7 @@
 //
 // One trace file per device: with a layer split every device appends only its own layers,
 // and the step counter is derived from the layer order inside one device, so the files stay
-// independent (docs/design/r200-routing-trace.md 3.4). The path gets a ".devN" suffix when
-// the process has more than one device.
+// independent. The path gets a ".devN" suffix when the process has more than one device.
 //
 // The trace records the raw (global) expert ids of the ids tensor, before the expert offset
 // is applied, so an eventual expert-parallel run keeps global ids.
@@ -39,8 +38,9 @@
 
 namespace {
 
-// header is 32 bytes, little endian, layout: "RTRC", version, header_bytes, n_layer,
-// n_expert, k, flags, n_records (see the replay reader HEADER_FMT)
+// header is 32 bytes, little endian, layout: "RTRC", version (u16), header_bytes (u16),
+// n_layer, n_expert, k, flags (u32 each), n_records (u64). Every record that follows is four
+// u32 (step, layer, n_tokens, record flags) and then n_tokens * k i32 expert ids.
 constexpr uint32_t TRACE_VERSION      = 1;
 constexpr uint32_t TRACE_HEADER_BYTES = 32;
 
