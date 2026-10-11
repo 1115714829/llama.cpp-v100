@@ -15980,14 +15980,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_qsa_select(4096, 3, 20, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(100, 0, 9, 4, 100, type_K));
-        // the 1024-thread kernels: the register kernel at each of its sizes (4096, 8192, 16384, 24576 and 33792 pools,
-        // the last at its bound) and the wide kernel past it
+        // the top-k kernels: the register kernel at each of its sizes (up to 4096, 8192, 16384 and 24576 pools), past
+        // them the multi-block kernels for passes of up to 16 tokens and the wide kernel for larger passes (20 tokens;
+        // 70 tokens: a 64-token pass and a 6-token pass, both on the wide kernel)
         test_cases.emplace_back(new test_qsa_select(6000, 8, 4, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(12000, 8, 4, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(20000, 8, 4, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(33792, 8, 4, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(40000, 8, 4, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(50000, 8, 4, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(30000, 8, 20, 4, 512, type_K));
+        test_cases.emplace_back(new test_qsa_select(30000, 8, 70, 4, 512, type_K));
         // a pool count of the 65536 order (not the full 200K context) that is not a multiple of the 256-key
         // block of the Volta wmma scorer: the last block scores only its first keys
         test_cases.emplace_back(new test_qsa_select(8192 + 7, 7, 70, 4, 512, type_K));

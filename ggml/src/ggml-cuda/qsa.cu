@@ -24,13 +24,18 @@
 
 // the 1024-thread top-k kernels (register and wide) hold one query per block, as in Strata
 #define QSA_TOPK_T 1024
-#define QSA_TOPK_PER 33
 #define QSA_TOPK_WARPS (QSA_TOPK_T/32)
 
-// dispatch of the top-k by the number of pools a query can scan: the register kernel holds QSA_TOPK_T*PER pools, with
-// PER the smallest of 4, 8, 16, 24, 33 that fits (a register kernel sized for more pools than it holds runs its
-// unrolled loops idle: on V100 4096 pools take 15.5 us with PER 4 and 25 us with PER 33); the wide kernel takes the
-// pools past QSA_TOPK_T*QSA_TOPK_PER. Every kernel selects the same ids.
+// dispatch of the top-k by the number of pools a query can scan (n_pool bounds every visible range) and the queries of
+// the pass; every kernel selects the same ids (V100, 4 queries / 64 queries, us):
+//   n_pool <= 1024*24      -> qsa_topk_reg_kernel<PER>, PER the smallest of 4, 8, 16, 24 that holds the pools
+//                             (a kernel sized for more pools runs its unrolled loops idle: 4096 pools 15.5 us with PER 4,
+//                             25 us with PER 33)
+//   larger, <= 16 queries  -> qsa_topk_mb (decode / verify: one block per 2048 pools; 52288 pools 35 us, wide 83 us)
+//   larger, more queries   -> qsa_topk_wide_kernel (prefill: the queries fill the GPU; 32832 pools 76 us against
+//                             91 us for the register kernel at PER 33 and 133 us for qsa_topk_mb)
+#define QSA_TOPK_REG_MAX (QSA_TOPK_T*24)
+#define QSA_MB_MAX_TOKENS 16
 
 // QSA_ATTN: batches up to this size take the chunked kernel, larger ones the prompt kernel
 #define QSA_ATTN_CHUNK_MAX_TOKENS 16
@@ -451,6 +456,293 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_wide_kernel(
     qsa_topk_epilogue(tidx, s_tidx, kpool, sentinel, s_nkept, qi, o, n_sel, &s_digit);
 }
 
+// ---- the same top-k over many blocks, for the few queries of a decode or verify step: a query's pools in chunks of
+// QSA_MB_CHUNK (8 keys per thread in registers), one block per (chunk, query), the radix passes as separate kernels
+// that add the chunk histograms into global ones (integer counts, so the same histograms), then a count kernel and a
+// write kernel that places each chunk's pools after the chunks before it. The threshold, the tie budget (lowest pools
+// first, chunks in pool order) and the output order are the single-block kernels': identical ids. One block per query
+// is bound by a single SM (52288 pools: 98 us on V100 with every pass instruction-bound); the chunks spread it.
+#define QSA_MB_THREADS 256
+#define QSA_MB_PER     8
+#define QSA_MB_CHUNK   (QSA_MB_THREADS*QSA_MB_PER)
+
+struct qsa_mb_args {
+    const float   * scores; int64_t n_pool;
+    const int32_t * rng;    int64_t s_rng;
+    const int32_t * pidx;   int     kpool;
+    const int32_t * tidx;   int64_t s_tidx;
+    int       n_top;
+    int       sentinel;
+    int32_t * out;
+    int       n_sel;
+    int     * hist;    // [QSA_RS_PASSES][n_tok][QSA_RS_BINS], zero before the first pass
+    int     * cnt;     // [n_tok][n_chunk][2]: pools above and at the threshold per chunk
+    int     * state;   // [n_tok][4]: threshold, tie budget, every pool kept
+    int       n_tok;
+    int       n_chunk;
+};
+
+// the digits of the passes before p, from the global histograms of query qi
+template <int NT>
+static __device__ __forceinline__ void qsa_mb_digits(const qsa_mb_args & a, const int qi, const int p, int * s_warp,
+                                                     uint32_t & prefix, int & above) {
+    prefix = 0;
+    above  = 0;
+    for (int pp = 0; pp < p; ++pp) {
+        int d, c;
+        qsa_find_digit<NT>(a.hist + ((int64_t) pp*a.n_tok + qi)*QSA_RS_BINS, qsa_rs_bins(pp), above, a.n_top, s_warp, d, c);
+        prefix |= (uint32_t) d << qsa_rs_shift(pp);
+        above = c;
+    }
+}
+
+template <int P>
+static __global__ void __launch_bounds__(QSA_MB_THREADS) qsa_mb_hist_kernel(const qsa_mb_args a) {
+    __shared__ int hist[QSA_RS_BINS];
+    __shared__ int s_warp[33];
+
+    const int c  = blockIdx.x;
+    const int qi = blockIdx.y;
+    const int t  = threadIdx.x;
+
+    const int64_t lo = a.rng[qi*a.s_rng + 0];
+    const int64_t hi = a.rng[qi*a.s_rng + 1];
+    const int64_t c0 = (int64_t) c*QSA_MB_CHUNK;
+    if (hi - lo <= a.n_top || c0 + QSA_MB_CHUNK <= lo || c0 >= hi) {
+        return; // every pool is kept, or none of this chunk is visible
+    }
+
+    uint32_t prefix;
+    int above;
+    qsa_mb_digits<QSA_MB_THREADS>(a, qi, P, s_warp, prefix, above);
+
+    const int      shift   = qsa_rs_shift(P);
+    const int      nbins   = qsa_rs_bins(P);
+    const uint32_t hi_mask = qsa_rs_hi_mask(P);
+    for (int i = t; i < nbins; i += QSA_MB_THREADS) {
+        hist[i] = 0;
+    }
+    __syncthreads();
+    const float * sc = a.scores + qi*a.n_pool;
+    uint32_t k[QSA_MB_PER];
+#pragma unroll
+    for (int j = 0; j < QSA_MB_PER; ++j) {
+        const int64_t b = c0 + t + j*QSA_MB_THREADS;
+        k[j] = b >= lo && b < hi ? qsa_order_key(sc[b]) : 0u;
+    }
+#pragma unroll
+    for (int j = 0; j < QSA_MB_PER; ++j) {
+        const int64_t b = c0 + t + j*QSA_MB_THREADS;
+        if (b >= lo && b < hi && (k[j] & hi_mask) == (prefix & hi_mask)) {
+            atomicAdd(&hist[(k[j] >> shift) & (nbins - 1)], 1);
+        }
+    }
+    __syncthreads();
+    int * g = a.hist + ((int64_t) P*a.n_tok + qi)*QSA_RS_BINS;
+    for (int i = t; i < nbins; i += QSA_MB_THREADS) {
+        if (hist[i] != 0) {
+            atomicAdd(&g[i], hist[i]);
+        }
+    }
+}
+
+static __global__ void __launch_bounds__(QSA_MB_THREADS) qsa_mb_count_kernel(const qsa_mb_args a) {
+    __shared__ int s_warp[33];
+
+    const int c  = blockIdx.x;
+    const int qi = blockIdx.y;
+    const int t  = threadIdx.x;
+
+    const int64_t lo  = a.rng[qi*a.s_rng + 0];
+    const int64_t hi  = a.rng[qi*a.s_rng + 1];
+    const int64_t c0  = (int64_t) c*QSA_MB_CHUNK;
+    const bool    all = hi - lo <= a.n_top;
+    int * cnt = a.cnt + ((int64_t) qi*a.n_chunk + c)*2;
+
+    const bool in = !(c0 + QSA_MB_CHUNK <= lo || c0 >= hi);
+    if (!in && t == 0) {
+        cnt[0] = 0;
+        cnt[1] = 0;
+    }
+    if (!in && c != 0) {
+        return; // nothing of this chunk is visible; chunk 0 still publishes the query's state for the write kernel
+    }
+
+    uint32_t thr       = 0;
+    int      eq_budget = 0;
+    if (!all) {
+        int above;
+        qsa_mb_digits<QSA_MB_THREADS>(a, qi, QSA_RS_PASSES, s_warp, thr, above);
+        eq_budget = a.n_top - above; // pools equal to thr that fit, lowest index first
+    }
+    if (c == 0 && t == 0) {
+        a.state[qi*4 + 0] = (int) thr;
+        a.state[qi*4 + 1] = eq_budget;
+        a.state[qi*4 + 2] = all ? 1 : 0;
+    }
+    if (!in) {
+        return;
+    }
+
+    const float * sc = a.scores + qi*a.n_pool;
+    int gt = 0;
+    int eq = 0;
+#pragma unroll
+    for (int j = 0; j < QSA_MB_PER; ++j) {
+        const int64_t b = c0 + t + j*QSA_MB_THREADS;
+        if (b >= lo && b < hi) {
+            const uint32_t k = all ? 1u : qsa_order_key(sc[b]);
+            if (all || k > thr) {
+                gt++;
+            } else if (k == thr) {
+                eq++;
+            }
+        }
+    }
+    int tot_gt, tot_eq;
+    qsa_excl_scan<QSA_MB_THREADS/32>(gt, s_warp, tot_gt);
+    qsa_excl_scan<QSA_MB_THREADS/32>(eq, s_warp, tot_eq);
+    if (t == 0) {
+        cnt[0] = tot_gt;
+        cnt[1] = tot_eq;
+    }
+}
+
+static __global__ void __launch_bounds__(QSA_MB_THREADS) qsa_mb_write_kernel(const qsa_mb_args a) {
+    __shared__ int s_warp[33];
+    __shared__ int s_base[3];
+
+    const int c  = blockIdx.x;
+    const int qi = blockIdx.y;
+    const int t  = threadIdx.x;
+
+    const int64_t lo = a.rng[qi*a.s_rng + 0];
+    const int64_t hi = a.rng[qi*a.s_rng + 1];
+    const int64_t c0 = (int64_t) c*QSA_MB_CHUNK;
+    const bool    in = !(c0 + QSA_MB_CHUNK <= lo || c0 >= hi);
+    if (!in && c != 0) {
+        return; // nothing of this chunk is visible, and the tail belongs to chunk 0
+    }
+
+    const uint32_t thr       = (uint32_t) a.state[qi*4 + 0];
+    const int      eq_budget = a.state[qi*4 + 1];
+    const bool     all       = a.state[qi*4 + 2] != 0;
+
+    // the kept pools and the tied pools of the chunks before this one, and of all chunks
+    if (t == 0) {
+        const int * cnt = a.cnt + (int64_t) qi*a.n_chunk*2;
+        int sb = 0;
+        int eb = 0;
+        for (int c2 = 0; c2 < a.n_chunk; ++c2) {
+            if (c2 == c) {
+                s_base[0] = sb;
+                s_base[1] = eb;
+            }
+            const int g2   = cnt[2*c2 + 0];
+            const int e2   = cnt[2*c2 + 1];
+            const int take = eq_budget - eb < 0 ? 0 : (eq_budget - eb > e2 ? e2 : eq_budget - eb);
+            sb += g2 + take;
+            eb += e2;
+        }
+        s_base[2] = sb;
+    }
+    __syncthreads();
+    int32_t * o = a.out + (int64_t) qi*a.n_sel;
+
+    if (in) {
+        // thread t holds the consecutive pools c0 + t*PER .. c0 + t*PER + PER - 1, so a prefix keeps the pool order
+        const float * sc = a.scores + qi*a.n_pool;
+        const int64_t b0 = c0 + (int64_t) t*QSA_MB_PER;
+        uint32_t k[QSA_MB_PER];
+        int gt = 0;
+        int eq = 0;
+#pragma unroll
+        for (int j = 0; j < QSA_MB_PER; ++j) {
+            const int64_t b = b0 + j;
+            k[j] = b >= lo && b < hi ? (all ? 1u : qsa_order_key(sc[b])) : 0u;
+            if (b >= lo && b < hi) {
+                if (all || k[j] > thr) {
+                    gt++;
+                } else if (k[j] == thr) {
+                    eq++;
+                }
+            }
+        }
+        int tot;
+        const int eq_before = qsa_excl_scan<QSA_MB_THREADS/32>(eq, s_warp, tot) + s_base[1];
+        int my_eq = eq_budget - eq_before;
+        my_eq = my_eq < 0 ? 0 : (my_eq > eq ? eq : my_eq);
+        const int sel = gt + my_eq;
+        int64_t wpos = qsa_excl_scan<QSA_MB_THREADS/32>(sel, s_warp, tot) + s_base[0];
+        int eq_left = my_eq;
+#pragma unroll
+        for (int j = 0; j < QSA_MB_PER; ++j) {
+            const int64_t b = b0 + j;
+            if (b < lo || b >= hi) {
+                continue;
+            }
+            bool keep = all || k[j] > thr;
+            if (!keep && k[j] == thr && eq_left > 0) {
+                keep = true;
+                eq_left--;
+            }
+            if (keep) {
+                for (int cc = 0; cc < a.kpool; ++cc) {
+                    o[wpos*a.kpool + cc] = a.pidx[b*a.kpool + cc];
+                }
+                wpos++;
+            }
+        }
+    }
+
+    if (c == 0) { // the tail cells after all kept pools, then -1
+        __syncthreads();
+        if (t == 0) {
+            int n = s_base[2]*a.kpool;
+            for (int cc = 0; cc < a.kpool - 1; ++cc) {
+                const int32_t cell = a.tidx[qi*a.s_tidx + cc];
+                if (cell != a.sentinel) {
+                    o[n++] = cell;
+                }
+            }
+            s_base[0] = n;
+        }
+        __syncthreads();
+        for (int i = s_base[0] + t; i < a.n_sel; i += QSA_MB_THREADS) {
+            o[i] = -1;
+        }
+    }
+}
+
+// ints of scratch the multi-block top-k needs for n_tok queries over n_pool pools
+static int64_t qsa_topk_mb_scratch(const int64_t n_tok, const int64_t n_pool) {
+    const int64_t n_chunk = (n_pool + QSA_MB_CHUNK - 1)/QSA_MB_CHUNK;
+    return (int64_t) QSA_RS_PASSES*n_tok*QSA_RS_BINS + n_tok*n_chunk*2 + n_tok*4;
+}
+
+static void qsa_topk_mb(const float * scores, const int64_t n_pool, const int32_t * rng, const int64_t s_rng,
+                        const int32_t * pidx, const int kpool, const int32_t * tidx, const int64_t s_tidx,
+                        const int n_top, const int sentinel, int32_t * out, const int n_sel, const int n_tok,
+                        int * scratch, cudaStream_t stream) {
+    const int n_chunk = (int) ((n_pool + QSA_MB_CHUNK - 1)/QSA_MB_CHUNK);
+
+    qsa_mb_args a;
+    a.scores = scores; a.n_pool = n_pool; a.rng = rng; a.s_rng = s_rng; a.pidx = pidx; a.kpool = kpool;
+    a.tidx = tidx; a.s_tidx = s_tidx; a.n_top = n_top; a.sentinel = sentinel; a.out = out; a.n_sel = n_sel;
+    a.hist  = scratch;
+    a.cnt   = a.hist + (int64_t) QSA_RS_PASSES*n_tok*QSA_RS_BINS;
+    a.state = a.cnt + (int64_t) n_tok*n_chunk*2;
+    a.n_tok = n_tok; a.n_chunk = n_chunk;
+
+    CUDA_CHECK(cudaMemsetAsync(a.hist, 0, sizeof(int)*QSA_RS_PASSES*n_tok*QSA_RS_BINS, stream));
+    const dim3 grid(n_chunk, n_tok);
+    qsa_mb_hist_kernel<0><<<grid, QSA_MB_THREADS, 0, stream>>>(a);
+    qsa_mb_hist_kernel<1><<<grid, QSA_MB_THREADS, 0, stream>>>(a);
+    qsa_mb_hist_kernel<2><<<grid, QSA_MB_THREADS, 0, stream>>>(a);
+    qsa_mb_count_kernel<<<grid, QSA_MB_THREADS, 0, stream>>>(a);
+    qsa_mb_write_kernel<<<grid, QSA_MB_THREADS, 0, stream>>>(a);
+}
+
 void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1]; // key table, read in place through pool_cells
@@ -473,6 +765,11 @@ void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     const int64_t tile = std::min<int64_t>(n_tokens, QSA_SELECT_TILE);
     ggml_cuda_pool_alloc<float> scores(ctx.pool(), n_pool*tile);
 
+    // the multi-block top-k's histograms, chunk counts and per-query state: decided by the pass size, so every pass of
+    // a batch takes the same kernel
+    const bool use_mb = n_pool > QSA_TOPK_REG_MAX && tile <= QSA_MB_MAX_TOKENS;
+    ggml_cuda_pool_alloc<int> mb_scratch(ctx.pool(), use_mb ? qsa_topk_mb_scratch(tile, n_pool) : 1);
+
     for (int64_t t0 = 0; t0 < n_tokens; t0 += tile) {
         const int64_t nt = std::min<int64_t>(tile, n_tokens - t0);
 
@@ -492,10 +789,10 @@ void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
             qsa_topk_reg_kernel<8><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
         } else if (n_pool <= (int64_t) QSA_TOPK_T*16) {
             qsa_topk_reg_kernel<16><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
-        } else if (n_pool <= (int64_t) QSA_TOPK_T*24) {
+        } else if (n_pool <= (int64_t) QSA_TOPK_REG_MAX) {
             qsa_topk_reg_kernel<24><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
-        } else if (n_pool <= (int64_t) QSA_TOPK_T*QSA_TOPK_PER) {
-            qsa_topk_reg_kernel<QSA_TOPK_PER><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
+        } else if (use_mb) {
+            qsa_topk_mb(QSA_TOPK_ARGS, (int) nt, mb_scratch.get(), stream);
         } else {
             qsa_topk_wide_kernel<<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
         }
