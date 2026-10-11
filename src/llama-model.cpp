@@ -466,6 +466,34 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         size_t   rotation; // when assigning tensor slices, rotate how the rounding is done for more even allocation
     };
 
+    // per-device share of ne elements, cut at multiples of g, with the device order rotated by `rotation`:
+    // the slices of every split tensor below, and what the MTP block compares to pick its rotation
+    auto split_units = [&](const int64_t ne, const int64_t g, const size_t rotation) -> std::vector<int64_t> {
+        const float * tensor_split = ud->model->tensor_split();
+        std::vector<float> tensor_split_scan;
+        tensor_split_scan.reserve(ud->n_devices);
+        for (size_t j = 0; j < ud->n_devices; j++) {
+            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + rotation) % ud->n_devices]);
+            if (j > 0) {
+                tensor_split_scan[j] += tensor_split_scan[j - 1];
+            }
+        }
+        std::vector<int64_t> ne_dev(ud->n_devices, 0);
+        int64_t low = 0;
+        size_t j = 0;
+        for (; j < ud->n_devices - 1; j++) {
+            int64_t high = tensor_split_scan.back() == 0.0f ?
+                ne * (j+1)/ud->n_devices : ne * tensor_split_scan[j]/tensor_split_scan.back();
+            if (high % g != 0) {
+                high -= high % g;
+            }
+            ne_dev[(j + rotation) % ud->n_devices] = high - low;
+            low = high;
+        }
+        ne_dev[(j + rotation) % ud->n_devices] = ne - low;
+        return ne_dev;
+    };
+
     auto get_tensor_config_impl = [&](
                 const ggml_backend_meta_split_axis axis, const std::string & suffix = "", const std::string & suffix_fallback = "") -> tensor_config {
         // the layers in a tensor can be inhomogeneous, if the pattern is cleanly divided by the number of GPUs there can be aliasing effects,
@@ -480,6 +508,55 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return ret;
         };
 
+        // The MTP block (the layers after the trunk) runs next to the trunk on every step and has fewer KV heads
+        // than there are devices, so its rotation decides which devices hold its attention weights and KV cache.
+        // Continuing the round robin of the trunk's attention layers keeps the KV heads spread evenly, but when
+        // the trunk already holds the same number of heads on every device, any rotation is as even, and the
+        // continuation can land on the devices that the expert split (rotation 0, an expert count the device
+        // count does not divide) gives one expert more in every layer: with 6 devices the 2 KV heads and the
+        // 2 extra experts both land on devices 2 and 5. So the block takes the rotation that first keeps the most
+        // KV heads on any device lowest and then puts its heads on the devices with the fewest experts, the
+        // round robin continuation on a tie. A head is computed the same way on any device, only its place changes.
+        auto get_rotation = [&](const uint32_t il) -> size_t {
+            const size_t rotation_rr = get_il_eff(il) % ud->n_devices;
+            if (!is_ep || il < hparams.n_layer() || hparams.is_recr(il) || hparams.n_expert == 0) {
+                return rotation_rr;
+            }
+            // KV heads per device of the trunk's layers of the same kind, with their round robin rotations
+            std::vector<int64_t> n_head_kv_trunk(ud->n_devices, 0);
+            for (uint32_t il_prev = 0; il_prev < hparams.n_layer(); il_prev++) {
+                if (hparams.is_recr(il_prev) != hparams.is_recr(il) || hparams.is_swa(il_prev) != hparams.is_swa(il)) {
+                    continue;
+                }
+                const std::vector<int64_t> n_head_kv_dev = split_units(hparams.n_head_kv(il_prev), 1, get_il_eff(il_prev) % ud->n_devices);
+                for (size_t j = 0; j < ud->n_devices; j++) {
+                    n_head_kv_trunk[j] += n_head_kv_dev[j];
+                }
+            }
+            const std::vector<int64_t> n_expert_dev = split_units(hparams.n_expert, 1, 0);
+            // (most KV heads on a device, experts on the devices that hold the block's heads): lower is better
+            auto score = [&](const size_t rotation) -> std::pair<int64_t, int64_t> {
+                const std::vector<int64_t> n_head_kv_dev = split_units(hparams.n_head_kv(il), 1, rotation);
+                int64_t max_heads = 0;
+                int64_t n_expert_at_heads = 0;
+                for (size_t j = 0; j < ud->n_devices; j++) {
+                    max_heads = std::max(max_heads, n_head_kv_trunk[j] + n_head_kv_dev[j]);
+                    n_expert_at_heads += n_head_kv_dev[j] * n_expert_dev[j];
+                }
+                return {max_heads, n_expert_at_heads};
+            };
+            size_t best = rotation_rr;
+            std::pair<int64_t, int64_t> best_score = score(rotation_rr);
+            for (size_t r = 0; r < ud->n_devices; r++) {
+                const std::pair<int64_t, int64_t> s = score(r);
+                if (s < best_score) {
+                    best       = r;
+                    best_score = s;
+                }
+            }
+            return best;
+        };
+
         uint32_t il;
         std::string prefix;
         size_t rotation;
@@ -488,13 +565,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             GGML_ASSERT(length_prefix != std::string::npos);
             prefix = tensor_name.substr(0, length_prefix + 1);
             il = std::stoull(tensor_name.substr(4, length_prefix));
-            rotation = get_il_eff(il) % ud->n_devices;
+            rotation = get_rotation(il);
         } else if (tensor_name.substr(0, 6) == "cache_") {
             const size_t layer_index_start = tensor_name.find("_l", 6);
             GGML_ASSERT(layer_index_start != std::string::npos);
             il = std::stoull(tensor_name.substr(layer_index_start + 2));
             prefix = "blk." + std::to_string(il) + ".";
-            rotation = get_il_eff(il) % ud->n_devices;
+            rotation = get_rotation(il);
         } else {
             il = 0;
             rotation = hparams.n_layer() % ud->n_devices;
@@ -920,15 +997,6 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     split_state.axis = tc.axis;
     if (split_state.axis >= 0 && split_state.axis < GGML_MAX_DIMS) {
         const int64_t blck_size = ggml_blck_size(tc.tensor_axis_0->type);
-        const float * tensor_split = ud->model->tensor_split();
-        std::vector<float> tensor_split_scan;
-        tensor_split_scan.reserve(ud->n_devices);
-        for (size_t j = 0; j < ud->n_devices; j++) {
-            tensor_split_scan.push_back(tensor_split == nullptr ? 0.0f : tensor_split[(j + tc.rotation) % ud->n_devices]);
-            if (j > 0) {
-                tensor_split_scan[j] += tensor_split_scan[j - 1];
-            }
-        }
         const std::vector<std::pair<int64_t, uint32_t>> segments = get_split_segments(split_state.axis, tc.il);
         const std::vector<int64_t> granularity = get_split_granularity(blck_size, tc.il, segments);
         const bool attn_3card = attn_kv_overlap_3card(hparams, *ud->model, tc.il);
@@ -997,18 +1065,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             const int64_t  ne_s = segments[is].first;
             const uint32_t nr_s = segments[is].second;
             const int64_t  g_s  = granularity[is];
-            int64_t low = 0;
-            size_t j = 0;
-            for (; j < ud->n_devices - 1; j++) {
-                int64_t high = tensor_split_scan.back() == 0.0f ?
-                    ne_s * (j+1)/ud->n_devices : ne_s * tensor_split_scan[j]/tensor_split_scan.back();
-                if (high % g_s != 0) {
-                    high -= high % g_s;
-                }
-                split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = high - low;
-                low = high;
+            const std::vector<int64_t> ne_dev = split_units(ne_s, g_s, tc.rotation);
+            for (size_t j = 0; j < ud->n_devices; j++) {
+                split_state.ne[is*ud->n_devices + j] = ne_dev[j];
             }
-            split_state.ne[is*ud->n_devices + (j + tc.rotation) % ud->n_devices] = ne_s - low;
             split_state.nr[is] = nr_s;
         }
         split_state.n_segments = segments.size();
