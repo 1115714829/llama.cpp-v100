@@ -10,6 +10,9 @@
 // Adapted to ggml: K/V rows are read from the ggml cache (F16 or Q8_0, row strides per KV head, cell and
 // stream) instead of Strata's paged pools, the selection comes from QSA_SELECT, a cell id of -1 is skipped.
 // The prompt kernel keeps the v70 numerics: hi/lo mma chains and Q8_0 scales applied in FP32.
+// Changed here (same selection): the radix select takes 11/11/10-bit digits with a block-parallel digit search,
+// the register kernel is sized to the pool count, and qsa_topk_mb (not from Strata) spreads a decode query over
+// blocks of 2048 pools.
 
 #include "qsa.cuh"
 #include "lightning-indexer.cuh"
