@@ -924,45 +924,43 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
 // ---------------------------------------------------------------------------------------------------------------------
 // QSA_SELECT scoring of up to QSA_SV_TOKENS tokens in one pass over the keys (decode and MTP verify batches)
 //
-// A warp holds 8 keys at a time, lane l the dims [4l, 4l + 4) of each, the layout of lightning_indexer_kernel_vec, and
-// forms the same per-lane partial products (fma over x, y, z, w from 0). Per token the 32 (key, head) partials of a
-// lane are reduce-scattered over the warp with warp_reduce_sum's pairing order (xor 16, 8, 4, 2, 1): every sum is the
-// same binary tree of the same partials that warp_reduce_sum builds on each lane, so the scores are bit for bit the
-// vec kernel's (relu per head, weighted, heads in order, + 0 as its unmasked write). The keys are read once for all
-// tokens, through cells, in their stored type: 31 instead of 160 shuffles per token and 8 keys, no F32 copy of the table.
+// A warp holds QSA_SV_KPW keys at a time, lane l the dims [4l, 4l + 4) of each, the layout of
+// lightning_indexer_kernel_vec, and forms the same per-lane partial products (fma over x, y, z, w from 0). Per token the
+// 16 (key, head) partials of a lane are reduce-scattered over the warp with warp_reduce_sum's pairing order (xor 16, 8,
+// 4, 2) and the last pair (xor 1) is summed on both lanes: every sum is the same binary tree of the same partials that
+// warp_reduce_sum builds on each lane, so the scores are bit for bit the vec kernel's (relu per head, weighted, heads
+// in order, + 0 as its unmasked write). The keys are read once for all tokens, through cells, in their stored type: 16
+// instead of 80 shuffles per token and 4 keys, no F32 copy of the table. 4 keys per warp rather than 8 halve the
+// registers of the partials (on V100 52288 pools x 4 tokens: 48 us against 56 us).
 
 #define QSA_SV_THREADS 256
 #define QSA_SV_TOKENS  8
+#define QSA_SV_KPW     4
 
-// p[v] (v = 0..31) of every lane reduce-scattered over the warp: lane l returns the sum of p[l] over the lanes, the tree
-// of warp_reduce_sum (xor 16, 8, 4, 2, 1), so it equals warp_reduce_sum(p[l]) bitwise
-static __device__ __forceinline__ float qsa_reduce_scatter32(const float (&p)[32], const int lane) {
-    float r16[16];
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        const bool hi = (lane & 16) != 0;
-        r16[i] = (hi ? p[i + 16] : p[i]) + __shfl_xor_sync(0xffffffff, hi ? p[i] : p[i + 16], 16);
-    }
+// p[v] (v = 0..15) of every lane reduce-scattered over the warp: lanes 2v and 2v + 1 return the sum of p[v] over the
+// lanes, the tree of warp_reduce_sum (xor 16, 8, 4, 2, 1), so it equals warp_reduce_sum(p[v]) bitwise
+static __device__ __forceinline__ float qsa_reduce_scatter16(const float (&p)[16], const int lane) {
     float r8[8];
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const bool hi = (lane & 8) != 0;
-        r8[i] = (hi ? r16[i + 8] : r16[i]) + __shfl_xor_sync(0xffffffff, hi ? r16[i] : r16[i + 8], 8);
+        const bool hi = (lane & 16) != 0;
+        r8[i] = (hi ? p[i + 8] : p[i]) + __shfl_xor_sync(0xffffffff, hi ? p[i] : p[i + 8], 16);
     }
     float r4[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const bool hi = (lane & 4) != 0;
-        r4[i] = (hi ? r8[i + 4] : r8[i]) + __shfl_xor_sync(0xffffffff, hi ? r8[i] : r8[i + 4], 4);
+        const bool hi = (lane & 8) != 0;
+        r4[i] = (hi ? r8[i + 4] : r8[i]) + __shfl_xor_sync(0xffffffff, hi ? r8[i] : r8[i + 4], 8);
     }
     float r2[2];
 #pragma unroll
     for (int i = 0; i < 2; ++i) {
-        const bool hi = (lane & 2) != 0;
-        r2[i] = (hi ? r4[i + 2] : r4[i]) + __shfl_xor_sync(0xffffffff, hi ? r4[i] : r4[i + 2], 2);
+        const bool hi = (lane & 4) != 0;
+        r2[i] = (hi ? r4[i + 2] : r4[i]) + __shfl_xor_sync(0xffffffff, hi ? r4[i] : r4[i + 2], 4);
     }
-    const bool hi = (lane & 1) != 0;
-    return (hi ? r2[1] : r2[0]) + __shfl_xor_sync(0xffffffff, hi ? r2[0] : r2[1], 1);
+    const bool  hi = (lane & 2) != 0;
+    const float r1 = (hi ? r2[1] : r2[0]) + __shfl_xor_sync(0xffffffff, hi ? r2[0] : r2[1], 2);
+    return r1 + __shfl_xor_sync(0xffffffff, r1, 1);
 }
 
 template <ggml_type TYPE_K>
@@ -971,6 +969,7 @@ static __global__ void __launch_bounds__(QSA_SV_THREADS) qsa_scores_vec_kernel(
         const char * __restrict__ K, const size_t nbk2, const int32_t * __restrict__ cells, const int64_t n_kv,
         const float w, float * __restrict__ dst, const size_t nb1) {
     constexpr int WARPS = QSA_SV_THREADS/WARP_SIZE;
+    constexpr int KPW   = QSA_SV_KPW;
 
     __shared__ float4 sq[QSA_SV_TOKENS][4][WARP_SIZE]; // [token][head][lane]: each lane's 4 dims of the query
 
@@ -986,11 +985,11 @@ static __global__ void __launch_bounds__(QSA_SV_THREADS) qsa_scores_vec_kernel(
 
     __syncthreads();
 
-    for (int64_t k0 = ((int64_t) blockIdx.x*WARPS + warp)*8; k0 < n_kv; k0 += (int64_t) gridDim.x*WARPS*8) {
-        // the 4 dims of this lane of 8 keys, keys past n_kv are zero
-        float4 kr[8];
+    for (int64_t k0 = ((int64_t) blockIdx.x*WARPS + warp)*KPW; k0 < n_kv; k0 += (int64_t) gridDim.x*WARPS*KPW) {
+        // the 4 dims of this lane of KPW keys, keys past n_kv are zero
+        float4 kr[KPW];
 #pragma unroll
-        for (int k = 0; k < 8; ++k) {
+        for (int k = 0; k < KPW; ++k) {
             kr[k] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
             if (k0 + k < n_kv) {
                 const char * row = K + (int64_t) cells[k0 + k]*nbk2;
@@ -1004,12 +1003,12 @@ static __global__ void __launch_bounds__(QSA_SV_THREADS) qsa_scores_vec_kernel(
         }
 
         for (int t = 0; t < n_batch; ++t) {
-            float p[32]; // [key][head]
+            float p[KPW*4]; // [key][head]
 #pragma unroll
             for (int h = 0; h < 4; ++h) {
                 const float4 q_vec = sq[t][h][lane];
 #pragma unroll
-                for (int k = 0; k < 8; ++k) {
+                for (int k = 0; k < KPW; ++k) {
                     float qk = 0.0f;
                     ggml_cuda_mad(qk, q_vec.x, kr[k].x);
                     ggml_cuda_mad(qk, q_vec.y, kr[k].y);
@@ -1019,14 +1018,14 @@ static __global__ void __launch_bounds__(QSA_SV_THREADS) qsa_scores_vec_kernel(
                 }
             }
 
-            // lane l holds the head l%4 sum of key l/4; lane 4k gathers the heads of key k
-            const float s0 = qsa_reduce_scatter32(p, lane);
-            const float s1 = __shfl_down_sync(0xffffffff, s0, 1);
-            const float s2 = __shfl_down_sync(0xffffffff, s0, 2);
-            const float s3 = __shfl_down_sync(0xffffffff, s0, 3);
+            // lanes 2v, 2v + 1 hold the head v%4 sum of key v/4; lane 8k gathers the heads of key k
+            const float s0 = qsa_reduce_scatter16(p, lane);
+            const float s1 = __shfl_down_sync(0xffffffff, s0, 2);
+            const float s2 = __shfl_down_sync(0xffffffff, s0, 4);
+            const float s3 = __shfl_down_sync(0xffffffff, s0, 6);
 
-            const int64_t b = k0 + lane/4;
-            if (lane % 4 == 0 && b < n_kv) {
+            const int64_t b = k0 + lane/8;
+            if (lane % 8 == 0 && b < n_kv) {
                 const float sh[4] = { s0, s1, s2, s3 };
                 float score = 0.0f;
 #pragma unroll
@@ -1088,9 +1087,11 @@ void ggml_cuda_lightning_indexer_scores(
     }
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
-    // the keys of a block of 8 warps are 64 consecutive pools; a few blocks per SM so that the query staging is shared
-    const int64_t n_groups = (n_pool + 8*(QSA_SV_THREADS/WARP_SIZE) - 1)/(8*(QSA_SV_THREADS/WARP_SIZE));
-    const dim3 grid((unsigned) std::max<int64_t>(1, std::min<int64_t>(n_groups, 4*(int64_t) ggml_cuda_info().devices[id].nsm)));
+    // the keys of a block are QSA_SV_KPW per warp, consecutive pools; a few blocks per SM so that the query staging is
+    // shared (8 per SM: 52288 pools x 4 tokens 48 us, 2 per SM 58 us)
+    const int64_t keys_per_block = QSA_SV_KPW*(QSA_SV_THREADS/WARP_SIZE);
+    const int64_t n_groups = (n_pool + keys_per_block - 1)/keys_per_block;
+    const dim3 grid((unsigned) std::max<int64_t>(1, std::min<int64_t>(n_groups, 8*(int64_t) ggml_cuda_info().devices[id].nsm)));
 
     for (int64_t t0 = 0; t0 < n_batch; t0 += QSA_SV_TOKENS) {
         const int64_t nt = std::min<int64_t>(QSA_SV_TOKENS, n_batch - t0);
