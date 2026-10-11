@@ -100,11 +100,11 @@ AC922 与 x86 服务器的基础区别，以及它们对加速效果的间接影
 
 ### 许可
 
-继承 llama.cpp 的 MIT 许可（见 `LICENSE`）。移植的代码保留原许可，出处与许可见各文件头。
+本项目自 2.0.0 起采用 GPL-3.0 许可（全文见 `LICENSE`）；1.1.1 及更早版本为 MIT。上游 llama.cpp 的 MIT 许可文本保留在 `licenses/LICENSE-llama.cpp`，移植的第三方代码保留各自原许可，出处与许可见各文件头与 `licenses/README.md`。
 
 ---
 
 ## 致谢（项目与 AI 助手）
 
-- **参考与借鉴的项目**：[llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml)（本项目的基础框架）；[1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)（V100 工程实践的参考，早期部分 SM70 内核移植自它，出处与许可见各文件头与 `licenses/`）；[vLLM](https://github.com/vllm-project/vllm)（投机解码等设计的参考）。
+- **参考与借鉴的项目**：[llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml)（本项目的基础框架）；[1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM)（V100 工程实践的参考，早期部分 SM70 内核移植自它，出处与许可见各文件头与 `licenses/`）；[Strata](https://github.com/Niko1221/Strata) 及其 AC922 分支 [Strata-AC922](https://github.com/eelgaev/Strata-AC922)（大 MoE 的专家融合矩阵乘、QSA 选择与注意力等内核移植自它们，专家缓存与预填充环参考其设计，出处与许可见各文件头与 `licenses/`）；[vLLM](https://github.com/vllm-project/vllm)（投机解码等设计的参考）。
 - **AI 助手**：开发过程由 Claude、DeepSeek、小米 MiMo、MiniMax 协作完成。

@@ -100,11 +100,11 @@ Scan the QR code below to add the maintainer on WeChat and join the discussion g
 
 ### License
 
-MIT, inherited from llama.cpp (see `LICENSE`). Ported code keeps its original license; origin and license are in each file header.
+GPL-3.0 from 2.0.0 on (full text in `LICENSE`); 1.1.1 and earlier were MIT. The MIT license of upstream llama.cpp is kept in `licenses/LICENSE-llama.cpp`; ported third-party code keeps its original license, with origin and license in each file header and in `licenses/README.md`.
 
 ---
 
 ## Acknowledgements (projects and AI assistants)
 
-- **Referenced projects**: [llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml) (the base framework of this project); [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) (reference for V100 engineering practice; some early SM70 kernels were ported from it — origin and license in the file headers and `licenses/`); [vLLM](https://github.com/vllm-project/vllm) (reference for the design of speculative decoding and more).
+- **Referenced projects**: [llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml) (the base framework of this project); [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) (reference for V100 engineering practice; some early SM70 kernels were ported from it — origin and license in the file headers and `licenses/`); [Strata](https://github.com/Niko1221/Strata) and its AC922 fork [Strata-AC922](https://github.com/eelgaev/Strata-AC922) (the fused expert matrix multiplication, QSA selection and attention kernels for the large MoE are ported from them, and the expert cache and prefill ring follow their design; origin and license in the file headers and `licenses/`); [vLLM](https://github.com/vllm-project/vllm) (reference for the design of speculative decoding and more).
 - **AI assistants**: development was done with Claude, DeepSeek, Xiaomi MiMo and MiniMax.

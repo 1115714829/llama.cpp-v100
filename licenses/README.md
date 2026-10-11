@@ -1,8 +1,8 @@
 # 第三方代码与许可 / Third-party code and licenses
 
-本仓库基于 [llama.cpp](https://github.com/ggml-org/llama.cpp)（MIT，见仓库根目录的 `LICENSE`）。下表列出移植或改编自其他项目的文件、来源和许可，每个文件的文件头也写明了出处。许可原文是本目录的 `LICENSE-*`（构建出的 `llama` 程序用 `llama licenses` 也能显示）和随代码放在子目录里的几份许可文件（见最后一列），发布包的 `licenses/` 目录包含全部这些文件。上游 llama.cpp 自带的其余第三方代码（`vendor/` 等）沿用上游的许可安排。
+本仓库自 2.0.0 起以 GPL-3.0 发布（见仓库根目录的 `LICENSE`），基于 [llama.cpp](https://github.com/ggml-org/llama.cpp)（MIT，原许可文本见本目录的 `LICENSE-llama.cpp`）。下表列出移植或改编自其他项目的文件、来源和许可，每个文件的文件头也写明了出处。许可原文是本目录的 `LICENSE-*`（构建出的 `llama` 程序用 `llama licenses` 也能显示）和随代码放在子目录里的几份许可文件（见最后一列），发布包的 `licenses/` 目录包含全部这些文件。上游 llama.cpp 自带的其余第三方代码（`vendor/` 等）沿用上游的许可安排。
 
-This repository is based on [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT, see `LICENSE` in the repository root). The tables below list the files that are ported or adapted from other projects, with their sources and licenses; each file also names its source in its header. The license texts are the `LICENSE-*` files in this directory (also printed by `llama licenses`) and the license files kept next to the vendored code (last column); the `licenses/` directory of a release package contains all of them. Other third-party code that comes with upstream llama.cpp (`vendor/` and so on) keeps upstream's arrangement.
+This repository is released under GPL-3.0 from 2.0.0 on (see `LICENSE` in the repository root) and is based on [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT; its license text is kept as `LICENSE-llama.cpp` in this directory). The tables below list the files that are ported or adapted from other projects, with their sources and licenses; each file also names its source in its header. The license texts are the `LICENSE-*` files in this directory (also printed by `llama licenses`) and the license files kept next to the vendored code (last column); the `licenses/` directory of a release package contains all of them. Other third-party code that comes with upstream llama.cpp (`vendor/` and so on) keeps upstream's arrangement.
 
 ## 移植或改编的代码 / Ported or adapted code
 
@@ -21,7 +21,7 @@ This repository is based on [llama.cpp](https://github.com/ggml-org/llama.cpp) (
 | `ggml/src/ggml-cuda/sm70-vendor/cute/`, `sm70-vendor/cutlass/` | [CUTLASS] @ `62750a2b` | BSD-3-Clause | `ggml/src/ggml-cuda/sm70-vendor/LICENSE-cute-cutlass` |
 | `ggml/src/ggml-cuda/gdn-chunk-sm70/gdn-chunk-cumsum-hv12.cuh`, `gdn-chunk-kkt.cuh`, `gdn-chunk-fwd.cuh` | FlashQLA kernels in [1Cat-vLLM] `flash_qla/`, compiled for sm_70 by [TileLang] 0.1.13 | MIT (FlashQLA, TileLang); Apache-2.0 (1Cat-vLLM) | `licenses/LICENSE-FlashQLA`; `ggml/src/ggml-cuda/gdn-chunk-sm70/LICENSE-tilelang`; `licenses/LICENSE-1Cat-vLLM` |
 | `ggml/src/ggml-cuda/gdn-chunk-sm70/tl_templates/` | [TileLang] templates | MIT | `ggml/src/ggml-cuda/gdn-chunk-sm70/LICENSE-tilelang` |
-| MTP draft borrowing the target's tensors: `src/llama-model-loader.cpp`, `src/llama-model-loader.h`, `src/llama-context.cpp`, `src/llama-cparams.h`, `src/models/qwen4exp.cpp`, `include/llama.h`, `common/speculative.cpp`, `conversion/base.py`, `convert_hf_to_gguf.py` (comments "from unsloth PR #142/#240") | [unsloth llama.cpp] PR #142, #240 | MIT (same as llama.cpp) | `LICENSE` |
+| MTP draft borrowing the target's tensors: `src/llama-model-loader.cpp`, `src/llama-model-loader.h`, `src/llama-context.cpp`, `src/llama-cparams.h`, `src/models/qwen4exp.cpp`, `include/llama.h`, `common/speculative.cpp`, `conversion/base.py`, `convert_hf_to_gguf.py` (comments "from unsloth PR #142/#240") | [unsloth llama.cpp] PR #142, #240 | MIT (same as llama.cpp) | `licenses/LICENSE-llama.cpp` |
 | `vendor/nlohmann/` (from upstream llama.cpp) | nlohmann/json | MIT | `licenses/LICENSE-jsonhpp` |
 
 Strata 与 Strata-AC922 用同一份 MIT 许可（Copyright (c) 2026 Niko1221 and the Strata contributors）。 / Strata and Strata-AC922 carry the same MIT license (Copyright (c) 2026 Niko1221 and the Strata contributors).
