@@ -1,3 +1,25 @@
+The following files are adapted from 1Cat-vLLM (https://github.com/1CatAI/1Cat-vLLM), which is
+licensed under the Apache License, Version 2.0 below. 1Cat-vLLM is a fork of vLLM; where a file
+header says so, the code reached 1Cat-vLLM from SGLang-V100
+(https://github.com/haohervchb/sglang-V100). vLLM and SGLang-V100 use the same Apache License 2.0.
+Parts that 1Cat-vLLM itself keeps under an MIT or BSD license keep that license here too, see
+licenses/README.md.
+
+  ggml/src/ggml-cuda/allreduce-push.cu, allreduce-push.cuh
+      csrc/custom_all_reduce.cuh (sm70_cross_device_reduce_1stage_push,
+      sm70_tp8_hierarchical_reduce_push; adapted there from SGLang-V100)
+  ggml/src/ggml-cuda/q8-skinny.cu, q8-skinny.cuh, q-skinny-common.cuh, q4k-skinny.cu, q4k-skinny.cuh
+      csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu (its QPN8 layout comes from dnv2003/v100-skinny,
+      MIT, see ggml/src/ggml-cuda/LICENSE.v100-skinny)
+  ggml/src/ggml-cuda/fattn-sm70-d256-kernel.cuh
+      csrc/attention/sm70_v37/tail.cu (Copyright (c) 2026, 1CatAI)
+  ggml/src/ggml-cuda/fattn-sm70-grouped.cuh
+      csrc/attention/sm70_grouped_long/ (BSD-3-Clause,
+      see licenses/LICENSE-ai-bond-flash-attention-v100)
+  ggml/src/ggml-cuda/gdn-chunk-sm70/gdn-chunk-cumsum-hv12.cuh, gdn-chunk-kkt.cuh, gdn-chunk-fwd.cuh
+      FlashQLA kernels in flash_qla/, compiled by TileLang for sm_70 (MIT,
+      see licenses/LICENSE-FlashQLA)
+
                                  Apache License
                            Version 2.0, January 2004
                         http://www.apache.org/licenses/

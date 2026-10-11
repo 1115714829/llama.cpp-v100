@@ -8838,7 +8838,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // SCALE -> UNARY(SILU): the hyper-connection mixer activation, silu(x*s), as built by
     // qwen4exp. The scale is folded into the silu kernel, which is what the Strata fused_gr.cu
-    // down projection does in its epilogue (refs/strata/src/kernels/cuda/fused_gr.cu:102-103).
+    // down projection does in its epilogue (Strata src/kernels/cuda/fused_gr.cu, end of gr_down_kernel).
     if (node->op == GGML_OP_SCALE &&
             ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU }) &&
             ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU &&
@@ -8870,7 +8870,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // SCALE -> UNARY(SIGMOID) -> SCALE -> DSV4_HC_POST -> RMS_NORM -> MUL: the combine gate and
     // post as below, followed by the grouped RMSNorm that opens the next mixer (qwen4exp
     // build_hc_mix), in one kernel. Strata likewise reads the pending block output into its next
-    // mixer instead of writing the residual first (refs/strata/src/kernels/cuda/fused_gr.cu:62-66).
+    // mixer instead of writing the residual first (Strata src/kernels/cuda/fused_gr.cu, start of gr_down_kernel).
     if (node->op == GGML_OP_SCALE && i + 5 < cgraph->n_nodes &&
             ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST,
                                                 GGML_OP_RMS_NORM, GGML_OP_MUL }, { i + 3, i + 5 }) &&
@@ -8888,7 +8888,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // SCALE -> UNARY(SIGMOID) -> SCALE -> DSV4_HC_POST: the hyper-connection combine gate,
     // post = 2*sigmoid(inject/hc), folded into the post kernel. qwen4exp builds the chain in
     // build_hc_combine. Strata folds the same gate into its up projection epilogue:
-    // rv = fmaf(bo, 2*sigmoid(inj/HC), rv) (refs/strata/src/kernels/cuda/fused_gr.cu:124).
+    // rv = fmaf(bo, 2*sigmoid(inj/HC), rv) (Strata src/kernels/cuda/fused_gr.cu, gr_up_kernel).
     if (node->op == GGML_OP_SCALE &&
             ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST }, { i + 3 }) &&
             ggml_check_edges(cgraph, i, {{1, 0, 0}, {2, 0, 1}, {3, 2, 2}}) &&

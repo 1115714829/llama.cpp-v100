@@ -1,7 +1,7 @@
 #pragma once
 
-// Per-token expert routing trace of the CUDA backend (RTRC format, see
-// docs/design/r200-routing-trace.md). Every MUL_MAT_ID of the process can record the raw
+// Per-token expert routing trace of the CUDA backend (RTRC format, the file layout is described
+// in ggml-cuda-routing-trace.cu). Every MUL_MAT_ID of the process can record the raw
 // top-k expert ids of each token into a per-device ring buffer; a background thread drains
 // the ring with events (no stream synchronization on the decode path) and writes one RTRC
 // file per device.

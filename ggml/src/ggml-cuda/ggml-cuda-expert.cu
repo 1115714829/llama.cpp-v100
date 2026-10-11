@@ -26,7 +26,7 @@
 // placement plan; this file owns the device allocations, the per-tensor device pointer
 // tables and the per-stream prefill staging areas.
 //
-// Prefill staging (Strata prefill ring, docs/analysis/strata-tiers-src.md 2.5, adapted to
+// Prefill staging (the prefill ring of Strata's src/prefill/prefill.cpp, adapted to
 // "only what this batch routes to"):
 //   1. a routing kernel de-duplicates the ids of the batch into a per-tensor bitmap of
 //      n_expert bits and counts the per-expert routes;
@@ -191,8 +191,8 @@ static void ggml_cuda_expert_free_host(void * user, void * ptr) {
         ggml_cuda_numa_release(device, node, size);
     }
 
-    // Strata A9: an arena that is no longer needed only drops its physical pages first
-    // (MADV_DONTNEED), cudaFreeHost then returns the pinned mapping itself
+    // as in Strata's src/core/expert_source.cpp: an arena that is no longer needed only drops its
+    // physical pages first (MADV_DONTNEED), cudaFreeHost then returns the pinned mapping itself
 #if defined(MADV_DONTNEED)
     if (ptr != nullptr && size > 0 && madvise(ptr, size, MADV_DONTNEED) != 0) {
         GGML_LOG_DEBUG("%s: MADV_DONTNEED of %.2f MiB failed: %s\n",
@@ -1880,9 +1880,10 @@ static ggml_backend_buffer_t ggml_backend_cuda_expert_buffer_type_alloc_buffer_n
         const ggml_expert_store_tensor * st = ggml_expert_store_tensor_at(ctx->store, tensor_id);
 
         // poison the freshly allocated tiers with zeros so reading an unfilled slot or host
-        // entry is a deterministic error instead of stale bytes (Strata A1). This also clears
-        // the row padding of every expert: only the data bytes are copied in later, so the
-        // kernels read zeros past the last row instead of a neighbour or uninitialized bytes.
+        // entry is a deterministic error instead of stale bytes (as Strata's ExpertCache clears
+        // its arena after allocating it). This also clears the row padding of every expert:
+        // only the data bytes are copied in later, so the kernels read zeros past the last row
+        // instead of a neighbour or uninitialized bytes.
         if (st->slots_dev != nullptr) {
             CUDA_CHECK(cudaMemset(st->slots_dev, 0, (size_t) st->n_slot * st->stride));
         }

@@ -3063,8 +3063,8 @@ extern "C" {
     // when the model is unloaded, in the same format as the profile above
     GGML_API void ggml_expert_store_set_dump_path(const char * path);
 
-    // when set, every mul_mat_id records its per-token routing trace (RTRC format,
-    // docs/design/r200-routing-trace.md) into a device ring buffer and the backend drains it
+    // when set, every mul_mat_id records its per-token routing trace (RTRC format, described in
+    // ggml-cuda/ggml-cuda-routing-trace.cu) into a device ring buffer and the backend drains it
     // to this path. size_mib is the device ring size per device in MiB. This records plain
     // (non store) expert tensors too. The trace file is written for the whole process, not
     // only when the model unloads.

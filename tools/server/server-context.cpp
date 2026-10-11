@@ -1883,7 +1883,6 @@ private:
     // look for another slot whose cached prompt shares a longer prefix with the incoming prompt
     // than this slot's own cache; if one is found together with a usable memory checkpoint, take
     // over its KV cache and state and return the new n_past; otherwise return n_past_self unchanged
-    // (see docs/design/v107-711-spec.md)
     size_t try_cross_slot_prefix_reuse(server_slot & slot, const server_tokens & input_tokens, size_t n_past_self) {
         if (slots.size() <= 1) {
             return n_past_self;

@@ -1,13 +1,13 @@
 // bench-pinned-read：GPU 读锁页主机内存的带宽，按（分配方式 × 分配线程所在 NUMA 节点 × 填充线程所在 NUMA 节点）列表。
 //
-// 目的：核实 Strata-AC922（refs/strata-ac922/docs/IBM_AC922.md "Hardware rules learned on the AC922"）的规则——
+// 目的：核实 Strata-AC922（https://github.com/eelgaev/Strata-AC922 的 docs/IBM_AC922.md "Hardware rules learned on the AC922"）的规则——
 //   * GPU 读的锁页内存必须来自 cudaHostAlloc，且由 GPU 所在 NUMA 节点上的线程分配（它忽略 numactl --membind）：
 //     本 socket 68～72 GB/s，跨 socket 40；
 //   * 页面要由它所在节点的 CPU 填充：被另一 socket 最后写过的本地页只有 45 GB/s；
 //   * cudaHostRegister 的内存在 UVM 迁移开启时 0～48 GB/s 不稳。
-// 对照我们 moe-meas-0.md 测到的 34～35 GB/s（numactl --membind=<节点> + 主线程 cudaHostAlloc + 主线程 memset）。
+// 对照我们原来的测法测到的 34～35 GB/s（numactl --membind=<节点> + 主线程 cudaHostAlloc + 主线程 memset）。
 //
-// 编译（ac922-3，CUDA 12.4）：
+// 编译（以 CUDA 12.4 为例）：
 //   /usr/local/cuda-12.4/bin/nvcc -O3 -arch=sm_70 -std=c++17 -o bench-pinned-read bench-pinned-read.cu -lpthread
 // 用法：
 //   bench-pinned-read [--mib 1024] [--reps 5] [--gpus 0,3] [--modes hostalloc,mallochost,register,policy,nobind]
@@ -18,7 +18,7 @@
 //     register   mmap 匿名页，由“填充节点”线程首次触碰（页落在该节点），再由“分配节点”线程 cudaHostRegister(Mapped|Portable)；
 //     policy     我们 ggml-cuda.cu 现在的做法：分配线程绑到“分配节点”以外的节点、set_mempolicy(MPOL_BIND 分配节点)、
 //                cudaHostAlloc、然后 mbind(MPOL_MF_MOVE) 搬页；打印搬页前后的页面分布；
-//     nobind     moe-meas-0 的测法：主线程直接 cudaHostAlloc + 主线程 memset（节点由外部 numactl 决定）。
+//     nobind     原来的测法：主线程直接 cudaHostAlloc + 主线程 memset（节点由外部 numactl 决定）。
 //   每一行：GPU、GPU 所在节点、方式、分配节点、填充节点、move_pages 抽样到的页面节点分布、直读 GB/s、cudaMemcpyAsync H2D GB/s。
 //   --concurrent：所有 GPU 同时读，三种放置（每卡本地节点分配+填充 / 全部节点 0 / 全部节点 8），打印每卡与合计。
 //   --small：小块（20 B～128 MiB）在另一节点线程 + set_mempolicy(MPOL_BIND 目标节点) 下连续分配，打印地址的页内偏移、
@@ -384,7 +384,7 @@ static pinned_buf pinned_alloc(alloc_mode mode, int dev, size_t size, int alloc_
             break;
         }
         case alloc_mode::nobind: {
-            // moe-meas-0 的测法：主线程分配、主线程填充，节点由外部 numactl 决定
+            // 原来的测法：主线程分配、主线程填充，节点由外部 numactl 决定
             CK(cudaSetDevice(dev));
             err = cudaHostAlloc(&b.host, size, cudaHostAllocMapped | cudaHostAllocPortable);
             if (err != cudaSuccess) { (void) cudaGetLastError(); b.note = std::string("alloc failed: ") + cudaGetErrorString(err); return b; }

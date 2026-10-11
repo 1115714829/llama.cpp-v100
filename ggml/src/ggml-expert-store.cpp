@@ -1052,9 +1052,10 @@ void ggml_expert_store_plan(
         }
     }
 
-    // static profile (Strata A3): experts with the highest hit counts get the slots. A profile
-    // that the user asked for but that cannot be read (or carries no entry) is a configuration
-    // error: loading it as a uniform placement would silently change where the experts live.
+    // static profile (as Strata's --expert-profile): experts with the highest hit counts get the
+    // slots. A profile that the user asked for but that cannot be read (or carries no entry) is a
+    // configuration error: loading it as a uniform placement would silently change where the
+    // experts live.
     const std::string path = profile_path != nullptr ? profile_path : ggml_expert_store_get_profile();
     ggml_expert_store_profile profile;
     const bool have_profile = !path.empty() && ggml_expert_store_read_profile(path.c_str(), profile);

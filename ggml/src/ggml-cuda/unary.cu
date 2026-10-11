@@ -1,5 +1,5 @@
 // The scale+silu fusion ports the scaled activation epilogue of Strata's fused_gr kernels
-// (MIT, refs/strata/src/kernels/cuda/fused_gr.cu).
+// (MIT, https://github.com/Niko1221/Strata src/kernels/cuda/fused_gr.cu, see licenses/LICENSE-strata).
 #include "unary.cuh"
 #include "convert.cuh"
 
@@ -706,7 +706,7 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
 
 // y = silu(x*scale). qwen4exp builds the hyper-connection mixer's low-rank activation this way
 // (src/models/qwen4exp.cpp: lo = silu(scale(lo, 1/hc))); the Strata fused_gr.cu down projection
-// folds the same 1/hc and silu into its epilogue (refs/strata/src/kernels/cuda/fused_gr.cu:102-103).
+// folds the same 1/hc and silu into its epilogue (Strata src/kernels/cuda/fused_gr.cu, end of gr_down_kernel).
 static __global__ void scale_silu_kernel(const float * x, float * dst, const float scale, const int64_t k) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;

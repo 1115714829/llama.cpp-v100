@@ -3,14 +3,16 @@
 // Host-side expert store for MoE weights spread over per-device VRAM slots and a
 // device-readable host arena.
 //
-// Layout follows Strata's expert cache (docs/analysis/strata-tiers-src.md A1/A2/A3/A10/A15):
+// Layout follows the expert cache of Strata (https://github.com/Niko1221/Strata,
+// include/strata/core/expert_cache.hpp, src/core/expert_cache.cpp, src/core/expert_source.cpp):
 //   - every registered tensor owns a contiguous array of VRAM slots, one expert per slot;
 //   - layers are isolated by construction because a tensor spans one layer only, so a slot
-//     array is exactly the per-layer quota of Strata A2;
+//     array is exactly the per-layer slot quota of Strata's per-layer admission;
 //   - a (expert) -> slot residency table per tensor says where each expert lives;
-//   - experts without a slot are packed into the host arena (the complement, A15);
-//   - a static routing profile (A3) decides which experts get slots, otherwise the first
-//     experts of each tensor are placed in the slots;
+//   - experts without a slot are packed into the host arena (the complement of the slots,
+//     like the compact host copy of Strata's resident RAM mode);
+//   - a static routing profile (as Strata's --expert-profile) decides which experts get
+//     slots, otherwise the first experts of each tensor are placed in the slots;
 //   - every expert is stored exactly once, either in a slot or in the host arena.
 //
 // The kernels read the weights through a per-tensor device pointer table whose address is
@@ -18,8 +20,9 @@
 // time and may be rewritten for prefill staging (the main table stays untouched).
 //
 // This file is internal to ggml. The CUDA backend provides the memory operations through
-// ggml_expert_store_backend, so the store itself stays platform independent and the CPU
-// in-place / copy-to-VRAM choices of docs/design/r200-x86-worklist.md 4.1 can reuse it.
+// ggml_expert_store_backend, so the store itself stays platform independent and other
+// platforms can reuse it (for example computing host experts in place on the CPU, or
+// copying them to VRAM).
 
 #include "ggml.h"
 #include "ggml-impl.h" // ggml_expert_store_node_lut, ggml_expert_assignment_of_weight (C linkage)
@@ -173,9 +176,9 @@ struct ggml_expert_store_tensor {
     char * host_dev   = nullptr; // device alias of host_host
     char ** table_host = nullptr; // host shadow of the main pointer table
 
-    // byte-level verification (Strata A10): while loading, the bytes of two sampled experts
-    // (one in the slots, one in the host arena) are kept aside; ggml_expert_store_verify()
-    // compares the stored copies against them after loading.
+    // byte-level verification (as Strata's ExpertCache::verify_slot): while loading, the
+    // bytes of two sampled experts (one in the slots, one in the host arena) are kept aside;
+    // ggml_expert_store_verify() compares the stored copies against them after loading.
     int64_t sample_expert[2] = { GGML_EXPERT_STORE_INVALID, GGML_EXPERT_STORE_INVALID };
     std::vector<uint8_t> sample_src[2];
     bool    sample_ready[2] = { false, false };
@@ -248,9 +251,10 @@ GGML_API void ggml_expert_store_set_profile(const char * path);
 GGML_API void ggml_expert_store_set_dump_path(const char * path);
 
 // per-token routing trace: when a path is set, every MUL_MAT_ID records the ids of the
-// launch into a device ring buffer and the CUDA backend drains it to this path. This is used
-// for the offline replay of mimo-runs/tools/expert-replay.py and for building a routing
-// profile from real traffic; see docs/design/r200-routing-trace.md.
+// launch into a device ring buffer and the CUDA backend drains it to this path. The trace is
+// meant for offline analysis of the routing (replaying expert placements, building a routing
+// profile from real traffic); the RTRC file layout is described in
+// ggml-cuda/ggml-cuda-routing-trace.cu.
 GGML_API void ggml_expert_store_set_trace_path(const char * path, int size_mib);
 #ifdef __cplusplus
 }
@@ -430,7 +434,7 @@ GGML_API void ggml_expert_store_memset(
 // byte-for-byte check of the sampled experts of one tensor: the loader kept the source
 // bytes of one slot expert and one host expert aside (see ggml_expert_store_tensor), the
 // check reads the placed copies back and compares them. A wrong slot/host index is caught
-// at startup instead of silently computing wrong results (Strata A10).
+// at startup instead of silently computing wrong results (as Strata's ExpertCache::verify_slot).
 GGML_API bool ggml_expert_store_verify(
         ggml_expert_store * store, int tensor_id);
 

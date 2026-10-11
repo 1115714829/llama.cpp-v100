@@ -1,5 +1,6 @@
-// The Volta (sm_70) scoring path for QSA_SELECT is ported from Strata (https://github.com/Niko1221/strata,
-// MIT License, see licenses/LICENSE-strata): scores_volta_kernel in src/kernels/cuda/qsa_select.cu.
+// The Volta (sm_70) scoring path for QSA_SELECT is ported from Strata-AC922, the AC922 fork of Strata
+// (https://github.com/eelgaev/Strata-AC922, branch ac922, MIT License, see licenses/LICENSE-strata):
+// scores_volta_kernel in src/kernels/cuda/qsa_select.cu.
 #include "common.cuh"
 #include "lightning-indexer.cuh"
 #include "fattn-common.cuh"
@@ -244,8 +245,8 @@ static __global__ void lightning_indexer_kernel_wmma(
 // ---------------------------------------------------------------------------------------------------------------------
 // QSA_SELECT scoring on Volta tensor cores
 
-// Ported from Strata (https://github.com/Niko1221/strata, MIT License, see licenses/LICENSE-strata): the
-// scores_volta_kernel in src/kernels/cuda/qsa_select.cu. FP16 wmma m16n16k16 with both operands split into
+// Ported from Strata-AC922 (https://github.com/eelgaev/Strata-AC922, MIT License, see licenses/LICENSE-strata):
+// the scores_volta_kernel in src/kernels/cuda/qsa_select.cu. FP16 wmma m16n16k16 with both operands split into
 // hi = fp16(x) and lo = fp16((x - hi)*2^11); Ah*Bh + Ah*Bl + Al*Bh keeps FP32-level accuracy. Volta's tensor cores
 // truncate when accumulating, so Ah*Bh goes through a fresh fragment per 16-dim step and is added with FP32 adds.
 // The Q8_0 keys are dequantized during the stage and split the same way. 16 tokens share each key read.

@@ -4,7 +4,7 @@
 // with device allocations + device-readable host memory, owns the per-tensor device
 // pointer tables, and stages the routed host tier experts into VRAM for prefill.
 //
-// Staging follows Strata's prefill ring (docs/analysis/strata-tiers-src.md 2.5): only the
+// Staging follows the prefill ring of Strata (src/prefill/prefill.cpp): only the
 // experts that the current batch routes to AND that live in the host arena are copied into
 // the staging area, organized as per-expert slots. A small device kernel de-duplicates the
 // routed ids into a bitmap first, then a second kernel builds the slot assignment, rewrites
