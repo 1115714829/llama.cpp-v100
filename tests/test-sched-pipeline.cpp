@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 // Pipeline scheduling test: consecutive ubatches through the pipeline API (n_stages > 1) must
@@ -725,6 +726,310 @@ static int run_pipeline_gpu_deep_realloc(void) {
     return n_gpu;
 }
 
+// Synchronous submission (n_stages == 1, the decode path): the host inputs a GPU consumes are staged in
+// pinned memory and uploaded with one copy per run of input copies that ggml-alloc placed back to back.
+// The graph has
+//  - an F32 input a read through a view with an offset, an I32 row index feeding get_rows and, after a
+//    node forced onto the CPU, an F32 input b: GPU 0 runs two splits, the copies of the second one are
+//    allocated where ggml-alloc finds room when that split starts;
+//  - with two GPUs a third part on GPU 1 that reads a again through another view.
+// Every mode first reserves a larger graph (a longer a), so the graphs below reuse the reserved layout
+// and their copy of a leaves part of its slot unused (the upload carries that slack). The iterations
+// alternate between rebuilding the graph (which rotates the copy slot of the double buffered scheduler)
+// and reusing it.
+//   mode 0: one input copy, asynchronous inputs: the caller synchronizes before it writes the inputs
+//   mode 1: one input copy, synchronous inputs: the inputs may be overwritten once the submission
+//           returns, and submissions may follow each other without a synchronization
+//   mode 2: two input copies (double buffered): same as mode 1
+// the compute nodes of the graph and the backend each one is placed on (0 = GPU 0, 1 = GPU 1, -1 = the
+// CPU): the placement is set explicitly, otherwise the node forced onto the CPU pulls its neighbours
+// along (the GPU weights are plain buffers, so they do not pin the ops by themselves)
+struct sync_graph_placement {
+    std::vector<std::pair<struct ggml_tensor *, int>> nodes;
+};
+
+static struct ggml_cgraph * build_graph_sync(
+        struct ggml_context * ctx, struct ggml_tensor * w0, struct ggml_tensor * w0b, struct ggml_tensor * wr,
+        struct ggml_tensor * w1, int a_len,
+        struct ggml_tensor ** a, struct ggml_tensor ** idx, struct ggml_tensor ** b,
+        struct ggml_tensor ** out, sync_graph_placement & place) {
+    *a   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, a_len);
+    *idx = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    *b   = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_tokens);
+    ggml_set_input(*a);
+    ggml_set_input(*idx);
+    ggml_set_input(*b);
+
+    place.nodes.clear();
+    struct ggml_tensor * rows = ggml_get_rows(ctx, wr, *idx);
+    struct ggml_tensor * s0   = ggml_add(ctx, w0, ggml_view_1d(ctx, *a, n_tokens, 4*sizeof(float)));
+    struct ggml_tensor * x0   = ggml_add(ctx, s0, ggml_reshape_1d(ctx, rows, n_tokens));
+    struct ggml_tensor * c    = ggml_scale(ctx, x0, 2.0f);
+    struct ggml_tensor * s1   = ggml_add(ctx, w0b, c);
+    struct ggml_tensor * x1   = ggml_add(ctx, s1, *b);
+    place.nodes.push_back({ rows, 0 });
+    place.nodes.push_back({ s0,   0 });
+    place.nodes.push_back({ x0,   0 });
+    place.nodes.push_back({ c,   -1 });
+    place.nodes.push_back({ s1,   0 });
+    place.nodes.push_back({ x1,   0 });
+    struct ggml_tensor * x = x1;
+    if (w1 != NULL) {
+        struct ggml_tensor * s2 = ggml_add(ctx, w1, x1);
+        x = ggml_add(ctx, s2, ggml_view_1d(ctx, *a, n_tokens, 0));
+        place.nodes.push_back({ s2, 1 });
+        place.nodes.push_back({ x,  1 });
+    }
+    ggml_set_output(x);
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, x);
+    *out = x;
+    return gf;
+}
+
+static int run_sync_inputs_gpu(int mode) {
+    std::vector<ggml_backend_dev_t> gpu_devs;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            gpu_devs.push_back(dev);
+        }
+    }
+    if (gpu_devs.empty()) {
+        printf("sync inputs mode %d: skipped (no GPU)\n", mode);
+        return 0;
+    }
+    if (gpu_devs.size() > 2) {
+        gpu_devs.resize(2);
+    }
+    const int n_gpu = (int) gpu_devs.size();
+
+    printf("sync inputs mode %d: %d GPU ... ", mode, n_gpu);
+    fflush(stdout);
+
+    ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+    if (cpu_dev == NULL) {
+        fprintf(stderr, "FAILED: no CPU backend\n");
+        exit(1);
+    }
+
+    std::vector<ggml_backend_t> backends;
+    std::vector<ggml_backend_buffer_type_t> bufts;
+    for (int g = 0; g < n_gpu; g++) {
+        ggml_backend_t backend = ggml_backend_dev_init(gpu_devs[g], NULL);
+        if (backend == NULL) {
+            fprintf(stderr, "FAILED: gpu backend init\n");
+            exit(1);
+        }
+        backends.push_back(backend);
+        bufts.push_back(ggml_backend_get_default_buffer_type(backend));
+    }
+    ggml_backend_t cpu_backend = ggml_backend_dev_init(cpu_dev, NULL);
+    backends.push_back(cpu_backend);
+    // the host inputs live in pinned memory, like the llama.cpp inputs
+    ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(gpu_devs[0]);
+    bufts.push_back(host_buft != NULL ? host_buft : ggml_backend_get_default_buffer_type(cpu_backend));
+
+    const int n_backends = (int) backends.size();
+
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends.data(), bufts.data(), n_backends, 2048, mode == 2, false);
+    ggml_backend_sched_set_async_inputs(sched, mode == 0);
+
+    // weights pinned on the GPUs: w0, w0b and the row table wr on GPU 0, w1 on GPU 1
+    constexpr int n_rows = 16;
+    struct ggml_init_params wparams = {
+        /* .mem_size   = */ 16 * 1024,
+        /* .mem_buffer = */ NULL,
+        /* .no_alloc   = */ true,
+    };
+    struct ggml_context * w_ctx0 = ggml_init(wparams);
+    struct ggml_tensor * w0  = ggml_new_tensor_1d(w_ctx0, GGML_TYPE_F32, n_tokens);
+    struct ggml_tensor * w0b = ggml_new_tensor_1d(w_ctx0, GGML_TYPE_F32, n_tokens);
+    struct ggml_tensor * wr  = ggml_new_tensor_2d(w_ctx0, GGML_TYPE_F32, n_tokens, n_rows);
+    ggml_backend_buffer_t w_buf0 = ggml_backend_alloc_ctx_tensors(w_ctx0, backends[0]);
+    struct ggml_context * w_ctx1 = NULL;
+    struct ggml_tensor * w1 = NULL;
+    ggml_backend_buffer_t w_buf1 = NULL;
+    if (n_gpu > 1) {
+        w_ctx1 = ggml_init(wparams);
+        w1 = ggml_new_tensor_1d(w_ctx1, GGML_TYPE_F32, n_tokens);
+        w_buf1 = ggml_backend_alloc_ctx_tensors(w_ctx1, backends[1]);
+    }
+    if (w_buf0 == NULL || (n_gpu > 1 && w_buf1 == NULL)) {
+        fprintf(stderr, "FAILED: weight alloc\n");
+        exit(1);
+    }
+    {
+        std::vector<float> host(n_tokens*n_rows);
+        for (int i = 0; i < n_tokens; i++) {
+            host[i] = (float) i;
+        }
+        ggml_backend_tensor_set(w0, host.data(), 0, ggml_nbytes(w0));
+        for (int i = 0; i < n_tokens; i++) {
+            host[i] = (float) (1000 + i);
+        }
+        ggml_backend_tensor_set(w0b, host.data(), 0, ggml_nbytes(w0b));
+        for (int r = 0; r < n_rows; r++) {
+            for (int i = 0; i < n_tokens; i++) {
+                host[r*n_tokens + i] = (float) (10*r + i);
+            }
+        }
+        ggml_backend_tensor_set(wr, host.data(), 0, ggml_nbytes(wr));
+        if (w1 != NULL) {
+            for (int i = 0; i < n_tokens; i++) {
+                host[i] = (float) (100 + i);
+            }
+            ggml_backend_tensor_set(w1, host.data(), 0, ggml_nbytes(w1));
+        }
+    }
+
+    constexpr int n_iter = 8;
+    const auto a_len_of = [](int it) { return n_tokens + 8 + 2*(it/2); };
+
+    const auto graph_ctx = []() {
+        struct ggml_init_params params = {
+            /* .mem_size   = */ (ggml_tensor_overhead() + ggml_graph_overhead()) * 32,
+            /* .mem_buffer = */ NULL,
+            /* .no_alloc   = */ true,
+        };
+        struct ggml_context * ctx = ggml_init(params);
+        if (ctx == NULL) {
+            fprintf(stderr, "FAILED: ggml_init\n");
+            exit(1);
+        }
+        return ctx;
+    };
+
+    const auto place_nodes = [&](const sync_graph_placement & p) {
+        for (const auto & np : p.nodes) {
+            ggml_backend_sched_set_tensor_backend(sched, np.first, np.second < 0 ? cpu_backend : backends[np.second]);
+        }
+    };
+
+    // reserve a larger graph first (a longer a): the graphs below fit its allocation
+    {
+        struct ggml_context * r_ctx = graph_ctx();
+        struct ggml_tensor * ra, * ridx, * rb, * rx;
+        sync_graph_placement rplace;
+        struct ggml_cgraph * rgf = build_graph_sync(r_ctx, w0, w0b, wr, w1, a_len_of(n_iter) + 16, &ra, &ridx, &rb, &rx, rplace);
+        ggml_backend_sched_reset(sched);
+        place_nodes(rplace);
+        if (!ggml_backend_sched_reserve(sched, rgf)) {
+            fprintf(stderr, "FAILED: reserve sync inputs\n");
+            exit(1);
+        }
+        ggml_free(r_ctx);
+    }
+
+    struct ggml_context * ctx = NULL;
+    struct ggml_tensor * a = nullptr, * idx = nullptr, * b = nullptr, * out = nullptr;
+    sync_graph_placement place;
+    struct ggml_cgraph * gf = nullptr;
+    int a_len = 0;
+
+    const auto set_inputs = [&](int it) {
+        for (int i = 0; i < a_len; i++) {
+            ((float *) a->data)[i] = (float) (it*1000 + i);
+        }
+        ((int32_t *) idx->data)[0] = it % n_rows;
+        for (int i = 0; i < n_tokens; i++) {
+            ((float *) b->data)[i] = (float) (it*7 + i);
+        }
+    };
+    const auto check_values = [&](int it, const std::vector<float> & res) {
+        for (int i = 0; i < n_tokens; i++) {
+            const float x0 = (float) i + (float) (it*1000 + i + 4) + (float) (10*(it % n_rows) + i);
+            float expect = (float) (1000 + i) + 2.0f*x0 + (float) (it*7 + i);
+            if (n_gpu > 1) {
+                expect += (float) (100 + i) + (float) (it*1000 + i);
+            }
+            if (memcmp(&res[i], &expect, sizeof(float)) != 0) {
+                fprintf(stderr, "got %f expected %f\n", res[i], expect);
+                fail("wrong output sync inputs", it, i);
+            }
+        }
+    };
+    const auto check = [&](int it) {
+        std::vector<float> res(n_tokens);
+        ggml_backend_tensor_get(out, res.data(), 0, ggml_nbytes(out));
+        check_values(it, res);
+    };
+
+    for (int it = 0; it < n_iter; it++) {
+        // even iterations rebuild the graph (a new layout, the next copy slot), odd ones reuse it
+        if (it % 2 == 0) {
+            if (ctx != NULL) {
+                ggml_free(ctx);
+            }
+            ctx = graph_ctx();
+            a_len = a_len_of(it);
+            gf = build_graph_sync(ctx, w0, w0b, wr, w1, a_len, &a, &idx, &b, &out, place);
+            ggml_backend_sched_reset(sched);
+            place_nodes(place);
+            if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+                fail("alloc_graph sync inputs", it, -1);
+            }
+            if (ggml_backend_sched_get_n_splits(sched) < 3) {
+                fail("expected a CPU split between the GPU 0 splits", it, ggml_backend_sched_get_n_splits(sched));
+            }
+        }
+
+        const auto clobber_inputs = [&]() {
+            memset(a->data, 0, ggml_nbytes(a));
+            memset(b->data, 0, ggml_nbytes(b));
+            ((int32_t *) idx->data)[0] = n_rows - 1;
+        };
+
+        set_inputs(it);
+        if (ggml_backend_sched_graph_compute_async(sched, gf) != GGML_STATUS_SUCCESS) {
+            fail("compute sync inputs", it, -1);
+        }
+        if (mode != 0) {
+            // the submission has taken the inputs: overwriting them must not change its result
+            clobber_inputs();
+        }
+        ggml_backend_sched_synchronize(sched);
+        check(it);
+
+        if (mode != 0) {
+            // two submissions of the same graph back to back, the second one with other inputs: the
+            // second upload must neither overwrite the staged inputs of the first one before they
+            // reached the device nor the device inputs before the first compute read them
+            set_inputs(it + 50);
+            if (ggml_backend_sched_graph_compute_async(sched, gf) != GGML_STATUS_SUCCESS) {
+                fail("compute sync inputs (back to back, first)", it, -1);
+            }
+            // the result of the first submission, read on the output stream before the second one
+            std::vector<float> first(n_tokens);
+            ggml_backend_tensor_get_async(ggml_backend_sched_get_tensor_backend(sched, out), out, first.data(), 0, ggml_nbytes(out));
+            set_inputs(it);
+            if (ggml_backend_sched_graph_compute_async(sched, gf) != GGML_STATUS_SUCCESS) {
+                fail("compute sync inputs (back to back, second)", it, -1);
+            }
+            clobber_inputs();
+            ggml_backend_sched_synchronize(sched);
+            check_values(it + 50, first);
+            check(it);
+        }
+    }
+
+    ggml_free(ctx);
+    ggml_backend_sched_free(sched);
+    ggml_backend_buffer_free(w_buf0);
+    ggml_free(w_ctx0);
+    if (w_buf1 != NULL) {
+        ggml_backend_buffer_free(w_buf1);
+        ggml_free(w_ctx1);
+    }
+    for (int bi = 0; bi < n_backends; bi++) {
+        ggml_backend_free(backends[bi]);
+    }
+
+    printf("OK\n");
+    return n_gpu;
+}
+
 int main() {
     printf("pipeline: 1 backend ... ");
     fflush(stdout);
@@ -745,6 +1050,10 @@ int main() {
     run_pipeline_gpu(true,  true,  true);
     run_pipeline_gpu_deep();
     run_pipeline_gpu_deep_realloc();
+
+    run_sync_inputs_gpu(0);
+    run_sync_inputs_gpu(1);
+    run_sync_inputs_gpu(2);
 
     return 0;
 }

@@ -1112,6 +1112,23 @@ bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph * graph)
     return true;
 }
 
+bool ggml_gallocr_get_node_slot(ggml_gallocr_t galloc, int node_index, int * buffer_id, int * chunk, size_t * offset, size_t * size) {
+    if (node_index < 0 || node_index >= galloc->n_nodes) {
+        return false;
+    }
+    const struct tensor_alloc * ta = &galloc->node_allocs[node_index].dst;
+    if (ta->buffer_id < 0 || ta->size_max == 0) {
+        // a view, a pre-allocated tensor or an unused node: ggml-alloc did not place it
+        return false;
+    }
+    *buffer_id = ta->buffer_id;
+    *chunk     = ta->addr.chunk;
+    *offset    = ta->addr.offset;
+    // ggml_dyn_tallocr_alloc hands out the allocation size rounded up to the alignment of the buffer
+    *size      = aligned_offset(NULL, ta->size_max, galloc->buf_tallocs[ta->buffer_id]->alignment);
+    return true;
+}
+
 size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     GGML_ASSERT(buffer_id >= 0 && buffer_id < galloc->n_buffers);
 

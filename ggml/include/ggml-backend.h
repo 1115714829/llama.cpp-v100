@@ -413,7 +413,10 @@ extern "C" {
 
     // copy user input tensors to the split backends asynchronously (default: false)
     // the caller synchronizes the scheduler before it writes the input tensors again, so user inputs
-    // can be copied asynchronously (see ggml_backend_sched_compute_splits)
+    // can be copied asynchronously (see ggml_backend_sched_compute_splits). on a scheduler with a
+    // single input copy the host inputs are staged in a pinned area per backend and uploaded with one
+    // copy per run of adjacent input copies, and the next graph reuses that area: the synchronization
+    // also covers it
     GGML_API void                 ggml_backend_sched_set_async_inputs(ggml_backend_sched_t sched, bool async_inputs);
 
     // dchain: record event on the stream of backend right after the asynchronous user-input copies of

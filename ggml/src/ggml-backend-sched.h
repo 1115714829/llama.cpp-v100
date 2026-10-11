@@ -56,13 +56,30 @@ extern "C" {
 #define GGML_SCHED_MAX_STAGES 8
 #endif
 
+// a group of input copies of a split whose slots ggml-alloc placed back to back: the host data of all of
+// them is staged with the same relative layout and uploaded with one copy through `window`, a byte
+// tensor that aliases the memory of the group (or the copy itself for a group of one)
+struct ggml_backend_sched_upload_run {
+    struct ggml_tensor * window;
+    size_t               stage_offs; // offset of the group in the staging entry of the backend
+    size_t               size;       // bytes uploaded
+};
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
     int i_end;
     struct ggml_tensor ** inputs;
+    // per input: index of its copy among the nodes of the graph copy (where ggml-alloc places it),
+    // and the offset of its host data in the staging entry of the backend (SIZE_MAX: the input is not
+    // staged, see ggml_backend_sched_upload_runs)
+    int    * inputs_cpy_node;
+    size_t * inputs_stage_offs;
     int n_inputs;
     int inputs_capacity;
+    // the staged host inputs of this split, grouped by adjacency of their copies (capacity: inputs)
+    struct ggml_backend_sched_upload_run * runs;
+    int n_runs;
     // graph view of this split
     struct ggml_cgraph graph;
 };
@@ -153,6 +170,14 @@ struct ggml_backend_sched {
     // worst case staging entry size of the reserved graph, per backend. the ring is sized from this
     // at reserve time, so the steady state (graphs no larger than the reserve) never grows again
     size_t staging_reserve[GGML_SCHED_MAX_BACKENDS];
+
+    // pinned host staging of the host user inputs on the synchronous submission path, per backend:
+    // one entry per input copy slot. the splits of a backend use disjoint areas of an entry, and the
+    // copies whose slots are adjacent are uploaded together (see ggml_backend_sched_upload_runs)
+    ggml_backend_buffer_t inputs_staging[GGML_SCHED_MAX_BACKENDS];      // n_copies entries
+    size_t                inputs_staging_size[GGML_SCHED_MAX_BACKENDS]; // bytes per entry
+    size_t                inputs_stage_need[GGML_SCHED_MAX_BACKENDS];   // bytes the current graph stages
+    size_t                inputs_stage_reserve[GGML_SCHED_MAX_BACKENDS];// worst case of the reserved graphs
 
     // pipeline depth; 1 = no pipeline (single ubatch at a time)
     int n_stages;

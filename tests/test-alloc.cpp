@@ -685,6 +685,88 @@ static void test_unread_leaf_grows() {
     }
 }
 
+// ggml_gallocr_get_node_slot reports where ggml-alloc placed a node and how much room it set aside there:
+// the address of the tensor and a slot at least as large as the tensor, rounded to the alignment of the
+// buffer; nothing for a view. Two nodes allocated one after the other get slots back to back, and a
+// smaller graph that reuses the reserved layout keeps the larger slots of the reserved graph
+static void test_node_slot() {
+    const size_t align = 16;
+    dummy_backend    backend = dummy_backend_init(1024, align);
+    ggml_gallocr_ptr galloc;
+
+    // checks the slot of every node, returns the slots of the two squares
+    const auto check_slots = [&](ggml_cgraph * graph, ggml_tensor * q0, ggml_tensor * q1,
+                                 size_t * off0, size_t * size0, size_t * off1, size_t * size1) {
+        for (int i = 0; i < graph->n_nodes; ++i) {
+            ggml_tensor * t = graph->nodes[i];
+            int buffer_id = -1;
+            int chunk     = -1;
+            size_t offset = 0;
+            size_t size   = 0;
+            const bool placed = ggml_gallocr_get_node_slot(galloc.get(), i, &buffer_id, &chunk, &offset, &size);
+            if (t->view_src != nullptr) {
+                GGML_ASSERT(!placed);
+                continue;
+            }
+            GGML_ASSERT(placed && buffer_id == 0 && chunk == 0);
+            GGML_ASSERT((char *) t->data == (char *) ggml_backend_buffer_get_base(t->buffer) + offset);
+            GGML_ASSERT(size >= ggml_nbytes(t) && size % align == 0);
+            if (t == q0) {
+                *off0 = offset;
+                *size0 = size;
+            }
+            if (t == q1) {
+                *off1 = offset;
+                *size1 = size;
+            }
+        }
+        GGML_ASSERT(!ggml_gallocr_get_node_slot(galloc.get(), graph->n_nodes, nullptr, nullptr, nullptr, nullptr));
+    };
+
+    // q0 and q1 are the two sources of the same node, so ggml-alloc allocates them one after the other
+    const auto build = [](ggml_context * ctx, ggml_cgraph * graph, size_t bytes, ggml_tensor ** q0, ggml_tensor ** q1) {
+        ggml_tensor * x0 = make_input_with_size(ctx, bytes);
+        ggml_tensor * x1 = make_input_with_size(ctx, bytes);
+        // outputs are never reused in place, so the squares get memory of their own
+        ggml_set_output(x0);
+        ggml_set_output(x1);
+        *q0 = ggml_sqr(ctx, x0);
+        *q1 = ggml_sqr(ctx, x1);
+        ggml_tensor * sum = ggml_add(ctx, *q0, *q1);
+        ggml_tensor * out = ggml_sum(ctx, ggml_view_1d(ctx, sum, 6, 0));
+        assign_names(ctx);
+        ggml_set_output(out);
+        ggml_build_forward_expand(graph, out);
+    };
+
+    size_t off0 = 0, size0 = 0, off1 = 0, size1 = 0;
+    {
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * q0 = nullptr;
+        ggml_tensor * q1 = nullptr;
+        build(ctx, graph, 40, &q0, &q1);
+        galloc = ggml_gallocr_ptr(ggml_gallocr_new(&backend.buffer_type));
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        check_slots(graph, q0, q1, &off0, &size0, &off1, &size1);
+        GGML_ASSERT(size0 == 48 && size1 == 48);
+        GGML_ASSERT(off0 + size0 == off1); // allocated one after the other
+    }
+    {
+        // the same graph with shorter inputs fits the reserved layout: the slots keep their 48 bytes
+        auto [ctx, graph, ctx_ptr] = make_context();
+        ggml_tensor * q0 = nullptr;
+        ggml_tensor * q1 = nullptr;
+        build(ctx, graph, 32, &q0, &q1);
+        GGML_ASSERT(ggml_gallocr_alloc_graph(galloc.get(), graph));
+        check_all_allocated(graph);
+        size_t o0 = 0, s0 = 0, o1 = 0, s1 = 0;
+        check_slots(graph, q0, q1, &o0, &s0, &o1, &s1);
+        GGML_ASSERT(o0 == off0 && s0 == size0 && o1 == off1 && s1 == size1);
+        GGML_ASSERT(ggml_nbytes(q0) == 32 && s0 == 48);
+    }
+}
+
 static void test_backend_graph_optimize(ggml_backend_t /*backend*/, ggml_cgraph * graph, ggml_backend_graph_optimize_params * params) {
     GGML_ASSERT(graph->n_nodes == 3);
     params->add_alloc_dep(params->user_data, graph->nodes[0], graph->nodes[2]);
@@ -1164,6 +1246,7 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_unread_leaf_grows", test_unread_leaf_grows);
+    run("test_node_slot", test_node_slot);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);

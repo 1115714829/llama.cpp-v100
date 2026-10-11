@@ -2746,10 +2746,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (!pipeline) {
-        // with a single input copy the user inputs are copied to the backends asynchronously, so the
-        // previous compute may still be reading them. synchronize before overwriting the input
-        // tensors (see ggml_backend_sched_set_async_inputs). double buffered schedulers instead wait
-        // for the previous user of the input slot and copy synchronously (see
+        // with a single input copy the user inputs are staged and uploaded to the backends
+        // asynchronously, and the next graph reuses the staging area, so the previous upload may still
+        // be reading it. synchronize before overwriting the input tensors (see
+        // ggml_backend_sched_set_async_inputs). double buffered schedulers instead wait for the
+        // previous user of the input slot before they stage the inputs (see
         // ggml_backend_sched_compute_splits), so the backend must not be synchronized here
         if (ggml_backend_sched_get_n_copies(sched_cur) == 1) {
             if (sched_cur == sched_dec.get() && ev_inputs_dec != nullptr) {
