@@ -1928,9 +1928,21 @@ bool llama_kv_cache::get_kq_range_reserve() const {
     return n_seq_max == 1 ? n_stream == 1 : n_stream == n_seq_max;
 }
 
+// true if pos[j] == pos[j - 1] + 1 for every j in [j0, j1): a branch-free scan that vectorizes
+static bool kq_range_pos_run_ok(const llama_pos * pos, uint32_t j0, uint32_t j1) {
+    int32_t broken = 0;
+    for (uint32_t j = j0; j < j1; ++j) {
+        broken |= pos[j] != pos[j - 1] + 1;
+    }
+    return !broken;
+}
+
 // true if the positions of the used cells strictly increase by one along the write order of the
 // ring (no shared M-RoPE positions, no holes): the standard SWA window [p1 - n_swa + 1, p1] is then
 // exactly min(n_swa, used) cells and set_input_kq_range can derive it from the cell count alone
+//
+// this runs for every ubatch of the cache (the MTP draft's 32K window: four times a decode round), so
+// the write order is walked as its two contiguous array segments, without a modulo per cell
 static bool kq_range_swa_order_ok(const llama_kv_cells & cells, uint32_t oldest) {
     const uint32_t n    = cells.get_used();
     const uint32_t size = cells.size();
@@ -1939,23 +1951,15 @@ static bool kq_range_swa_order_ok(const llama_kv_cells & cells, uint32_t oldest)
 
     if (n < size) {
         // append-only prefix [0, n): the array order is the write order
-        for (uint32_t j = 1; j < n; ++j) {
-            if (pos[j] != pos[j - 1] + 1) {
-                return false;
-            }
-        }
-
-        return true;
+        return kq_range_pos_run_ok(pos, 1, n);
     }
 
-    // full ring: the write order starts at the oldest cell
-    for (uint32_t k = 1; k < size; ++k) {
-        if (pos[(oldest + k) % size] != pos[(oldest + k - 1) % size] + 1) {
-            return false;
-        }
+    // full ring: the write order is oldest, ..., size - 1, 0, ..., oldest - 1
+    if (oldest == 0) {
+        return kq_range_pos_run_ok(pos, 1, size);
     }
-
-    return true;
+    return kq_range_pos_run_ok(pos, oldest + 1, size) && pos[0] == pos[size - 1] + 1 &&
+           kq_range_pos_run_ok(pos, 1, oldest);
 }
 
 bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch & ubatch) const {
