@@ -699,6 +699,17 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             tc.rotation = 0;
             return tc;
         }
+        if (is_ep && (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
+                      std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight))) {
+            // expert parallelism: the shared expert is split like a dense FFN, gate/up by rows and
+            // down by columns. Its down projection is a partial sum next to the partial sum of the
+            // routed experts, and the meta backend delays the routed experts' all-reduce to the sum
+            // of the two (ffn_out), so the layer keeps a single all-reduce.
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
+        }
+        if (is_ep && std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+        }
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
@@ -973,6 +984,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (is_ep && tensor_name.find("_exps") != std::string::npos) {
                 // expert parallelism splits along the expert dim, so the granularity is one whole expert
                 return std::vector<int64_t>(segments.size(), 1);
+            }
+            if (is_ep && tensor_name.find("_shexp") != std::string::npos) {
+                // the shared expert is narrow (640 rows on Flash-Next): units of 128 rows would leave
+                // one of 6 devices without a slice, and a partial branch that a device skips cannot
+                // share the routed experts' all-reduce. Units of 64 rows give each of 6 devices a
+                // slice and keep the q8 skinny split-K of the down projection (K = slice, k % 64 == 0).
+                GGML_ASSERT(segments.size() == 1);
+                return {std::lcm(blck_size, (int64_t) 64)};
             }
             const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);

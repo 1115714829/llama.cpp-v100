@@ -14128,6 +14128,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_ffn_q8(2560, 640, n_tokens));
     }
     test_cases.emplace_back(new test_ffn_q8(5120, 4352, 4));
+    // the shared expert split over the devices under expert parallelism (64-row units of the 640
+    // rows): gate/up rows and down columns per device on 6 (64/128), 4 (128/192), 3 (192/256) and
+    // 2 (320) devices, the fused decode/verify path and the plain matmuls of decode and prefill
+    for (int64_t n_ff : {64, 128, 192, 256, 320}) {
+        for (int64_t n_tokens : {1, 4, 16, 17}) {
+            test_cases.emplace_back(new test_ffn_q8(2560, n_ff, n_tokens));
+        }
+    }
+    for (int64_t n_ff : {64, 128, 192, 320}) {
+        for (int64_t n_tokens : {1, 4, 17, 512}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, n_ff, n_tokens, 2560, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, n_tokens, n_ff, {1, 1}, {1, 1}));
+        }
+    }
 
     // multiple repacked Q2_K~Q6_K matmuls sharing one input: the multi-weight kernel for
     // M <= 16, one M=32 two-phase launch per weight for M = 17..64. The N columns follow the
