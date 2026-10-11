@@ -2,7 +2,6 @@
 //
 // Portions ported from Strata (https://github.com/Niko1221/strata), MIT License,
 // Copyright (c) 2026 Niko1221 and the Strata contributors:
-//   - qsa_topk_kernel:        src/kernels/cuda/qsa_select.cu, block_topk_kernel (radix select)
 //   - qsa_topk_reg_kernel:    src/kernels/cuda/qsa_select.cu, block_topk_reg_kernel (radix select, 1024 threads)
 //   - qsa_topk_wide_kernel:   src/kernels/cuda/qsa_select.cu, block_topk_wide_kernel (radix select, 1024 threads)
 //   - qsa_attn_chunk_kernel:  src/kernels/cuda/qsa_decode_attn.cu, attn_chunk_kernel_pre75, reduce12, head_of_lane
@@ -22,21 +21,16 @@
 
 // tokens scored per pass of QSA_SELECT: the score scratch is n_pool*QSA_SELECT_TILE floats, independent of the batch
 #define QSA_SELECT_TILE 64
-#define QSA_TOPK_THREADS 256
 
 // the 1024-thread top-k kernels (register and wide) hold one query per block, as in Strata
 #define QSA_TOPK_T 1024
 #define QSA_TOPK_PER 33
 #define QSA_TOPK_WARPS (QSA_TOPK_T/32)
 
-// dispatch of the top-k by the number of pools a query can scan (Strata's block_topk dispatch, in blocks; the
-// register kernel holds QSA_TOPK_T*QSA_TOPK_PER pools, the wide kernel takes the rest):
-//   n_pool <  QSA_TOPK_MIN_POOLS                  -> qsa_topk_kernel (256 threads)
-//   n_pool <= QSA_TOPK_T*QSA_TOPK_PER             -> qsa_topk_reg_kernel<QSA_TOPK_PER>
-//   n_pool >  QSA_TOPK_T*QSA_TOPK_PER             -> qsa_topk_wide_kernel
-// QSA_TOPK_MIN_POOLS is Strata's kWideMinBlocks (4608, measured on RTX 3060); the value for this card is still
-// to be measured, the register bound above is exact.
-static constexpr int QSA_TOPK_MIN_POOLS = 4608;
+// dispatch of the top-k by the number of pools a query can scan: the register kernel holds QSA_TOPK_T*PER pools, with
+// PER the smallest of 4, 8, 16, 24, 33 that fits (a register kernel sized for more pools than it holds runs its
+// unrolled loops idle: on V100 4096 pools take 15.5 us with PER 4 and 25 us with PER 33); the wide kernel takes the
+// pools past QSA_TOPK_T*QSA_TOPK_PER. Every kernel selects the same ids.
 
 // QSA_ATTN: batches up to this size take the chunked kernel, larger ones the prompt kernel
 #define QSA_ATTN_CHUNK_MAX_TOKENS 16
@@ -58,158 +52,29 @@ static __device__ __forceinline__ uint32_t qsa_order_key(const float s) {
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
 
-// one block per token: keep the n_top highest scores of the pools [lo, hi), equal scores by ascending pool, and write
-// their cells in ascending pool order, then the tail cells, then -1
-static __global__ void __launch_bounds__(QSA_TOPK_THREADS) qsa_topk_kernel(
-        const float * __restrict__ scores, const int64_t n_pool,
-        const int32_t * __restrict__ rng, const int64_t s_rng,
-        const int32_t * __restrict__ pidx, const int kpool,
-        const int32_t * __restrict__ tidx, const int64_t s_tidx,
-        const int n_top, const int sentinel,
-        int32_t * __restrict__ out, const int n_sel) {
-    __shared__ int hist[256];
-    __shared__ int s_a[QSA_TOPK_THREADS];
-    __shared__ int s_b[QSA_TOPK_THREADS];
-    __shared__ int s_digit;
-    __shared__ int s_above;
+// ---- radix select shared by the top-k kernels. The threshold is the n_top-th largest key, found digit by digit from the
+// top: three digits of 11, 11 and 10 bits (the first one holds the sign, the exponent and two mantissa bits, so the
+// scores of a query spread over more bins than with an 8-bit first digit, and there is one pass less). The threshold
+// does not depend on how the key is cut into digits, and every count is an integer, so the selection is the same as
+// with Strata's four 8-bit digits.
+#define QSA_RS_BINS   2048
+#define QSA_RS_PASSES 3
 
-    const int qi = blockIdx.x;
-    const int t  = threadIdx.x;
-
-    const int64_t lo = rng[qi*s_rng + 0];
-    const int64_t hi = rng[qi*s_rng + 1];
-    const int64_t nv = hi - lo;
-
-    const float * sc = scores + qi*n_pool;
-    int32_t     * o  = out    + (int64_t) qi*n_sel;
-
-    // contiguous ranges of pools per thread, so a prefix over the threads keeps the pool order
-    const int64_t per = (nv + QSA_TOPK_THREADS - 1)/QSA_TOPK_THREADS;
-    const int64_t b0  = lo + t*per;
-    const int64_t b1  = min(b0 + per, hi);
-
-    const bool all = nv <= n_top;
-
-    uint32_t thr       = 0;
-    int64_t  eq_budget = 0;
-    if (!all) {
-        // radix select: the largest key thr with (pools with key >= thr) >= n_top, 8 bits at a time
-        uint32_t prefix = 0;
-        int above = 0; // pools strictly above the digits fixed so far
-        for (int shift = 24; shift >= 0; shift -= 8) {
-            for (int i = t; i < 256; i += QSA_TOPK_THREADS) {
-                hist[i] = 0;
-            }
-            __syncthreads();
-            const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
-            for (int64_t b = b0; b < b1; ++b) {
-                const uint32_t k = qsa_order_key(sc[b]);
-                if ((k & hi_mask) == (prefix & hi_mask)) {
-                    atomicAdd(&hist[(k >> shift) & 255], 1);
-                }
-            }
-            __syncthreads();
-            if (t == 0) {
-                int cum = above;
-                int d   = 255;
-                for (; d > 0; --d) {
-                    if (cum + hist[d] >= n_top) {
-                        break;
-                    }
-                    cum += hist[d];
-                }
-                s_digit = d;
-                s_above = cum;
-            }
-            __syncthreads();
-            prefix |= (uint32_t) s_digit << shift;
-            above = s_above;
-            __syncthreads();
-        }
-        thr       = prefix;
-        eq_budget = n_top - above; // pools equal to thr that fit, lowest index first
-    }
-
-    // per-thread counts above and at the threshold, then the exclusive prefixes
-    int gt = 0;
-    int eq = 0;
-    for (int64_t b = b0; b < b1; ++b) {
-        const uint32_t k = all ? 1u : qsa_order_key(sc[b]);
-        if (all || k > thr) {
-            gt++;
-        } else if (k == thr) {
-            eq++;
-        }
-    }
-    s_a[t] = gt;
-    s_b[t] = eq;
-    __syncthreads();
-    if (t == 0) {
-        int ag = 0;
-        int ae = 0;
-        for (int i = 0; i < QSA_TOPK_THREADS; ++i) {
-            const int g = s_a[i];
-            const int e = s_b[i];
-            s_a[i] = ag;
-            s_b[i] = ae;
-            ag += g;
-            ae += e;
-        }
-    }
-    __syncthreads();
-    int64_t my_eq = eq_budget - s_b[t];
-    my_eq = my_eq < 0 ? 0 : (my_eq > eq ? eq : my_eq);
-    const int sel = gt + (int) my_eq;
-    __syncthreads();
-    s_a[t] = sel;
-    __syncthreads();
-    if (t == 0) {
-        int a = 0;
-        for (int i = 0; i < QSA_TOPK_THREADS; ++i) {
-            const int c = s_a[i];
-            s_a[i] = a;
-            a += c;
-        }
-        s_digit = a; // the number of kept pools
-    }
-    __syncthreads();
-
-    int64_t wpos    = s_a[t];
-    int64_t eq_left = my_eq;
-    for (int64_t b = b0; b < b1; ++b) {
-        const uint32_t k = all ? 1u : qsa_order_key(sc[b]);
-        bool keep = all || k > thr;
-        if (!keep && k == thr && eq_left > 0) {
-            keep = true;
-            eq_left--;
-        }
-        if (keep) {
-            for (int c = 0; c < kpool; ++c) {
-                o[wpos*kpool + c] = pidx[b*kpool + c];
-            }
-            wpos++;
-        }
-    }
-    __syncthreads();
-
-    const int n_kept = s_digit;
-    if (t == 0) {
-        int n = n_kept*kpool;
-        for (int c = 0; c < kpool - 1; ++c) {
-            const int32_t cell = tidx[qi*s_tidx + c];
-            if (cell != sentinel) {
-                o[n++] = cell;
-            }
-        }
-        s_digit = n;
-    }
-    __syncthreads();
-    for (int i = s_digit + t; i < n_sel; i += QSA_TOPK_THREADS) {
-        o[i] = -1;
-    }
+static __device__ __forceinline__ int qsa_rs_shift(const int p) {
+    return p == 0 ? 21 : (p == 1 ? 10 : 0);
 }
 
-// exclusive prefix sum over the block, per warp then across warps; total gets the block total
+static __device__ __forceinline__ int qsa_rs_bins(const int p) {
+    return p == 2 ? 1024 : 2048;
+}
+
+// the bits fixed by the passes before p
+static __device__ __forceinline__ uint32_t qsa_rs_hi_mask(const int p) {
+    return p == 0 ? 0u : (p == 1 ? 0xffe00000u : 0xfffffc00u);
+}
+
+// exclusive prefix sum over a block of NW warps, per warp then across warps; total gets the block total
+template <int NW>
 static __device__ __forceinline__ int qsa_excl_scan(const int v, int * s_warp, int & total) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     int x = v;
@@ -221,21 +86,66 @@ static __device__ __forceinline__ int qsa_excl_scan(const int v, int * s_warp, i
     if (lane == 31) s_warp[warp] = x;
     __syncthreads();
     if (warp == 0) {
-        int w = s_warp[lane];
+        const int w = lane < NW ? s_warp[lane] : 0;
         int z = w;
 #pragma unroll
         for (int o = 1; o < 32; o <<= 1) {
             const int y = __shfl_up_sync(0xffffffffu, z, o);
             if (lane >= o) z += y;
         }
-        s_warp[lane] = z - w;               // exclusive per warp
-        if (lane == 31) s_warp[32] = z;     // total
+        if (lane < NW) s_warp[lane] = z - w; // exclusive per warp
+        if (lane == 31) s_warp[32] = z;      // total
     }
     __syncthreads();
     const int r = s_warp[warp] + x - v;
     total = s_warp[32];
     __syncthreads();
     return r;
+}
+
+// The digit of a pass: the largest d in [1, nbins) with above + hist[d] + ... + hist[nbins - 1] >= n_top, else 0, and in
+// cum the pools above it (above + hist[d + 1] + ... ; for d = 0 above + hist[1] + ...): the scan from the top bin down,
+// done by the whole block. Thread t holds the bins top - bpt + 1 .. top (top = nbins - 1 - t*bpt); a block scan of the
+// thread sums finds the one thread whose bins carry the count over n_top, and it walks them.
+template <int NT>
+static __device__ __forceinline__ void qsa_find_digit(const int * hist, const int nbins, const int above, const int n_top,
+                                                      int * s_warp, int & digit, int & cum) {
+    const int t   = threadIdx.x;
+    const int bpt = (nbins + NT - 1)/NT;
+    const int top = nbins - 1 - t*bpt;
+
+    int sum = 0;
+    for (int i = 0; i < bpt; ++i) {
+        if (top - i >= 0) {
+            sum += hist[top - i];
+        }
+    }
+    int total;
+    const int excl = qsa_excl_scan<NT/32>(sum, s_warp, total);
+    if (above + excl < n_top && above + excl + sum >= n_top) {
+        int c = above + excl;
+        int d = 0;
+        for (int i = 0; i < bpt; ++i) {
+            const int b = top - i;
+            if (b <= 0) {
+                break; // bin 0 is taken untested, as at the end of the serial scan
+            }
+            if (c + hist[b] >= n_top) {
+                d = b;
+                break;
+            }
+            c += hist[b];
+        }
+        s_warp[0] = d;
+        s_warp[1] = c;
+    } else if (t == 0 && above + total < n_top) {
+        s_warp[0] = 0;
+        s_warp[1] = above + total - hist[0];
+    }
+    __syncthreads();
+    digit = s_warp[0];
+    cum   = s_warp[1];
+    __syncthreads();
 }
 
 // The tail cells and the -1 padding after the kept pools, shared by the 1024-thread kernels. n_kept pools have been
@@ -262,9 +172,10 @@ static __device__ __forceinline__ void qsa_topk_epilogue(const int32_t * __restr
     }
 }
 
-// ---- the same top-k with each query's pools read once: 1,024 threads hold up to QSA_TOPK_PER consecutive pools' keys
-// in registers, per-warp histograms, block-wide scans. The selection rule is qsa_topk_kernel's (radix threshold, ties
-// to the lowest pool, pools ascending): identical ids. Ported from Strata's block_topk_reg_kernel.
+// ---- one block per token: keep the n_top highest scores of the pools [lo, hi), equal scores by ascending pool, and write
+// their cells in ascending pool order, then the tail cells, then -1. Each query's pools are read once: 1,024 threads
+// hold up to PER consecutive pools' keys in registers; radix threshold, ties to the lowest pool, block-wide scans.
+// Ported from Strata's block_topk_reg_kernel.
 template <int PER>
 static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_reg_kernel(
         const float * __restrict__ scores, const int64_t n_pool,
@@ -273,12 +184,12 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_reg_kernel(
         const int32_t * __restrict__ tidx, const int64_t s_tidx,
         const int n_top, const int sentinel,
         int32_t * __restrict__ out, const int n_sel) {
-    __shared__ int hist[QSA_TOPK_WARPS][256];
+    __shared__ int hist[QSA_RS_BINS];
     __shared__ int s_warp[33];
     __shared__ int s_digit;
 
     const int qi = blockIdx.x;
-    const int t  = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int t  = threadIdx.x;
 
     const int64_t lo = rng[qi*s_rng + 0];
     const int64_t hi = rng[qi*s_rng + 1];
@@ -307,50 +218,27 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_reg_kernel(
         key[j] = (b0 + j < b1) ? qsa_order_key(sc[b0 + j]) : 0u;
     }
 
-    // radix select: the largest key thr with (pools with key >= thr) >= n_top, 8 bits at a time
     uint32_t prefix = 0;
     int above = 0;
-    for (int shift = 24; shift >= 0; shift -= 8) {
-        for (int i = lane; i < 256; i += 32) {
-            hist[warp][i] = 0;
+    for (int p = 0; p < QSA_RS_PASSES; ++p) {
+        const int      shift   = qsa_rs_shift(p);
+        const int      nbins   = qsa_rs_bins(p);
+        const uint32_t hi_mask = qsa_rs_hi_mask(p);
+        for (int i = t; i < nbins; i += QSA_TOPK_T) {
+            hist[i] = 0;
         }
-        __syncwarp();
-        const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
+        __syncthreads();
 #pragma unroll
         for (int j = 0; j < PER; ++j) {
-            const int64_t b = b0 + j;
-            if (b >= b1) {
-                break;
-            }
-            if ((key[j] & hi_mask) == (prefix & hi_mask)) {
-                atomicAdd(&hist[warp][(key[j] >> shift) & 255], 1);
+            if (b0 + j < b1 && (key[j] & hi_mask) == (prefix & hi_mask)) {
+                atomicAdd(&hist[(key[j] >> shift) & (nbins - 1)], 1);
             }
         }
         __syncthreads();
-        if (t < 256) {                     // fold the warps' histograms into warp 0's
-            int s = 0;
-            for (int w2 = 0; w2 < QSA_TOPK_WARPS; ++w2) {
-                s += hist[w2][t];
-            }
-            hist[0][t] = s;
-        }
-        __syncthreads();
-        if (t == 0) {
-            int cum = above;
-            int d   = 255;
-            for (; d > 0; --d) {
-                if (cum + hist[0][d] >= n_top) {
-                    break;
-                }
-                cum += hist[0][d];
-            }
-            s_digit = d;
-            s_warp[0] = cum;
-        }
-        __syncthreads();
-        prefix |= (uint32_t) s_digit << shift;
-        above = s_warp[0];
-        __syncthreads();
+        int d, c;
+        qsa_find_digit<QSA_TOPK_T>(hist, nbins, above, n_top, s_warp, d, c);
+        prefix |= (uint32_t) d << shift;
+        above = c;
     }
     const uint32_t thr       = prefix;
     const int64_t  eq_budget = n_top - above;   // pools equal to thr that fit, lowest index first
@@ -370,11 +258,11 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_reg_kernel(
         }
     }
     int tot;
-    const int eq_before = qsa_excl_scan(eq, s_warp, tot);
+    const int eq_before = qsa_excl_scan<QSA_TOPK_WARPS>(eq, s_warp, tot);
     int64_t my_eq = eq_budget - eq_before;
     my_eq = my_eq < 0 ? 0 : (my_eq > eq ? eq : my_eq);
     const int sel = gt + (int) my_eq;
-    int64_t wpos = qsa_excl_scan(sel, s_warp, tot);
+    int64_t wpos = qsa_excl_scan<QSA_TOPK_WARPS>(sel, s_warp, tot);
     int64_t eq_left = my_eq;
 #pragma unroll
     for (int j = 0; j < PER; ++j) {
@@ -398,12 +286,13 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_reg_kernel(
     qsa_topk_epilogue(tidx, s_tidx, kpool, sentinel, tot, qi, o, n_sel, &s_digit);
 }
 
-// ---- a query with more pools than the register kernel holds: the register kernel's threads, per-warp histograms and
-// warp scans, with each key read from memory again on every pass. A histogram has no order, so on the four radix
-// passes thread t reads pools t, t + 1024, ...: a warp reads 32 neighbours at a time. The cells are emitted ascending
-// in the order (warp, row, lane): warp w holds the `per` rows of 32 consecutive pools from pool w * 32 * per. The
-// selection rule is qsa_topk_kernel's (radix threshold, ties to the lowest pool): identical ids. Ported from Strata's
-// block_topk_wide_kernel.
+// ---- a query with more pools than the register kernel holds: the register kernel's threads and block scans, with each
+// key read from memory again on every pass, QSA_TOPK_UNROLL independent loads in flight per thread. A histogram has no
+// order, so on the radix passes thread t reads pools t, t + 1024, ...: a warp reads 32 neighbours at a time. The cells
+// are emitted ascending in the order (warp, row, lane): warp w holds the `per` rows of 32 consecutive pools from pool
+// w * 32 * per. The selection rule is the register kernel's (radix threshold, ties to the lowest pool): identical ids.
+// Ported from Strata's block_topk_wide_kernel.
+#define QSA_TOPK_UNROLL 4
 static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_wide_kernel(
         const float * __restrict__ scores, const int64_t n_pool,
         const int32_t * __restrict__ rng, const int64_t s_rng,
@@ -411,7 +300,10 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_wide_kernel(
         const int32_t * __restrict__ tidx, const int64_t s_tidx,
         const int n_top, const int sentinel,
         int32_t * __restrict__ out, const int n_sel) {
-    __shared__ int hist[QSA_TOPK_WARPS][256];
+    constexpr int U = QSA_TOPK_UNROLL;
+
+    __shared__ int hist[QSA_RS_BINS];
+    __shared__ int s_warp[33];
     __shared__ int s_gt[QSA_TOPK_WARPS], s_eq[QSA_TOPK_WARPS];
     __shared__ int s_digit, s_nkept;
 
@@ -439,55 +331,56 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_wide_kernel(
 
     uint32_t prefix = 0;
     int above = 0;
-    for (int shift = 24; shift >= 0; shift -= 8) {
-        for (int i = lane; i < 256; i += 32) {
-            hist[warp][i] = 0;
-        }
-        __syncwarp();
-        const uint32_t hi_mask = shift == 24 ? 0u : (0xffffffffu << (shift + 8));
-        for (int64_t b = lo + t; b < hi; b += QSA_TOPK_T) {
-            const uint32_t k = qsa_order_key(sc[b]);
-            if ((k & hi_mask) == (prefix & hi_mask)) {
-                atomicAdd(&hist[warp][(k >> shift) & 255], 1);
-            }
+    for (int p = 0; p < QSA_RS_PASSES; ++p) {
+        const int      shift   = qsa_rs_shift(p);
+        const int      nbins   = qsa_rs_bins(p);
+        const uint32_t hi_mask = qsa_rs_hi_mask(p);
+        for (int i = t; i < nbins; i += QSA_TOPK_T) {
+            hist[i] = 0;
         }
         __syncthreads();
-        if (t < 256) {                     // fold the warps' histograms into warp 0's
-            int sum = 0;
-            for (int w2 = 0; w2 < QSA_TOPK_WARPS; ++w2) {
-                sum += hist[w2][t];
+        for (int64_t bu = lo + t; bu < hi; bu += U*QSA_TOPK_T) {
+            uint32_t k[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                const int64_t b = bu + u*QSA_TOPK_T;
+                k[u] = b < hi ? qsa_order_key(sc[b]) : 0u;
             }
-            hist[0][t] = sum;
-        }
-        __syncthreads();
-        if (t == 0) {
-            int cum = above;
-            int d   = 255;
-            for (; d > 0; --d) {
-                if (cum + hist[0][d] >= n_top) {
-                    break;
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                if (bu + u*QSA_TOPK_T < hi && (k[u] & hi_mask) == (prefix & hi_mask)) {
+                    atomicAdd(&hist[(k[u] >> shift) & (nbins - 1)], 1);
                 }
-                cum += hist[0][d];
             }
-            s_digit = d;
-            s_nkept = cum;
         }
         __syncthreads();
-        prefix |= (uint32_t) s_digit << shift;
-        above = s_nkept;
-        __syncthreads();
+        int d, c;
+        qsa_find_digit<QSA_TOPK_T>(hist, nbins, above, n_top, s_warp, d, c);
+        prefix |= (uint32_t) d << shift;
+        above = c;
     }
     const uint32_t thr       = prefix;
     const int      eq_budget = n_top - above;   // pools equal to thr that fit, lowest index first
 
-    const int64_t w0 = lo + (int64_t) warp*32*per;
+    const int64_t w0   = lo + (int64_t) warp*32*per;
+    const int64_t wend = min(hi, w0 + 32*per);
     int gt = 0, eq = 0;
-    for (int64_t b = w0 + lane; b < hi && b < w0 + 32*per; b += 32) {
-        const uint32_t k = qsa_order_key(sc[b]);
-        if (k > thr) {
-            gt++;
-        } else if (k == thr) {
-            eq++;
+    for (int64_t bu = w0 + lane; bu < wend; bu += U*32) {
+        uint32_t k[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int64_t b = bu + u*32;
+            k[u] = b < wend ? qsa_order_key(sc[b]) : 0u;
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            if (bu + u*32 < wend) {
+                if (k[u] > thr) {
+                    gt++;
+                } else if (k[u] == thr) {
+                    eq++;
+                }
+            }
         }
     }
 #pragma unroll
@@ -514,37 +407,46 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_wide_kernel(
     }
     __syncthreads();
     int run_sel = s_gt[warp], run_eq = s_eq[warp];
-    for (int64_t r0 = w0; r0 < hi && r0 < w0 + 32*per; r0 += 32) {
-        const int64_t b = r0 + lane;
-        const bool has = b < hi;
-        const uint32_t k = has ? qsa_order_key(sc[b]) : 0u;
-        const int my_gt = (has && k > thr) ? 1 : 0, my_eq = (has && k == thr) ? 1 : 0;
-        if (__ballot_sync(0xffffffffu, (my_gt | my_eq) != 0) == 0u) {
-            continue;                      // a row without a selected pool
-        }
-        int pe = my_eq;                    // tied cells up to and with this lane
+    for (int64_t ru = w0; ru < wend; ru += U*32) {
+        // the keys of U rows first, so that their loads are in flight together
+        uint32_t k[U];
 #pragma unroll
-        for (int o2 = 1; o2 < 32; o2 <<= 1) {
-            const int y = __shfl_up_sync(0xffffffffu, pe, o2);
-            if (lane >= o2) pe += y;
+        for (int u = 0; u < U; ++u) {
+            const int64_t b = ru + u*32 + lane;
+            k[u] = b < wend ? qsa_order_key(sc[b]) : 0u;
         }
-        const int left = eq_budget - (run_eq + pe - my_eq);
-        const int take = left < 0 ? 0 : (left > my_eq ? my_eq : left);
-        const int my_sel = my_gt + take;
-        int ps = my_sel;
 #pragma unroll
-        for (int o2 = 1; o2 < 32; o2 <<= 1) {
-            const int y = __shfl_up_sync(0xffffffffu, ps, o2);
-            if (lane >= o2) ps += y;
-        }
-        int32_t * dst = o + (int64_t) (run_sel + ps - my_sel)*kpool;
-        for (int j = 0; j < my_sel; ++j) {
-            for (int c = 0; c < kpool; ++c) {
-                dst[j*kpool + c] = pidx[b*kpool + c];
+        for (int u = 0; u < U; ++u) {
+            const int64_t b = ru + u*32 + lane;
+            const bool has = b < wend;
+            const int my_gt = (has && k[u] > thr) ? 1 : 0, my_eq = (has && k[u] == thr) ? 1 : 0;
+            if (__ballot_sync(0xffffffffu, (my_gt | my_eq) != 0) == 0u) {
+                continue;                  // a row without a selected pool
             }
+            int pe = my_eq;                // tied cells up to and with this lane
+#pragma unroll
+            for (int o2 = 1; o2 < 32; o2 <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, pe, o2);
+                if (lane >= o2) pe += y;
+            }
+            const int left = eq_budget - (run_eq + pe - my_eq);
+            const int take = left < 0 ? 0 : (left > my_eq ? my_eq : left);
+            const int my_sel = my_gt + take;
+            int ps = my_sel;
+#pragma unroll
+            for (int o2 = 1; o2 < 32; o2 <<= 1) {
+                const int y = __shfl_up_sync(0xffffffffu, ps, o2);
+                if (lane >= o2) ps += y;
+            }
+            int32_t * dst = o + (int64_t) (run_sel + ps - my_sel)*kpool;
+            for (int j = 0; j < my_sel; ++j) {
+                for (int c = 0; c < kpool; ++c) {
+                    dst[j*kpool + c] = pidx[b*kpool + c];
+                }
+            }
+            run_eq  += __shfl_sync(0xffffffffu, pe, 31);
+            run_sel += __shfl_sync(0xffffffffu, ps, 31);
         }
-        run_eq  += __shfl_sync(0xffffffffu, pe, 31);
-        run_sel += __shfl_sync(0xffffffffu, ps, 31);
     }
     qsa_topk_epilogue(tidx, s_tidx, kpool, sentinel, s_nkept, qi, o, n_sel, &s_digit);
 }
@@ -578,26 +480,26 @@ void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         ggml_cuda_lightning_indexer_scores(q_d, q->nb[1], q->nb[2], nt, k, (const int32_t *) pcell->data, n_pool,
                                            head_scale, scores.get(), n_pool*sizeof(float), stream);
 
-        // the kernel holds QSA_TOPK_T*QSA_TOPK_PER pools at most; n_pool bounds every query's visible range
+        // n_pool bounds every query's visible range, so it picks the kernel
         const int32_t * rng = (const int32_t *) ((const char *) prng->data + t0*prng->nb[1]);
         const int32_t * tx  = (const int32_t *) ((const char *) tidx->data + t0*tidx->nb[1]);
         int32_t       * o   = (int32_t *) ((char *) dst->data + t0*dst->nb[1]);
-        if (n_pool < QSA_TOPK_MIN_POOLS) {
-            qsa_topk_kernel<<<nt, QSA_TOPK_THREADS, 0, stream>>>(
-                scores.get(), n_pool, rng, prng->nb[1]/sizeof(int32_t),
-                (const int32_t *) pidx->data, kpool, tx, tidx->nb[1]/sizeof(int32_t),
-                n_top, sentinel, o, n_sel);
+#define QSA_TOPK_ARGS scores.get(), n_pool, rng, prng->nb[1]/sizeof(int32_t), (const int32_t *) pidx->data, kpool, \
+                      tx, tidx->nb[1]/sizeof(int32_t), n_top, sentinel, o, n_sel
+        if (n_pool <= (int64_t) QSA_TOPK_T*4) {
+            qsa_topk_reg_kernel<4><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
+        } else if (n_pool <= (int64_t) QSA_TOPK_T*8) {
+            qsa_topk_reg_kernel<8><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
+        } else if (n_pool <= (int64_t) QSA_TOPK_T*16) {
+            qsa_topk_reg_kernel<16><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
+        } else if (n_pool <= (int64_t) QSA_TOPK_T*24) {
+            qsa_topk_reg_kernel<24><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
         } else if (n_pool <= (int64_t) QSA_TOPK_T*QSA_TOPK_PER) {
-            qsa_topk_reg_kernel<QSA_TOPK_PER><<<nt, QSA_TOPK_T, 0, stream>>>(
-                scores.get(), n_pool, rng, prng->nb[1]/sizeof(int32_t),
-                (const int32_t *) pidx->data, kpool, tx, tidx->nb[1]/sizeof(int32_t),
-                n_top, sentinel, o, n_sel);
+            qsa_topk_reg_kernel<QSA_TOPK_PER><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
         } else {
-            qsa_topk_wide_kernel<<<nt, QSA_TOPK_T, 0, stream>>>(
-                scores.get(), n_pool, rng, prng->nb[1]/sizeof(int32_t),
-                (const int32_t *) pidx->data, kpool, tx, tidx->nb[1]/sizeof(int32_t),
-                n_top, sentinel, o, n_sel);
+            qsa_topk_wide_kernel<<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
         }
+#undef QSA_TOPK_ARGS
     }
     CUDA_CHECK(cudaGetLastError());
 }
