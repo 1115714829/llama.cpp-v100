@@ -195,6 +195,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
 
     llama_build(test-llama-archs.cpp)
 
+    # expert assignment table; ggml-expert-store.h lives in ggml/src, so the test includes it directly
+    llama_build_and_test(test-expert-assign.cpp)
+    target_include_directories(test-expert-assign PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
     set(MODEL_DIR "${CMAKE_CURRENT_BINARY_DIR}/test-models/")
     file(MAKE_DIRECTORY "${MODEL_DIR}")
 
@@ -299,6 +303,8 @@ endif()
 
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build(test-backend-ops.cpp)
+# the permuted expert store test drives the expert assignment of ggml-expert-store.h (ggml/src)
+target_include_directories(test-backend-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
 # needs the non-public ggml-expert-store.h
 if (NOT LLAMA_USE_SYSTEM_GGML)

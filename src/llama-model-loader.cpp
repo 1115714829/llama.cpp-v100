@@ -1279,10 +1279,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // Mark the MoE expert weights explicitly while the tensor is created, so the expert store
     // identifies them by the flag and never by the name. The flag is set for every load
     // (device, host, and the no-alloc fit trials); the store decides from its own buffer type
-    // and the layout whether it can place the tensor.
+    // and the layout whether it can place the tensor. Without the store (no_expert_store) they
+    // stay plain device weights; they are still expert weights for their layout over the devices.
     auto mark_expert_tensor = [&](ggml_tensor * tensor) {
-        if (!no_expert_store && llm_tensor_is_expert_weight(tn)) {
-            tensor->flags |= GGML_TENSOR_FLAG_EXPERT;
+        if (llm_tensor_is_expert_weight(tn)) {
+            expert_weights.insert(tensor);
+            if (!no_expert_store) {
+                tensor->flags |= GGML_TENSOR_FLAG_EXPERT;
+            }
         }
     };
 
@@ -1780,6 +1784,145 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
     return data;
 }
 
+// Layout of the experts of one expert tensor in the host buffer the loader writes. A tensor that is
+// split over the devices along the expert dim takes its experts at the positions of the expert
+// assignment table of the model: the buffer is the concatenation of the device segments (the meta
+// buffer hands segment j to device j), segment j holds the experts of device j in local order, so
+// global expert e sits at sum(experts of the devices before owner(e)) + local(e)
+// (ggml_expert_assignment_load_position). A tensor that holds the whole expert dim keeps the file
+// order. The table of a model whose experts live in the expert stores is the profile's proposal;
+// without a profile, and for plain device weights, it is the contiguous split and the position of
+// every expert is its own number: that is the capability branch of those cases, not another code
+// path - the same formula, the same activation and the same checks run.
+struct llama_expert_layout {
+    bool by_table = false;       // the experts are laid out by the expert assignment table
+    bool identity = true;        // position(e) == e for every expert
+    // the experts go into expert stores whose devices receive whole experts (a tensor on one
+    // device, or split along the expert dim), so the loader registers the hash of every expert for
+    // the placement check of the backend. A tensor the meta buffer splits along another axis hands
+    // every device a part of every expert; its bytes are not comparable per expert and the check
+    // skips it. Plain device weights have no store that could compare them.
+    bool check    = false;
+    int  layer    = -1;
+    std::vector<int64_t> pos_of; // [n_expert] position of global expert e (by_table only)
+
+    int64_t position(int64_t e) const {
+        return by_table ? pos_of[(size_t) e] : e;
+    }
+};
+
+// dev_slices: the experts every device holds of this tensor, nullptr when the tensor is not split
+// over the devices; table: the expert assignment table of the model. The table must describe
+// exactly the split the meta buffer applies (as many devices, the quota of every device equal to
+// its slice), otherwise the positions and the device segments would disagree, which nothing
+// downstream could repair: that is an error of the run.
+static llama_expert_layout llama_expert_layout_of(const ggml_tensor * cur, const std::vector<int64_t> * dev_slices, uint32_t table) {
+    llama_expert_layout layout;
+    const bool in_store = (cur->flags & GGML_TENSOR_FLAG_EXPERT) != 0;
+    if (dev_slices == nullptr) {
+        layout.check = in_store && (cur->buffer == nullptr || !ggml_backend_buffer_is_meta(cur->buffer));
+        return layout;
+    }
+    const char *  name     = ggml_get_name(cur);
+    const int64_t n_expert = cur->ne[2];
+
+    int layer = -1;
+    if (sscanf(name, "blk.%d.", &layer) != 1 || layer < 0) {
+        throw std::runtime_error(format("%s: expert tensor '%s' has no layer number in its name", __func__, name));
+    }
+    if (!ggml_is_contiguous(cur)) {
+        throw std::runtime_error(format("%s: expert tensor '%s' is not contiguous, its experts cannot be laid out", __func__, name));
+    }
+
+    int n_dev = 0;
+    int n_layer = 0;
+    int n_expert_table = 0;
+    if (table == 0 || !ggml_expert_assignment_dims(table, &n_dev, &n_layer, &n_expert_table)) {
+        throw std::runtime_error(format("%s: tensor '%s' is split over the devices along the expert dim, "
+            "but the model has no expert assignment table", __func__, name));
+    }
+    if ((size_t) n_dev != dev_slices->size() || n_expert_table != n_expert || layer >= n_layer) {
+        throw std::runtime_error(format("%s: tensor '%s' (layer %d, %" PRId64 " experts over %zu devices) does not match the "
+            "expert assignment (%d layers, %d experts over %d devices)", __func__, name, layer, n_expert, dev_slices->size(),
+            n_layer, n_expert_table, n_dev));
+    }
+    for (int j = 0; j < n_dev; j++) {
+        const int cap = ggml_expert_assignment_cap(table, j);
+        if ((int64_t) cap != (*dev_slices)[(size_t) j]) {
+            throw std::runtime_error(format("%s: tensor '%s': device %d holds %" PRId64 " experts but the expert assignment "
+                "gives it %d; the tensor split is not the even expert split the assignment is built for", __func__, name, j,
+                (*dev_slices)[(size_t) j], cap));
+        }
+    }
+
+    layout.by_table = true;
+    layout.check    = in_store;
+    layout.layer    = layer;
+    layout.pos_of.resize((size_t) n_expert);
+    std::vector<uint8_t> taken((size_t) n_expert, 0);
+    for (int64_t e = 0; e < n_expert; e++) {
+        const int64_t pos = ggml_expert_assignment_load_position(table, layer, (int) e);
+        GGML_ASSERT(pos >= 0 && pos < n_expert && !taken[(size_t) pos]);
+        taken[(size_t) pos]      = 1;
+        layout.pos_of[(size_t) e] = pos;
+        layout.identity = layout.identity && pos == e;
+    }
+    return layout;
+}
+
+// the hash of the bytes of global expert e of an expert tensor as they go into the device buffers,
+// for the placement check the backend runs after the load (ggml_expert_store_verify_placement)
+static void llama_expert_note_source(const ggml_tensor * cur, int64_t e, const void * data, size_t expert_size) {
+    ggml_expert_store_set_source_hash(ggml_get_name(cur), e, ggml_expert_store_hash_expert(data, expert_size));
+}
+
+// Move the experts of a host buffer from file order to the layout: expert e goes to position
+// pos_of[e]. In place along the cycles of the permutation with one expert of scratch, so the
+// buffer of the tensor is the only one of its size.
+static void llama_permute_experts(uint8_t * data, size_t expert_size, const std::vector<int64_t> & pos_of) {
+    const int64_t n = (int64_t) pos_of.size();
+    std::vector<uint8_t> hold(expert_size);
+    std::vector<uint8_t> next(expert_size);
+    std::vector<uint8_t> placed((size_t) n, 0);
+    for (int64_t e0 = 0; e0 < n; e0++) {
+        if (placed[(size_t) e0] || pos_of[(size_t) e0] == e0) {
+            placed[(size_t) e0] = 1;
+            continue;
+        }
+        // hold is the expert that still has to be placed: in[e0] first, then the expert its slot
+        // displaced, until the cycle closes at e0
+        memcpy(hold.data(), data + (size_t) e0*expert_size, expert_size);
+        int64_t cur = e0;
+        while (true) {
+            const int64_t nxt = pos_of[(size_t) cur];
+            if (nxt == e0) {
+                memcpy(data + (size_t) nxt*expert_size, hold.data(), expert_size);
+                placed[(size_t) nxt] = 1;
+                break;
+            }
+            memcpy(next.data(), data + (size_t) nxt*expert_size, expert_size);
+            memcpy(data + (size_t) nxt*expert_size, hold.data(), expert_size);
+            std::swap(hold, next);
+            placed[(size_t) nxt] = 1;
+            cur = nxt;
+        }
+    }
+}
+
+// an expert tensor that is complete in host memory in file order: register the hash of every expert
+// for the placement check, then move the experts to their positions
+static void llama_expert_layout_apply(const ggml_tensor * cur, const llama_expert_layout & layout, uint8_t * data) {
+    const size_t expert_size = cur->nb[2];
+    if (layout.check) {
+        for (int64_t e = 0; e < cur->ne[2]; e++) {
+            llama_expert_note_source(cur, e, data + (size_t) e*expert_size, expert_size);
+        }
+    }
+    if (layout.by_table && !layout.identity) {
+        llama_permute_experts(data, expert_size, layout.pos_of);
+    }
+}
+
 // The file stores the merged gate/up expert weight per expert as the n_ff rows of gate followed by
 // the n_ff rows of up. ggml_mul_mat_id_swiglu reads them as pairs, row 2r = gate row r and
 // row 2r+1 = up row r, so the rows are reordered here while the weight is loaded, which keeps the
@@ -1821,11 +1964,14 @@ static void llama_interleave_gate_up_rows(uint8_t * data, ggml_type type, int64_
 // The whole tensor is written with one tensor_set(): the expert weights are split along the expert
 // axis, and a buffer that holds such a split tensor takes the whole tensor in one call (the split
 // chunks are contiguous in it), so a partial write would not be a valid write.
+//
+// Every expert goes straight to its position of the layout (llama_expert_layout), so the buffer is
+// written once and nothing is moved afterwards.
 static void llama_load_merged_gate_up(
         const llama_files & files, ggml_tensor * cur,
         const llama_model_loader::llama_tensor_weight_src & gate,
         const llama_model_loader::llama_tensor_weight_src & up,
-        bool bf16_as_f16, bool check_tensors) {
+        bool bf16_as_f16, bool check_tensors, const llama_expert_layout & layout) {
     const size_t n_size = ggml_nbytes(cur);
 
     const int64_t n_ff    = cur->ne[1] / 2;
@@ -1870,11 +2016,16 @@ static void llama_load_merged_gate_up(
             }
         }
 
-        no_init<uint8_t> * dst_expert = buf_merged.data() + e*expert_size;
+        no_init<uint8_t> * dst_expert = buf_merged.data() + layout.position(e)*expert_size;
 
         for (int64_t r = 0; r < n_ff; r++) {
             memcpy(dst_expert + (2*r    )*row_size, buf_gate.data() + r*row_size, row_size);
             memcpy(dst_expert + (2*r + 1)*row_size, buf_up  .data() + r*row_size, row_size);
+        }
+
+        // the bytes of global expert e as the device buffers receive them, for the placement check
+        if (layout.check) {
+            llama_expert_note_source(cur, e, dst_expert, expert_size);
         }
     }
 
@@ -2046,6 +2197,18 @@ bool llama_model_loader::load_all_data(
     for (struct ggml_tensor * cur : tensors) {
         const std::string cur_name = ggml_get_name(cur);
 
+        // a routed expert weight (one expert per ne[2] slice; in the expert store or a plain device
+        // weight): where every expert goes in the buffer that is written, see llama_expert_layout
+        const bool is_expert = expert_weights.count(cur) != 0 && cur->ne[2] > 1;
+        llama_expert_layout layout;
+        if (is_expert) {
+            const auto sit = expert_dev_slices.find(cur);
+            layout = llama_expert_layout_of(cur, sit != expert_dev_slices.end() ? &sit->second : nullptr, expert_assignment);
+            if (layout.by_table) {
+                expert_tensors_by_table.push_back(cur);
+            }
+        }
+
         // a gate/up expert weight that is synthesized from the gate and the up weight of the file:
         // it is not in the file, so it never goes through the mapping below
         if (auto mit = merged_tensors.find(cur_name); mit != merged_tensors.end()) {
@@ -2057,7 +2220,7 @@ bool llama_model_loader::load_all_data(
 
             const auto & merged = mit->second;
 
-            llama_load_merged_gate_up(files, cur, merged.gate, merged.up, merged.bf16_as_f16, check_tensors);
+            llama_load_merged_gate_up(files, cur, merged.gate, merged.up, merged.bf16_as_f16, check_tensors, layout);
 
             // the weights are now in a buffer the device reads directly, drop the page cache of
             // the two source ranges, they are not mapped into a buffer
@@ -2100,6 +2263,10 @@ bool llama_model_loader::load_all_data(
 
             llama_interleave_gate_up_rows((uint8_t *) read_buf.data(), cur->type, cur->ne[0], cur->ne[1]/2, cur->ne[2]);
 
+            if (is_expert) {
+                llama_expert_layout_apply(cur, layout, (uint8_t *) read_buf.data());
+            }
+
             if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                 throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
             }
@@ -2123,6 +2290,10 @@ bool llama_model_loader::load_all_data(
             const int64_t n = n_size / sizeof(ggml_bf16_t);
             n_bf16_clamped += ggml_bf16_to_fp16_row((const ggml_bf16_t *) read_buf.data(), (ggml_fp16_t *) read_buf.data(), n);
             n_bf16_converted += n;
+
+            if (is_expert) {
+                llama_expert_layout_apply(cur, layout, (uint8_t *) read_buf.data());
+            }
 
             if (check_tensors && !ggml_validate_row_data(GGML_TYPE_F16, read_buf.data(), n_size)) {
                 throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
@@ -2157,6 +2328,9 @@ bool llama_model_loader::load_all_data(
 
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
+                // a tensor bound to the mapping keeps the file order; a tensor laid out by the
+                // expert assignment is never bound (it lives in the device buffers), see above
+                GGML_ASSERT(!(is_expert && layout.by_table));
                 if (ggml_backend_tensor_alloc(buf_mmap, cur, data) != GGML_STATUS_SUCCESS) {
                     throw std::runtime_error(format("%s: failed to bind tensor '%s' to %s",
                             __func__, ggml_get_name(cur), ggml_backend_buffer_name(buf_mmap)));
@@ -2175,7 +2349,25 @@ bool llama_model_loader::load_all_data(
                 const bool devread = cur->buffer != nullptr && is_device_readable_buft(ggml_backend_buffer_get_type(cur->buffer));
                 const int64_t t0 = devread ? ggml_time_us() : 0;
 
-                ggml_backend_tensor_set(cur, data, 0, n_size);
+                if (is_expert && layout.check) {
+                    const size_t expert_size = cur->nb[2];
+                    for (int64_t e = 0; e < cur->ne[2]; e++) {
+                        llama_expert_note_source(cur, e, data + (size_t) e*expert_size, expert_size);
+                    }
+                }
+                if (is_expert && layout.by_table && !layout.identity) {
+                    // the mapping is read only, so the experts are copied to their positions in a
+                    // buffer of the tensor size and that buffer is written: still one copy to the
+                    // device, the buffer lives for this tensor only
+                    const size_t expert_size = cur->nb[2];
+                    std::vector<no_init<uint8_t>> perm_buf(n_size);
+                    for (int64_t e = 0; e < cur->ne[2]; e++) {
+                        memcpy(perm_buf.data() + (size_t) layout.pos_of[(size_t) e]*expert_size, data + (size_t) e*expert_size, expert_size);
+                    }
+                    ggml_backend_tensor_set(cur, perm_buf.data(), 0, n_size);
+                } else {
+                    ggml_backend_tensor_set(cur, data, 0, n_size);
+                }
 
                 if (devread) {
                     ms_devread += ggml_time_us() - t0;
@@ -2193,6 +2385,9 @@ bool llama_model_loader::load_all_data(
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
+                if (is_expert) {
+                    llama_expert_layout_apply(cur, layout, (uint8_t *) cur->data);
+                }
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
@@ -2200,7 +2395,11 @@ bool llama_model_loader::load_all_data(
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+                // An expert tensor of the store or one laid out by the assignment table is read whole
+                // below instead: its experts are hashed for the placement check and laid out by the
+                // table, which needs the whole tensor.
+                const bool expert_whole = is_expert && ((cur->flags & GGML_TENSOR_FLAG_EXPERT) != 0 || layout.by_table);
+                if (upload_backend && !expert_whole) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
@@ -2257,6 +2456,9 @@ bool llama_model_loader::load_all_data(
                     std::vector<no_init<uint8_t>> read_buf(n_size);
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
+                    if (is_expert) {
+                        llama_expert_layout_apply(cur, layout, (uint8_t *) read_buf.data());
+                    }
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
                     if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));

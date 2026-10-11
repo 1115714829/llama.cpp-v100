@@ -1551,6 +1551,22 @@ extern "C" {
     // use this global count instead. Returns 0 when the node is not MUL_MAT_ID or it is not set.
     GGML_API void    ggml_mul_mat_id_set_n_expert_total(struct ggml_tensor * a, int32_t n_expert_total);
     GGML_API int32_t ggml_mul_mat_id_get_n_expert_total(const struct ggml_tensor * a);
+    // expert parallelism: the layer of the expert weight (the N of its "blk.N." name) and the device
+    // that computes this node. The two select the expert map of the node (which global expert id is
+    // which local expert of the device, see ggml_expert_store_node_lut); the map replaces the
+    // [expert_offset, expert_offset + as->ne[2]) range test once the experts of a layer are no
+    // longer a contiguous range of the numbering. Both return 0 when the node is not MUL_MAT_ID.
+    GGML_API void    ggml_mul_mat_id_set_layer(struct ggml_tensor * a, int32_t layer);
+    GGML_API int32_t ggml_mul_mat_id_get_layer(const struct ggml_tensor * a);
+    GGML_API void    ggml_mul_mat_id_set_device(struct ggml_tensor * a, int32_t device);
+    GGML_API int32_t ggml_mul_mat_id_get_device(const struct ggml_tensor * a);
+    // expert parallelism: the expert assignment table the expert weight of the node was laid out by
+    // (ggml_expert_assignment_*): > 0 the table, whose row of (device, layer) is the expert map of the
+    // node; 0 the weight holds the contiguous segment named by the expert offset (nodes built by hand,
+    // the tests); < 0 the weight was laid out by no table. The meta backend sets it from the binding
+    // of the weight. Returns 0 when the node is not MUL_MAT_ID.
+    GGML_API void    ggml_mul_mat_id_set_assignment(struct ggml_tensor * a, int32_t assignment);
+    GGML_API int32_t ggml_mul_mat_id_get_assignment(const struct ggml_tensor * a);
 
     // A: m columns, n rows,
     // B: p columns, n rows,
@@ -3053,6 +3069,47 @@ extern "C" {
     // (non store) expert tensors too. The trace file is written for the whole process, not
     // only when the model unloads.
     GGML_API void ggml_expert_store_set_trace_path(const char * path, int size_mib);
+
+    // Expert assignment tables: which device holds which expert of every layer when the routed
+    // experts are split over the devices along the expert dim, as the loaded data is laid out. A
+    // loader makes one table for the expert weights of its model it splits that way, lays the experts
+    // out by it, activates it - which binds those weights to it - and releases it with the model. The
+    // MUL_MAT_ID nodes of a weight read the table of that weight (ggml_mul_mat_id_get_assignment), so
+    // two models (a target and its MTP draft) each read their own. A table never changes; its id
+    // (> 0) is never reused in the process. 0 is returned when no table could be made.
+    //
+    // a snapshot of the proposal the expert buffers were planned with (the profile LPT split, the
+    // contiguous split without a profile; computed while the expert stores of the model were
+    // planned): the table of a model whose experts live in the expert stores. The proposal must have
+    // n_dev devices, n_expert experts and at least n_layer layers.
+    GGML_API uint32_t ggml_expert_assignment_from_proposal(int n_dev, int n_layer, int n_expert);
+    // the contiguous split, device j holding the caps[j] experts after those of the devices before
+    // it: the table of a model whose experts are plain device weights (the meta backend slices them)
+    GGML_API uint32_t ggml_expert_assignment_contiguous(int n_dev, int n_layer, int n_expert, const int64_t * caps);
+    // sizes of a table; false for an unknown table
+    GGML_API bool     ggml_expert_assignment_dims(uint32_t table, int * n_dev, int * n_layer, int * n_expert);
+    // experts device dev holds per layer, -1 for an unknown table or device
+    GGML_API int      ggml_expert_assignment_cap(uint32_t table, int dev);
+    // position of expert `expert` of layer `layer` in the host buffer of a tensor split over the
+    // devices: the buffer is the concatenation of the device segments in device order, segment j
+    // holds the cap(j) experts of device j in local order, so the position is
+    // sum(cap(0..owner)) + local. The loader writes expert `expert` there. -1 when unknown.
+    GGML_API int64_t  ggml_expert_assignment_load_position(uint32_t table, int layer, int expert);
+    // the loader placed every weight of the list by the table: bind them to it (a MUL_MAT_ID node
+    // of such a weight reads its expert map from the table from now on) and make it known to the
+    // placement check of the backends. Once per table.
+    GGML_API void     ggml_expert_assignment_activate(uint32_t table, const struct ggml_tensor * const * weights, size_t n_weights);
+    // drop a table and the bindings of its weights (the model is freed); 0 is a no-op
+    GGML_API void     ggml_expert_assignment_release(uint32_t table);
+
+    // Placement check: the loader registers, per tensor name, the hash of the bytes of every
+    // global expert it placed (ggml_expert_store_hash_expert); the backend compares them after the
+    // load against the bytes every local expert received, mapped through the table the tensor was
+    // laid out by (ggml_expert_assignment_activate).
+    GGML_API uint64_t ggml_expert_store_hash_expert(const void * data, size_t size);
+    GGML_API void     ggml_expert_store_set_source_hash(const char * tensor_name, int64_t expert, uint64_t hash);
+    // drop the registered hashes once the backends checked the placement
+    GGML_API void     ggml_expert_store_clear_source_hashes(void);
 
     GGML_API struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor);
 

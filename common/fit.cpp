@@ -214,7 +214,7 @@ static bool common_expert_get_allocation(ggml_backend_buffer_type_t buft, size_t
 // loaded model, then handed to the pure plan function of the device that computes the layer
 struct common_expert_tensor {
     int        layer      = -1; // block index from the tensor name
-    int64_t    expert_base = 0; // global index of local expert 0 (expert parallelism)
+    int64_t    expert_base = 0; // start of the device's segment of the expert dim (expert parallelism)
     int64_t    n_expert   = 0;
     size_t     blob_bytes = 0;  // data bytes of one expert
     ggml_type  type       = GGML_TYPE_COUNT; // for the per-expert row padding of the backend
@@ -849,8 +849,12 @@ static void common_fit_ep(
         }
     }
 
-    // expert tensors of the model (loader mark), with the per-device expert counts and bases
-    // of the same split the meta backend applies (llama_model_tensor_split_state).
+    // expert tensors of the model (loader mark), with the per-device expert counts and segment
+    // starts of the same split the meta backend applies (llama_model_tensor_split_state).
+    // expert_base[j] is the start of device j's segment of the expert dim; the byte budget only
+    // depends on n_expert[j], and the plan maps a local expert to its profile row through the
+    // expert assignment (which global expert the loader puts at that local number), so the
+    // segment start is the device's name in the plan, not an offset to add to local numbers.
     struct ep_tensor { int layer; std::vector<int64_t> expert_base; std::vector<int64_t> n_expert; size_t blob_bytes; ggml_type type; int64_t ne0; };
     std::vector<ep_tensor> expert_tensors;
     for (const auto & kv : llama_internal_get_tensor_map(model)) {

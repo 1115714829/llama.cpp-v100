@@ -22,6 +22,7 @@
 // in-place / copy-to-VRAM choices of docs/design/r200-x86-worklist.md 4.1 can reuse it.
 
 #include "ggml.h"
+#include "ggml-impl.h" // ggml_expert_store_node_lut, ggml_expert_assignment_of_weight (C linkage)
 
 #include <cstddef>
 #include <cstdint>
@@ -146,9 +147,11 @@ struct ggml_expert_store_backend {
 struct ggml_expert_store_tensor {
     int      layer      = -1;
     int      kind       = -1; // llm tensor id of one of the ffn_*_exps tensors
-    // global index of expert 0 of this tensor: with expert parallelism each device holds a
-    // contiguous slice of the expert dim, so the profile and the routing dump need the base
-    // to address global (layer, expert) entries. Always 0 for layer-split tensors.
+    // start of this device's segment of the expert dim (the prefix sum of the segment lengths
+    // of the preceding devices): with expert parallelism each device holds n_expert experts of
+    // the tensor. Which global expert a local one is comes from the table the loader laid the
+    // experts out by (see global_of), not from expert_base + local. Always 0 for layer-split
+    // tensors, which hold the whole expert dim.
     int64_t  expert_base = 0;
     int64_t  n_expert   = 0;
     size_t   blob_bytes = 0;  // data bytes of one expert inside this tensor
@@ -177,6 +180,21 @@ struct ggml_expert_store_tensor {
     std::vector<uint8_t> sample_src[2];
     bool    sample_ready[2] = { false, false };
     bool    sample_skip[2]  = { false, false };
+
+    // placement check: hash of the bytes every local expert received through
+    // ggml_expert_store_write() (see ggml_expert_store_hash_expert), compared by
+    // ggml_expert_store_verify_placement() against the hash the loader registered for the
+    // global expert the table of the tensor maps the local one to. state: 0 nothing written, 1 the
+    // expert arrived whole in one write (hash valid), 2 written in pieces (no hash)
+    std::vector<uint64_t> write_hash;
+    std::vector<uint8_t>  write_hash_state;
+
+    // global expert of every local expert, from the expert assignment table the loader laid the
+    // tensor out by (the identity for a tensor that holds the whole expert dim in file order).
+    // Recorded by ggml_expert_store_verify_placement() from what the loader registered; the routing
+    // dump numbers its rows through it. Empty when the loader did not write the tensor.
+    std::vector<int64_t> global_of;
+    uint32_t             assignment = 0; // the table global_of comes from, 0 for the identity
 
     // statistics (filled at runtime by the kernels' dispatch code)
     int64_t stat_hits_vram = 0;
@@ -257,8 +275,10 @@ GGML_API void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_de
 struct ggml_expert_store_plan_tensor {
     int     layer      = -1; // profile row of the tensor
     int64_t n_expert   = 0;
-    // global index of expert 0 of this tensor (expert parallelism). The profile is addressed
-    // with expert_base + local expert, so the per-device slices of a tensor share one row.
+    // start of this device's segment of the expert dim (expert parallelism): the prefix sum of
+    // the segment lengths of the preceding devices. Together with n_expert it names the device
+    // (ggml_expert_store_slice_device); the profile row of a local expert is the one of the
+    // global expert the assignment maps it to, not expert_base + local.
     int64_t expert_base = 0;
     size_t  blob_bytes = 0;  // data bytes of one expert
     // trailing bytes one expert needs past its data for the row padding of the kernels.
@@ -286,11 +306,96 @@ struct ggml_expert_store_placement {
 // totals. No allocation, repeatable. slot_budget < 0 gives every expert a slot. profile_path
 // is the routing profile that ranks the experts; nullptr means the process-wide profile
 // (ggml_expert_store_set_profile), which is the file that stores created afterwards use - so
-// fit and the real allocation plan with the same profile.
+// fit and the real allocation plan with the same profile. n_device is the number of devices
+// the experts are split over; it is needed for the per-device assignment (see
+// ggml_expert_store_owner) and must be the count of the whole run, not of one store.
 GGML_API void ggml_expert_store_plan(
         const ggml_expert_store_plan_tensor * tensors, size_t n_tensors,
+        int n_device,
         int64_t slot_budget, const char * profile_path,
         ggml_expert_store_placement * placement);
+
+// compute the expert assignment (the per-layer LPT split of the experts over the devices) and
+// cache it for the process. profile is the routing profile of the run, nullptr (or an empty one)
+// means the counts are unknown and the contiguous split is used. Called by
+// ggml_expert_store_plan(); the table it produces is read through ggml_expert_store_owner().
+GGML_API void ggml_expert_store_compute_assignment(
+        const char * path, const ggml_expert_store_profile * profile,
+        int n_device, int n_layer, int n_expert);
+
+// result of the expert assignment (the per-layer LPT split of the experts over the devices)
+struct ggml_expert_store_assignment_info {
+    int    n_dev    = 0;  // devices the experts are split over
+    int    n_layer  = 0;  // layers covered by the assignment
+    int    n_expert = 0;  // experts per layer
+    int    cap_max  = 0;  // most experts on one device
+    bool   has_profile = false; // the assignment was computed from a routing profile
+    // mean over the layers of max(dev load) / mean(dev load), before and after the assignment
+    double imbalance_contiguous = 0.0;
+    double imbalance_permuted    = 0.0;
+    int    worst_layer           = -1;  // layer with the largest imbalance_permuted
+    double worst_layer_imbalance = 0.0;
+};
+
+// device that holds one expert, or -1 when no assignment has been computed yet
+GGML_API int ggml_expert_store_owner(int layer, int expert);
+
+// local expert number of every expert of one layer on one device, -1 for the experts of the
+// other devices; the row has ggml_expert_store_assignment_info::n_expert entries and stays
+// valid until the next assignment is computed. nullptr when there is no assignment for dev.
+GGML_API const int16_t * ggml_expert_store_local_of(int dev, int layer);
+
+// global expert number of one local expert, or -1 when there is no such expert on dev
+GGML_API int ggml_expert_store_global_of(int dev, int layer, int local);
+
+// state of the cached assignment, for logging and tests
+GGML_API bool ggml_expert_store_assignment_info_get(ggml_expert_store_assignment_info * info);
+
+// the device whose segment of the expert dim in the proposal is exactly
+// [expert_base, expert_base + n_expert): >= 0 that device, -1 when the range is the whole expert dim
+// (a tensor that is not split over the devices holds every expert, so its local numbers are the
+// global ones), -2 when the range matches no segment (or there is no proposal)
+GGML_API int ggml_expert_store_slice_device(int64_t expert_base, int64_t n_expert);
+
+// Expert assignment tables (the layout of loaded data, see ggml.h ggml_expert_assignment_*): the
+// queries the store and the tests use. table is the id a loader got from
+// ggml_expert_assignment_from_proposal() or ggml_expert_assignment_contiguous(); an unknown id
+// answers like an unknown layer (-1 / nullptr / false).
+GGML_API bool            ggml_expert_assignment_is_active(uint32_t table);
+GGML_API int             ggml_expert_assignment_owner    (uint32_t table, int layer, int expert);
+GGML_API const int16_t * ggml_expert_assignment_local_of (uint32_t table, int dev, int layer);
+GGML_API int             ggml_expert_assignment_global_of(uint32_t table, int dev, int layer, int local);
+// the device of the segment [expert_base, expert_base + n_expert) of the table: >= 0, -1 for the
+// whole expert dim, -2 for no segment
+GGML_API int             ggml_expert_assignment_slice_device(uint32_t table, int64_t expert_base, int64_t n_expert);
+// fingerprint of the owners and local numbers of the table (the one the activation logs)
+GGML_API uint64_t        ggml_expert_assignment_fingerprint(uint32_t table);
+// tables that exist (created and not released), for the tests
+GGML_API size_t          ggml_expert_assignment_count(void);
+
+// hash of the bytes of one expert as the placement check uses it on both sides (loader and store):
+// for a small expert all bytes, otherwise three windows (head, middle, tail) of
+// GGML_EXPERT_STORE_HASH_WINDOW bytes each, so the check costs a fixed small fraction of the load.
+// Two different experts of one tensor never share a hash in practice; the full-byte integrity of
+// the stored copies is covered separately by ggml_expert_store_verify().
+#define GGML_EXPERT_STORE_HASH_WINDOW (16*1024)
+GGML_API uint64_t ggml_expert_store_hash_expert(const void * data, size_t size);
+
+// Placement check of the loader's layout (the second half of ggml_expert_store_set_source_hash in
+// ggml.h): the loader registered the hash of every global expert of a tensor by tensor name, and
+// the activation of its table registered the table it laid the tensor out by; the store hashed the
+// bytes it received for every local expert. The check maps every local expert of this store's slice
+// to its global expert through that table (the identity for a tensor written in file order, which
+// has to hold the whole expert dim), records the mapping in the store tensor (global_of) and
+// compares the two hashes. A tensor the loader did not register is counted as skipped (not a
+// failure: the store can be filled by other code), a registered expert whose hash differs is a
+// failure. n_checked and n_skipped (optional) receive the counts.
+GGML_API bool ggml_expert_store_verify_placement(
+        ggml_expert_store * store, int tensor_id, const char * tensor_name,
+        int64_t * n_checked, int64_t * n_skipped);
+
+// drop every registered source hash (after all stores verified their placement)
+GGML_API void ggml_expert_store_clear_source_hashes(void);
 
 // register one expert tensor at the placement computed by ggml_expert_store_plan:
 // slot_experts[0..n_slot) are the experts that get slots 0..n_slot-1, the others are packed

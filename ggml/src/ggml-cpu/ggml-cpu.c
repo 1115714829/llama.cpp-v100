@@ -1607,9 +1607,12 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 
-    // expert parallelism: the local weights only cover the experts [expert_offset, expert_offset + n_as),
-    // the other ids are not computed and their output slots stay zero
-    const int32_t expert_offset = ggml_mul_mat_id_get_expert_offset(dst);
+    // expert parallelism: the local weights only cover the experts the expert map of the node
+    // names (ggml_expert_store_node_lut, read below), the other ids are not computed and their
+    // output slots are zeroed
+    const bool    expert_parallel = ggml_mul_mat_id_is_expert_parallel(dst);
+    const int32_t n_expert_total  = expert_parallel ? ggml_mul_mat_id_get_n_expert_total(dst) : n_as;
+    GGML_ASSERT(n_expert_total >= n_as);
 
     void * wdata_cur = params->wdata;
 
@@ -1695,16 +1698,23 @@ static void ggml_compute_forward_mul_mat_id(
         // initialize matrix_row_counts
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
 
+        // the expert map of the node: local expert number of every routing id, -1 for the experts
+        // of the other devices. It is the same row the CUDA kernels read (through a device copy):
+        // identity without expert parallelism, otherwise the row of (device, layer) of the expert
+        // assignment table the weight of the node was laid out by (ggml-impl.h).
+        const int16_t * expert_lut = ggml_expert_store_node_lut(dst);
+        GGML_ASSERT(expert_lut != NULL);
+
         // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
 
                 assert(i02 >= 0);
-                // expert parallelism: the local weights only cover [expert_offset, expert_offset + n_as),
-                // ids of the other devices are valid and their output slots are zeroed below
-                assert(ggml_mul_mat_id_is_expert_parallel(dst) || i02 < n_as);
-                if (i02 < expert_offset || i02 >= expert_offset + n_as) {
+                // expert parallelism: ids of the other devices are valid and their output slots are zeroed below
+                assert(expert_parallel || i02 < n_as);
+                const int32_t local = i02 >= 0 && i02 < n_expert_total ? (int32_t) expert_lut[i02] : -1;
+                if (local < 0) {
                     // this id belongs to another device, zero its output slot
                     char * dst_slot = (char *) dst->data + (iid1*nb2 + id*nb1);
                     for (int64_t i0 = 0; i0 < ne0; ++i0) {
@@ -1716,9 +1726,10 @@ static void ggml_compute_forward_mul_mat_id(
                     }
                     continue;
                 }
+                GGML_ASSERT(local < n_as);
 
-                MMID_MATRIX_ROW(i02 - expert_offset, matrix_row_counts[i02 - expert_offset]) = (struct mmid_row_mapping) {id, iid1};
-                matrix_row_counts[i02 - expert_offset] += 1;
+                MMID_MATRIX_ROW(local, matrix_row_counts[local]) = (struct mmid_row_mapping) {id, iid1};
+                matrix_row_counts[local] += 1;
             }
         }
     }
