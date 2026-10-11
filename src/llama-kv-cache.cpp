@@ -465,17 +465,33 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
 
-        uint32_t new_head = cells.size();
+        // a single-sequence SWA cache is written as a ring (see llama_kv_cells_ring_oldest). Removing the newest
+        // positions, but not all of them (the rejected tail of a speculative round), moves the head back to the
+        // cell of the first removed position, the first freed cell in write order: the freed cells stay one run
+        // at the head also when they straddle the end of the cell array, where the lowest freed index is not
+        // the first freed cell and would leave the others as a hole inside the window
+        const bool ring_tail = swa_type != LLAMA_SWA_TYPE_NONE && n_seq_max == 1 && n_stream == 1 &&
+                               cells.seq_n_cells(seq_id) > 0 &&
+                               p0 > cells.seq_pos_min(seq_id) && p1 > cells.seq_pos_max(seq_id);
 
-        // collect first, as seq_rm() updates seq_pos and would invalidate the iteration
+        uint32_t new_head  = cells.size();
+        uint32_t ring_head = cells.size();
+
+        // collect first, as seq_rm() updates seq_pos and would invalidate the iteration (the cells come in
+        // position order)
         for (const uint32_t i : cells.seq_pos_range(seq_id, p0, p1)) {
             if (cells.seq_rm(i, seq_id)) {
                 new_head = std::min(new_head, i);
+                if (ring_head == cells.size()) {
+                    ring_head = i;
+                }
             }
         }
 
-        // If we freed up a slot, set head to it so searching can start there.
-        if (new_head != cells.size() && new_head < head) {
+        if (ring_tail && ring_head != cells.size()) {
+            head = ring_head;
+        } else if (new_head != cells.size() && new_head < head) {
+            // If we freed up a slot, set head to it so searching can start there.
             head = new_head;
         }
     } else {
@@ -1928,40 +1944,6 @@ bool llama_kv_cache::get_kq_range_reserve() const {
     return n_seq_max == 1 ? n_stream == 1 : n_stream == n_seq_max;
 }
 
-// true if pos[j] == pos[j - 1] + 1 for every j in [j0, j1): a branch-free scan that vectorizes
-static bool kq_range_pos_run_ok(const llama_pos * pos, uint32_t j0, uint32_t j1) {
-    int32_t broken = 0;
-    for (uint32_t j = j0; j < j1; ++j) {
-        broken |= pos[j] != pos[j - 1] + 1;
-    }
-    return !broken;
-}
-
-// true if the positions of the used cells strictly increase by one along the write order of the
-// ring (no shared M-RoPE positions, no holes): the standard SWA window [p1 - n_swa + 1, p1] is then
-// exactly min(n_swa, used) cells and set_input_kq_range can derive it from the cell count alone
-//
-// this runs for every ubatch of the cache (the MTP draft's 32K window: four times a decode round), so
-// the write order is walked as its two contiguous array segments, without a modulo per cell
-static bool kq_range_swa_order_ok(const llama_kv_cells & cells, uint32_t oldest) {
-    const uint32_t n    = cells.get_used();
-    const uint32_t size = cells.size();
-
-    const llama_pos * pos = cells.pos_data();
-
-    if (n < size) {
-        // append-only prefix [0, n): the array order is the write order
-        return kq_range_pos_run_ok(pos, 1, n);
-    }
-
-    // full ring: the write order is oldest, ..., size - 1, 0, ..., oldest - 1
-    if (oldest == 0) {
-        return kq_range_pos_run_ok(pos, 1, size);
-    }
-    return kq_range_pos_run_ok(pos, oldest + 1, size) && pos[0] == pos[size - 1] + 1 &&
-           kq_range_pos_run_ok(pos, 1, oldest);
-}
-
 bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch & ubatch) const {
     if (!kq_range_enabled) {
         return false;
@@ -2000,11 +1982,7 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
 
         const uint32_t n_used = cells.get_used();
 
-        if (n_used == 0 || n_used != cells.used_max_p1()) {
-            return false;
-        }
-
-        if (cells.seq_n_cells(s) != n_used) {
+        if (n_used == 0 || cells.seq_n_cells(s) != n_used) {
             return false;
         }
 
@@ -2018,10 +1996,15 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
                 return false;
             }
 
-            // the ring write order is the position order (see set_input_kq_range)
-            const uint32_t oldest = n_used < cells.size() ? 0 : v_heads[sinfo.strm[0]] % cells.size();
+            // the ring write order is the position order, with the empty cells (if any) right at the
+            // write head: a ring that has not wrapped yet, a full ring, and a full ring whose newest
+            // positions were removed (the rejected tail of a speculative round) all take the range mask,
+            // see llama_kv_cells_ring_oldest and set_input_kq_range
+            return llama_kv_cells_ring_oldest(cells, v_heads[sinfo.strm[0]]) >= 0;
+        }
 
-            return kq_range_swa_order_ok(cells, oldest);
+        if (n_used != cells.used_max_p1()) {
+            return false;
         }
 
         // the range [0, cell + 1) of a token equals its causal mask (see set_input_kq_mask) when the cells are in
@@ -2173,41 +2156,15 @@ void llama_kv_cache::set_input_kq_range(ggml_tensor * dst, const llama_ubatch * 
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        const uint32_t size = cells.size();
-        const uint32_t used = cells.get_used();
-
-        // when the cache is not full the used cells are the prefix [0, used): the write order is the
-        // array order, so the cells available to this token are [0, end]
-        const bool full = used == size;
+        // the cells are in the ring layout of llama_kv_cells_ring_oldest (checked by get_kq_range_ok on the
+        // same state): the cells available to a token run from the oldest cell to its own
+        const int64_t oldest = llama_kv_cells_ring_oldest(cells, v_heads[sinfo.strm[s]]);
+        GGML_ASSERT(oldest >= 0);
 
         for (uint32_t i = 0; i < n_tps; ++i) {
             const uint32_t end = sinfo.idxs[s][i];       // the token's own cell, the newest in the window
-            const uint32_t avail = full ? size : end + 1;
-            const uint32_t span = std::min<uint32_t>(n_swa, avail);
 
-            int32_t * row = data + 4*(s*n_tps + i);
-
-            if (span == 0) {
-                row[0] = 0;
-                row[1] = 0;
-                row[2] = 0;
-                row[3] = 0;
-                continue;
-            }
-
-            const uint32_t start = (end + size - (span - 1)) % size;
-
-            if (start <= end) {
-                row[0] = (int32_t) start;
-                row[1] = (int32_t) end + 1;
-                row[2] = 0;
-                row[3] = 0;
-            } else {
-                row[0] = (int32_t) start;
-                row[1] = (int32_t) size;
-                row[2] = 0;
-                row[3] = (int32_t) end + 1;
-            }
+            llama_kv_cells_ring_window(cells.size(), (uint32_t) oldest, end, n_swa, data + 4*(s*n_tps + i));
         }
     }
 }
