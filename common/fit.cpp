@@ -1163,7 +1163,7 @@ static void common_fit_ep(
     }
 
     // Device memory the runtime adds after the free sample below, budgeted explicitly instead of
-    // being left to the margin (measured growth on 6 x V100, see mimo-runs/margin-report.md):
+    // being left to the margin (measured growth on 6 x V100, see COMMON_FIT_EP_MARGIN_DEFAULT in fit.h):
     //  - comm: the communication contexts of the target and the draft context, measured above;
     //  - page tables: every card maps all device-readable host memory into its page table, 8 bytes
     //    per 4 KiB page: the mapped weights, the pinned host buffers of the contexts and the host
