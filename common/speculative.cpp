@@ -3516,9 +3516,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
     // during catch-up and decodes n_max+1 tokens per step. The draft compute buffer is sized by
     // n_ubatch, so a smaller one keeps it small. n_batch keeps the target value: the h sink of an MTP
     // draft holds two target batch column groups, and the pending columns start behind them.
-    // n_ubatch == 0 keeps the target value (llama_context does the same for the main context)
-    result.n_ubatch = std::min<int32_t>(params_spec.n_ubatch, result.n_batch);
-    result.n_batch  = std::max<int32_t>(result.n_batch, result.n_ubatch);
+    // n_ubatch == 0 (the default) keeps the target -ub, as every draft did before the option existed
+    if (params_spec.n_ubatch > 0) {
+        result.n_ubatch = std::min<int32_t>(params_spec.n_ubatch, result.n_batch);
+    }
+    result.n_batch = std::max<int32_t>(result.n_batch, result.n_ubatch);
 
     // dflash/dspark decode the whole noise block in a single pass and sample every block position on the backend
     // TODO: refactor such properties to be announced by the speculative types

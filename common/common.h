@@ -339,7 +339,7 @@ struct common_params_speculative_draft {
 
     int32_t window = 32768; // the MTP draft layer attends to the last N positions (0 = attend every position)
 
-    int32_t n_ubatch = 512; // physical batch size of the draft context (catch-up replays the target window in batches of this size)
+    int32_t n_ubatch = 0;   // physical batch size of the draft context (catch-up replays the target window in batches of this size); 0 = inherit the target -ub
 
     common_params_model mparams;
 
