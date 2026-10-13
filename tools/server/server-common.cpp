@@ -988,7 +988,10 @@ server_tokens process_mtmd_prompt(
     for (auto & file : files) {
         auto out = mtmd_helper_bitmap_init_from_buf(mctx, file.data(), file.size(), is_placeholder, init_opt);
         if (!out.bitmap) {
-            throw std::runtime_error("Failed to load image or audio file");
+            throw std::runtime_error(
+                "Failed to load multimodal input; check the server log for details. "
+                "Video requires ffmpeg and ffprobe; WebP requires ffmpeg. "
+                "Make them available on PATH or set --video-ffmpeg-dir.");
         }
         bitmaps.entries.emplace_back(out.bitmap);
         if (out.video_ctx) {
