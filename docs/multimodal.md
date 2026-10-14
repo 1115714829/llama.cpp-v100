@@ -7,7 +7,21 @@ llama.cpp supports multimodal input via `libmtmd`. Currently, there are 2 tools 
 
 Currently, we support **image**, **audio** and **video** input.
 
-To enable it, you can use one of the 2 methods below:
+### Runtime dependencies
+
+Most common image formats (including PNG, JPEG, BMP and GIF) are decoded by `stb_image`. WebP and
+video inputs require a build with `MTMD_VIDEO` enabled and the FFmpeg tools available to the
+`llama-server` process. Video decoding requires both `ffmpeg` and `ffprobe`; WebP decoding requires
+`ffmpeg`.
+
+Put the tools on `PATH`, or pass `--video-ffmpeg-dir DIR` (also available as
+`LLAMA_ARG_VIDEO_FFMPEG_DIR`) with the directory containing them. The path must be visible to the
+server process, not just an interactive shell. `--video-fps N` controls video frame sampling
+(default: 4); lowering it reduces processing time and image tokens but may miss brief events.
+
+If media initialization fails, check the server log for the underlying `mtmd` error.
+
+To enable multimodal input, you can use one of the 2 methods below:
 
 - Use `-hf` option with a supported model (see a list of pre-quantized model below)
     - To load a model using `-hf` while disabling multimodal, use `--no-mmproj`
