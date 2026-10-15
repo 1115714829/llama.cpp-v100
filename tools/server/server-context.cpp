@@ -2194,9 +2194,11 @@ private:
             slot.spec_use_rejection = spec && spec_sparse_draft && spec_draft_has_q && common_sampler_can_sparse_reject(slot.smpl.get());
 
             // dchain: at T = 0 the verification takes the argmax of every row from its top-k candidates
-            // on the host, so the full rows of the verified tokens stay on the device as well
+            // on the host, so the full rows of the verified tokens stay on the device as well.
+            // only for a single slot: the top-k output of the context is configured below only when
+            // n_parallel == 1 (it is shared by all slots), with it off the greedy verifier aborts
             slot.spec_greedy_topk = spec && spec_sparse_draft && !slot.spec_use_rejection && !use_backend_sampling &&
-                !need_pre_sample_logits && common_sampler_can_greedy_topk(slot.smpl.get());
+                !need_pre_sample_logits && params_base.n_parallel == 1 && common_sampler_can_greedy_topk(slot.smpl.get());
 
             // the rejection and the greedy top-k verification read only the top-k logits of the verified
             // rows, so they do not have to leave the device; the context setting is shared by the slots,
