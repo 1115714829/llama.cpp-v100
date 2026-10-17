@@ -4,7 +4,7 @@ tilelang_chunk_local_cumsum (flash_qla/ops/utils/cumsum.py), tilelang_kkt_solve
 (flash_qla/ops/gated_delta_rule/chunk/hopper/kkt_solve.py) and tilelang_fused_chunk_gdr_fwd
 (flash_qla/ops/gated_delta_rule/chunk/hopper/fused_fwd.py), as 1Cat-vLLM
 (https://github.com/1CatAI/1Cat-vLLM) builds them for sm_70. FlashQLA is under the license below;
-the TileLang templates are under ggml/src/ggml-cuda/gdn-chunk-sm70/LICENSE-tilelang and 1Cat-vLLM
+the TileLang templates are under licenses/LICENSE-tilelang and 1Cat-vLLM
 under licenses/LICENSE-1Cat-vLLM.
 
 MIT License

@@ -2,7 +2,7 @@
 //
 // Adapted from 1Cat-vLLM csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu (Apache-2.0). The QPN8
 // execution layout is derived from dnv2003/v100-skinny (MIT) and its block-scale adaptation
-// in haohervchb/sglang-V100. See LICENSE.v100-skinny in this directory.
+// in haohervchb/sglang-V100. See licenses/LICENSE-v100-skinny in the repository root.
 
 #pragma once
 

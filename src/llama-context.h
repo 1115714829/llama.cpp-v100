@@ -314,6 +314,10 @@ struct llama_context {
 
     const std::vector<std::pair<std::string, ggml_tensor *>> & get_memory_tensors() const;
 
+    // connect the collectives of the prefill graph on the communication context of a tensor split
+    // (ggml_backend_meta_comm_connect), see llama_internal_comm_connect
+    void comm_connect();
+
     //
     // training
     //
@@ -647,6 +651,11 @@ private:
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+
+    // the collectives of the reserved prefill graph (sched_reserve), for comm_connect: the elements
+    // of one all-reduce of the hidden state and of the largest reduce-scatter (0: none)
+    int64_t comm_ne_allreduce      = 0;
+    int64_t comm_ne_reduce_scatter = 0;
 
     // Separate arenas give batches with different graph layouts distinct CUDA graph cache keys:
     // by outputs for regular contexts, by input kind (embd/token) for DFlash drafts,

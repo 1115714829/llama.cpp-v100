@@ -913,6 +913,17 @@ void llama_context::sched_reserve() {
         n_nodes_pp         = ggml_graph_n_nodes(gf);
         n_inputs_pp        = get_gf_res_reserve()->inputs.size();
         n_input_tensors_pp = this->n_input_tensors;
+
+        // the collectives this graph runs under a tensor split: the all-reduces of the hidden state
+        // and the reduce-scatters of sequence parallelism (llama_internal_comm_connect)
+        comm_ne_allreduce      = (int64_t) model.hparams.n_embd * n_tokens_pp;
+        comm_ne_reduce_scatter = 0;
+        for (int i = 0; i < n_nodes_pp; ++i) {
+            const ggml_tensor * node = ggml_graph_node(gf, i);
+            if (node->op == GGML_OP_SEQ_SCATTER) {
+                comm_ne_reduce_scatter = std::max(comm_ne_reduce_scatter, ggml_nelements(node->src[0]));
+            }
+        }
     }
 
     // reserve with tg (token generation) graph to get the number of splits and nodes
@@ -2701,6 +2712,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ggml_backend_sched_pipeline_wait_next_stage(sched_cur);
         }
 
+        LLAMA_LOG_DEBUG("%s: ctx=%s slot=%d sched=%s gtype=%d n_tokens=%u n_outputs=%d REBUILD graph\n",
+                __func__, cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "dft" : "tgt",
+                slot, sched_cur == sched_dec.get() ? "sched_dec" : (sched_slot0 && sched_cur == sched_slot0.get() ? "sched_slot0" : "sched"),
+                (int) gtype, ubatch.n_tokens, n_outputs);
+
         res->reset();
 
         ggml_backend_sched_reset(sched_cur);
@@ -3303,9 +3319,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // the host reads no raw logits of this decode when the context declared that it never does
     // (logits_topk_only: the MTP draft reads its top-k rows or its device ring) or when a batch with
-    // several outputs has the top-k output on (only the top-k rows are copied, see llama_set_logits_topk)
+    // several outputs has the top-k output on (only the top-k rows are copied, see llama_set_logits_topk).
+    // the latter only with a single sequence: the setting is per context, and with several sequences a
+    // batch mixes the rows of requests that read their top-k rows with rows of requests that need the
+    // full ones (another sampler, n_probs, no speculation), so the full rows are copied as well
     const bool logits_host_off = cparams.logits_topk_only ||
-        (cparams.logits_topk > 0 && cparams.logits_topk_active && n_outputs_all > 1);
+        (cparams.logits_topk > 0 && cparams.logits_topk_active && n_outputs_all > 1 && cparams.n_seq_max == 1);
     logits_full = !logits_host_off;
 
     // the output buffers of this decode are being refilled
@@ -5274,6 +5293,17 @@ llama_memory_breakdown llama_context::memory_breakdown() const {
     return ret;
 }
 
+void llama_context::comm_connect() {
+    if (comm_ne_allreduce <= 0) {
+        return;
+    }
+    for (ggml_backend_t backend : backend_ptrs) {
+        if (ggml_backend_dev_is_meta(ggml_backend_get_device(backend))) {
+            ggml_backend_meta_comm_connect(backend, comm_ne_allreduce, comm_ne_reduce_scatter);
+        }
+    }
+}
+
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_context::get_memory_tensors() const {
     return memory_tensors;
 }
@@ -6419,6 +6449,10 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
 
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_memory_tensors(const struct llama_context * ctx) {
     return ctx->get_memory_tensors();
+}
+
+void llama_internal_comm_connect(struct llama_context * ctx) {
+    ctx->comm_connect();
 }
 
 llama_context * llama_get_ctx_other(struct llama_context * ctx) {

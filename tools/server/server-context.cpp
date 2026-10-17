@@ -1215,7 +1215,7 @@ private:
         }
 
         // optionally fit mmproj memory usage
-        if (has_mmproj && params_base.fit_params) {
+        if (has_mmproj && params_base.fit_params && params_base.fit_mmproj) {
             const auto & mmproj_mem = mmproj_usage.backend_mem_usage;
             const int64_t t_elapsed = mmproj_usage_t_us;
             if (!mmproj_mem.empty()) {
@@ -2199,9 +2199,11 @@ private:
                 !need_pre_sample_logits && common_sampler_can_greedy_topk(slot.smpl.get());
 
             // the rejection and the greedy top-k verification read only the top-k logits of the verified
-            // rows, so they do not have to leave the device; the context setting is shared by the slots,
-            // hence a single slot only
-            if (params_base.n_parallel == 1) {
+            // rows. the setting is per context: with a single slot the full rows of the verification then
+            // stay on the device; with several slots k only grows to the largest one a slot needs (a smaller
+            // or zero k keeps the graph and its top-k rows) and the full rows are still copied for the slots
+            // that read them (see llama_set_logits_topk), so the verification takes the same path at any -np
+            {
                 int32_t k = 0;
                 if (slot.spec_use_rejection && !use_backend_sampling && !need_pre_sample_logits) {
                     k = common_sampler_sparse_k(slot.smpl.get());
@@ -2216,10 +2218,9 @@ private:
             slot.smpl.reset();
 
             // a task without sampling (decision, embedding, rerank) reads the full rows of its outputs, so
-            // the top-k output of a previous request must not stay on for it (k = 0 keeps the graph)
-            if (params_base.n_parallel == 1) {
-                llama_set_logits_topk(ctx_tgt, 0);
-            }
+            // the top-k output of a previous request must not stay on for it (k = 0 keeps the graph; with
+            // several slots the full rows are copied anyway)
+            llama_set_logits_topk(ctx_tgt, 0);
         }
 
         // the per-request limit takes priority over the global one

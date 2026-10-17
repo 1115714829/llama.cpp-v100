@@ -4,6 +4,8 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <type_traits>
 
@@ -1203,6 +1205,618 @@ static void mul_mat_vec_q_moe_launch(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Compacted MUL_MAT_ID kernels for the decode and verify batches (the MMVQ mmid window).
+//
+// mul_mat_vec_q_moe launches one block per (row pair, slot) with one warp per token. Under expert
+// parallelism a warp whose expert lives on another device only writes zeros: with 4..6 devices
+// 75..83% of the warps of the 6400 (gate_up, 1280 rows) and 12800 (down, 2560 rows) blocks of a
+// verify step do no dot product, so about a quarter of the resident warps stream weights and the
+// down projection (K = 640: two loop trips per row) does not reach the DRAM bandwidth. The kernels
+// below build the list of the (token, slot) pairs whose expert is local once per block from ids,
+// and walk a fixed grid over (local pair, row group) items: every resident warp has rows to stream
+// and the block count no longer scales with the slots of other devices.
+//
+// Every row is still reduced by one warp exactly as in mul_mat_vec_q_moe: lane l accumulates the
+// blocks kbx = l/(qi/vdr) + i*blocks_per_iter in order, then warp_reduce_sum. The results are bit
+// identical to mul_mat_vec_q_moe at any token count. For a plain (no epilogue) launch with one
+// token the other path is mul_mat_vec_q<type, 1>; it is bit identical as well as long as its K loop
+// is a single trip (mmvq_moe_single_trip): warp w of that kernel covers exactly the blocks of trip
+// w of the one-warp loop and its block reduction adds the warps in order, with plain additions of
+// rounded vec_dot results, so that launch sums its trips with __fadd_rn (mmvq_moe_rows, n1).
+// ---------------------------------------------------------------------------------------------
+
+// MMVQ_MMID_MAX_BATCH_SIZE tokens times 32 slots
+#define MMVQ_MOE_MAX_PAIRS 512
+
+enum mmvq_moe_out {
+    MMVQ_MOE_OUT_F32  = 0, // dst[token][slot][row] F32, zero rows for the slots of other devices
+    MMVQ_MOE_OUT_H16  = 1, // SwiGLU epilogue: dst[token][slot][row/2] = F16 silu(gate) * up, zero rows likewise
+    MMVQ_MOE_OUT_H16L = 2, // the same H rows for the local slots only (a private buffer of the fused MoE FFN)
+};
+
+// The (token, slot) pairs of the launch: the local ones first, then (with_nonlocal) the others,
+// each group in (token, slot) order. Every block builds the same list; the order only decides
+// which block takes which item. s_expert is the local expert number of a local pair (the expert
+// map of the launch, as in mul_mat_vec_q_moe). Returns the number of local pairs.
+static __device__ __forceinline__ int mmvq_moe_build_pairs(
+        const int32_t * __restrict__ ids, const int ids_stride, const int n_tokens, const int n_used,
+        const ggml_cuda_expert_lut & lut, uint16_t * s_pair, uint16_t * s_expert,
+        int * s_scan, const bool with_nonlocal) {
+    const int lane     = threadIdx.x;
+    const int warp     = threadIdx.y;
+    const int nwarps   = blockDim.y;
+    const int nthreads = nwarps*WARP_SIZE;
+    const int n_pairs  = n_tokens*n_used;
+
+    int n_local = 0;
+    for (int pass = 0; pass < (with_nonlocal ? 2 : 1); ++pass) {
+        int base = n_local;
+        for (int p0 = 0; p0 < n_pairs; p0 += nthreads) {
+            const int p = p0 + warp*WARP_SIZE + lane;
+            bool take = false;
+            int  el   = -1;
+            if (p < n_pairs) {
+                const int t = p / n_used;
+                const int s = p - t*n_used;
+                el = ggml_cuda_expert_local(lut, ids[s + t*ids_stride]);
+                take = pass == 0 ? el >= 0 : el < 0;
+            }
+            const uint32_t m = __ballot_sync(0xffffffff, take);
+            if (lane == 0) {
+                s_scan[warp] = __popc(m);
+            }
+            __syncthreads();
+            int off = base;
+            int tot = 0;
+            for (int w = 0; w < nwarps; ++w) {
+                const int c = s_scan[w];
+                off += w < warp ? c : 0;
+                tot += c;
+            }
+            if (take) {
+                const int idx = off + __popc(m & ((1u << lane) - 1u));
+                s_pair[idx]   = (uint16_t) p;
+                s_expert[idx] = (uint16_t) (el < 0 ? 0 : el);
+            }
+            base += tot;
+            __syncthreads();
+        }
+        if (pass == 0) {
+            n_local = base;
+        }
+    }
+    return n_local;
+}
+
+// R consecutive rows of one (expert, token) pair, reduced by the calling warp in the order of
+// mul_mat_vec_q_moe (see above). kbx_row0 is the block index of the first row within vx.
+// n1: the rounding of mul_mat_vec_q<type, 1> instead (one token, no epilogue). Its K loop is a single
+// trip (the callers check it), so every thread holds one rounded vec_dot result and the results of
+// the other warps are added with plain additions; here the trips are summed with __fadd_rn, which is
+// never contracted into an FMA with the product that ends some vec_dots (Q8_0: d8_0*d8_1*sumi). With
+// tmp += vec_dot the compiler fuses that product into the accumulation, as it does in
+// mul_mat_vec_q_moe, which is what the other launches have to reproduce.
+template <ggml_type type, int R, bool n1 = false>
+static __device__ __forceinline__ void mmvq_moe_rows(
+        const void * __restrict__ vx, const block_q8_1 * __restrict__ y, const int kbx_row0,
+        const int stride_row_x, const int blocks_per_row_x, float (&tmp)[R]) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int blocks_per_iter = vdr * WARP_SIZE / qi;
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+        tmp[i] = 0.0f;
+    }
+    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (threadIdx.x % (qi/vdr));
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            if constexpr (n1) {
+                tmp[i] = __fadd_rn(tmp[i], vec_dot_q_cuda(vx, &y[kby], kbx_row0 + i*stride_row_x + kbx, kqs));
+            } else {
+                tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_row0 + i*stride_row_x + kbx, kqs);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+        tmp[i] = warp_reduce_sum<WARP_SIZE>(tmp[i]);
+    }
+}
+
+// One item = R*W rows (W warps of R rows) of one (token, slot) pair. nrows_x is a multiple of R.
+// Four blocks per SM (at most 64 registers; no spills on the types below at R = 2).
+// n1: a one-token launch without an epilogue, which replaces mul_mat_vec_q<type, 1> (see mmvq_moe_rows).
+template <ggml_type type, int R, int W, mmvq_moe_out out, bool n1>
+__launch_bounds__(W*WARP_SIZE, 4)
+static __global__ void mul_mat_vec_q_moe_compact(
+        const void * __restrict__ vx_base, const char * const * __restrict__ expert_ptrs,
+        const void * __restrict__ vy, const int32_t * __restrict__ ids, void * __restrict__ dst_ptr,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_channel_x,
+        const int nchannels_y, const int stride_col_y, const int stride_channel_y,
+        const int stride_col_dst, const int stride_channel_dst,
+        const int n_tokens, const int n_used, const int ids_stride,
+        const ggml_cuda_expert_lut lut) {
+    static_assert(out == MMVQ_MOE_OUT_F32 || R % 2 == 0, "the SwiGLU epilogue pairs rows 2r and 2r+1 inside one warp");
+    static_assert(!n1 || out == MMVQ_MOE_OUT_F32, "a launch with the SwiGLU epilogue replaces mul_mat_vec_q_moe at any width");
+    constexpr int  qk            = ggml_cuda_type_traits<type>::qk;
+    constexpr bool zero_nonlocal = out != MMVQ_MOE_OUT_H16L;
+
+    __shared__ uint16_t s_pair[MMVQ_MOE_MAX_PAIRS];
+    __shared__ uint16_t s_expert[MMVQ_MOE_MAX_PAIRS];
+    __shared__ int      s_scan[W];
+
+    const int n_local = mmvq_moe_build_pairs(ids, ids_stride, n_tokens, n_used, lut,
+        s_pair, s_expert, s_scan, zero_nonlocal);
+
+    constexpr int rows_per_item = R*W;
+    const int n_groups         = (nrows_x + rows_per_item - 1) / rows_per_item;
+    const int blocks_per_row_x = ncols_x / qk;
+    const int n_items_compute  = n_local*n_groups;
+    const int n_items          = zero_nonlocal ? n_tokens*n_used*n_groups : n_items_compute;
+
+    for (int item = blockIdx.x; item < n_items; item += gridDim.x) {
+        const int pl   = item / n_groups;
+        const int g    = item - pl*n_groups;
+        const int p    = s_pair[pl];
+        const int t    = p / n_used;
+        const int s    = p - t*n_used;
+        const int row0 = g*rows_per_item + threadIdx.y*R;
+        if (row0 >= nrows_x) {
+            continue;
+        }
+
+        if constexpr (zero_nonlocal) {
+            if (item >= n_items_compute) {
+                // a slot routed to another device: zero rows, as mul_mat_vec_q_moe writes them
+                if constexpr (out == MMVQ_MOE_OUT_F32) {
+                    if (threadIdx.x < R) {
+                        ((float *) dst_ptr)[s*stride_channel_dst + t*stride_col_dst + row0 + threadIdx.x] = 0.0f;
+                    }
+                } else {
+                    if (threadIdx.x < R/2) {
+                        ((half *) dst_ptr)[s*stride_channel_dst + t*stride_col_dst + row0/2 + threadIdx.x] = __float2half(0.0f);
+                    }
+                }
+                continue;
+            }
+        }
+
+        const int          el       = s_expert[pl];
+        const void *       vx       = expert_ptrs != nullptr ? (const void *) expert_ptrs[el] : vx_base;
+        const int          kbx_row0 = (expert_ptrs != nullptr ? 0 : el*stride_channel_x) + row0*stride_row_x;
+        const block_q8_1 * y        = (const block_q8_1 *) vy + (s % nchannels_y)*stride_channel_y + t*stride_col_y;
+
+        float tmp[R];
+        mmvq_moe_rows<type, R, n1>(vx, y, kbx_row0, stride_row_x, blocks_per_row_x, tmp);
+
+        if constexpr (out == MMVQ_MOE_OUT_F32) {
+            float * dst = (float *) dst_ptr + s*stride_channel_dst + t*stride_col_dst + row0;
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                if (threadIdx.x == i) {
+                    dst[i] = tmp[i];
+                }
+            }
+        } else {
+            half * dst = (half *) dst_ptr + s*stride_channel_dst + t*stride_col_dst + row0/2;
+#pragma unroll
+            for (int i = 0; i < R/2; ++i) {
+                if (threadIdx.x == i) {
+                    // the epilogue of mul_mat_vec_q_moe: gate row 2r, up row 2r+1, F16 H
+                    dst[i] = __float2half(ggml_cuda_op_silu_single(tmp[2*i]) * tmp[2*i + 1]);
+                }
+            }
+        }
+    }
+}
+
+struct mmvq_moe_args {
+    const void *         vx;
+    const char * const * expert_ptrs;
+    const void *         vy;
+    const int32_t *      ids;
+    void *               dst;
+    int ncols_x;
+    int nrows_x;
+    int stride_row_x;
+    int stride_channel_x;
+    int nchannels_y;
+    int stride_col_y;
+    int stride_channel_y;
+    int stride_col_dst;
+    int stride_channel_dst;
+    int n_tokens;
+    int n_used;
+    int ids_stride;
+    ggml_cuda_expert_lut lut; // expert map of the launch (identity without expert parallelism)
+};
+
+// Two rows per warp, as mul_mat_vec_q_moe, and four 8-warp blocks per SM (__launch_bounds__): 32
+// resident warps that all stream weights. Eight rows per warp (110 registers on Q4_K) leave two
+// blocks per SM and stop at 41..54% of the DRAM bandwidth (ncu on V100).
+#define MMVQ_MOE_COMPACT_R 2
+#define MMVQ_MOE_COMPACT_W 8
+
+static int mmvq_moe_blocks_per_sm(const void * kernel, const int threads, const size_t smem) {
+    int n = 0;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, kernel, threads, smem));
+    return n > 0 ? n : 1;
+}
+
+// A fixed grid: as many blocks as fit on the device at once, at most one per item of the largest
+// possible launch (every slot local). The occupancy query runs once per kernel and device.
+template <ggml_type type, mmvq_moe_out out, bool n1>
+static void mul_mat_vec_q_moe_compact_launch_n1(const mmvq_moe_args & a, cudaStream_t stream) {
+    constexpr int R = MMVQ_MOE_COMPACT_R;
+    constexpr int W = MMVQ_MOE_COMPACT_W;
+    static std::atomic<int> blocks_per_sm[GGML_CUDA_MAX_DEVICES];
+
+    const int device = ggml_cuda_get_device();
+    int bps = blocks_per_sm[device].load(std::memory_order_relaxed);
+    if (bps == 0) {
+        bps = mmvq_moe_blocks_per_sm((const void *) mul_mat_vec_q_moe_compact<type, R, W, out, n1>, W*WARP_SIZE, 0);
+        blocks_per_sm[device].store(bps, std::memory_order_relaxed);
+    }
+    const int n_groups    = (a.nrows_x + R*W - 1) / (R*W);
+    const int n_items_max = a.n_tokens*a.n_used*n_groups;
+    const int nblocks     = std::max(1, std::min(n_items_max, ggml_cuda_info().devices[device].nsm*bps));
+
+    mul_mat_vec_q_moe_compact<type, R, W, out, n1><<<nblocks, dim3(WARP_SIZE, W, 1), 0, stream>>>(
+        a.vx, a.expert_ptrs, a.vy, a.ids, a.dst,
+        a.ncols_x, a.nrows_x, a.stride_row_x, a.stride_channel_x,
+        a.nchannels_y, a.stride_col_y, a.stride_channel_y,
+        a.stride_col_dst, a.stride_channel_dst,
+        a.n_tokens, a.n_used, a.ids_stride, a.lut);
+}
+
+// The F32 rows of a one-token launch replace mul_mat_vec_q<type, 1> and take its rounding; every
+// other launch (wider, or with the SwiGLU epilogue at any width) replaces mul_mat_vec_q_moe.
+template <ggml_type type, mmvq_moe_out out>
+static void mul_mat_vec_q_moe_compact_launch(const mmvq_moe_args & a, cudaStream_t stream) {
+    if constexpr (out == MMVQ_MOE_OUT_F32) {
+        if (a.n_tokens == 1) {
+            mul_mat_vec_q_moe_compact_launch_n1<type, out, true>(a, stream);
+            return;
+        }
+    }
+    mul_mat_vec_q_moe_compact_launch_n1<type, out, false>(a, stream);
+}
+
+template <mmvq_moe_out out>
+static void mul_mat_vec_q_moe_compact_switch_type(const ggml_type type, const mmvq_moe_args & a, cudaStream_t stream) {
+    switch (type) {
+        case GGML_TYPE_Q1_0: mul_mat_vec_q_moe_compact_launch<GGML_TYPE_Q1_0, out>(a, stream); break;
+        case GGML_TYPE_Q2_0: mul_mat_vec_q_moe_compact_launch<GGML_TYPE_Q2_0, out>(a, stream); break;
+        case GGML_TYPE_Q4_0: mul_mat_vec_q_moe_compact_launch<GGML_TYPE_Q4_0, out>(a, stream); break;
+        case GGML_TYPE_Q4_1: mul_mat_vec_q_moe_compact_launch<GGML_TYPE_Q4_1, out>(a, stream); break;
+        case GGML_TYPE_Q5_0: mul_mat_vec_q_moe_compact_launch<GGML_TYPE_Q5_0, out>(a, stream); break;
+        case GGML_TYPE_Q5_1: mul_mat_vec_q_moe_compact_launch<GGML_TYPE_Q5_1, out>(a, stream); break;
+        case GGML_TYPE_Q8_0: mul_mat_vec_q_moe_compact_launch<GGML_TYPE_Q8_0, out>(a, stream); break;
+        case GGML_TYPE_Q4_K: mul_mat_vec_q_moe_compact_launch<GGML_TYPE_Q4_K, out>(a, stream); break;
+        case GGML_TYPE_Q5_K: mul_mat_vec_q_moe_compact_launch<GGML_TYPE_Q5_K, out>(a, stream); break;
+        case GGML_TYPE_Q6_K: mul_mat_vec_q_moe_compact_launch<GGML_TYPE_Q6_K, out>(a, stream); break;
+        default:
+            GGML_ABORT("%s: type %s has no compact MoE kernel", __func__, ggml_type_name(type));
+    }
+}
+
+// The down projection followed by the weighted sum over the slots (moe_weighted_reduction_f32),
+// dst[token][row] F32. Every block works on one token (block b takes token b % n_tokens; the grid is
+// a multiple of n_tokens). Once per block it reads the expert map of the slots of the token and
+// quantizes the activation rows of its local slots (F16 or F32) into shared memory with the lanes,
+// reductions and rounding of quantize_q8_1, so the dot products read the q8_1 blocks
+// quantize_row_q8_1_cuda writes for the (converted) activation, as mul_mat_vec_q_moe does: no
+// conversion and no quantization launch in front of the down projection. Then it walks its items:
+// one item = RP row pairs of the token with all of its local slots. The (local slot, row pair) units
+// of an item go round robin over the W warps, and every unit is two rows reduced by one warp exactly
+// as in mul_mat_vec_q_moe (mmvq_moe_rows); the slots are summed in order per row afterwards.
+// An item has RP = W row pairs, so with the one or two local slots a token has under expert
+// parallelism every warp takes one row pair per slot (ggml_cuda_mmvq_moe_sparse).
+#define MMVQ_MOE_REDUCE_MAX_USED 16
+#define MMVQ_MOE_REDUCE_W 8
+
+template <ggml_type type, int RP, int W, typename act_t, bool n1>
+__launch_bounds__(W*WARP_SIZE, 4)
+static __global__ void mul_mat_vec_q_moe_reduce(
+        const void * __restrict__ vx_base, const char * const * __restrict__ expert_ptrs,
+        const act_t * __restrict__ act, const int64_t s_act_slot, const int64_t s_act_tok, const int nchannels_act,
+        const int32_t * __restrict__ ids, const float * __restrict__ weights, const float * __restrict__ expert_scale,
+        float * __restrict__ dst,
+        const int ncols_x, const int nrows_x, const int stride_row_x, const int stride_channel_x,
+        const int stride_col_dst, const int n_tokens, const int n_used, const int ids_stride,
+        const ggml_cuda_expert_lut lut) {
+    constexpr int R             = 2; // rows of a unit
+    constexpr int rows_per_item = R*RP;
+    constexpr int QT            = 4; // quantization tasks of a warp in flight
+    static_assert(rows_per_item <= W*WARP_SIZE, "the epilogue gives every row of an item its own thread");
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+
+    extern __shared__ char mmvq_moe_reduce_smem_raw[];
+    block_q8_1 * s_y = (block_q8_1 *) mmvq_moe_reduce_smem_raw; // [n_used][ncols_x/QK8_1]
+    __shared__ float    s_res[MMVQ_MOE_REDUCE_MAX_USED][rows_per_item];
+    __shared__ int      s_e[MMVQ_MOE_REDUCE_MAX_USED];    // local expert of a slot
+    __shared__ int      s_slot[MMVQ_MOE_REDUCE_MAX_USED]; // slot of the k-th local slot
+    __shared__ uint32_t s_mask;
+
+    const int blocks_per_row_y = ncols_x / QK8_1;
+    const int blocks_per_row_x = ncols_x / qk;
+    const int n_groups         = (nrows_x + rows_per_item - 1) / rows_per_item;
+    const int t                = blockIdx.x % n_tokens;
+
+    if (threadIdx.y == 0) {
+        bool local = false;
+        if ((int) threadIdx.x < n_used) {
+            // the expert map of the launch, as in mul_mat_vec_q_moe
+            const int el = ggml_cuda_expert_local(lut, ids[threadIdx.x + t*ids_stride]);
+            local = el >= 0;
+            s_e[threadIdx.x] = el;
+        }
+        const uint32_t m = __ballot_sync(0xffffffff, local);
+        if (local) {
+            s_slot[__popc(m & ((1u << threadIdx.x) - 1u))] = threadIdx.x;
+        }
+        if (threadIdx.x == 0) {
+            s_mask = m;
+        }
+    }
+    __syncthreads();
+    const uint32_t mask    = s_mask;
+    const int      n_local = __popc(mask);
+
+    // quantize_q8_1 on the activation rows of the local slots: one q8_1 block per warp task, lane l
+    // takes value l of the block (the element order of the 32 lanes of quantize_q8_1); QT tasks per
+    // pass, so that their loads and reductions overlap
+    const int n_tasks = n_local*blocks_per_row_y;
+    for (int task0 = threadIdx.y; task0 < n_tasks; task0 += QT*W) {
+        float xi[QT];
+        int   yb_idx[QT];
+#pragma unroll
+        for (int u = 0; u < QT; ++u) {
+            const int task = task0 + u*W;
+            xi[u]     = 0.0f;
+            yb_idx[u] = -1;
+            if (task < n_tasks) {
+                const int k = task / blocks_per_row_y;
+                const int b = task - k*blocks_per_row_y;
+                const int s = s_slot[k];
+                xi[u]     = (float) act[t*s_act_tok + (s % nchannels_act)*s_act_slot + b*QK8_1 + threadIdx.x];
+                yb_idx[u] = s*blocks_per_row_y + b;
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < QT; ++u) {
+            const float amax = warp_reduce_max<QK8_1>(fabsf(xi[u]));
+            const float sum  = warp_reduce_sum<QK8_1>(xi[u]);
+
+            const float  d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(xi[u] / d);
+
+            if (yb_idx[u] >= 0) {
+                block_q8_1 * yb = s_y + yb_idx[u];
+                yb->qs[threadIdx.x] = q;
+                if (threadIdx.x == 0) {
+                    yb->ds = make_half2(d, sum);
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    const int n_units = n_local*RP;
+    for (int g = blockIdx.x / n_tokens; g < n_groups; g += gridDim.x / n_tokens) {
+        for (int unit = threadIdx.y; unit < n_units; unit += W) {
+            const int k    = unit / RP;
+            const int rp   = unit - k*RP;
+            const int row0 = g*rows_per_item + rp*R;
+            if (row0 < nrows_x) {
+                const int    s        = s_slot[k];
+                const int    el       = s_e[s];
+                const void * vx       = expert_ptrs != nullptr ? (const void *) expert_ptrs[el] : vx_base;
+                const int    kbx_row0 = (expert_ptrs != nullptr ? 0 : el*stride_channel_x) + row0*stride_row_x;
+
+                float tmp[R];
+                mmvq_moe_rows<type, R, n1>(vx, s_y + s*blocks_per_row_y, kbx_row0, stride_row_x, blocks_per_row_x, tmp);
+#pragma unroll
+                for (int i = 0; i < R; ++i) {
+                    if (threadIdx.x == i) {
+                        s_res[s][rp*R + i] = tmp[i];
+                    }
+                }
+            }
+        }
+        __syncthreads();
+
+        // moe_weighted_reduction_f32 on the row: the slots in order, a slot of another device is the
+        // zero row mul_mat_vec_q_moe would have written
+        const int r   = threadIdx.y*WARP_SIZE + threadIdx.x;
+        const int row = g*rows_per_item + r;
+        if (r < rows_per_item && row < nrows_x) {
+            const uint64_t first_row   = (uint64_t) t * n_used;
+            const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
+            const float    e0          = (mask & 1u) ? s_res[0][r] : 0.0f;
+            float          sum         = (e0 * first_scale) * weights[first_row];
+
+            for (int expert = 1; expert < n_used; ++expert) {
+                const uint64_t row_w = first_row + expert;
+                const float    scale = expert_scale != nullptr ? expert_scale[row_w] : 1.0f;
+                const float    e     = ((mask >> expert) & 1u) ? s_res[expert][r] : 0.0f;
+                sum += (e * scale) * weights[row_w];
+            }
+            dst[t*stride_col_dst + row] = sum;
+        }
+        __syncthreads();
+    }
+}
+
+struct mmvq_moe_reduce_args {
+    const void *         vx;
+    const char * const * expert_ptrs;
+    const void *         act;
+    int64_t              s_act_slot;
+    int64_t              s_act_tok;
+    int                  nchannels_act;
+    const int32_t *      ids;
+    const float *        weights;
+    const float *        expert_scale;
+    float *              dst;
+    int ncols_x;
+    int nrows_x;
+    int stride_row_x;
+    int stride_channel_x;
+    int stride_col_dst;
+    int n_tokens;
+    int n_used;
+    int ids_stride;
+    ggml_cuda_expert_lut lut; // expert map of the launch (identity without expert parallelism)
+};
+
+static size_t mmvq_moe_reduce_smem(const int64_t ncols_x, const int64_t n_used) {
+    return (size_t) n_used * (size_t) (ncols_x / QK8_1) * sizeof(block_q8_1);
+}
+
+template <ggml_type type, typename act_t, bool n1>
+static void mul_mat_vec_q_moe_reduce_launch_n1(const mmvq_moe_reduce_args & a, cudaStream_t stream) {
+    constexpr int W  = MMVQ_MOE_REDUCE_W;
+    constexpr int RP = MMVQ_MOE_REDUCE_W;
+    static std::atomic<int>    blocks_per_sm[GGML_CUDA_MAX_DEVICES];
+    static std::atomic<size_t> blocks_per_sm_smem[GGML_CUDA_MAX_DEVICES];
+
+    const int    device = ggml_cuda_get_device();
+    const size_t smem   = mmvq_moe_reduce_smem(a.ncols_x, a.n_used);
+    int bps = blocks_per_sm[device].load(std::memory_order_relaxed);
+    if (bps == 0 || blocks_per_sm_smem[device].load(std::memory_order_relaxed) != smem) {
+        bps = mmvq_moe_blocks_per_sm((const void *) mul_mat_vec_q_moe_reduce<type, RP, W, act_t, n1>, W*WARP_SIZE, smem);
+        blocks_per_sm_smem[device].store(smem, std::memory_order_relaxed);
+        blocks_per_sm[device].store(bps, std::memory_order_relaxed);
+    }
+    // a fixed grid of at most one block per item, a multiple of the token count: every block keeps
+    // one token, so it reads the expert map and quantizes the activation of that token once
+    const int n_items = a.n_tokens*((a.nrows_x + 2*RP - 1) / (2*RP));
+    int nblocks = std::min(n_items, ggml_cuda_info().devices[device].nsm*bps);
+    nblocks = std::max(a.n_tokens, nblocks - nblocks % a.n_tokens);
+
+    mul_mat_vec_q_moe_reduce<type, RP, W, act_t, n1><<<nblocks, dim3(WARP_SIZE, W, 1), smem, stream>>>(
+        a.vx, a.expert_ptrs, (const act_t *) a.act, a.s_act_slot, a.s_act_tok, a.nchannels_act,
+        a.ids, a.weights, a.expert_scale, a.dst,
+        a.ncols_x, a.nrows_x, a.stride_row_x, a.stride_channel_x, a.stride_col_dst,
+        a.n_tokens, a.n_used, a.ids_stride, a.lut);
+}
+
+// A one-token launch replaces mul_mat_vec_q<type, 1> and takes its rounding (see mmvq_moe_rows).
+template <ggml_type type, typename act_t>
+static void mul_mat_vec_q_moe_reduce_launch(const mmvq_moe_reduce_args & a, cudaStream_t stream) {
+    if (a.n_tokens == 1) {
+        mul_mat_vec_q_moe_reduce_launch_n1<type, act_t, true>(a, stream);
+    } else {
+        mul_mat_vec_q_moe_reduce_launch_n1<type, act_t, false>(a, stream);
+    }
+}
+
+template <typename act_t>
+static void mul_mat_vec_q_moe_reduce_switch_type(const ggml_type type, const mmvq_moe_reduce_args & a, cudaStream_t stream) {
+    switch (type) {
+        case GGML_TYPE_Q1_0: mul_mat_vec_q_moe_reduce_launch<GGML_TYPE_Q1_0, act_t>(a, stream); break;
+        case GGML_TYPE_Q2_0: mul_mat_vec_q_moe_reduce_launch<GGML_TYPE_Q2_0, act_t>(a, stream); break;
+        case GGML_TYPE_Q4_0: mul_mat_vec_q_moe_reduce_launch<GGML_TYPE_Q4_0, act_t>(a, stream); break;
+        case GGML_TYPE_Q4_1: mul_mat_vec_q_moe_reduce_launch<GGML_TYPE_Q4_1, act_t>(a, stream); break;
+        case GGML_TYPE_Q5_0: mul_mat_vec_q_moe_reduce_launch<GGML_TYPE_Q5_0, act_t>(a, stream); break;
+        case GGML_TYPE_Q5_1: mul_mat_vec_q_moe_reduce_launch<GGML_TYPE_Q5_1, act_t>(a, stream); break;
+        case GGML_TYPE_Q8_0: mul_mat_vec_q_moe_reduce_launch<GGML_TYPE_Q8_0, act_t>(a, stream); break;
+        case GGML_TYPE_Q4_K: mul_mat_vec_q_moe_reduce_launch<GGML_TYPE_Q4_K, act_t>(a, stream); break;
+        case GGML_TYPE_Q5_K: mul_mat_vec_q_moe_reduce_launch<GGML_TYPE_Q5_K, act_t>(a, stream); break;
+        case GGML_TYPE_Q6_K: mul_mat_vec_q_moe_reduce_launch<GGML_TYPE_Q6_K, act_t>(a, stream); break;
+        default:
+            GGML_ABORT("%s: type %s has no compact MoE kernel", __func__, ggml_type_name(type));
+    }
+}
+
+// Whether mul_mat_vec_q<type, 1> (the one-token MUL_MAT_ID launch without an epilogue) runs its K
+// loop in a single trip, which is what makes the compact kernel bit identical to it.
+template <ggml_type type>
+static bool mmvq_moe_single_trip_t(const int64_t ncols_x, const mmvq_parameter_table_id table_id) {
+    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr = get_vdr_mmvq(type);
+    return ncols_x / qk <= (int64_t) calc_nwarps(type, 1, table_id) * (vdr * WARP_SIZE / qi);
+}
+
+static bool mmvq_moe_single_trip(const ggml_type type, const int64_t ncols_x, const int cc) {
+    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
+    switch (type) {
+        case GGML_TYPE_Q1_0: return mmvq_moe_single_trip_t<GGML_TYPE_Q1_0>(ncols_x, table_id);
+        case GGML_TYPE_Q2_0: return mmvq_moe_single_trip_t<GGML_TYPE_Q2_0>(ncols_x, table_id);
+        case GGML_TYPE_Q4_0: return mmvq_moe_single_trip_t<GGML_TYPE_Q4_0>(ncols_x, table_id);
+        case GGML_TYPE_Q4_1: return mmvq_moe_single_trip_t<GGML_TYPE_Q4_1>(ncols_x, table_id);
+        case GGML_TYPE_Q5_0: return mmvq_moe_single_trip_t<GGML_TYPE_Q5_0>(ncols_x, table_id);
+        case GGML_TYPE_Q5_1: return mmvq_moe_single_trip_t<GGML_TYPE_Q5_1>(ncols_x, table_id);
+        case GGML_TYPE_Q8_0: return mmvq_moe_single_trip_t<GGML_TYPE_Q8_0>(ncols_x, table_id);
+        case GGML_TYPE_Q4_K: return mmvq_moe_single_trip_t<GGML_TYPE_Q4_K>(ncols_x, table_id);
+        case GGML_TYPE_Q5_K: return mmvq_moe_single_trip_t<GGML_TYPE_Q5_K>(ncols_x, table_id);
+        case GGML_TYPE_Q6_K: return mmvq_moe_single_trip_t<GGML_TYPE_Q6_K>(ncols_x, table_id);
+        default:             return false;
+    }
+}
+
+// The compact and the fused MoE kernels walk the local (token, slot) pairs. That pays where expert
+// parallelism leaves a token one or two local slots of its n_used: the dedicated kernels launch
+// blocks for every slot and most of their warps only write zeros. With most of the experts on the
+// device (the weight split over one or two devices) nearly every slot is local, the dedicated kernels
+// keep their warps busy, and the fused down projection would quantize the activation of every slot
+// in every block (measured: single device n=1 +21..37%, two devices n=2..8 +9..13%), so those
+// launches stay on the dedicated kernels. Sparse: fewer than four local slots expected per token
+// (n_used times the share of the experts the device holds).
+static bool ggml_cuda_mmvq_moe_sparse(const int64_t n_used, const int64_t n_experts_local, const int64_t n_expert_total) {
+    return n_used*n_experts_local < 4*n_expert_total;
+}
+
+// global expert count of a MUL_MAT_ID node (its own count without expert parallelism)
+static int64_t mmvq_moe_n_expert_total(const ggml_tensor * node) {
+    const int64_t n_total = ggml_mul_mat_id_is_expert_parallel(node) ? ggml_mul_mat_id_get_n_expert_total(node) : 0;
+    return n_total > 0 ? n_total : node->src[0]->ne[2];
+}
+
+// The compact kernel covers the MUL_MAT_ID launches of the MMVQ mmid window that carry no fusion
+// arguments (the plain rows and the SwiGLU epilogue) on NVIDIA, for the types listed in
+// mul_mat_vec_q_moe_compact_switch_type, where the routing is sparse on the device
+// (ggml_cuda_mmvq_moe_sparse). A plain launch with one token replaces mul_mat_vec_q<type, 1> and is
+// only taken where that kernel's K loop is a single trip (the results stay bit identical).
+static bool ggml_cuda_mmvq_moe_compact_supported(
+        const ggml_type type, const int64_t ncols_x, const int64_t nrows_x, const int64_t n_tokens,
+        const int64_t n_used, const int64_t n_experts_local, const int64_t n_expert_total, const bool swiglu,
+        const int cc) {
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !ggml_cuda_mmvq_moe_sparse(n_used, n_experts_local, n_expert_total)) {
+        return false;
+    }
+    switch (type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            break;
+        default:
+            return false;
+    }
+    if (n_tokens < 1 || n_tokens > MMVQ_MMID_MAX_BATCH_SIZE || n_used < 1 || n_tokens*n_used > MMVQ_MOE_MAX_PAIRS) {
+        return false;
+    }
+    if (nrows_x % MMVQ_MOE_COMPACT_R != 0) {
+        return false;
+    }
+    return swiglu || n_tokens > 1 || mmvq_moe_single_trip(type, ncols_x, cc);
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_switch_ncols_dst(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -1741,11 +2355,227 @@ void ggml_cuda_mul_mat_vec_q(
         GGML_ASSERT(lut.n >= ne02);
     }
 
+    // the MUL_MAT_ID launches without fusion arguments (the plain rows and the SwiGLU epilogue) of
+    // the mmid window: walk the local (token, slot) pairs instead of one block per slot
+    if (ids != nullptr && fusion == nullptr && ne03 == 1 && ne3 == 1) {
+        const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+        if (ggml_cuda_mmvq_moe_compact_supported(src0->type, ne00, ne01, ncols_dst, nchannels_dst, ne02, lut.n, swiglu, cc)) {
+            mmvq_moe_args a = {};
+            a.vx                 = vx_weights;
+            a.expert_ptrs        = fusion_local.expert_ptrs;
+            a.vy                 = src1_q8_1.get();
+            a.ids                = ids_d;
+            a.dst                = dst->data;
+            a.ncols_x            = (int) ne00;
+            a.nrows_x            = (int) ne01;
+            a.stride_row_x       = (int) s01;
+            a.stride_channel_x   = (int) s02;
+            a.nchannels_y        = (int) nchannels_y;
+            a.stride_col_y       = (int) stride_col_y;
+            a.stride_channel_y   = (int) stride_channel_y;
+            a.stride_col_dst     = (int) stride_col_dst;
+            a.stride_channel_dst = (int) stride_channel_dst;
+            a.n_tokens           = (int) ncols_dst;
+            a.n_used             = (int) nchannels_dst;
+            a.ids_stride         = (int) ids_stride;
+            a.lut                = lut;
+            if (swiglu) {
+                mul_mat_vec_q_moe_compact_switch_type<MMVQ_MOE_OUT_H16>(src0->type, a, stream);
+            } else {
+                mul_mat_vec_q_moe_compact_switch_type<MMVQ_MOE_OUT_F32>(src0->type, a, stream);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
+
     mul_mat_vec_q_switch_type(
         vx_weights, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, lut, swiglu, stream);
+}
+
+// The weight of a MUL_MAT_ID node as the compact kernels read it: the expert store gives either one
+// strided block (uniform, addressed arithmetically) or a device pointer table (the staging table of
+// the launch when the decode batch routed to host experts), as in ggml_cuda_mul_mat_vec_q.
+struct mmvq_moe_src0 {
+    const void *         vx;
+    int64_t              s02;
+    const char * const * expert_ptrs;
+};
+
+static mmvq_moe_src0 mmvq_moe_src0_resolve(const ggml_tensor * src0, const char * const * expert_ptrs) {
+    const size_t ts_src0 = ggml_type_size(src0->type);
+    mmvq_moe_src0 r = { src0->data, (int64_t) (src0->nb[2] / ts_src0), nullptr };
+    ggml_cuda_expert_table ex_table;
+    if (ggml_cuda_expert_table_get(src0, &ex_table)) {
+        if (ex_table.uniform) {
+            r.vx  = ex_table.plain_base;
+            r.s02 = (int64_t) ex_table.plain_pitch / ts_src0;
+        } else {
+            r.expert_ptrs = expert_ptrs != nullptr ? expert_ptrs : ex_table.main;
+        }
+    }
+    return r;
+}
+
+bool ggml_cuda_mmvq_moe_reduce_supported(const ggml_tensor * down, const ggml_tensor * weights,
+        const ggml_tensor * expert_scale, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = down->src[0];
+    const ggml_tensor * src1 = down->src[1];
+    const ggml_tensor * ids  = down->src[2];
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    if (down->op != GGML_OP_MUL_MAT_ID || ggml_mul_mat_id_get_epilogue(down) != GGML_MUL_MAT_ID_EPILOGUE_NONE) {
+        return false;
+    }
+    if (!ggml_is_quantized(src0->type) || down->type != GGML_TYPE_F32 || ids == nullptr || ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if ((src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) || src1->nb[0] != ggml_type_size(src1->type)) {
+        return false;
+    }
+    if (src0->ne[3] != 1 || src1->ne[3] != 1 || down->ne[3] != 1 || src0->nb[0] != ggml_type_size(src0->type)) {
+        return false;
+    }
+    const int64_t n_tokens = down->ne[2];
+    const int64_t n_used   = down->ne[1];
+    if (n_used > MMVQ_MOE_REDUCE_MAX_USED || src0->ne[0] % QK8_1 != 0 ||
+            !ggml_cuda_mmvq_moe_compact_supported(src0->type, src0->ne[0], src0->ne[1], n_tokens, n_used,
+                src0->ne[2], mmvq_moe_n_expert_total(down), false, cc)) {
+        return false;
+    }
+    // the q8_1 activation of the slots of one token sits in shared memory
+    if (mmvq_moe_reduce_smem(src0->ne[0], n_used) > 32*1024) {
+        return false;
+    }
+    if (dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || dst->ne[0] != down->ne[0] || ggml_nrows(dst) != n_tokens) {
+        return false;
+    }
+    auto per_slot = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) == n_used*n_tokens;
+    };
+    return per_slot(weights) && (expert_scale == nullptr || per_slot(expert_scale));
+}
+
+bool ggml_cuda_mmvq_moe_gate_up_h_supported(const ggml_tensor * gate_up) {
+    const ggml_tensor * src0 = gate_up->src[0];
+    const ggml_tensor * src1 = gate_up->src[1];
+    const ggml_tensor * ids  = gate_up->src[2];
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    if (gate_up->op != GGML_OP_MUL_MAT_ID || ggml_mul_mat_id_get_epilogue(gate_up) != GGML_MUL_MAT_ID_EPILOGUE_SWIGLU) {
+        return false;
+    }
+    if (!ggml_is_quantized(src0->type) || gate_up->type != GGML_TYPE_F16 || ids == nullptr || ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || src1->nb[0] != sizeof(float) || src0->nb[0] != ggml_type_size(src0->type)) {
+        return false;
+    }
+    if (src0->ne[3] != 1 || src1->ne[3] != 1 || gate_up->ne[3] != 1 || gate_up->ne[0] != src0->ne[1]/2) {
+        return false;
+    }
+    return ggml_cuda_mmvq_moe_compact_supported(src0->type, src0->ne[0], src0->ne[1], gate_up->ne[2], gate_up->ne[1],
+        src0->ne[2], mmvq_moe_n_expert_total(gate_up), true, cc);
+}
+
+void ggml_cuda_mmvq_moe_gate_up_h(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_up,
+        half * h, const char * const * expert_ptrs, const void * src1_q8) {
+    const ggml_tensor * src0 = gate_up->src[0];
+    const ggml_tensor * src1 = gate_up->src[1];
+    const ggml_tensor * ids  = gate_up->src[2];
+    cudaStream_t stream = ctx.stream();
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const int64_t ne13 = src1->ne[3];
+
+    const mmvq_moe_src0 w = mmvq_moe_src0_resolve(src0, expert_ptrs);
+
+    // the q8_1 activation exactly as ggml_cuda_mul_mat_vec_q quantizes it (rows of ne10_padded values),
+    // unless the caller quantized it already in that layout
+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool());
+    if (src1_q8 == nullptr) {
+        src1_q8_1.alloc(ne13*ne12*ne11*ne10_padded*sizeof(block_q8_1)/QK8_1);
+        quantize_row_q8_1_cuda((const float *) src1->data, nullptr, src1_q8_1.get(), src0->type, ne10,
+            src1->nb[1] / sizeof(float), src1->nb[2] / sizeof(float), src1->nb[3] / sizeof(float),
+            ne10_padded, ne11, ne12, ne13, stream);
+        src1_q8 = src1_q8_1.get();
+    }
+    const int64_t s11 = ne10_padded / QK8_1;
+
+    mmvq_moe_args a = {};
+    a.vx                 = w.vx;
+    a.expert_ptrs        = w.expert_ptrs;
+    a.vy                 = src1_q8;
+    a.ids                = (const int32_t *) ids->data;
+    a.dst                = h;
+    a.ncols_x            = (int) src0->ne[0];
+    a.nrows_x            = (int) src0->ne[1];
+    a.stride_row_x       = (int) (src0->nb[1] / ggml_type_size(src0->type));
+    a.stride_channel_x   = (int) w.s02;
+    a.nchannels_y        = (int) ne11;
+    a.stride_col_y       = (int) (ne11*s11);
+    a.stride_channel_y   = (int) s11;
+    a.stride_col_dst     = (int) (gate_up->ne[1]*gate_up->ne[0]);
+    a.stride_channel_dst = (int) gate_up->ne[0];
+    a.n_tokens           = (int) gate_up->ne[2];
+    a.n_used             = (int) gate_up->ne[1];
+    a.ids_stride         = (int) (ids->nb[1] / ggml_type_size(ids->type));
+    a.lut                = ggml_cuda_mul_mat_id_lut(ctx, gate_up);
+    GGML_ASSERT(a.lut.n >= src0->ne[2]);
+    mul_mat_vec_q_moe_compact_switch_type<MMVQ_MOE_OUT_H16L>(src0->type, a, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void ggml_cuda_mmvq_moe_down_reduce(ggml_backend_cuda_context & ctx, const ggml_tensor * down,
+        const ggml_tensor * weights, const ggml_tensor * expert_scale, ggml_tensor * dst,
+        const char * const * expert_ptrs, const half * act_h) {
+    const ggml_tensor * src0 = down->src[0];
+    const ggml_tensor * src1 = down->src[1];
+    const ggml_tensor * ids  = down->src[2];
+
+    const mmvq_moe_src0 w = mmvq_moe_src0_resolve(src0, expert_ptrs);
+
+    mmvq_moe_reduce_args a = {};
+    a.vx               = w.vx;
+    a.expert_ptrs      = w.expert_ptrs;
+    if (act_h != nullptr) {
+        // the private H of the fused MoE FFN: [token][slot][ne10] F16
+        a.act           = act_h;
+        a.s_act_slot    = src1->ne[0];
+        a.s_act_tok     = src1->ne[0]*src1->ne[1];
+        a.nchannels_act = (int) src1->ne[1];
+    } else {
+        a.act           = src1->data;
+        a.s_act_slot    = src1->nb[1] / ggml_type_size(src1->type);
+        a.s_act_tok     = src1->nb[2] / ggml_type_size(src1->type);
+        a.nchannels_act = (int) src1->ne[1];
+    }
+    a.ids              = (const int32_t *) ids->data;
+    a.weights          = (const float *) weights->data;
+    a.expert_scale     = expert_scale != nullptr ? (const float *) expert_scale->data : nullptr;
+    a.dst              = (float *) dst->data;
+    a.ncols_x          = (int) src0->ne[0];
+    a.nrows_x          = (int) src0->ne[1];
+    a.stride_row_x     = (int) (src0->nb[1] / ggml_type_size(src0->type));
+    a.stride_channel_x = (int) w.s02;
+    a.stride_col_dst   = (int) (dst->nb[1] / sizeof(float));
+    a.n_tokens         = (int) down->ne[2];
+    a.n_used           = (int) down->ne[1];
+    a.ids_stride       = (int) (ids->nb[1] / ggml_type_size(ids->type));
+    a.lut              = ggml_cuda_mul_mat_id_lut(ctx, down);
+    GGML_ASSERT(a.lut.n >= src0->ne[2]);
+    if (act_h != nullptr || src1->type == GGML_TYPE_F16) {
+        mul_mat_vec_q_moe_reduce_switch_type<half>(src0->type, a, ctx.stream());
+    } else {
+        mul_mat_vec_q_moe_reduce_switch_type<float>(src0->type, a, ctx.stream());
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

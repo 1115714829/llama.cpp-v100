@@ -855,6 +855,7 @@ struct llama_model_base : public llama_model {
     const int TENSOR_ALLOW_RESHAPE;
     const int TENSOR_READ_LAZY;
     const int TENSOR_GATE_UP_INTERLEAVE;
+    const int TENSOR_F32_AS_BF16;
 
     explicit llama_model_base(const llama_model_params & params);
     virtual ~llama_model_base() = default;

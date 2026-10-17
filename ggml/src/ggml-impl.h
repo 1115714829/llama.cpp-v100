@@ -398,6 +398,11 @@ struct ggml_cgraph {
     // an optional identifier that can be utilized to recognize same graphs if two non-zero values match
     // a value of 0 means it is not set and should be ignored
     uint64_t uid;
+
+    // the uid of the graph this one replaces: a scheduler that splits a new graph drops its previous
+    // split of the same backend, which is then never computed again (see ggml_backend_sched_split_graph).
+    // 0 = no such graph
+    uint64_t uid_prev;
 };
 
 // returns a slice of cgraph with nodes [i0, i1)

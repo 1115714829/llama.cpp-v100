@@ -2606,6 +2606,10 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * input,
                             int   il);
 
+        // sequence parallelism (docs/design/r200-seqpar.md): the per-token part of the target graph
+        // runs on one token slice per device, see graph(). The draft graph keeps it false.
+        bool seq_par = false;
+
         const llama_model & model;
     };
 

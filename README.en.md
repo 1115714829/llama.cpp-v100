@@ -1,10 +1,25 @@
 # llama.cpp-v100
 
-[简体中文](README.md) | **English** | [27B dense model (Qwen3.8-27B + DFlash2)](docs/v100/27b.en.md) | [2.0.0 large MoE (Qwen3.8-Flash-Next + MTP)](docs/v100/moe-2.0.0.en.md) | [Changelog (Chinese)](CHANGELOG.md)
+[简体中文](README.md) | **English** | [27B dense model detail page](docs/v100/27b.en.md) | [Large MoE detail page](docs/v100/moe-2.0.0.en.md) | [Changelog (Chinese)](CHANGELOG.md)
 
-A modified llama.cpp for NVIDIA V100 (SM70). Current version **2.0.0**; see [CHANGELOG.md](CHANGELOG.md) (Chinese) for what changed in each version.
+A modified llama.cpp for NVIDIA V100 (SM70). Current version **2.0.1** (2026-10-18).
 
-**Quick deployment**: both detail pages give copy-ready full commands per hardware setup, and their last section, "Quick deployment (for AI assistants and beginners)" ([27B](docs/v100/27b.en.md#quick-deployment-for-ai-assistants-and-beginners) / [large MoE](docs/v100/moe-2.0.0.en.md#quick-deployment-for-ai-assistants-and-beginners)), lists the effect of every parameter on capability / speed / VRAM, decision steps for choosing a configuration, and a symptom-to-fix table. You can hand a detail page to an AI assistant and have it deploy from there.
+---
+
+## Performance at a glance
+
+**Measurement conditions: temperature 0, thinking off**, not the sampling parameters recommended by the model card; numbers with thinking on and model-card sampling will be measured in a later version and labeled separately.
+
+| Model (6 × V100-16GB, context 262144) | Scenario | Prefill | Decode | Measured on |
+|---|---|---:|---:|---|
+| Large MoE: Qwen3.8-Flash-Next UD-Q4_K_XL + MTP | ~200K tokens of real code | **3464 tok/s** | 118.5 tok/s | 2.0.1 |
+| | ~16K tokens of real code | 2823 tok/s | **139.6 tok/s** | 2.0.1 |
+| | Short prompt | — | **151.0 tok/s** | 2.0.1 |
+| 27B: Qwen3.8-27B Q8_0 + DFlash2 | ~200K tokens of real code | 2140 tok/s | 128.9 tok/s | 2.0.1 |
+| | ~16K tokens of real code | **3178 tok/s** | — | 2.0.1 |
+| | Short prompt | — | **225.8 tok/s** | 2.0.1 |
+
+<sub>All numbers are reproducible on the current version: 2026-10-17, 2.0.1 release build, IBM AC922 + 6 × V100-SXM2-16GB (see "Test platforms"), measured alternately with the previous version in the same window. Temperature 0, thinking off, 1024 / 768 / 256 output tokens; the 27B ~16K request ran at temperature 0.8 (prefill does not depend on temperature); the 27B ~200K request hit the cached prefix of the previous request in the same server and actually processed 195048 tokens. When a model does not change in a new version, its rows keep the last measured numbers and version. Full conditions and all measurements per version: [Measured results by version](docs/v100/benchmarks.en.md).</sub>
 
 ---
 
@@ -12,50 +27,42 @@ A modified llama.cpp for NVIDIA V100 (SM70). Current version **2.0.0**; see [CHA
 
 Based on llama.cpp (upstream v0.6.0, `d81235049` of 2026-10-05), re-implemented and optimized for V100 from the compute kernels up to the runtime. External implementations used are listed in the acknowledgements at the end; their origin and license are in each file header and in the `licenses/` directory.
 
+**This project only optimizes the underlying framework (the inference runtime); it does not make or modify quantized models**: it uses the GGUF weights published by the model authors, with quantization formats and weights left untouched; what changes are the compute kernels, multi-GPU parallelism, scheduling and the speculative-decoding execution path, accepted only when outputs are bit-identical or match token-for-token at temperature 0. For the model's intelligence and capabilities, refer to the original model card and the quantization level you choose; this project only changes how fast it runs and how much VRAM it takes.
+
 Systematic optimizations built around the hardware characteristics of V100 (SM70), from compute kernels to runtime:
 
-- **Multi-GPU parallelism**: optimized scheduling and kernel launches for tensor parallelism, reducing the time GPUs wait for the host; all-reduce across GPUs is hierarchical, following the NVLink topology; optimized splitting when the number of attention heads is not divisible by the number of GPUs (e.g. 6 GPUs).
+- **Multi-GPU parallelism**: 2–6 GPUs work together efficiently, adapted to the NVLink topology, including GPU counts that do not divide the number of attention heads (e.g. 6 GPUs).
 - **Long context**: prefill and decode speed stay stable at very long context, and compute buffers use less VRAM.
 - **Speculative decoding**: the complete DFlash2 speculative decoding path, with optimized sampling and per-round overhead for faster decode.
 - **Compute kernels**: optimized SM70 kernels adapted to the Q8_0 quantization format, plus operator fusion.
 - **Platform**: adapted to the NVLink interconnect and NUMA memory architecture of the IBM AC922.
 - **Concurrency**: with several requests, decode has priority and the time spent on prompt processing is capped; decode batches, speculative decoding and VRAM reservations scale with the number of slots.
 - **Multimodal**: the vision module (mmproj) runs on GPU and handles images, PDFs and video.
-- **Large MoE models** (2.0.0): multi-GPU split combining expert parallelism and tensor parallelism; experts that do not fit in VRAM live in pinned host memory, read directly by the GPU and placed per NUMA node; a routing profile decides which experts stay resident in VRAM and which experts each GPU gets; MTP speculative decoding and sparse attention optimized for V100.
+- **Large MoE models**: 16 GB V100s run a 100B-class MoE model with a 262K context, automatically using host memory for what does not fit in VRAM; MTP speculative decoding and sparse attention optimized for V100.
 
 ---
 
-## Acknowledgements
+## Supported models and configurations
 
-**Thanks to community members [umacro](https://github.com/umacro), 看透<!-- TODO: GitHub 链接待补 -->, [天语星落](https://github.com/ativx928) and [lsaac](https://github.com/isaac-bj).** Without the test machines and tokens they provided, this project would not have come this far this fast.
+| Model | Recommended setup | Detail page |
+|---|---|---|
+| Qwen3.8-27B (Q8_0) + DFlash2 speculative decoding | 2–6 × V100-16GB, context 262144; Q4 quantization, concurrency, multimodal and a 524288 context also work | [27B dense model](docs/v100/27b.en.md) |
+| Qwen3.8-Flash-Next (UD-Q4_K_XL, large MoE) + MTP speculative decoding | 6 × V100-16GB or 4 × V100-32GB, context 262144 | [Large MoE](docs/v100/moe-2.0.0.en.md) |
 
-Development: the repository author (started the project, provides the hardware and test environment, sets the goals and trade-offs); external contributor [天语星落 (ATIVX928)](https://github.com/ativx928) ([PR #1](https://github.com/1115714829/llama.cpp-v100/pull/1), [PR #2](https://github.com/1115714829/llama.cpp-v100/pull/2)). Referenced projects and the AI assistants used are listed in the [acknowledgements at the end](#acknowledgements-projects-and-ai-assistants).
+Launch commands, parameters and known limitations are on the detail pages; all measured tables per version (GPU counts, Q4, concurrency, multimodal) are in [Measured results by version](docs/v100/benchmarks.en.md).
 
----
+## Quick start
 
-## What's new in 2.0.0
+- **Prebuilt binaries**: x86_64 Linux builds on the [Releases](https://github.com/1115714829/llama.cpp-v100/releases) page.
+- **Docker image**: `ghcr.io/1115714829/llama.cpp-v100:2.0.1`, one tag for x86_64 and IBM Power (ppc64le); usage in the [Docker section of the 27B page](docs/v100/27b.en.md#docker).
+- **Build from source**: see the [build section of the 27B page](docs/v100/27b.en.md#build).
+- **Launch commands**: both detail pages give copy-ready full commands per hardware setup; their last section, "Quick deployment (for AI assistants and beginners)", lists each parameter's effect on capability / speed / VRAM, decision steps and a symptom-to-fix table, so you can hand a detail page to an AI assistant to deploy from.
 
-2.0.0 adds V100-specific support for the large MoE model Qwen3.8-Flash-Next; Qwen3.8-27B keeps the same features and gets the fixes in the next section. Large MoE configurations supported in this version: **6 × V100-16GB + Qwen3.8-Flash-Next UD-Q4_K_XL + MTP draft (Q4_K_M)** is the standard configuration, and all measurements on this page and the detail page come from it; **4 × V100-32GB (x86, PCIe)** runs, with all experts resident in VRAM and none in host memory (reference numbers on the [MoE detail page](docs/v100/moe-2.0.0.en.md#measured-results)); other GPU counts, other quantizations (e.g. a Q8_0 main model) and more models will follow.
+## Current version 2.0.1
 
-- **Large MoE model Qwen3.8-Flash-Next**: with multi-GPU `--split-mode tensor`, routed experts are distributed across GPUs by expert (expert parallelism), and the dense parts — attention, linear attention, shared experts and so on — are tensor-parallel. Recommended configuration: 6 × 16 GB V100, context 262144, with MTP speculative decoding.
-- **Experts in two tiers, VRAM and host memory**: at startup, the experts resident in VRAM for each layer are chosen automatically from the VRAM left on each GPU; the rest live in pinned host memory that the GPU reads directly, and are still computed on the GPU. `--n-cpu-moe` / `-ot` are not needed. The pinned memory is allocated and filled per CPU node (NUMA) the GPU is attached to.
-- **Expert routing profile**: `--expert-profile` uses routing statistics to keep the most-used experts in VRAM and to rebalance which experts each GPU gets so the GPUs do similar amounts of work; `scripts/v100-expert-profile.sh` builds a profile from a calibration text.
-- **n-gram embedding table in host memory**: the model's n-gram embedding table and token embedding table live in pinned host memory, shared by all GPUs as one copy and looked up directly by the GPU; they take no VRAM.
-- **Sparse attention (QSA)**: full-attention layers attend only to the positions selected by the indexer (the previous upstream implementation computed over the whole context on V100); compute buffers no longer grow linearly with context, so a 262144 context fits on 16 GB GPUs.
-- **V100 optimizations for MTP speculative decoding**: the draft chain runs back to back on the GPU and returns its result once per round; the draft layer attends only to the most recent positions (new parameter `--spec-draft-window`); the draft context can have its own physical batch size (new parameter `--spec-draft-ubatch`).
-- **Kernels and runtime**: expert matrix multiplications in prefill use fused Volta tensor-core kernels; several small operators are fused in decode; the first run of a multi-GPU execution plan is submitted in parallel by per-GPU launch threads.
+Faster prefill and decode for the large MoE model on top of 2.0.0; fixes for 27B T=0 output differing across restarts at long context on 6 GPUs and for the server aborting with speculative decoding and multiple slots (`-np > 1`); the per-GPU VRAM peak is no higher than 2.0.0. Same-window comparison with 2.0.0 at ~200K tokens: large MoE prefill +48%, decode +8%; 27B prefill +3%, decode +2%. New parameter `--fit-mmproj` (default keeps the previous behavior).
 
-Measured (2026-10-11, IBM AC922 + 6 × V100-SXM2-16GB, build `4d50148cc`; context 262144, with MTP and the expert routing profile; about 200K tokens of real code, fresh server, temperature 0, thinking off, output ended naturally at 686 tokens): prefill 2334.8 / 2340.8 tok/s, decode 107.9 / 109.7 tok/s. On the same machine, the large MoE prefills ~200K tokens about 13% faster than 27B and decodes at about 87% of 27B's speed.
-
----
-
-## 27B fixes
-
-- **VRAM re-planned for every batch when top-k output is on** (present in 1.1.1): when the target model produces top-k output (device-side top-k or rejection sampling), a prefill batch without output rows did not match the reserved compute graph, so every batch re-planned VRAM and synchronized all GPUs. The current 27B DFlash2 configuration does not trigger it; measured, there is no difference before and after the fix. The fix prepares 27B for MTP support later.
-- **Layer split + DFlash2 failed at startup** (present in 1.1.1): `--split-mode layer` with a DFlash2 draft failed to start; it now starts, and the startup VRAM plan includes the DFlash2 draft's hidden-state buffers.
-- **Other**: the ggml allocator could overwrite neighboring memory when an input that only appears as a leaf grew; the CPU IQ1_S dot product gave wrong results on POWER9 (ppc64le) (CPU compute only; GPU inference was not affected).
-
-Measured (2026-10-11, IBM AC922 + 6 × V100-SXM2-16GB; 1.1.1 and 2.0.0 build `4d50148cc` alternated in the same time window, two rounds each; context 262144, DFlash2; conditions on the [27B detail page](docs/v100/27b.en.md#measured-results)): short-prompt decode 186.2 / 188.9 → 218.3 / 206.9 tok/s; ~16K-token prefill 2863.4 / 2842.7 → 3119.1 / 3121.1 tok/s; ~200K-token prefill 2047.8 / 2047.1 → 2066.6 / 2063.2 tok/s and decode 114.5 / 115.6 → 122.2 / 127.0 tok/s.
+Changes and the measurements of every version: [CHANGELOG.md](CHANGELOG.md) (2.0.1 back to 1.0.0) and [Measured results by version](docs/v100/benchmarks.en.md).
 
 ---
 
@@ -80,31 +87,32 @@ Basic differences between the AC922 and x86 servers, and how they indirectly aff
 
 This is a general-purpose version: the same code runs on the AC922 and on x86; architecture-specific optimizations will come later.
 
----
+### Host memory and performance
 
-## Community group
-
-Scan the QR code below to add the maintainer on WeChat and join the discussion group.
-
-<img src="media/v100-wechat.jpg" width="260" alt="WeChat QR code">
+When part of the experts of a large MoE model lives in host memory (because they do not fit in VRAM), prefill and decode speed depends on host memory bandwidth and capacity: performance is better when all memory channels are populated and the memory is large enough to hold the experts that are not in VRAM. How to configure host memory is up to you and your machine.
 
 ---
 
-## Versions and license
+## Acknowledgements
 
-### Versions
+**Thanks to community members [umacro](https://github.com/umacro), 看透<!-- TODO: GitHub 链接待补 -->, [天语星落](https://github.com/ativx928) and [lsaac](https://github.com/isaac-bj).** Without the test machines and tokens they provided, this project would not have come this far this fast.
 
-- Current version 2.0.0 (released 2026-10-12); see [CHANGELOG.md](CHANGELOG.md) (Chinese) for what changed in each version.
-- Build instructions, the prebuilt x86_64 Linux binaries on the Releases page, and the Docker image `ghcr.io/1115714829/llama.cpp-v100:2.0.0` (one tag covering x86_64 and IBM Power AC922) are described on the two detail pages.
-- The full documentation of 1.1.1 and earlier (27B test tables for 2–6 GPUs, Q4 configurations, concurrency, multimodal, etc.) is in the README of the corresponding tag, e.g. [v100-1.1.1](https://github.com/1115714829/llama.cpp-v100/blob/v100-1.1.1/README.md) (Chinese).
-
-### License
-
-GPL-3.0 from 2.0.0 on (full text in `LICENSE`); 1.1.1 and earlier were MIT. The MIT license of upstream llama.cpp is kept in `licenses/LICENSE-llama.cpp`; ported third-party code keeps its original license, with origin and license in each file header and in `licenses/README.md`.
-
----
-
-## Acknowledgements (projects and AI assistants)
+Development: the repository author (started the project, provides the hardware and test environment, sets the goals and trade-offs); external contributors [天语星落 (ATIVX928)](https://github.com/ativx928) ([PR #1](https://github.com/1115714829/llama.cpp-v100/pull/1), [PR #2](https://github.com/1115714829/llama.cpp-v100/pull/2)), [Poqianhu7895](https://github.com/Poqianhu7895) ([PR #4](https://github.com/1115714829/llama.cpp-v100/pull/4)). Referenced projects and the AI assistants used are listed in the [acknowledgements at the end](#acknowledgements-projects-and-ai-assistants).
 
 - **Referenced projects**: [llama.cpp](https://github.com/ggml-org/llama.cpp) / [ggml](https://github.com/ggml-org/ggml) (the base framework of this project); [1Cat-vLLM](https://github.com/1CatAI/1Cat-vLLM) (reference for V100 engineering practice; some early SM70 kernels were ported from it — origin and license in the file headers and `licenses/`); [Strata](https://github.com/Niko1221/Strata) and its AC922 fork [Strata-AC922](https://github.com/eelgaev/Strata-AC922) (the fused expert matrix multiplication, QSA selection and attention kernels for the large MoE are ported from them, and the expert cache and prefill ring follow their design; origin and license in the file headers and `licenses/`); [vLLM](https://github.com/vllm-project/vllm) (reference for the design of speculative decoding and more).
 - **AI assistants**: development was done with Claude, DeepSeek, Xiaomi MiMo and MiniMax.
+
+---
+
+## Community
+
+| WeChat | QQ group |
+|---|---|
+| <img src="media/v100-wechat.jpg" width="220" alt="WeChat QR code"> | <img src="media/v100-qq-group.jpg" width="220" alt="QQ group QR code"> |
+| Scan to add the author on WeChat; the author will invite you to the WeChat group (WeChat group codes expire, so add the author first) | Scan to join the QQ group directly |
+
+---
+
+## License
+
+GPL-3.0 from 2.0.0 on (full text in `LICENSE`); 1.1.1 and earlier were MIT. The MIT license of upstream llama.cpp is kept in `licenses/LICENSE-llama.cpp`; ported third-party code keeps its original license, with origin and license in each file header and in `licenses/README.md`.

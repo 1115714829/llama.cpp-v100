@@ -313,19 +313,36 @@ __global__ void sm70_d256_range_bounds_kernel(
 }
 
 // Assist split point, derived from the bounds on the device: kv_end is the KV length this batch
-// actually uses (the rounded widest mask bound, as *kv_limit), s = 2/3 of it aligned to the q
-// block. The idle device takes [s, kv_end), so the owner lowers *kv_limit to s: its mirror needs
-// no rows past s. A batch shorter than the assist threshold is not split (s = kv_end), so short
-// prompts never pay the cross-device cost. The owner signals its kv epoch after this kernel, so
-// the idle sees both the split and the staged Q.
-__global__ void sm70_d256_assist_split_kernel(int * __restrict__ kv_limit, ggml_backend_meta_assist_split * __restrict__ split) {
+// actually uses (the rounded widest mask bound, as *kv_limit). The idle device takes [s, kv_end),
+// so the owner lowers *kv_limit to s: its mirror needs no rows past s. A batch shorter than the
+// assist threshold is not split (s = kv_end), so short prompts never pay the cross-device cost.
+// The owner signals its kv epoch after this kernel, so the idle sees both the split and the
+// staged Q.
+//
+// The owner share f balances the critical path of the layer. The idle device has no attention
+// heads of its own in this layer, so it starts once the owner has staged Q; it serves `idle_load`
+// owners back to back, and per KV row it costs SM70_D256_ASSIST_ROW_COST_NUM/_DEN times the owner
+// (it pulls the rows over the peer link and merges into the owner's slot). The last owner it
+// serves finishes together with its own segment when
+//     f = idle_load*NUM / (DEN + idle_load*NUM),
+// aligned down to the q block. The cost ratio was measured on a 200K prefill (6 x V100, 27B Q8_0
+// KV, CUPTI per kernel): owner 34.2 ms per full KV range, idle 43.2 ms per full range per owner,
+// ratio 1.26; 9/7 gives f = 18/25 for the two owners per idle device of the 6-card layout (at the
+// previous fixed 2/3 the second owner of every idle device waited ~6 ms per layer) and 9/16 for
+// an idle device that serves a single owner.
+#define SM70_D256_ASSIST_ROW_COST_NUM 9
+#define SM70_D256_ASSIST_ROW_COST_DEN 7
+__global__ void sm70_d256_assist_split_kernel(int * __restrict__ kv_limit, ggml_backend_meta_assist_split * __restrict__ split,
+        const int idle_load) {
     if (threadIdx.x != 0) {
         return;
     }
     const int kv_end = *kv_limit;
+    const int64_t num = (int64_t) idle_load * SM70_D256_ASSIST_ROW_COST_NUM;
+    const int64_t den = SM70_D256_ASSIST_ROW_COST_DEN + num;
     const int s = kv_end < GGML_BACKEND_META_ASSIST_MIN_KV
         ? kv_end
-        : (kv_end * 2 / 3) & ~(SM70_D256_BLOCK_M - 1);
+        : (int) (((int64_t) kv_end * num / den) & ~(int64_t) (SM70_D256_BLOCK_M - 1));
     split->kv_end = kv_end;
     split->s = s;
     *kv_limit = s;
@@ -803,21 +820,24 @@ static __global__ void sm70_d256_assist_signal(uint32_t * epoch) {
     atomicAdd(epoch, 1);
 }
 
-// One thread spins until the epoch changes, then records it. `last` lives on the waiting device,
-// `epoch` may live on a peer device; the volatile read keeps the poll in the spin loop. The
-// fences order the data reads/writes around the flag access.
-static __global__ void sm70_d256_assist_wait(volatile uint32_t * epoch, uint32_t * last) {
+// One thread spins until the epoch reaches a target generation. Every epoch word is signalled once
+// per execution of the plan, so after n executions it holds n. `gen` lives on the waiting device
+// and counts the executions this waiter entered: with `bump` it is advanced first (the wait that
+// opens this layer's work), and the target is gen - lag (lag 1 waits for a signal of the previous
+// execution). The comparison is modular so the 32-bit counters may wrap. `epoch` may live on a
+// peer device; the volatile read keeps the poll in the spin loop. The fences order the data
+// reads/writes around the flag access.
+static __global__ void sm70_d256_assist_wait(volatile uint32_t * epoch, uint32_t * gen, uint32_t bump, uint32_t lag) {
     if (threadIdx.x != 0) {
         return;
     }
     __threadfence_system();
-    const uint32_t seen = *last;
-    if (*epoch == seen) {
-        while (*epoch == seen) {
-        }
+    const uint32_t g = *gen + bump;
+    *gen = g;
+    const uint32_t target = g - lag;
+    while ((int32_t) (*epoch - target) < 0) {
     }
     __threadfence_system();
-    *last = *epoch;
 }
 
 static void sm70_d256_assist_signal_launch(uint32_t * epoch, cudaStream_t stream) {
@@ -825,8 +845,8 @@ static void sm70_d256_assist_signal_launch(uint32_t * epoch, cudaStream_t stream
     CUDA_CHECK(cudaGetLastError());
 }
 
-static void sm70_d256_assist_wait_launch(volatile uint32_t * epoch, uint32_t * last, cudaStream_t stream) {
-    sm70_d256_assist_wait<<<1, 1, 0, stream>>>(epoch, last);
+static void sm70_d256_assist_wait_launch(volatile uint32_t * epoch, uint32_t * gen, uint32_t bump, uint32_t lag, cudaStream_t stream) {
+    sm70_d256_assist_wait<<<1, 1, 0, stream>>>(epoch, gen, bump, lag);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -1013,10 +1033,10 @@ bool ggml_cuda_sm70_d256_assist_run(void * backend, const ggml_backend_meta_assi
         GGML_ASSERT(d->k_src[j] != nullptr && d->v_src[j] != nullptr && d->qs_src[j] != nullptr);
         GGML_ASSERT(d->p_out_dst[j] != nullptr && d->p_max_dst[j] != nullptr && d->p_sum_dst[j] != nullptr);
         GGML_ASSERT(d->epoch_kv[j] != nullptr && d->epoch_partial[j] != nullptr && d->epoch_free[j] != nullptr);
-        GGML_ASSERT(d->last_kv[j] != nullptr && d->last_free[j] != nullptr && d->split_src[j] != nullptr);
+        GGML_ASSERT(d->gen[j] != nullptr && d->free_lag[j] <= 1 && d->split_src[j] != nullptr);
 
         // The owner's Q staging and its split point are complete once it bumps this epoch.
-        sm70_d256_assist_wait_launch(d->epoch_kv[j], d->last_kv[j], stream);
+        sm70_d256_assist_wait_launch(d->epoch_kv[j], d->gen[j], 1, 0, stream);
         sm70_d256_assist_read_split<<<1, 32, 0, stream>>>(d->split_src[j], split);
         CUDA_CHECK(cudaGetLastError());
 
@@ -1030,10 +1050,11 @@ bool ggml_cuda_sm70_d256_assist_run(void * backend, const ggml_backend_meta_assi
             CUDA_CHECK(cudaGetLastError());
         }
 
-        // The owner may still be reading the partial slot of the previous execution; wait before
-        // the slot is cleared. On the very first execution the free epoch is still the initial
-        // value, so this passes.
-        sm70_d256_assist_wait_launch(d->epoch_free[j], d->last_free[j], stream);
+        // The owner may still be reading the partial slot from the previous layer that used it
+        // (possibly served by another idle device); wait for that layer's free signal of this
+        // execution, or of the previous one when that layer comes later in the plan. On the very
+        // first execution such a wait targets generation 0 and passes.
+        sm70_d256_assist_wait_launch(d->epoch_free[j], d->gen[j], 0, d->free_lag[j], stream);
         sm70_d256_assist_clear_partial<<<clear_blocks, 256, 0, stream>>>(
             d->p_out_dst[j], d->p_max_dst[j], d->p_sum_dst[j], w.rows);
         CUDA_CHECK(cudaGetLastError());
@@ -1176,9 +1197,10 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             GGML_ASSERT(assist->batch == 1 && assist->q_pad == q_pad && assist->q_len == q_len);
             GGML_ASSERT(assist->heads_q == heads_q && assist->kv_view == kv_len);
             GGML_ASSERT(assist->split_local != nullptr);
+            GGML_ASSERT(assist->idle_load >= 1);
             GGML_ASSERT(assist->p_out_local != nullptr && assist->p_max_local != nullptr && assist->p_sum_local != nullptr);
             GGML_ASSERT(assist->epoch_kv_local != nullptr && assist->epoch_partial_local != nullptr);
-            GGML_ASSERT(assist->last_partial_local != nullptr && assist->epoch_free_local != nullptr);
+            GGML_ASSERT(assist->gen_local != nullptr && assist->epoch_free_local != nullptr);
         }
         CUDA_CHECK(cudaMemsetAsync(Qs, 0, scratch.n_q * sizeof(half), stream));
         // the bounds kernel raises it to the rows its bounds allow
@@ -1208,7 +1230,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
 
         if (assist_owner) {
             sm70_d256_assist_split_kernel<<<1, 1, 0, stream>>>(
-                kv_limit, assist->split_local);
+                kv_limit, assist->split_local, assist->idle_load);
             CUDA_CHECK(cudaGetLastError());
             // *kv_limit is now s, so the mirror below holds only rows the owner computes.
             sm70_d256_assist_signal_launch(assist->epoch_kv_local, stream);
@@ -1337,7 +1359,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             // Wait for the assist partial [n_rows, kv_len) and fold it into the accumulator as
             // one more window; the merge kernel skips empty (-inf) rows and takes the assist
             // values for rows this segment never saw.
-            sm70_d256_assist_wait_launch(assist->epoch_partial_local, assist->last_partial_local, stream);
+            sm70_d256_assist_wait_launch(assist->epoch_partial_local, assist->gen_local, 1, 0, stream);
             const unsigned n_merge = (unsigned) ((scratch.rows
                 + FLASH_NAMESPACE::kWindowMergeRowsPerCta - 1)
                 / FLASH_NAMESPACE::kWindowMergeRowsPerCta);

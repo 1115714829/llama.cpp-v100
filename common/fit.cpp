@@ -32,7 +32,7 @@ class common_params_fit_exception : public std::runtime_error {
 // Page table of the host memory a GPU reads in place: with unified addressing every portable
 // pinned allocation (the mapped weights, the expert host arenas, the pinned host buffers of the
 // contexts) is mapped into the page table of every device, 8 bytes per 4 KiB page. Measured on
-// 6 x V100 (AC922): mapping the 26.82 GiB PLE table took 52 MiB on every card.
+// 6 x V100: mapping the 26.82 GiB PLE table took 52 MiB on every card.
 static constexpr int64_t COMMON_FIT_GPU_PAGE = 4096;
 static constexpr int64_t COMMON_FIT_GPU_PTE  = 8;
 
@@ -786,6 +786,11 @@ static void common_fit_ep(
         llama_model_free(model);
         throw common_params_fit_exception("failed to create llama_context from model");
     }
+    // the connection buffers that sequence parallelism adds to the target's collectives (the ring of
+    // its reduce-scatters/all-gathers, beyond the all-reduces that the margin holds): the real
+    // context sets them up at its first large prefill, so connect them here, where the communication
+    // memory below measures them. The draft context below runs no large collective.
+    llama_internal_comm_connect(ctx);
 
     // every simple device must offer an expert buffer type: the store is the only expert
     // placement in tensor mode
@@ -1164,12 +1169,13 @@ static void common_fit_ep(
 
     // Device memory the runtime adds after the free sample below, budgeted explicitly instead of
     // being left to the margin (measured growth on 6 x V100, see COMMON_FIT_EP_MARGIN_DEFAULT in fit.h):
-    //  - comm: the communication contexts of the target and the draft context, measured above;
+    //  - comm: the communication contexts of the target and the draft context, measured above,
+    //    with the connection buffers sequence parallelism adds (llama_internal_comm_connect);
     //  - page tables: every card maps all device-readable host memory into its page table, 8 bytes
     //    per 4 KiB page: the mapped weights, the pinned host buffers of the contexts and the host
     //    complement of the expert store of every card (all cards map every arena);
     //  - the margin: what the fit cannot see (the connection buffers NCCL allocates at the first
-    //    large collective, the operator pools, CUDA graphs, module code), the user's -fitt or the
+    //    large all-reduce, the operator pools, CUDA graphs, module code), the user's -fitt or the
     //    expert parallel default.
     std::vector<int64_t> margin_dev(nd, 0);
     for (size_t j = 0; j < nd; j++) {
@@ -1188,7 +1194,9 @@ static void common_fit_ep(
     // the budget of one card for a given runtime reserve: slots, staging (fixed point of the
     // staging that the host complement of the slot plan needs) and the host complement
     struct ep_plan { int64_t surplus; size_t slot_budget; size_t stage_bytes; size_t slot_used; size_t host_bytes; size_t stage_peak; };
-    const auto plan_device = [&](size_t j, int64_t reserve, std::vector<size_t> * host_each_j) -> ep_plan {
+    // slot_cap bounds the slot budget from above (the budget every card is equalized to); the
+    // staging fixed point below then sizes the staging of the larger host complement
+    const auto plan_device = [&](size_t j, int64_t reserve, std::vector<size_t> * host_each_j, size_t slot_cap) -> ep_plan {
         ep_plan pl = {};
         pl.surplus = free_mem[j] - dev_model[j] - ctx_dev[j] - compute_total
                    - dev_draft[j] - draft_ctx_dev[j] - draft_compute_total - sinks_total - reserve;
@@ -1208,7 +1216,7 @@ static void common_fit_ep(
                 " MiB staging of one prefill batch cannot be allocated; reduce the context size,"
                 " use more devices or a lower quantization");
         }
-        pl.slot_budget = (size_t) pl.surplus;
+        pl.slot_budget = std::min((size_t) pl.surplus, slot_cap);
         for (int round = 0; round < 64; ++round) {
             if (!common_expert_plan(expert_bufts[j], dev_tensors[j], pl.slot_budget, &pl.slot_used, &pl.host_bytes, &pl.stage_peak)) {
                 throw common_params_fit_exception("expert store: the buffer type of device " + std::to_string(j) +
@@ -1219,7 +1227,7 @@ static void common_fit_ep(
                 break;
             }
             pl.stage_bytes = next;
-            pl.slot_budget = (size_t) pl.surplus - pl.stage_bytes;
+            pl.slot_budget = std::min((size_t) pl.surplus - pl.stage_bytes, slot_cap);
         }
         if (!common_expert_plan(expert_bufts[j], dev_tensors[j], pl.slot_budget, &pl.slot_used, &pl.host_bytes, &pl.stage_peak, host_each_j)) {
             throw common_params_fit_exception("expert store: the buffer type of device " + std::to_string(j) +
@@ -1243,15 +1251,35 @@ static void common_fit_ep(
     const int64_t pt_fixed = page_table(mapped_host + pinned_host);
     int64_t host_first = 0;
     for (size_t j = 0; j < nd; j++) {
-        host_first += (int64_t) plan_device(j, comm_dev[j] + pt_fixed + margin_dev[j], nullptr).host_bytes;
+        host_first += (int64_t) plan_device(j, comm_dev[j] + pt_fixed + margin_dev[j], nullptr, SIZE_MAX).host_bytes;
     }
     int64_t pt_hc = page_table(host_first);
     pt_hc += page_table((int64_t) nd * pt_hc);
 
+    // VRAM balance first: one card running out takes the whole service down, so every card
+    // gets the slot budget of the tightest card (the per-card peaks then line up at that card's
+    // instead of the loosest card's runtime reserve). Equal budgets leave the plans unchanged.
+    std::vector<ep_plan> plans(nd);
+    for (size_t j = 0; j < nd; j++) {
+        const int64_t reserve = comm_dev[j] + pt_fixed + pt_hc + margin_dev[j];
+        plans[j] = plan_device(j, reserve, &host_each[j], SIZE_MAX);
+    }
+    std::vector<size_t> slot_budgets_own(nd, 0);
+    size_t slot_equal = SIZE_MAX;
+    for (size_t j = 0; j < nd; j++) {
+        slot_budgets_own[j] = plans[j].slot_budget;
+        slot_equal = std::min(slot_equal, plans[j].slot_budget);
+    }
+    for (size_t j = 0; j < nd; j++) {
+        if (plans[j].slot_budget != slot_equal) {
+            const int64_t reserve = comm_dev[j] + pt_fixed + pt_hc + margin_dev[j];
+            plans[j] = plan_device(j, reserve, &host_each[j], slot_equal);
+        }
+    }
+
     for (size_t j = 0; j < nd; j++) {
         const int64_t pt_j    = pt_fixed + pt_hc;
-        const int64_t reserve = comm_dev[j] + pt_j + margin_dev[j];
-        const ep_plan pl      = plan_device(j, reserve, &host_each[j]);
+        const ep_plan & pl    = plans[j];
 
         LOG_INF("%s: device %zu: free %.0f MiB, dense %.0f MiB, context %.0f MiB, compute %.0f MiB,"
                 " draft %.0f MiB, draft context %.0f MiB, draft compute %.0f MiB, sinks %.0f MiB,"
@@ -1271,7 +1299,7 @@ static void common_fit_ep(
             (double) dev_model[j]/MiB, (double) ctx_dev[j]/MiB, (double) compute_total/MiB,
             pl.slot_used/1024.0/1024.0, pl.slot_budget/1024.0/1024.0, pl.stage_bytes/1024.0/1024.0,
             pl.host_bytes/1024.0/1024.0, hit);
-        slot_budgets[j] = pl.slot_budget;
+        slot_budgets[j] = slot_budgets_own[j];
         host_complement += (int64_t) pl.host_bytes;
         has_experts = true;
     }
@@ -1298,6 +1326,16 @@ static void common_fit_ep(
         LOG_INF("%s: expert slot budgets: min %.0f MiB (device %zu), max %.0f MiB (device %zu), difference %.0f MiB\n",
             __func__, min_slot/1024.0/1024.0, min_id, max_slot/1024.0/1024.0, max_id,
             (max_slot - min_slot)/1024.0/1024.0);
+        if (max_slot > min_slot) {
+            std::string cuts;
+            for (size_t j = 0; j < nd; j++) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%s%.0f", j == 0 ? "" : ",", (slot_budgets[j] - min_slot)/1024.0/1024.0);
+                cuts += buf;
+            }
+            LOG_INF("%s: expert slot budgets equalized to %.0f MiB on every device (cut per device %s MiB)\n",
+                __func__, min_slot/1024.0/1024.0, cuts.c_str());
+        }
     }
 
     // host complement NUMA check, same backend proc the layer-split path uses

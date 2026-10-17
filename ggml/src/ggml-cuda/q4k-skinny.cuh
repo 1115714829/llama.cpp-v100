@@ -3,8 +3,8 @@
 // Design follows the QPN8 execution layout of q8-skinny.cu (itself adapted from 1Cat-vLLM
 // fp8_qpn8_sm70.cu, Apache-2.0) and the int4 scale/bias folding of 1Cat's awq_qpn_m1_sm70.cu
 // and ninfer-v100's q4 Volta kernels. The QPN8 layout is derived from dnv2003/v100-skinny
-// (MIT) and its block-scale adaptation in haohervchb/sglang-V100. See LICENSE.v100-skinny in
-// this directory; the repacked weight layout is described below.
+// (MIT) and its block-scale adaptation in haohervchb/sglang-V100. See licenses/LICENSE-v100-skinny in
+// the repository root; the repacked weight layout is described below.
 
 #pragma once
 

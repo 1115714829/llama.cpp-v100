@@ -121,6 +121,12 @@ extern "C" {
         void * user_data;
     };
 
+    // the allocation-dependency part of a backend's graph_optimize that is pure graph-structure analysis
+    // (it only calls params->add_alloc_dep): a backend may export it through its registry
+    // (ggml_backend_reg_get_proc_address) so that a backend wrapping its devices, such as the meta backend
+    // under tensor parallelism, can forward it from its own graph_optimize
+    typedef void (*ggml_backend_graph_optimize_fusion_deps_t)(struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
     struct ggml_backend_i {
         const char * (*get_name)(ggml_backend_t backend);
 

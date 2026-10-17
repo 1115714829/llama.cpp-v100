@@ -587,9 +587,12 @@ extern "C" {
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_QSA_SELECT,
         GGML_OP_QSA_ATTN,
+        GGML_OP_QSA_EXPAND,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_SEQ_SCATTER,
+        GGML_OP_SEQ_GATHER,
 
         GGML_OP_UNARY,
 
@@ -2793,6 +2796,37 @@ extern "C" {
         int32_t               n_top_pool,
         int32_t               sentinel);
 
+    // The same selection stopped at the pool level (op_params[3] = 1): the kept pool indices in
+    // ascending order, then -1 up to n_top_pool. ggml_qsa_expand turns a row into the cell row
+    // that ggml_qsa_select writes. Every token only depends on its own q row and range, so a
+    // multi-device backend can score disjoint token slices and gather the small pool rows.
+    // The sources are q, k, pool_rng, pool_cells (no member or tail cells).
+    //
+    // res [n_top_pool, n_tokens] I32
+    GGML_API struct ggml_tensor * ggml_qsa_select_pool(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * pool_cells,
+        struct ggml_tensor  * pool_rng,
+        float                 head_scale,
+        int32_t               n_top_pool,
+        int32_t               sentinel);
+
+    // Expand the pool rows of ggml_qsa_select_pool into cell rows: the member cells of every
+    // pool >= 0 in row order, then the tail cells that are not sentinel, then -1 up to the end.
+    //
+    // ids_pool  [n_top_pool, n_tokens]              I32 kept pools ascending, -1 padded
+    // pool_idxs [kpool,      n_pool]                I32 member cells of each block
+    // tail_idxs [kpool - 1,  n_tokens]              I32 incomplete tail cells of each token
+    // res       [kpool*n_top_pool + kpool - 1, n_tokens] I32, identical to ggml_qsa_select
+    GGML_API struct ggml_tensor * ggml_qsa_expand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids_pool,
+        struct ggml_tensor  * pool_idxs,
+        struct ggml_tensor  * tail_idxs,
+        int32_t               sentinel);
+
     // QSA attention: each token attends to the cells that ids lists for it.
     //
     // q   [n_embd_k, n_head,    n_tokens]          F32
@@ -2858,6 +2892,37 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // Sequence-parallel token split and gather (see docs/design/r200-seqpar.md).
+    //
+    // seq_scatter: a [..., T] on `axis` -> [..., n] holding the token slice [t0, t0 + n). The
+    // graph builder passes t0 = 0, n = T, so the node keeps a's global shape; under the meta
+    // backend each device's simple tensor is the per-device node with its own (t0_j, T_j)
+    // from ggml_seq_token_share, so a MIRRORED source is sliced locally (no communication)
+    // and a PARTIAL source makes this node the reduce-scatter boundary of the collective.
+    //
+    // seq_gather: a [..., n_j] on `axis` (the concatenation of all per-device slices is the
+    // global T) -> [..., T], optionally casting to `type` (F16/F32/I32). The graph builder
+    // passes the global shape; on a single backend the node is a cast/dup, under the meta
+    // backend it is the all-gather boundary.
+    GGML_API struct ggml_tensor * ggml_seq_scatter(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   axis,
+            int64_t               t0,
+            int64_t               n);
+
+    GGML_API struct ggml_tensor * ggml_seq_gather(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   axis,
+            enum ggml_type        type);
+
+    // Token share of device j of n devices over a global token count T on the token axis:
+    // Tp = ceil(T/n), t0_j = j*Tp, n_j = Tp for j < n-1 and n_{n-1} = T - Tp*(n-1).
+    // Single source of truth for every per-device token slice under sequence parallelism,
+    // including the device shares of the per-rank all-gather of the communication backends.
+    GGML_API void ggml_seq_token_share(int64_t T, int64_t n, int64_t j, int64_t * t0, int64_t * nj);
 
     // custom operators
 

@@ -421,7 +421,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_kv_cache        ("cache_(k|v)_l\\d*");
     static const std::regex pattern_kv_rot          ("cache_(k|v)_rot");
     static const std::regex pattern_layer_inp_sink  ("(embd_(layer_inp|src)_sink|h_nextn_sink)");
-    static const std::regex pattern_idx_cache       ("cache_idx_(k|v)_l\\d*");
+    static const std::regex pattern_idx_cache       ("cache_idx_(k|v|r)_l\\d*");
     static const std::regex pattern_dsv4_state      ("dsv4_(csa|hca|lid)_state_(kv|score)_l\\d*");
     static const std::regex pattern_attn_sinks      ("blk\\.\\d*\\.attn_sinks.weight");
     static const std::regex pattern_attn_out_weight ("blk\\.\\d*\\.attn_output.weight");
@@ -616,7 +616,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             }
         }
 
-        // the qsa indexer has one key head and its projections are mirrored, so its cache cannot be split
+        // the qsa indexer has one key head and its projections are mirrored, so its cache cannot be split (k: the indexer
+        // keys, or the pooled keys of the compact layout; r: the compact layout's raw-key ring)
         if (std::regex_match(tensor_name, pattern_idx_cache)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
@@ -2193,16 +2194,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        // BF16 weights converted to F16 are rewritten while loading, they cannot point into the mapping
-        bool ctx_has_bf16_as_f16 = false;
+        // weights converted to another type (BF16 to F16, F32 to BF16) are rewritten while loading,
+        // they cannot point into the mapping
+        bool ctx_has_converted = false;
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (ml.is_bf16_as_f16(t)) {
-                ctx_has_bf16_as_f16 = true;
+            if (ml.is_type_converted(t)) {
+                ctx_has_converted = true;
                 break;
             }
         }
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && !ctx_has_bf16_as_f16 && buffer_from_host_ptr_supported && is_default_buft) {
+        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && !ctx_has_converted && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
@@ -2943,6 +2945,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                     /* n_seq_max         */ cparams.n_seq_max,
                     /* n_rs_seq          */ cparams.n_rs_seq,
+                    /* n_ubatch          */ cparams.n_ubatch,
                     /* offload           */ cparams.offload_kqv,
                     /* unified           */ cparams.kv_unified,
                     /* filter_attn       */ std::move(filter_attn),
@@ -3238,6 +3241,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
                             /* n_seq_max         */ cparams.n_seq_max,
                             /* n_rs_seq          */ cparams.n_rs_seq,
+                            /* n_ubatch          */ cparams.n_ubatch,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
@@ -3891,7 +3895,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
     TENSOR_ALLOW_RESHAPE  (llama_model_loader::TENSOR_ALLOW_RESHAPE),
     TENSOR_READ_LAZY      (llama_model_loader::TENSOR_READ_LAZY),
-    TENSOR_GATE_UP_INTERLEAVE(llama_model_loader::TENSOR_GATE_UP_INTERLEAVE) {}
+    TENSOR_GATE_UP_INTERLEAVE(llama_model_loader::TENSOR_GATE_UP_INTERLEAVE),
+    TENSOR_F32_AS_BF16    (llama_model_loader::TENSOR_F32_AS_BF16) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
         const LLM_TN_IMPL * tn_src_gate, const LLM_TN_IMPL * tn_src_up) {

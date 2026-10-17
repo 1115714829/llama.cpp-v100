@@ -96,6 +96,12 @@ struct llama_model_loader {
     // by n_ff up rows per expert) and is rewritten into the interleaved order (row 2r = gate row r,
     // row 2r+1 = up row r) that ggml_mul_mat_id_swiglu reads; see llama_interleave_gate_up_rows
     static const int TENSOR_GATE_UP_INTERLEAVE = 1 << 6;
+    // an F32 weight of the file is stored as BF16 (rounded to nearest even while loading): the MoE
+    // router of qwen4exp, whose F32 values in the GGUF are the BF16 values of the checkpoint, so the
+    // conversion is exact for them and halves the bytes every token reads. BF16 is kept on devices
+    // without native BF16 support too: the CUDA kernels read it into F32 and accumulate in F32
+    // (mul_mat_vec_f, cuBLAS SGEMM after the BF16->F32 conversion), as for the F32 weight
+    static const int TENSOR_F32_AS_BF16     = 1 << 7;
 
     int n_kv      = 0;
     int n_tensors = 0;
@@ -206,6 +212,10 @@ struct llama_model_loader {
     // BF16 weights loaded as F16 on devices without native BF16 support
     size_t n_bf16_converted = 0; // elements
     size_t n_bf16_clamped   = 0; // elements clamped to +-65504
+
+    // F32 weights stored as BF16 (TENSOR_F32_AS_BF16)
+    size_t n_f32_as_bf16         = 0; // elements
+    size_t n_f32_as_bf16_rounded = 0; // elements that BF16 does not represent exactly
 
     // The routed expert weights this loader created (by their role), whether they go into the
     // expert store or stay plain device weights (no_expert_store): both are laid out by the expert
@@ -323,8 +333,9 @@ struct llama_model_loader {
     // true if the devices in the list have no native BF16 support, so BF16 weights should be loaded as F16
     static bool bf16_weights_as_f16(const buft_list_t * buft_list);
 
-    // true if the tensor is a BF16 weight that is loaded as F16
-    bool is_bf16_as_f16(const struct ggml_tensor * tensor) const;
+    // true if the tensor has another type than its weight in the file (a BF16 weight loaded as
+    // F16, an F32 weight stored as BF16): it is rewritten while loading and cannot point into the mapping
+    bool is_type_converted(const struct ggml_tensor * tensor) const;
 
     // tn_src_gate and tn_src_up name the two file tensors a gate/up tensor is synthesized from,
     // instead of looking the tensor up in the file. only valid when they are set

@@ -15,8 +15,10 @@ inline constexpr size_t COMMON_FIT_TARGET_DEFAULT = 1024ull*1024*1024;
 // 270 MiB per card once every request shape has run; evicted graphs give their memory to new
 // ones, so the total stops growing), the operator pools of the CUDA backend (they keep their
 // peak, about 90 MiB), the cuBLAS handle, lazily loaded module code, and the connection buffers
-// NCCL >= 2.22 allocates at the first large collective (78-116 MiB per card; NCCL 2.21 allocates
-// them at the init, where the fit measures them). Measured on 6 x V100 (AC922, MTP, 30-37 minute
+// NCCL >= 2.22 allocates at the first large all-reduce (78-116 MiB per card; NCCL 2.21 allocates
+// them at the init, where the fit measures them). The ring that the reduce-scatters/all-gathers of
+// sequence parallelism add on top is budgeted by the fit itself (llama_internal_comm_connect).
+// Measured on 6 x V100 (MTP, 30-37 minute
 // runs of 75 requests of 15 shapes: short to 200K prompts, outputs up to 2048, prefix reuse):
 // at most 521 MiB per card with NCCL 2.27 and 443 MiB with NCCL 2.21, flat from the third round
 // on; NCCL 2.29 projects to at most 540 MiB. The default keeps at least 250 MiB free above each

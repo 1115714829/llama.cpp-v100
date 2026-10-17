@@ -113,6 +113,13 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
 // backend reports one number per buffer type and the tensors are split differently
 LLAMA_API const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_memory_tensors(const llama_context * ctx);
 
+// Under a tensor split, run one of each collective the context's prefill graph uses (the large
+// all-reduce, the reduce-scatter of sequence parallelism) on its communication context, so that
+// the connection buffers a collective library sets up lazily are allocated now and count as device
+// memory of that context. The expert parallel fit calls it on its measurement context to budget
+// them; the real context still connects them at its first large collective.
+LLAMA_API void llama_internal_comm_connect(llama_context * ctx);
+
 // Set whether the context outputs nextn embeddings or not
 // If masked == true,  output the embeddings only for the tokens with batch.logits != 0
 // If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits

@@ -65,8 +65,7 @@ jobs:
           mkdir -p "$name/licenses"
           cp -a build/bin/llama-* build/bin/lib*.so* build/bin/test-backend-ops "$name/"
           cp LICENSE README.md "$name/"
-          cp licenses/* ggml/src/ggml-cuda/LICENSE.v100-skinny ggml/src/ggml-cuda/gdn-chunk-sm70/LICENSE-tilelang \
-             ggml/src/ggml-cuda/sm70-vendor/LICENSE-* "$name/licenses/"
+          cp -a licenses/* "$name/licenses/"
           tar -czf "$name.tar.gz" "$name"
 
       - name: Upload package

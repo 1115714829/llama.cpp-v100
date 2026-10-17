@@ -1,5 +1,6 @@
 #include "norm.cuh"
 #include "unary.cuh"
+#include "mmvf-narrow.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -970,7 +971,12 @@ void ggml_cuda_op_rms_norm_scale_fused(ggml_backend_cuda_context & ctx, ggml_ten
 // and stores them (the DSV4_HC_POST output), adds their squares over the columns tid, tid + 1024,
 // ... and reduces them like rms_norm_f32; the normalized values times the gamma are the MUL
 // output. Both outputs are bitwise those of the two kernels it replaces.
-template <int block_size, bool has_post>
+// With inject (has_post only): `post` is not read; the inject projection that produces it (the previous
+// mixer's F32 [hc_dim, hc] inject weight times its normed input, qwen4exp build_hc_mix) is computed by the
+// first 256 threads of each block for its (row, channel) with the warps of mul_mat_vec_f_split
+// (mmvf-narrow.cuh), the same accumulation, warp reduction and 8-warp reduction, so the value is bitwise
+// the one that separate launch writes.
+template <int block_size, bool has_post, bool inject = false>
 static __global__ void dsv4_hc_post_rms_norm_mul_f32(
         const float * __restrict__ x,
         const float * __restrict__ residual,
@@ -994,7 +1000,12 @@ static __global__ void dsv4_hc_post_rms_norm_mul_f32(
         const int64_t mul_stride_channel,
         const uint3   mul_ncols_packed,
         const uint3   mul_nrows_packed,
-        const uint3   mul_nchannels_packed) {
+        const uint3   mul_nchannels_packed,
+        const float * __restrict__ inj_w = nullptr,
+        const float * __restrict__ inj_y = nullptr,
+        const int64_t inj_w_stride = 0,
+        const int64_t inj_y_stride = 0,
+        const int     inj_ncols2 = 0) {
     const int nrows   = gridDim.x;
     const int row     = blockIdx.x; // stream
     const int channel = blockIdx.y; // token
@@ -1015,8 +1026,35 @@ static __global__ void dsv4_hc_post_rms_norm_mul_f32(
     float tmp = 0.0f; // partial sum for thread in warp
 
     if constexpr (has_post) {
+        float post_v;
+        if constexpr (inject) {
+            __shared__ float s_inj[mmvf_narrow_split_warps + 1];
+            if (tid < mmvf_narrow_block_size) {
+                float sumf[1] = { 0.0f };
+                mul_mat_vec_f_narrow_accumulate<float, 1>(inj_w + row*inj_w_stride, (const float2 *) (inj_y + channel*inj_y_stride),
+                                                          inj_ncols2, 0, tid, sumf);
+                const float ws = warp_reduce_sum<WARP_SIZE>(sumf[0]);
+                if (tid % WARP_SIZE == 0) {
+                    s_inj[tid / WARP_SIZE] = ws;
+                }
+            }
+            __syncthreads();
+            if (tid < WARP_SIZE) {
+                float v = tid < mmvf_narrow_split_warps ? s_inj[tid] : 0.0f;
+                v = warp_reduce_sum<WARP_SIZE>(v);
+                if (tid == 0) {
+                    s_inj[mmvf_narrow_split_warps] = v;
+                }
+            }
+            __syncthreads();
+            post_v = s_inj[mmvf_narrow_split_warps];
+            GGML_UNUSED_VARS(post, sp0, sp1);
+        } else {
+            GGML_UNUSED_VARS(inj_w, inj_y, inj_w_stride, inj_y_stride, inj_ncols2);
+            post_v = post[row*sp0 + channel*sp1];
+        }
         // dsv4_hc_post_f32<false, true>
-        const float v = gate_inv_hc * post[row*sp0 + channel*sp1];
+        const float v = gate_inv_hc * post_v;
         const float p = gate_scale * (1.0f / (1.0f + expf(-v)));
 
         for (int col = tid; col < ncols; col += block_size) {
@@ -1074,7 +1112,8 @@ static bool hc_mix_norm_supported(const ggml_tensor * rms_in, const ggml_tensor 
 // DSV4_HC_POST before it is computed too. mul_f16, if not nullptr, receives the F16 copy of the
 // MUL output.
 static void hc_mix_norm_launch(ggml_backend_cuda_context & ctx, ggml_tensor * hc_post, ggml_tensor * scale_inv_hc,
-                               ggml_tensor * scale_gate, ggml_tensor * rms_norm, ggml_tensor * mul, half * mul_f16) {
+                               ggml_tensor * scale_gate, ggml_tensor * rms_norm, ggml_tensor * mul, half * mul_f16,
+                               const ggml_tensor * inject = nullptr) {
     const ggml_tensor * rms_in = rms_norm->src[0];
     const ggml_tensor * gamma  = mul->src[0] == rms_norm ? mul->src[1] : mul->src[0];
 
@@ -1095,7 +1134,10 @@ static void hc_mix_norm_launch(ggml_backend_cuda_context & ctx, ggml_tensor * hc
     const dim3 blocks_num(nrows, nchannels, 1);
     const dim3 block_dims(1024, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32 * sizeof(float), ctx.stream()};
-    auto kernel = hc_post ? dsv4_hc_post_rms_norm_mul_f32<1024, true> : dsv4_hc_post_rms_norm_mul_f32<1024, false>;
+    auto kernel = hc_post ? (inject ? dsv4_hc_post_rms_norm_mul_f32<1024, true, true> : dsv4_hc_post_rms_norm_mul_f32<1024, true, false>)
+                          : dsv4_hc_post_rms_norm_mul_f32<1024, false>;
+    const ggml_tensor * inj_w = inject ? inject->src[0] : nullptr;
+    const ggml_tensor * inj_y = inject ? inject->src[1] : nullptr;
     ggml_cuda_kernel_launch(kernel, launch_params,
         x ? (const float *) x->data : nullptr, (const float *) residual->data, post ? (const float *) post->data : nullptr,
         hc_post ? (float *) hc_post->data : nullptr, (float *) mul->data, mul_f16, (int) ncols,
@@ -1105,7 +1147,10 @@ static void hc_mix_norm_launch(ggml_backend_cuda_context & ctx, ggml_tensor * hc
         inv_hc, factor, eps,
         (const float *) gamma->data, (int64_t) (gamma->nb[1] / ts), (int64_t) (gamma->nb[2] / ts),
         init_fastdiv_values((uint32_t) gamma->ne[0]), init_fastdiv_values((uint32_t) gamma->ne[1]),
-        init_fastdiv_values((uint32_t) gamma->ne[2]));
+        init_fastdiv_values((uint32_t) gamma->ne[2]),
+        inj_w ? (const float *) inj_w->data : nullptr, inj_y ? (const float *) inj_y->data : nullptr,
+        inj_w ? (int64_t) (inj_w->nb[1] / ts) : 0, inj_y ? (int64_t) (inj_y->nb[1] / ts) : 0,
+        inj_w ? (int) (inj_w->ne[0] / 2) : 0);
 }
 
 // Returns false when the nodes are not the shapes the fused kernel covers; the caller then runs
@@ -1141,9 +1186,13 @@ bool ggml_cuda_hc_mix_norm_supported(const ggml_tensor * hc_post, const ggml_ten
 }
 
 void ggml_cuda_op_hc_mix_norm(ggml_backend_cuda_context & ctx, ggml_tensor * hc_post, ggml_tensor * scale_inv_hc,
-                              ggml_tensor * scale_gate, ggml_tensor * rms_norm, ggml_tensor * mul, half * mul_f16) {
+                              ggml_tensor * scale_gate, ggml_tensor * rms_norm, ggml_tensor * mul, half * mul_f16,
+                              const ggml_tensor * inject) {
     GGML_ASSERT(ggml_cuda_hc_mix_norm_supported(hc_post, scale_inv_hc, rms_norm, mul));
-    hc_mix_norm_launch(ctx, hc_post, scale_inv_hc, scale_gate, rms_norm, mul, mul_f16);
+    GGML_ASSERT(inject == nullptr || (hc_post != nullptr && scale_inv_hc->src[0] == inject &&
+                inject->src[0]->type == GGML_TYPE_F32 && inject->src[1]->type == GGML_TYPE_F32 &&
+                inject->src[0]->ne[0] % (2*mmvf_narrow_block_size) == 0));
+    hc_mix_norm_launch(ctx, hc_post, scale_inv_hc, scale_gate, rms_norm, mul, mul_f16, inject);
 }
 
 void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor) {

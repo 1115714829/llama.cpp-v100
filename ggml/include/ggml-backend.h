@@ -233,9 +233,50 @@ extern "C" {
     // collective can be recorded into such a capture (same arguments as `can`).
     typedef bool   (*ggml_backend_capture_begin_t) (ggml_backend_t backend);
     typedef void * (*ggml_backend_capture_end_t)   (ggml_backend_t backend);
+    // Like `end`, but records the capture into `exec`, an executable of an earlier capture of another graph
+    // with the same topology, in place where possible (cheaper than a new executable). `exec` is consumed:
+    // the result is `exec` itself, a new executable replacing it, or NULL if the capture failed. `exec`
+    // must not be in flight.
+    typedef void * (*ggml_backend_capture_update_t)(ggml_backend_t backend, void * exec);
     typedef bool   (*ggml_backend_capture_launch_t)(ggml_backend_t backend, void * exec);
     typedef void   (*ggml_backend_capture_free_t)  (void * exec);
+    // Whether a graph computes a prefill-sized ubatch, by the rule the backend uses for its own per-graph
+    // capture cache; a graph split into subgraphs (meta backend) asks it for the whole graph, since a
+    // subgraph without a weight matmul cannot tell. While `uncached` is set, the backend evaluates the
+    // graphs it is given like prefill-sized ones: directly, without an entry in its per-graph capture cache.
+    typedef bool   (*ggml_backend_graph_prefill_sized_t)(const struct ggml_cgraph * cgraph);
+    typedef void   (*ggml_backend_set_graph_uncached_t)(ggml_backend_t backend, bool uncached);
     typedef bool   (*ggml_backend_comm_allreduce_rank_capturable_t)(void * comm_ctx, struct ggml_tensor ** tensors, bool exact);
+
+    // Per-rank reduce-scatter and all-gather of the sequence-parallel token axis (see
+    // docs/design/r200-seqpar.md). Both split the token axis `axis` of the tensors into n
+    // shares (ggml_seq_token_share) and use one NCCL call over a padded, evenly split buffer.
+    //
+    // reduce_scatter_rank: rank's src_full [..., T] holds a partial sum over the whole token
+    // axis; dst_slice [..., T_rank] receives rank's own share of the sum. The wire type is
+    // bf16. `can` gets the tensors of all ranks and reports (without enqueueing anything)
+    // whether the per-rank calls handle this collective, all ranks taking the same route.
+    typedef bool   (*ggml_backend_comm_reduce_scatter_rank_can_t)(void * comm_ctx, struct ggml_tensor ** srcs, struct ggml_tensor ** dsts, int axis);
+    typedef bool   (*ggml_backend_comm_reduce_scatter_rank_t)    (void * comm_ctx, size_t rank, struct ggml_tensor * src_full, struct ggml_tensor * dst_slice, int axis, int64_t col_off);
+
+    // allgather_rank: rank's src_slice [..., T_rank] holds rank's share; dst_full [..., T]
+    // receives all shares concatenated on `axis`. dst_full's type selects the wire type
+    // (F16/F32/I32); a F32 source gathered into F16 is cast first.
+    typedef bool   (*ggml_backend_comm_allgather_rank_can_t)(void * comm_ctx, struct ggml_tensor ** srcs, struct ggml_tensor ** dsts, int axis);
+    typedef bool   (*ggml_backend_comm_allgather_rank_t)    (void * comm_ctx, size_t rank, struct ggml_tensor * src_slice, struct ggml_tensor * dst_full, int axis, int64_t col_off);
+
+    // Capability query: whether this communication context can run the per-rank all-gather at all
+    // (independent of any tensor shape). The scheduling side uses it to decide whether a graph is
+    // split across the ranks for a collective that only exists as a per-rank all-gather.
+    typedef bool   (*ggml_backend_comm_allgather_rank_available_t)(void * comm_ctx);
+
+    // Connect the collectives a context will run: an all-reduce of ne_allreduce elements and, when
+    // ne_reduce_scatter > 0, a reduce-scatter of that many elements (its ring also carries the
+    // all-gathers). A collective library may set up its connection buffers lazily, at the first
+    // collective of each algorithm. The device memory the reduce-scatter connects beyond what the
+    // all-reduce connects counts as device memory of the communication context
+    // (ggml_backend_comm_memory); the parameter fit uses it on its measurement context to budget it.
+    typedef void   (*ggml_backend_comm_connect_t)(void * comm_ctx, int64_t ne_allreduce, int64_t ne_reduce_scatter);
 
     // Split buffer type for tensor parallelism (old)
     typedef ggml_backend_buffer_type_t   (*ggml_backend_split_buffer_type_t)(int main_device, const float * tensor_split);
@@ -506,6 +547,11 @@ extern "C" {
     // returns true if the buffer belongs to a meta backend
     GGML_API bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf);
 
+    // Connects the collectives of a meta backend's communication context, see
+    // ggml_backend_comm_connect_t. No-op for a backend without a communication context or whose
+    // simple backends offer no connect.
+    GGML_API void ggml_backend_meta_comm_connect(ggml_backend_t backend, int64_t ne_allreduce, int64_t ne_reduce_scatter);
+
     // The buffer type of a meta device for the weights that its GPUs read in place (the n-gram
     // table and the token embedding table): all devices share one mapped host allocation, so the
     // tables are MIRRORED and every device reads the same rows over UVA. Returns NULL when none
@@ -552,14 +598,20 @@ extern "C" {
     // narrows each window), dequantizes them into a local f16 window mirror, runs the Split-D
     // partial kernel and merges the window partials into the owner's partial slots. The owner
     // computes [0, s) with its existing windowed path, merges the idle partial and scatters the
-    // normalized output. Epoch slots order the cross-device accesses; every slot belongs to the
-    // device that waits on it (epoch on the owner, last on the idle/owner that spins). All
-    // pointers are valid for the lifetime of the plan.
+    // normalized output. Epoch words order the cross-device accesses. They are per (assist layer,
+    // owner) and live on the owner; each one is signalled exactly once per execution of the plan,
+    // so after n executions it holds n. A waiter keeps its own generation word (how many
+    // executions it has entered) and spins until the epoch reaches the generation it needs: the
+    // owner/idle pairing of a layer is fixed, but the device that serves an owner differs between
+    // layers (the KV heads rotate over the devices), so no waiter may rely on "the value it saw
+    // last time", which another device's layer has moved on. All pointers are valid for the
+    // lifetime of the plan.
     struct ggml_backend_meta_assist_rank {
         int32_t role;            // 0 = owner, 1 = assist
         int32_t n_owners;        // role 1: owners served (1 or 2); role 0: 1
         int32_t owners[2];       // role 1: owner ranks; role 0: unused
         int32_t assist_rank;     // role 0: rank of its assist; role 1: unused
+        int32_t idle_load;       // role 0: owners its assist serves back to back (sets the split); role 1: unused
         int32_t owner_dev[2];    // role 1: owner CUDA device ordinals for the peer copies
 
         // KV window partition in rows: both ranks walk the whole K/V view [0, kv_view) in
@@ -589,11 +641,13 @@ extern "C" {
         float * p_out_dst[2];    // owner raw partial slots
         float * p_max_dst[2];
         float * p_sum_dst[2];
-        uint32_t * epoch_kv[2];      // wait: owner signals after its Q staging and split point
-        uint32_t * epoch_partial[2]; // signal: owner waits before merging
-        uint32_t * epoch_free[2];    // wait: owner signals after its merge/scatter
-        uint32_t * last_kv[2];       // idle local
-        uint32_t * last_free[2];     // idle local
+        uint32_t * epoch_kv[2];      // wait: owner signals after its Q staging and split point (this layer)
+        uint32_t * epoch_partial[2]; // signal: owner waits before merging (this layer)
+        uint32_t * epoch_free[2];    // wait: owner signals after the merge/scatter of the previous layer
+                                     //       that used the same partial slot of this owner
+        uint32_t   free_lag[2];      // 1 when that previous layer comes later in the plan (it ran in the
+                                     //   previous execution), else 0
+        uint32_t * gen[2];           // idle local generation of (this layer, owner)
         const struct ggml_backend_meta_assist_split * split_src[2]; // owner split point, peer VA
         struct ggml_backend_meta_assist_split * split_local;        // role 0: own slot; role 1: local copy
 
@@ -603,7 +657,7 @@ extern "C" {
         float * p_sum_local;
         uint32_t * epoch_kv_local;      // signal after stage_q and the split point
         uint32_t * epoch_partial_local; // wait before the merge
-        uint32_t * last_partial_local;  // owner local
+        uint32_t * gen_local;           // owner local generation of this layer
         uint32_t * epoch_free_local;    // signal after the scatter
 
         // role 1: idle workspace, ggml_backend_cuda_assist_workspace_size bytes

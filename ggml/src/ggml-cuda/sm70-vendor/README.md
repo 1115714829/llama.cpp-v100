@@ -3,7 +3,7 @@
 ## cute/ + cutlass/ (152 headers)
 - Source: https://github.com/NVIDIA/cutlass
 - Commit: 62750a2b75c802660e4894434dc55e839f322277
-- License: BSD-3-Clause (see LICENSE-cute-cutlass)
+- License: BSD-3-Clause (see licenses/LICENSE-cute-cutlass)
 - Why: the 1Cat SM70 D256 Split-D flash-attention kernel is written in CuTe
   (MMA_Atom<SM70_8x8x4> etc). llama.cpp does not vendor cute; this plugin
   needs the transitive include closure (152 headers, header-only).
@@ -11,7 +11,7 @@
 ## flash/ (8 headers)
 - Source: https://github.com/zhinianqin/flash-attention-v100
 - Commit: c2eda5e6115b98c3ba4bfd181570668742eece22
-- License: BSD-3-Clause (FlashAttention lineage; see LICENSE-flash-attention)
+- License: BSD-3-Clause (FlashAttention lineage; see licenses/LICENSE-flash-attention-sm70)
 - Why: the kernel uses the FA2 base layer for online softmax
   (sm70_reduce_max / sm70_row_slot / sm70_row_allreduce_8 /
   sm70_scale_apply_exp2 in softmax.h), masking (mask.h), and kernel

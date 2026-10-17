@@ -12482,12 +12482,15 @@ void ggml_compute_forward_qsa_select(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
 
+    // pool_only (ggml_qsa_select_pool): the sources are q, k, pool_rng, pool_cells and a row holds the kept pools
+    const bool pool_only = ggml_get_op_params_i32(dst, 3) == 1;
+
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1]; // key table
-    const ggml_tensor * pidx  = dst->src[2]; // member cells of each pool
-    const ggml_tensor * tidx  = dst->src[3]; // tail cells of each token
-    const ggml_tensor * prng  = dst->src[4]; // visible pools [lo, hi) of each token
-    const ggml_tensor * pcell = dst->src[5]; // row of k holding each pool's key
+    const ggml_tensor * pidx  = pool_only ? nullptr     : dst->src[2]; // member cells of each pool
+    const ggml_tensor * tidx  = pool_only ? nullptr     : dst->src[3]; // tail cells of each token
+    const ggml_tensor * prng  = pool_only ? dst->src[2] : dst->src[4]; // visible pools [lo, hi) of each token
+    const ggml_tensor * pcell = pool_only ? dst->src[3] : dst->src[5]; // row of k holding each pool's key
 
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
     GGML_ASSERT(  q->type == GGML_TYPE_F32);
@@ -12497,7 +12500,7 @@ void ggml_compute_forward_qsa_select(
     const int64_t n_tokens   = q->ne[2];
     const int64_t n_pool     = pcell->ne[0];
     const int64_t n_rows     = k->ne[2];
-    const int64_t kpool      = pidx->ne[0];
+    const int64_t kpool      = pool_only ? 0 : pidx->ne[0];
     const int64_t n_sel      = dst->ne[0];
 
     const float   head_scale = ggml_get_op_params_f32(dst, 0);
@@ -12550,9 +12553,21 @@ void ggml_compute_forward_qsa_select(
         });
         std::sort(order, order + nk);
 
-        // the kept pools, the tail, then -1: the valid ids form a prefix
         int32_t * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
         int64_t   n   = 0;
+        if (pool_only) {
+            // the kept pools ascending, then -1
+            GGML_ASSERT(n_top == n_sel);
+            for (int64_t r = 0; r < nk; ++r) {
+                out[n++] = (int32_t) (lo + order[r]);
+            }
+            for (; n < n_sel; ++n) {
+                out[n] = -1;
+            }
+            continue;
+        }
+
+        // the kept pools, the tail, then -1: the valid ids form a prefix
         for (int64_t r = 0; r < nk; ++r) {
             for (int64_t c = 0; c < kpool; ++c) {
                 const int32_t cell = *(const int32_t *) ((const char *) pidx->data + c*pidx->nb[0] + (lo + order[r])*pidx->nb[1]);
@@ -12570,6 +12585,64 @@ void ggml_compute_forward_qsa_select(
             out[n] = -1;
         }
         GGML_ASSERT(n_top*kpool + kpool - 1 == n_sel);
+    }
+}
+
+// ggml_compute_forward_qsa_expand
+
+void ggml_compute_forward_qsa_expand(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * ids  = dst->src[0]; // kept pools of each token, ascending, -1 padded
+    const ggml_tensor * pidx = dst->src[1]; // member cells of each pool
+    const ggml_tensor * tidx = dst->src[2]; // tail cells of each token
+
+    GGML_ASSERT( dst->type == GGML_TYPE_I32);
+    GGML_ASSERT( ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(pidx->type == GGML_TYPE_I32);
+    GGML_ASSERT(tidx->type == GGML_TYPE_I32);
+
+    const int64_t n_top    = ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    const int64_t kpool    = pidx->ne[0];
+    const int64_t n_pool   = pidx->ne[1];
+    const int64_t n_sel    = dst->ne[0];
+
+    const int32_t sentinel = ggml_get_op_params_i32(dst, 0);
+
+    GGML_ASSERT(n_top*kpool + kpool - 1 == n_sel);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    for (int64_t t = ith; t < n_tokens; t += nth) {
+        const char * row = (const char *) ids->data + t*ids->nb[1];
+        int32_t    * out = (int32_t *) ((char *) dst->data + t*dst->nb[1]);
+        int64_t      n   = 0;
+
+        // the cells of the kept pools in row order: the -1 padding ends the kept prefix
+        for (int64_t r = 0; r < n_top; ++r) {
+            const int32_t pool = *(const int32_t *) (row + r*ids->nb[0]);
+            if (pool < 0) {
+                break;
+            }
+            GGML_ASSERT(pool < n_pool);
+            for (int64_t c = 0; c < kpool; ++c) {
+                const int32_t cell = *(const int32_t *) ((const char *) pidx->data + c*pidx->nb[0] + pool*pidx->nb[1]);
+                GGML_ASSERT(cell != sentinel && "qsa expand: a kept pool has a padded member");
+                out[n++] = cell;
+            }
+        }
+        for (int64_t c = 0; c < kpool - 1; ++c) {
+            const int32_t cell = *(const int32_t *) ((const char *) tidx->data + c*tidx->nb[0] + t*tidx->nb[1]);
+            if (cell != sentinel) {
+                out[n++] = cell;
+            }
+        }
+        for (; n < n_sel; ++n) {
+            out[n] = -1;
+        }
     }
 }
 
@@ -12668,4 +12741,55 @@ void ggml_compute_forward_qsa_attn(
             out[d] = acc[d]*inv;
         }
     }
+}
+
+// ggml_compute_forward_seq_scatter
+
+void ggml_compute_forward_seq_scatter(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(src0->type == dst->type);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+
+    const int32_t axis = ggml_get_op_params_i32(dst, 0);
+    const int64_t t0   = ggml_get_op_params_i32(dst, 1);
+    const int64_t n    = ggml_get_op_params_i32(dst, 2);
+    GGML_ASSERT(axis >= 0 && axis < GGML_MAX_DIMS);
+    GGML_ASSERT(dst->ne[axis] == n);
+    GGML_ASSERT(t0 >= 0 && t0 + n <= src0->ne[axis]);
+
+    int64_t inner = 1;
+    for (int i = 0; i < axis; i++) {
+        inner *= dst->ne[i];
+    }
+    int64_t outer = 1;
+    for (int i = axis + 1; i < GGML_MAX_DIMS; i++) {
+        outer *= dst->ne[i];
+    }
+
+    const size_t row_bytes = inner * ggml_type_size(dst->type);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+    for (int64_t o = ith; o < outer; o += nth) {
+        const char * src = (const char *) src0->data + (o*src0->ne[axis] + t0)*row_bytes;
+        char       * d   = (char *)       dst->data +  o*n*row_bytes;
+        memcpy(d, src, n*row_bytes);
+    }
+}
+
+// ggml_compute_forward_seq_gather
+
+void ggml_compute_forward_seq_gather(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+
+    // on a single backend the node is a cast/dup; under the meta backend the
+    // all-gather boundary is handled by the per-rank communication proc
+    ggml_compute_forward_dup(params, dst);
 }

@@ -1201,6 +1201,17 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
 void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    // the splits of the previous graph, per backend in split order: the scheduler drops them here, so
+    // they are never computed again, and each new split names the one it replaces on its backend
+    // (graph.uid_prev). A pipelined scheduler may still run the graph of another stage, it names none
+    std::vector<std::pair<int, uint64_t>> uids_prev;
+    if (sched->n_stages == 1) {
+        uids_prev.reserve(sched->n_splits);
+        for (int i = 0; i < sched->n_splits; i++) {
+            uids_prev.emplace_back(sched->splits[i].backend_id, sched->splits[i].graph.uid);
+        }
+    }
+
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -1749,7 +1760,24 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     // set ids for all splits
     for (int i = 0; i < sched->n_splits; ++i) {
-        sched->splits[i].graph.uid = ggml_graph_next_uid();
+        sched->splits[i].graph.uid      = ggml_graph_next_uid();
+        sched->splits[i].graph.uid_prev = 0;
+    }
+    // the k-th new split of a backend replaces the k-th previous split of that backend
+    for (int b = 0; b < sched->n_backends && !uids_prev.empty(); b++) {
+        size_t k = 0;
+        for (int i = 0; i < sched->n_splits; ++i) {
+            if (sched->splits[i].backend_id != b) {
+                continue;
+            }
+            while (k < uids_prev.size() && uids_prev[k].first != b) {
+                k++;
+            }
+            if (k == uids_prev.size()) {
+                break;
+            }
+            sched->splits[i].graph.uid_prev = uids_prev[k++].second;
+        }
     }
 }
 
@@ -3366,6 +3394,8 @@ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
+        case GGML_OP_SEQ_GATHER: // the all-gather receive buffer holds the rank segments' pad columns
+        case GGML_OP_QSA_SELECT: // so does the pool-row selection that the meta backend gathers in place
             return true;
         default:
             return false;

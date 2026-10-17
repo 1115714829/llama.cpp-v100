@@ -2177,6 +2177,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_qsa_attn(params, tensor);
             } break;
+        case GGML_OP_QSA_EXPAND:
+            {
+                ggml_compute_forward_qsa_expand(params, tensor);
+            } break;
         case GGML_OP_DSV4_HC_COMB:
             {
                 ggml_compute_forward_dsv4_hc_comb(params, tensor);
@@ -2188,6 +2192,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_DSV4_HC_POST:
             {
                 ggml_compute_forward_dsv4_hc_post(params, tensor);
+            } break;
+        case GGML_OP_SEQ_SCATTER:
+            {
+                ggml_compute_forward_seq_scatter(params, tensor);
+            } break;
+        case GGML_OP_SEQ_GATHER:
+            {
+                ggml_compute_forward_seq_gather(params, tensor);
             } break;
         case GGML_OP_MAP_CUSTOM1:
             {
@@ -2372,6 +2384,8 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
+        case GGML_OP_SEQ_SCATTER:
+        case GGML_OP_SEQ_GATHER:
             {
                 n_tasks = n_threads;
             } break;
@@ -2516,6 +2530,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_LIGHTNING_INDEXER:
         case GGML_OP_QSA_SELECT:
         case GGML_OP_QSA_ATTN:
+        case GGML_OP_QSA_EXPAND:
             {
                 n_tasks = n_threads;
             } break;
@@ -3131,9 +3146,11 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_QSA_SELECT:
                     {
-                        // one widened key, the scores of the visible pools and their order, see ops.cpp
-                        const int64_t n_embd = node->src[1]->ne[0];
-                        const int64_t n_pool = node->src[5]->ne[0];
+                        // one widened key, the scores of the visible pools and their order, see ops.cpp;
+                        // pool_cells is the last source (src[3] for pool rows, src[5] for cell rows)
+                        const bool    pool_only = ggml_get_op_params_i32(node, 3) == 1;
+                        const int64_t n_embd    = node->src[1]->ne[0];
+                        const int64_t n_pool    = node->src[pool_only ? 3 : 5]->ne[0];
                         cur += ((n_embd + 2*n_pool)*sizeof(float) + CACHE_LINE_SIZE)*n_tasks;
                     } break;
                 case GGML_OP_QSA_ATTN:

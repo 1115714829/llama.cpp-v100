@@ -12,9 +12,15 @@
 //   single  MUL_MAT(W[K,N], x[K,M])                                q8_skinny_kernel
 //   gated   SWIGLU(MUL_MAT(G, x), MUL_MAT(U, x))                    q8_skinny_gated_kernel
 //   ffn     MUL_MAT(D, SWIGLU(MUL_MAT(G, x), MUL_MAT(U, x)))         gated pair + down projection
+//   ffng    ffn followed by the F32 [K, 1] shared expert gate of the same x (qwen4exp order)
 //   multi   MUL_MAT(W_i, x) for 2..4 weights sharing one input     q8_skinny_multi_kernel
 //   hcpost  gated DSV4_HC_POST -> RMS_NORM -> MUL (the hyper-connection combine and next mixer norm)
 //   hcmix   hcpost followed by the Q8_0 down projection, SCALE -> SILU and the up projection
+//   hcmixi  hcmix with the F32 inject projection of the same input expanded right before the down
+//           projection (qwen4exp build_hc_mix order)
+//   hcmixp  hcmixi followed by the gated hc_pre mixer and the Q8_0 GDN qkv/z projections of its result
+//   hcmixq  hcmixp without the inject after the norm, the post input of the combine being the previous
+//           mixer's F32 inject projection (qwen4exp graph order)
 //   hcpre   gated DSV4_HC_PRE followed by the Q8_0 projections of the block input (GDN qkv + z)
 //   gnorm   RMS_NORM -> MUL -> SIGMOID -> MUL (the GDN gated norm) followed by the Q8_0 ssm_out
 //   agate   CONT -> SIGMOID -> MUL (the attention output gate) followed by the Q8_0 wo
@@ -59,6 +65,7 @@ static std::vector<bench_case> make_cases() {
         { "moe", "single", "hc_up",           320, { 10240 } },
         { "moe", "gated",  "shexp_gate_up",  2560, { 640 } },
         { "moe", "ffn",    "shexp_ffn",      2560, { 640 } },
+        { "moe", "ffng",   "shexp_ffn_gate", 2560, { 640 } },
         { "moe", "single", "shexp_down",      640, { 2560 } },
         { "moe", "single", "ssm_out_3h",     1152, { 2560 } },
         { "moe", "single", "ssm_out_2h",      768, { 2560 } },
@@ -71,6 +78,10 @@ static std::vector<bench_case> make_cases() {
         { "hc", "hcpost", "hc_post_norm",  2560, { 4 }, GGML_TYPE_F32 },
         // the whole mixer opening: the combine, the norm, the Q8_0 down/up projections (n = { hc, lr })
         { "hc", "hcmix",  "hc_mix",        2560, { 4, 320 }, GGML_TYPE_Q8_0 },
+        // the same with the F32 inject projection [n_embd*hc, hc] of the normed input
+        { "hc", "hcmixi", "hc_mix_inject", 2560, { 4, 320 }, GGML_TYPE_Q8_0 },
+        { "hc", "hcmixp", "hc_mix_pre",    2560, { 4, 320 }, GGML_TYPE_Q8_0 },
+        { "hc", "hcmixq", "hc_mix_injprev", 2560, { 4, 320 }, GGML_TYPE_Q8_0 },
         // a fused producer handing its result to the next Q8_0 projection: k = n_embd (hcpre, n = { hc,
         // projection widths }) or the projection K (gnorm, agate: n = { head_dim, N })
         { "hand", "hcpre", "hcpre_gdn_3h",   2560, { 4, 1920, 1152 } },
@@ -84,6 +95,9 @@ static std::vector<bench_case> make_cases() {
         { "mmvf", "single", "gate_inp",       2560, { 512 }, GGML_TYPE_F32 },
         { "mmvf", "single", "gate_inp_shexp", 2560, { 1 },   GGML_TYPE_F32 },
         { "mmvf", "single", "ssm_beta",       2560, { 8 },   GGML_TYPE_F32 },
+        // the GDN ssm_beta and ssm_alpha slices of one layer (3-head / 2-head card), one input
+        { "mmvf", "multi",  "ssm_beta_alpha_3h", 2560, { 9, 9 }, GGML_TYPE_F32 },
+        { "mmvf", "multi",  "ssm_beta_alpha_2h", 2560, { 6, 6 }, GGML_TYPE_F32 },
         { "mmvf", "single", "idx_q_proj",     2560, { 512 }, GGML_TYPE_BF16 },
         { "mmvf", "single", "idx_k_proj",     2560, { 128 }, GGML_TYPE_BF16 },
         // Qwen3.8-27B under a 4-card tensor split, per card (regression check)
@@ -116,26 +130,39 @@ static void fill_weight(std::vector<uint8_t> & bytes, ggml_type type, int64_t k,
 // those read and written by the unfused pair.
 static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m, int iters, double min_mib,
                          int * r_out, double * gb_out, const std::string & dump) {
-    const bool    mix    = strcmp(c.pattern, "hcmix") == 0;
+    const bool    injp   = strcmp(c.pattern, "hcmixq") == 0;
+    const bool    pre    = strcmp(c.pattern, "hcmixp") == 0 || injp;
+    const bool    inj    = strcmp(c.pattern, "hcmixi") == 0 || strcmp(c.pattern, "hcmixp") == 0;
+    const bool    mix    = strcmp(c.pattern, "hcmix") == 0 || inj || injp;
     const int64_t n_embd = c.k;
     const int64_t hc     = c.n[0];
     const int64_t n_lr   = mix ? c.n[1] : 0;
-    const size_t w_bytes = mix ? 2 * ggml_row_size(GGML_TYPE_Q8_0, n_embd*hc) * n_lr : 0;
+    const size_t w_bytes = (mix ? 2 * ggml_row_size(GGML_TYPE_Q8_0, n_embd*hc) * n_lr : 0) +
+                           (inj ? sizeof(float) * (size_t) (n_embd*hc*hc) : 0) +
+                           (pre ? ggml_row_size(GGML_TYPE_Q8_0, n_embd) * (1920 + 1152) : 0) +
+                           (injp ? sizeof(float) * (size_t) (n_embd*hc*hc + n_embd*hc*m) : 0);
     const size_t copy_bytes = sizeof(float) * (size_t) (n_embd*m + 3*n_embd*hc*m + hc*m) + w_bytes;
     int r = (int) std::ceil(min_mib * 1024.0 * 1024.0 / (double) copy_bytes);
     r = std::max(4, std::min(r, mix ? 512 : 1024));
 
-    ggml_init_params ip = { ggml_tensor_overhead() * (size_t) r * 20 + ggml_graph_overhead_custom(8192, false), nullptr, true };
+    ggml_init_params ip = { ggml_tensor_overhead() * (size_t) r * 32 + ggml_graph_overhead_custom(16384, false), nullptr, true };
     ggml_context * ctx   = ggml_init(ip);
     ggml_context * ctx_w = ggml_init(ip);
     ggml_tensor * gamma = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, hc);
-    std::vector<ggml_tensor *> xs(r), res(r), posts(r), w_down(r), w_up(r), first_outs;
-    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
+    std::vector<ggml_tensor *> xs(r), res(r), posts(r), w_down(r), w_up(r), w_inj(r), w_q(r), w_z(r), xprev(r), w_injp(r), first_outs;
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx, 16384, false);
     for (int i = 0; i < r; ++i) {
         xs[i]    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, m);
         res[i]   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, m);
         posts[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, m);
-        ggml_tensor * post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, posts[i], 1.0f / (float) hc)), 2.0f);
+        ggml_tensor * post_in = posts[i];
+        if (injp) {
+            // the previous mixer's inject projection of its normed input, read by the gate of the combine
+            xprev[i]  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, m);
+            w_injp[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd*hc, hc);
+            post_in   = ggml_mul_mat(ctx, w_injp[i], xprev[i]);
+        }
+        ggml_tensor * post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post_in, 1.0f / (float) hc)), 2.0f);
         ggml_tensor * hp   = ggml_dsv4_hc_post(ctx, xs[i], res[i], post, nullptr);
         ggml_tensor * xn   = ggml_mul(ctx, ggml_rms_norm(ctx, hp, 1e-6f), gamma);
         if (mix) {
@@ -143,12 +170,39 @@ static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m
             w_down[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q8_0, n_embd*hc, n_lr);
             w_up[i]   = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q8_0, n_lr, n_embd*hc);
             ggml_tensor * x2   = ggml_reshape_2d(ctx, xn, n_embd*hc, m);
+            ggml_tensor * inject = nullptr;
+            if (inj) {
+                // expanded before the down projection, as build_hc_mix does
+                w_inj[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd*hc, hc);
+                inject   = ggml_mul_mat(ctx, w_inj[i], x2);
+                ggml_build_forward_expand(gf, inject);
+            }
             ggml_tensor * lo   = ggml_silu(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, w_down[i], x2), 1.0f / (float) hc));
             ggml_tensor * gate = ggml_mul_mat(ctx, w_up[i], lo);
             ggml_build_forward_expand(gf, gate);
+            ggml_tensor * mixed = nullptr, * pq = nullptr, * pz = nullptr;
+            if (pre) {
+                // build_hc_mix's hc_pre, then build_qkvz's projections of the mixed stream, next to each other
+                mixed = ggml_dsv4_hc_pre_gated(ctx, ggml_reshape_3d(ctx, x2, n_embd, hc, m), ggml_reshape_3d(ctx, gate, n_embd, hc, m),
+                                               1.0f / (float) hc);
+                w_q[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q8_0, n_embd, 1920);
+                w_z[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q8_0, n_embd, 1152);
+                pq = ggml_mul_mat(ctx, w_q[i], mixed);
+                ggml_build_forward_expand(gf, pq);
+                pz = ggml_mul_mat(ctx, w_z[i], mixed);
+                ggml_build_forward_expand(gf, pz);
+            }
             ggml_build_forward_expand(gf, xn);
             if (i == 0) {
                 first_outs = { hp, xn, gate };
+                if (inject) {
+                    first_outs.push_back(inject);
+                }
+                if (pre) {
+                    first_outs.push_back(mixed);
+                    first_outs.push_back(pq);
+                    first_outs.push_back(pz);
+                }
             }
         } else {
             ggml_build_forward_expand(gf, xn);
@@ -180,14 +234,38 @@ static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m
         fill(xs[i]);
         fill(res[i]);
         fill(posts[i]);
+        if (injp) {
+            fill(xprev[i]);
+        }
     }
     if (mix) {
         std::vector<uint8_t> wd, wu;
         fill_weight(wd, GGML_TYPE_Q8_0, n_embd*hc, n_lr, rng);
         fill_weight(wu, GGML_TYPE_Q8_0, n_lr, n_embd*hc, rng);
+        std::vector<uint8_t> wi, wqd, wzd, wip;
+        if (inj) {
+            fill_weight(wi, GGML_TYPE_F32, n_embd*hc, hc, rng);
+        }
+        if (injp) {
+            fill_weight(wip, GGML_TYPE_F32, n_embd*hc, hc, rng);
+        }
+        if (pre) {
+            fill_weight(wqd, GGML_TYPE_Q8_0, n_embd, 1920, rng);
+            fill_weight(wzd, GGML_TYPE_Q8_0, n_embd, 1152, rng);
+        }
         for (int i = 0; i < r; ++i) {
             ggml_backend_tensor_set(w_down[i], wd.data(), 0, wd.size());
             ggml_backend_tensor_set(w_up[i],   wu.data(), 0, wu.size());
+            if (inj) {
+                ggml_backend_tensor_set(w_inj[i], wi.data(), 0, wi.size());
+            }
+            if (pre) {
+                ggml_backend_tensor_set(w_q[i], wqd.data(), 0, wqd.size());
+                ggml_backend_tensor_set(w_z[i], wzd.data(), 0, wzd.size());
+            }
+            if (injp) {
+                ggml_backend_tensor_set(w_injp[i], wip.data(), 0, wip.size());
+            }
         }
     }
     for (int i = 0; i < 3; ++i) {
@@ -409,11 +487,13 @@ static double run_stail(ggml_backend_t backend, const bench_case & c, int64_t m,
 
 static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, int iters, double min_mib,
                        int * r_out, double * gb_out, const std::string & dump) {
-    const bool ffn    = strcmp(c.pattern, "ffn") == 0;
+    const bool ffng   = strcmp(c.pattern, "ffng") == 0;
+    const bool ffn    = strcmp(c.pattern, "ffn") == 0 || ffng;
     const bool gated  = strcmp(c.pattern, "gated") == 0 || ffn;
     const bool multi  = strcmp(c.pattern, "multi") == 0;
     const bool hcpost = strcmp(c.pattern, "hcpost") == 0;
-    if (hcpost || strcmp(c.pattern, "hcmix") == 0) {
+    if (hcpost || strcmp(c.pattern, "hcmix") == 0 || strcmp(c.pattern, "hcmixi") == 0 || strcmp(c.pattern, "hcmixp") == 0 ||
+            strcmp(c.pattern, "hcmixq") == 0) {
         return run_hcpost(backend, c, m, iters, min_mib, r_out, gb_out, dump);
     }
     if (strcmp(c.pattern, "hcpre") == 0 || strcmp(c.pattern, "gnorm") == 0 || strcmp(c.pattern, "agate") == 0) {
@@ -437,26 +517,33 @@ static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, 
     for (int64_t n : ws) {
         copy_bytes += ggml_row_size(c.type, c.k) * n;
     }
+    if (ffng) {
+        copy_bytes += sizeof(float) * (size_t) c.k;
+    }
     int r = (int) std::ceil(min_mib * 1024.0 * 1024.0 / (double) copy_bytes);
     r = std::max(4, std::min(r, 1024));
 
-    const size_t n_tensors = (size_t) r * (ws.size() + 4);
+    const size_t n_tensors = (size_t) r * (ws.size() + 6);
     ggml_init_params ip = { ggml_tensor_overhead() * n_tensors + ggml_graph_overhead_custom(8192, false), nullptr, true };
     ggml_context * ctx_w = ggml_init(ip);
     ggml_context * ctx   = ggml_init(ip);
 
     std::vector<std::vector<ggml_tensor *>> w(r);
-    std::vector<ggml_tensor *> x(r);
+    std::vector<ggml_tensor *> x(r), w_sg(r);
     for (int i = 0; i < r; ++i) {
         for (size_t j = 0; j < ws.size(); ++j) {
             // the down projection of the ffn pattern maps the pair width back to k
             w[i].push_back(ffn && j == 2 ? ggml_new_tensor_2d(ctx_w, c.type, c.n[0], c.k)
                                          : ggml_new_tensor_2d(ctx_w, c.type, c.k, ws[j]));
         }
+        if (ffng) {
+            w_sg[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, c.k, 1);
+        }
         // Q8_0 copies get their own input, so that the multi-weight matcher does not merge
         // neighbouring copies; the F32/BF16 GEMV is never merged and shares one hot input,
         // as in the decode graph where the input was just written
-        x[i] = (c.type == GGML_TYPE_Q8_0 || i == 0) ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.k, m) : x[0];
+        // (a multi copy also gets its own input: the F32 multi-weight matcher would merge copies too)
+        x[i] = (c.type == GGML_TYPE_Q8_0 || multi || i == 0) ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.k, m) : x[0];
     }
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
@@ -472,6 +559,14 @@ static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, 
             ggml_build_forward_expand(gf, out);
             if (i == 0) {
                 first_outs.push_back(out);
+            }
+            if (ffng) {
+                // after the down projection, as build_layer_ffn orders the shared expert gate
+                ggml_tensor * sg = ggml_mul_mat(ctx, w_sg[i], x[i]);
+                ggml_build_forward_expand(gf, sg);
+                if (i == 0) {
+                    first_outs.push_back(sg);
+                }
             }
         } else if (multi) {
             std::vector<ggml_tensor *> outs;
@@ -515,9 +610,16 @@ static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, 
     for (float & v : xdata) {
         v = ud(rng);
     }
+    std::vector<uint8_t> sgdata;
+    if (ffng) {
+        fill_weight(sgdata, GGML_TYPE_F32, c.k, 1, rng);
+    }
     for (int i = 0; i < r; ++i) {
         for (size_t j = 0; j < ws.size(); ++j) {
             ggml_backend_tensor_set(w[i][j], wdata[j].data(), 0, wdata[j].size());
+        }
+        if (ffng) {
+            ggml_backend_tensor_set(w_sg[i], sgdata.data(), 0, sgdata.size());
         }
         if (i == 0 || x[i] != x[0]) {
             ggml_backend_tensor_set(x[i], xdata.data(), 0, xdata.size() * sizeof(float));

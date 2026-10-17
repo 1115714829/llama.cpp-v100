@@ -946,13 +946,9 @@ bool llama_model_loader::bf16_weights_as_f16(const buft_list_t * buft_list) {
     return false;
 }
 
-bool llama_model_loader::is_bf16_as_f16(const struct ggml_tensor * tensor) const {
-    if (tensor->type != GGML_TYPE_F16) {
-        return false;
-    }
-
+bool llama_model_loader::is_type_converted(const struct ggml_tensor * tensor) const {
     const auto * weight = get_weight(ggml_get_name(tensor));
-    return weight != nullptr && weight->tensor->type == GGML_TYPE_BF16;
+    return weight != nullptr && weight->tensor->type != tensor->type;
 }
 
 // checks if the weight tensor can be used with the specified buffer type and device
@@ -1275,6 +1271,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
     bool bf16_as_f16 = false;
+    bool f32_as_bf16 = false;
 
     // Mark the MoE expert weights explicitly while the tensor is created, so the expert store
     // identifies them by the flag and never by the name. The flag is set for every load
@@ -1347,7 +1344,8 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
         // skip unused tensors
         if (info.op == GGML_OP_NONE || (flags & TENSOR_SKIP)) {
-            const size_t nbytes = ggml_nbytes(t_meta);
+            // size_data counts the bytes in the file: an F32 weight stored as BF16 has twice its size there
+            const size_t nbytes = ggml_nbytes(t_meta) * (f32_as_bf16 ? 2 : 1);
             LLAMA_LOG_WARN("model has unused tensor %s (size = %zu bytes) -- ignoring\n", tn.str().c_str(), nbytes);
 
             size_data -= nbytes;
@@ -1618,10 +1616,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     bf16_as_f16 = cur->type == GGML_TYPE_BF16 &&
         (bf16_weights_as_f16(buft_list_input) || bf16_weights_as_f16(buft_list_output) || bf16_weights_as_f16(buft_list_layer));
 
+    // an F32 weight the model asks to keep as BF16 (TENSOR_F32_AS_BF16); the type is set below,
+    // before the buffer type is selected
+    f32_as_bf16 = (flags & TENSOR_F32_AS_BF16) && cur->type == GGML_TYPE_F32;
+
     if (flags & TENSOR_READ_LAZY) {
         // a converted tensor is rewritten while loading, so it cannot stay in the mapping
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = !bf16_as_f16 && lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+        is_lazy = !bf16_as_f16 && !f32_as_bf16 && lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
     }
 
     ggml_tensor t_meta = *cur;
@@ -1639,6 +1641,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     GGML_ASSERT(ggml_nbytes(&t_meta) == ggml_nbytes(cur));
+
+    if (f32_as_bf16) {
+        t_meta.type  = GGML_TYPE_BF16;
+        t_meta.nb[0] = ggml_type_size(t_meta.type);
+        t_meta.nb[1] = ggml_row_size(t_meta.type, t_meta.ne[0]);
+        for (int dim = 2; dim < GGML_MAX_DIMS; dim++) {
+            t_meta.nb[dim] = t_meta.nb[dim-1]*t_meta.ne[dim-1];
+        }
+    }
 
     ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
     if (buft == nullptr) {
@@ -2310,6 +2321,37 @@ bool llama_model_loader::load_all_data(
             continue;
         }
 
+        // F32 weights stored as BF16 (TENSOR_F32_AS_BF16) are converted here: the file holds F32,
+        // the tensor that was created is BF16 and half the size. size_done counts the file bytes,
+        // as size_data does
+        if (weight->tensor->type == GGML_TYPE_F32 && cur->type == GGML_TYPE_BF16) {
+            const size_t  n_file = ggml_nbytes(weight->tensor);
+            const int64_t n      = ggml_nelements(cur);
+            GGML_ASSERT(n_file == (size_t) n*sizeof(float) && n_size == (size_t) n*sizeof(ggml_bf16_t));
+
+            std::vector<no_init<uint8_t>> read_buf(n_file);
+            const float * src = (const float *) load_data_range(*weight, 0, n_file, read_buf.data());
+
+            std::vector<ggml_bf16_t> bf16(n);
+            ggml_fp32_to_bf16_row_ref(src, bf16.data(), n);
+            for (int64_t i = 0; i < n; i++) {
+                uint32_t bits;
+                memcpy(&bits, src + i, sizeof(bits));
+                n_f32_as_bf16_rounded += (bits & 0xffffu) != 0;
+            }
+            n_f32_as_bf16 += n;
+
+            ggml_backend_tensor_set(cur, bf16.data(), 0, n_size);
+
+            // the weights are now in a buffer the device reads directly, drop the page cache
+            if (use_mmap && cur->buffer != nullptr && is_device_readable_buft(ggml_backend_buffer_get_type(cur->buffer))) {
+                mappings.at(weight->idx)->drop_page_cache(weight->offs, weight->offs + n_file);
+            }
+
+            size_done += n_file;
+            continue;
+        }
+
         const bool from_mapping = use_mmap || lazy.has(cur);
 
         if (from_mapping) {
@@ -2498,6 +2540,10 @@ bool llama_model_loader::load_all_data(
         if (n_bf16_converted > 0) {
             LLAMA_LOG_INFO("%s: converted %zu BF16 weight values to F16 (%zu clamped to +-65504)\n",
                     __func__, n_bf16_converted, n_bf16_clamped);
+        }
+        if (n_f32_as_bf16 > 0) {
+            LLAMA_LOG_INFO("%s: stored %zu F32 weight values as BF16 (%zu not exactly representable, rounded to nearest even)\n",
+                    __func__, n_f32_as_bf16, n_f32_as_bf16_rounded);
         }
         if (n_devread_bytes > 0) {
             const double t_s = std::max<int64_t>(ms_devread, 1)/1e6;

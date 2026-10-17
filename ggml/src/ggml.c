@@ -1102,9 +1102,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "LIGHTNING_INDEXER",
     "QSA_SELECT",
     "QSA_ATTN",
+    "QSA_EXPAND",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "SEQ_SCATTER",
+    "SEQ_GATHER",
 
     "UNARY",
 
@@ -1122,7 +1125,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1219,9 +1222,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "lightning_indexer(q, k, weights, mask)",
     "qsa_select(q, k, pool_cells, pool_idxs, tail_idxs, pool_rng)",
     "qsa_attn(q, k, v, ids)",
+    "qsa_expand(ids_pool, pool_idxs, tail_idxs)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "seq_scatter(x)",
+    "seq_gather(x)",
 
     "unary(x)",
 
@@ -1239,7 +1245,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6674,6 +6680,7 @@ struct ggml_tensor * ggml_qsa_select(
     ggml_set_op_params_f32(result, 0, head_scale);
     ggml_set_op_params_i32(result, 1, n_top_pool);
     ggml_set_op_params_i32(result, 2, sentinel);
+    ggml_set_op_params_i32(result, 3, 0); // cells
 
     result->op     = GGML_OP_QSA_SELECT;
     result->src[0] = q;
@@ -6682,6 +6689,78 @@ struct ggml_tensor * ggml_qsa_select(
     result->src[3] = tail_idxs;
     result->src[4] = pool_rng;
     result->src[5] = pool_cells;
+
+    return result;
+}
+
+// ggml_qsa_select_pool
+
+struct ggml_tensor * ggml_qsa_select_pool(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * pool_cells,
+        struct ggml_tensor  * pool_rng,
+        float                 head_scale,
+        int32_t               n_top_pool,
+        int32_t               sentinel) {
+
+    GGML_ASSERT(         q->type == GGML_TYPE_F32);
+    GGML_ASSERT(pool_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(  pool_rng->type == GGML_TYPE_I32);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[1] == 1);
+    GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1);
+    GGML_ASSERT(ggml_is_vector(pool_cells));
+    GGML_ASSERT(pool_rng->ne[0] == 2 && pool_rng->ne[1] == q->ne[2]);
+    GGML_ASSERT(n_top_pool > 0 && n_top_pool <= pool_cells->ne[0]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_top_pool, q->ne[2]);
+
+    ggml_set_op_params_f32(result, 0, head_scale);
+    ggml_set_op_params_i32(result, 1, n_top_pool);
+    ggml_set_op_params_i32(result, 2, sentinel);
+    ggml_set_op_params_i32(result, 3, 1); // pools
+
+    // the sources stay contiguous: the pool row needs no member or tail cells; pool_cells last, as for the cell rows
+    result->op     = GGML_OP_QSA_SELECT;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = pool_rng;
+    result->src[3] = pool_cells;
+
+    return result;
+}
+
+// ggml_qsa_expand
+
+struct ggml_tensor * ggml_qsa_expand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids_pool,
+        struct ggml_tensor  * pool_idxs,
+        struct ggml_tensor  * tail_idxs,
+        int32_t               sentinel) {
+
+    GGML_ASSERT( ids_pool->type == GGML_TYPE_I32);
+    GGML_ASSERT(pool_idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT(tail_idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT(ids_pool->ne[2] == 1 && ids_pool->ne[3] == 1);
+    GGML_ASSERT(tail_idxs->ne[0] == pool_idxs->ne[0] - 1);
+    GGML_ASSERT(tail_idxs->ne[1] == ids_pool->ne[1]);
+
+    const int64_t kpool = pool_idxs->ne[0];
+    const int64_t n_top = ids_pool->ne[0];
+    GGML_ASSERT(kpool >= 1);
+    GGML_ASSERT(n_top >= 1 && n_top <= pool_idxs->ne[1]);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kpool*n_top + kpool - 1, ids_pool->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, sentinel);
+
+    result->op     = GGML_OP_QSA_EXPAND;
+    result->src[0] = ids_pool;
+    result->src[1] = pool_idxs;
+    result->src[2] = tail_idxs;
 
     return result;
 }
@@ -6868,6 +6947,74 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+// ggml_seq_token_share
+
+void ggml_seq_token_share(int64_t T, int64_t n, int64_t j, int64_t * t0, int64_t * nj) {
+    GGML_ASSERT(T >= 0);
+    GGML_ASSERT(n > 0);
+    GGML_ASSERT(j >= 0 && j < n);
+
+    const int64_t tp = (T + n - 1) / n; // ceil(T/n)
+    *t0 = j * tp;
+    *nj = (j < n - 1) ? tp : T - tp * (n - 1);
+}
+
+// ggml_seq_scatter
+
+struct ggml_tensor * ggml_seq_scatter(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   axis,
+        int64_t               t0,
+        int64_t               n) {
+    GGML_ASSERT(axis >= 0 && axis < GGML_MAX_DIMS);
+    GGML_ASSERT(t0 >= 0 && n >= 0);
+    GGML_ASSERT(t0 + n <= a->ne[axis]);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_I32);
+
+    int64_t ne[GGML_MAX_DIMS];
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        ne[i] = a->ne[i];
+    }
+    // this backend keeps only the [t0, t0 + n) slice of the token axis; under the meta backend
+    // the per-device node carries its own (t0, n) and this shape becomes the per-device ne
+    ne[axis] = n;
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, GGML_MAX_DIMS, ne);
+
+    ggml_set_op_params_i32(result, 0, axis);
+    ggml_set_op_params_i32(result, 1, (int32_t) t0);
+    ggml_set_op_params_i32(result, 2, (int32_t) n);
+
+    result->op     = GGML_OP_SEQ_SCATTER;
+    result->src[0] = a;
+
+    return result;
+}
+
+// ggml_seq_gather
+
+struct ggml_tensor * ggml_seq_gather(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   axis,
+        enum ggml_type        type) {
+    GGML_ASSERT(axis >= 0 && axis < GGML_MAX_DIMS);
+    GGML_ASSERT(type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_I32);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 || a->type == GGML_TYPE_I32);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, type, GGML_MAX_DIMS, a->ne);
+
+    ggml_set_op_params_i32(result, 0, axis);
+
+    result->op     = GGML_OP_SEQ_GATHER;
+    result->src[0] = a;
 
     return result;
 }
@@ -7772,6 +7919,7 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
         /*.uid          =*/ 0,
+        /*.uid_prev     =*/ 0,
     };
 
     ggml_hash_set_reset(&cgraph->visited_hash_set);
@@ -7799,7 +7947,8 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.use_counts       =*/ cgraph0->use_counts,
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
         /*.order            =*/ cgraph0->order,
-        /*.uid              =*/ 0
+        /*.uid              =*/ 0,
+        /*.uid_prev         =*/ 0,
     };
 
     return cgraph;

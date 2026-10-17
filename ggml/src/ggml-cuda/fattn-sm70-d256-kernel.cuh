@@ -10,8 +10,8 @@
 //   (c) 1CatAI, BSD-3-Clause compatible.
 // The support layer (Mask, sm70_* helpers, gemm) is vendored from
 //   zhinianqin/flash-attention-v100 @ c2eda5e (BSD-3-Clause);
-//   see sm70-vendor/LICENSE-flash-attention.
-// CuTe/CUTLASS: see sm70-vendor/ (LICENSE-cute-cutlass).
+//   see licenses/LICENSE-flash-attention-sm70.
+// CuTe/CUTLASS: see sm70-vendor/ (licenses/LICENSE-cute-cutlass).
 //
 // This file contains ONLY the device-side kernel + traits + helpers. The
 // upstream torch host wrapper (onecat_v37_dense_state_float_raw) is NOT

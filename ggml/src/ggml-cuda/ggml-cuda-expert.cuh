@@ -237,7 +237,7 @@ void ggml_cuda_numa_log_final_placement(void);
 
 // CPU affinity of a host memory fill: bind the calling thread to the CPUs of host NUMA node
 // `node` before it writes device-readable host memory that lives there, and restore the
-// previous affinity with ggml_cuda_numa_unbind_cpus() afterwards. On the AC922 a GPU reads the
+// previous affinity with ggml_cuda_numa_unbind_cpus() afterwards. On a two-socket POWER9 host a GPU reads the
 // pages of its own node at 44 GB/s when the CPUs of that node wrote them last and at 17-30 GB/s
 // when the CPUs of the other socket did (tests/bench-pinned-read.cu), so every fill of a host
 // arena or a mapped table runs on the node of its pages. Returns false and binds nothing when

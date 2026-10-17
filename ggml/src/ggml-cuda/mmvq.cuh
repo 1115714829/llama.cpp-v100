@@ -21,6 +21,32 @@ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr,
     const char * const * expert_ptrs = nullptr);
 
+// The down projection of a decode/verify MUL_MAT_ID node (no epilogue, F32 or F16 activation)
+// followed by the weighted sum over its slots, the moe_weighted_reduction pattern:
+// dst[token][row] = sum_slot (down[token][slot][row] * expert_scale) * weights[token][slot], written
+// by one compact MMVQ kernel that also quantizes the activation itself, with the results of the
+// separate steps (bit identical). The caller checks that ggml_cuda_mul_mat_id would run the node on
+// the MMVQ mmid kernel.
+bool ggml_cuda_mmvq_moe_reduce_supported(const ggml_tensor * down, const ggml_tensor * weights,
+    const ggml_tensor * expert_scale, const ggml_tensor * dst);
+
+// expert_ptrs: the staging table of the launch (ggml_cuda_expert_stage_prepare_decode) or nullptr.
+// act_h: the activation in a private buffer, [token][slot][ne10] F16 (the fused MoE FFN), nullptr to
+// read down->src[1] itself. The kernel reads the activation, ids, weights and expert_scale while it
+// writes dst.
+void ggml_cuda_mmvq_moe_down_reduce(ggml_backend_cuda_context & ctx, const ggml_tensor * down,
+    const ggml_tensor * weights, const ggml_tensor * expert_scale, ggml_tensor * dst,
+    const char * const * expert_ptrs, const half * act_h = nullptr);
+
+// The gate_up MUL_MAT_ID node with the SwiGLU epilogue of a decode/verify batch (F32 activation),
+// written into a private buffer h = [token][slot][ne0] F16 for the local slots only (the slots of
+// other devices are left unwritten: the down projection of the fused MoE FFN reads no other).
+// src1_q8: the q8_1 activation in the layout of quantize_row_q8_1_cuda (rows of
+// GGML_PAD(ne10, MATRIX_ROW_PADDING) values) when the caller already has it, nullptr to quantize here.
+bool ggml_cuda_mmvq_moe_gate_up_h_supported(const ggml_tensor * gate_up);
+void ggml_cuda_mmvq_moe_gate_up_h(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_up,
+    half * h, const char * const * expert_ptrs, const void * src1_q8 = nullptr);
+
 void ggml_cuda_op_mul_mat_vec_q(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,

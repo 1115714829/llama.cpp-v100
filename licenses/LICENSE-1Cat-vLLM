@@ -10,7 +10,7 @@ licenses/README.md.
       sm70_tp8_hierarchical_reduce_push; adapted there from SGLang-V100)
   ggml/src/ggml-cuda/q8-skinny.cu, q8-skinny.cuh, q-skinny-common.cuh, q4k-skinny.cu, q4k-skinny.cuh
       csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu (its QPN8 layout comes from dnv2003/v100-skinny,
-      MIT, see ggml/src/ggml-cuda/LICENSE.v100-skinny)
+      MIT, see licenses/LICENSE-v100-skinny)
   ggml/src/ggml-cuda/fattn-sm70-d256-kernel.cuh
       csrc/attention/sm70_v37/tail.cu (Copyright (c) 2026, 1CatAI)
   ggml/src/ggml-cuda/fattn-sm70-grouped.cuh

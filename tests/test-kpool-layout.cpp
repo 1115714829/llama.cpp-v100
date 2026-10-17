@@ -4,7 +4,8 @@
 // and appends the rest; a rebuild is the same code keeping nothing. These are the edits that reach it:
 //  - speculative decoding: decode a draft of k tokens, then seq_rm its rejected tail, every round - also when none is
 //    rejected, which removes nothing but still stales from there, as the server does
-//  - seq_rm of a range in the middle, which leaves a gap
+//  - seq_rm of a range in the middle, which leaves a gap (the compact layout of qwen4exp refuses it: the pools after the
+//    gap would regroup from raw keys it no longer keeps)
 //  - seq_add of the tail down (overlapping positions) and up (a gap), on models that can shift
 //  - clearing a sequence and filling it again
 //  - two sequences in their own streams, rolled back in turn and in one batch
@@ -12,8 +13,12 @@
 //  - many sequences whose first tokens share one ubatch, which pads more new-pool entries than the layout has cells
 //    that are no rep; then they grow a token each, and half of them decode two and roll back the second, per ubatch
 //  - one sequence decoded across an n_kv grain boundary, by single tokens and by verify rounds
-// The layout is compared after every decode. After the speculative rounds the next token's logits must also match a
-// context that decoded the accepted tokens straight.
+//  - a checkpoint (partial state) taken mid-pool, the sequence decoded on, the checkpoint restored and the sequence cut
+//    back to it, then a different continuation; a full state saved, the sequence dropped and restored, decoded on
+//  - a sequence copied to another stream (seq_cp of a non unified cache), both decoded on
+// The layout is compared after every decode. After the speculative rounds, the restores and the copy the next token's
+// logits must also match a context that decoded the same tokens straight.
+// The compact layout (pooled keys plus a raw-key ring, qwen4exp) also has its slots and ring checked after every decode.
 // After every decode the cells for padded new-pool entries are also picked over the layout, for counts up to every cell
 // that is no pool's rep: each must be in range, no rep and taken once. The graph's pool count must leave a padded pool
 // after the real ones and fit the reserved graph; across the grain boundary it must be the pools of the cells padded
@@ -114,6 +119,11 @@ struct kpool_case {
             LOG_ERR("%s: %s: %s step %d: kept layout differs from a rebuild: %s\n", __func__, name, what, step, diff.c_str());
             return false;
         }
+        const std::string store = mem->kpool_store_check();
+        if (!store.empty()) {
+            LOG_ERR("%s: %s: %s step %d: compact cache: %s\n", __func__, name, what, step, store.c_str());
+            return false;
+        }
         const std::string pads = mem->kpool_pad_check();
         if (!pads.empty()) {
             LOG_ERR("%s: %s: %s step %d: bad padding cells: %s\n", __func__, name, what, step, pads.c_str());
@@ -129,6 +139,34 @@ struct kpool_case {
 
     bool decode_check(const std::vector<span> & spans, const char * what, int step) {
         return decode(spans) && check(what, step);
+    }
+
+    // after a sequence edit: the compact layout follows every edit at once; the per-cell one catches up at the next
+    // ubatch, so it is checked after the next decode instead
+    bool check_edit(const char * what, int step) {
+        return mem->get_kstore() == nullptr || check(what, step);
+    }
+
+    // tokens toks at positions p0.. of sequence s, the logits of the last one
+    bool decode_toks(llama_seq_id s, llama_pos p0, const std::vector<llama_token> & toks, const char * what) {
+        common_batch batch(ctx.get());
+        for (size_t i = 0; i < toks.size(); ++i) {
+            batch.add(toks[i], p0 + (llama_pos) i, s, i + 1 == toks.size());
+        }
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+            LOG_ERR("%s: %s: %s: decode failed\n", __func__, name, what);
+            return false;
+        }
+        return check(what, 0);
+    }
+
+    // sequence s's tokens [p0, p1), or the rejected-draft ones
+    std::vector<llama_token> toks(llama_seq_id s, llama_pos p0, llama_pos p1, bool bad = false) const {
+        std::vector<llama_token> res;
+        for (llama_pos pos = p0; pos < p1; ++pos) {
+            res.push_back(tok(s, pos, bad));
+        }
+        return res;
     }
 
     llama_pos pos_next(llama_seq_id s) const {
@@ -174,7 +212,7 @@ static bool make_case(kpool_case & tc, const common_params & params, llama_model
     }
 
     tc.mem = dynamic_cast<llama_memory_hybrid_idx *>(llama_get_memory(tc.ctx.get()));
-    if (tc.mem == nullptr || tc.mem->get_mem_idx() == nullptr || tc.mem->get_kpool() == 0) {
+    if (tc.mem == nullptr || !tc.mem->has_idx() || tc.mem->get_kpool() == 0) {
         LOG_INF("%s: %s: no k-pool indexer, skipping\n", __func__, name);
         res = test_status::SKIP;
         return false;
@@ -250,13 +288,26 @@ static test_status test_single(const common_params & params, llama_model * model
         tc.n_checks += ref.n_checks;
     }
 
-    // a range in the middle, off the pool grid, leaves a gap that later pools must step over
+    // a range in the middle, off the pool grid, leaves a gap that later pools must step over. The compact layout keeps
+    // no raw key for the pools that would regroup, so it refuses the cut and the front cut alike, and leaves every
+    // cache as it was
     {
         const llama_pos pos = tc.pos_next(0);
         const llama_pos a   = pos/3 + 1;
-        if (!llama_memory_seq_rm(tc.mem_i(), 0, a, a + 6)) {
-            LOG_ERR("%s: removing [%d, %d) was refused\n", __func__, (int) a, (int) a + 6);
+        const bool compact = tc.mem->get_kstore() != nullptr;
+        if (llama_memory_seq_rm(tc.mem_i(), 0, a, a + 6) == compact) {
+            LOG_ERR("%s: removing [%d, %d) was %s\n", __func__, (int) a, (int) a + 6, compact ? "accepted" : "refused");
             return test_status::FAIL;
+        }
+        if (compact) {
+            if (llama_memory_seq_rm(tc.mem_i(), 0, 0, a)) {
+                LOG_ERR("%s: removing the front [0, %d) was accepted\n", __func__, (int) a);
+                return test_status::FAIL;
+            }
+            if (tc.pos_next(0) != pos || !tc.check_edit("refused cuts", 0)) {
+                LOG_ERR("%s: a refused cut changed the sequence\n", __func__);
+                return test_status::FAIL;
+            }
         }
         if (!tc.decode_check({ { 0, pos, pos + 3 } }, "mid-rm", 0) || !tc.spec_rounds(0, 8, "mid-rm spec")) {
             return test_status::FAIL;
@@ -266,7 +317,7 @@ static test_status test_single(const common_params & params, llama_model * model
     // the tail shifted down onto earlier positions, then up past a gap; only where the cache can shift
     if (llama_memory_can_shift(tc.mem_i())) {
         // the hybrid's pos_min is the recurrent tail's, the cells start where the indexer cache says
-        const llama_pos c = (tc.mem->get_mem_idx()->seq_pos_min(0) + tc.pos_next(0))/2;
+        const llama_pos c = (tc.mem->get_idx_cells()->seq_pos_min(0) + tc.pos_next(0))/2;
         llama_memory_seq_add(tc.mem_i(), 0, c, -1, -3);
         llama_pos pos = tc.pos_next(0);
         if (!tc.decode_check({ { 0, pos, pos + 2 } }, "shift-down", 0)) {
@@ -283,7 +334,7 @@ static test_status test_single(const common_params & params, llama_model * model
         // a gap inside a pool's span that a rollback then removes: the pool across it forms only once the gap is
         // gone, so the scan must go back before the first pool it dropped
         const llama_pos kpool = (llama_pos) tc.mem->get_kpool();
-        const llama_pos pmin  = tc.mem->get_mem_idx()->seq_pos_min(0);
+        const llama_pos pmin  = tc.mem->get_idx_cells()->seq_pos_min(0);
         pos = tc.pos_next(0);
         const llama_pos q = pos + (kpool - (pos - pmin) % kpool) % kpool;
         if ((q > pos && !tc.decode_check({ { 0, pos, q } }, "gap align", 0)) || !tc.decode_check({ { 0, q, q + kpool } }, "gap pool", 0)) {
@@ -461,7 +512,7 @@ static test_status test_grain(const common_params & params, llama_model * model)
         return res;
     }
 
-    const llama_kv_cache * idx   = tc.mem->get_mem_idx();
+    const llama_kv_cache * idx   = tc.mem->get_idx_cells();
     const uint32_t         kpool = tc.mem->get_kpool();
 
     uint32_t n_kv_last   = 0;
@@ -522,12 +573,185 @@ static test_status test_grain(const common_params & params, llama_model * model)
     return test_status::PASS;
 }
 
+// the logits of the last decode of the case against those of a context that decoded the same tokens straight
+static bool logits_match(kpool_case & tc, kpool_case & ref, const char * what) {
+    const float * a = llama_get_logits_ith(tc.ctx.get(),  -1);
+    const float * b = llama_get_logits_ith(ref.ctx.get(), -1);
+    if (a == nullptr || b == nullptr) {
+        LOG_ERR("%s: %s: %s: missing logits\n", __func__, tc.name, what);
+        return false;
+    }
+    const double e = nmse(a, b, tc.n_vocab);
+    if (e > 1e-4) {
+        LOG_ERR("%s: %s: %s: logits differ from a straight decode, nmse %g\n", __func__, tc.name, what, e);
+        return false;
+    }
+    LOG_INF("%s: %s: %s: logits match a straight decode, nmse %g\n", __func__, tc.name, what, e);
+    return true;
+}
+
+// A checkpoint (partial state) taken inside a pool: the sequence goes on over several ubatches, which retires the raw
+// keys of the checkpoint's incomplete pool from the compact cache's ring, then the checkpoint is restored and the
+// sequence cut back to it, as the server does for a prompt that shares a prefix, and it continues differently. The same
+// checkpoint is then loaded into a second sequence that took the prefix with seq_cp, as the server's cross-slot reuse
+// does. Last a full state of that sequence is saved, the sequence dropped and the state restored. After each the next
+// token must match a context that decoded the same tokens straight.
+static test_status test_states(const common_params & params, llama_model * model) {
+    kpool_case tc;
+    test_status res = test_status::SKIP;
+    if (!make_case(tc, params, model, "states", 2, true, res)) {
+        return res;
+    }
+
+    kpool_case ref;
+    test_status res_ref = test_status::SKIP;
+    if (!make_case(ref, params, model, "states-ref", 1, true, res_ref)) {
+        return test_status::FAIL;
+    }
+
+    const llama_pos kpool  = (llama_pos) tc.mem->get_kpool();
+    const llama_pos p_ckpt = 17*kpool + 2; // inside a pool
+
+    const auto prefix = tc.toks(0, 0, p_ckpt);
+    if (!tc.decode_toks(0, 0, prefix, "prefix") || !ref.decode_toks(0, 0, prefix, "prefix")) {
+        return test_status::FAIL;
+    }
+
+    std::vector<uint8_t> ckpt(llama_state_seq_get_size_ext(tc.ctx.get(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+    if (ckpt.empty() || llama_state_seq_get_data_ext(tc.ctx.get(), ckpt.data(), ckpt.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != ckpt.size()) {
+        LOG_ERR("%s: saving the checkpoint failed\n", __func__);
+        return test_status::FAIL;
+    }
+
+    // on past the checkpoint in several ubatches, and a rollback
+    const llama_pos p_on = p_ckpt + 6*kpool + 1;
+    for (llama_pos p = p_ckpt; p < p_on; p += kpool + 1) {
+        const llama_pos p1 = std::min(p + kpool + 1, p_on);
+        if (!tc.decode_toks(0, p, tc.toks(0, p, p1, true), "past the checkpoint")) {
+            return test_status::FAIL;
+        }
+    }
+    if (!llama_memory_seq_rm(tc.mem_i(), 0, p_on - 2, -1) || !tc.check_edit("rollback past the checkpoint", 0)) {
+        LOG_ERR("%s: rolling back past the checkpoint failed\n", __func__);
+        return test_status::FAIL;
+    }
+
+    // back to the checkpoint, then another continuation
+    if (llama_state_seq_set_data_ext(tc.ctx.get(), ckpt.data(), ckpt.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != ckpt.size()) {
+        LOG_ERR("%s: restoring the checkpoint failed\n", __func__);
+        return test_status::FAIL;
+    }
+    if (!llama_memory_seq_rm(tc.mem_i(), 0, p_ckpt, -1) || !tc.check_edit("cut back to the checkpoint", 0)) {
+        LOG_ERR("%s: cutting back to the checkpoint was refused\n", __func__);
+        return test_status::FAIL;
+    }
+
+    const llama_pos p_cont = p_ckpt + 2*kpool + 1;
+    const auto cont = tc.toks(5, p_ckpt, p_cont);
+    if (!tc.decode_toks(0, p_ckpt, cont, "after the checkpoint") || !ref.decode_toks(0, p_ckpt, cont, "after the checkpoint") ||
+        !logits_match(tc, ref, "after the checkpoint")) {
+        return test_status::FAIL;
+    }
+
+    // the prefix copied into another sequence, the checkpoint loaded into it, the same continuation
+    if (!llama_memory_seq_rm(tc.mem_i(), 1, -1, -1)) {
+        LOG_ERR("%s: clearing sequence 1 failed\n", __func__);
+        return test_status::FAIL;
+    }
+    llama_memory_seq_cp(tc.mem_i(), 0, 1, 0, p_ckpt);
+    if (!tc.check_edit("prefix copied", 0)) {
+        return test_status::FAIL;
+    }
+    if (llama_state_seq_set_data_ext(tc.ctx.get(), ckpt.data(), ckpt.size(), 1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != ckpt.size()) {
+        LOG_ERR("%s: loading the checkpoint into sequence 1 failed\n", __func__);
+        return test_status::FAIL;
+    }
+    if (!tc.check_edit("checkpoint loaded into the copy", 0) || !tc.decode_toks(1, p_ckpt, cont, "copy after the checkpoint") ||
+        !logits_match(tc, ref, "copy after the checkpoint")) {
+        return test_status::FAIL;
+    }
+
+    // a full state of the copy, which ends inside a pool, dropped and restored, then decoded on
+    std::vector<uint8_t> full(llama_state_seq_get_size(tc.ctx.get(), 1));
+    if (full.empty() || llama_state_seq_get_data(tc.ctx.get(), full.data(), full.size(), 1) != full.size()) {
+        LOG_ERR("%s: saving the full state failed\n", __func__);
+        return test_status::FAIL;
+    }
+    if (!llama_memory_seq_rm(tc.mem_i(), 1, -1, -1) || !tc.check_edit("copy dropped", 0)) {
+        LOG_ERR("%s: dropping sequence 1 failed\n", __func__);
+        return test_status::FAIL;
+    }
+    if (llama_state_seq_set_data(tc.ctx.get(), full.data(), full.size(), 1) != full.size() || !tc.check_edit("full state restored", 0)) {
+        LOG_ERR("%s: restoring the full state failed\n", __func__);
+        return test_status::FAIL;
+    }
+
+    const auto tail = tc.toks(6, p_cont, p_cont + kpool + 2);
+    if (!tc.decode_toks(1, p_cont, tail, "after the full state") || !ref.decode_toks(0, p_cont, tail, "after the full state") ||
+        !logits_match(tc, ref, "after the full state")) {
+        return test_status::FAIL;
+    }
+
+    tc.n_checks += ref.n_checks;
+    LOG_INF("%s: %d layout checks\n", __func__, tc.n_checks);
+    return test_status::PASS;
+}
+
+// A sequence copied to another stream (seq_cp of a non unified cache copies the whole stream), both continued, the copy
+// against a context that decoded its tokens straight.
+static test_status test_copy_streams(const common_params & params, llama_model * model) {
+    kpool_case tc;
+    test_status res = test_status::SKIP;
+    if (!make_case(tc, params, model, "copy-streams", 2, false, res)) {
+        return res;
+    }
+
+    kpool_case ref;
+    test_status res_ref = test_status::SKIP;
+    if (!make_case(ref, params, model, "copy-streams-ref", 1, true, res_ref)) {
+        return test_status::FAIL;
+    }
+
+    const llama_pos kpool = (llama_pos) tc.mem->get_kpool();
+    const llama_pos p0    = 11*kpool + 3; // inside a pool
+
+    const auto prefix = tc.toks(0, 0, p0);
+    if (!tc.decode_toks(0, 0, prefix, "prefix") || !ref.decode_toks(0, 0, prefix, "prefix")) {
+        return test_status::FAIL;
+    }
+
+    if (!llama_memory_seq_rm(tc.mem_i(), 1, -1, -1)) {
+        LOG_ERR("%s: clearing sequence 1 failed\n", __func__);
+        return test_status::FAIL;
+    }
+    llama_memory_seq_cp(tc.mem_i(), 0, 1, -1, -1);
+    if (!tc.check_edit("stream copied", 0)) {
+        return test_status::FAIL;
+    }
+
+    // the source goes its own way first, then the copy continues the prefix
+    if (!tc.decode_toks(0, p0, tc.toks(0, p0, p0 + kpool + 3, true), "source on")) {
+        return test_status::FAIL;
+    }
+    const auto cont = tc.toks(7, p0, p0 + 2*kpool + 1);
+    if (!tc.decode_toks(1, p0, cont, "copy on") || !ref.decode_toks(0, p0, cont, "copy on") ||
+        !logits_match(tc, ref, "copy on")) {
+        return test_status::FAIL;
+    }
+
+    tc.n_checks += ref.n_checks;
+    LOG_INF("%s: %d layout checks\n", __func__, tc.n_checks);
+    return test_status::PASS;
+}
+
 struct test_results {
     test_status single  = test_status::SKIP;
     test_status streams = test_status::SKIP;
     test_status shared  = test_status::SKIP;
     test_status many    = test_status::SKIP;
     test_status grain   = test_status::SKIP;
+    test_status states  = test_status::SKIP;
+    test_status copy    = test_status::SKIP;
 };
 
 static test_results run_tests_for_model(const std::string & model_path, const common_params & base_params) {
@@ -538,7 +762,8 @@ static test_results run_tests_for_model(const std::string & model_path, const co
     auto * model = llama_init->model();
     if (model == nullptr) {
         LOG_ERR("%s: failed to init model '%s'\n", __func__, model_path.c_str());
-        return { test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL };
+        return { test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL, test_status::FAIL,
+                 test_status::FAIL, test_status::FAIL };
     }
 
     test_results res;
@@ -550,6 +775,8 @@ static test_results run_tests_for_model(const std::string & model_path, const co
     res.shared  = test_shared(params, model);
     res.many    = test_many(params, model);
     res.grain   = test_grain(params, model);
+    res.states  = test_states(params, model);
+    res.copy    = test_copy_streams(params, model);
     return res;
 }
 
@@ -623,7 +850,8 @@ int main(int argc, char ** argv) {
         name_width = std::max(name_width, std::filesystem::path(model_path).filename().string().size());
     }
 
-    LOG("%-*s  %-6s  %-7s  %-6s  %-4s  %s\n", (int) name_width, "Model", "single", "streams", "shared", "many", "grain");
+    LOG("%-*s  %-6s  %-7s  %-6s  %-4s  %-5s  %-6s  %s\n", (int) name_width, "Model", "single", "streams", "shared", "many", "grain",
+            "states", "copy");
     common_log_flush(common_log_main());
 
     size_t n_pass = 0;
@@ -631,12 +859,15 @@ int main(int argc, char ** argv) {
     for (const auto & model_path : models) {
         const test_results res = run_tests_for_model(model_path, params);
 
-        LOG("%-*s  %s    %s     %s    %s  %s\n", (int) name_width, std::filesystem::path(model_path).filename().string().c_str(),
+        LOG("%-*s  %s    %s     %s    %s  %s   %s    %s\n", (int) name_width, std::filesystem::path(model_path).filename().string().c_str(),
                 test_status_str(res.single), test_status_str(res.streams), test_status_str(res.shared), test_status_str(res.many),
-                test_status_str(res.grain));
+                test_status_str(res.grain), test_status_str(res.states), test_status_str(res.copy));
         common_log_flush(common_log_main());
 
-        const test_status all = merge_status(merge_status(merge_status(merge_status(res.single, res.streams), res.shared), res.many), res.grain);
+        test_status all = res.single;
+        for (const test_status st : { res.streams, res.shared, res.many, res.grain, res.states, res.copy }) {
+            all = merge_status(all, st);
+        }
         if (all == test_status::PASS) {
             n_pass++;
         } else if (all == test_status::FAIL) {

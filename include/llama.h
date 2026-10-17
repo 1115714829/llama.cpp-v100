@@ -1150,9 +1150,11 @@ extern "C" {
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
     // Top-k logits output. With k > 0 the k largest logits of every output row are copied back with
-    // their token ids, and a batch with several outputs (e.g. a speculative verification) no longer
-    // copies its full logits: only llama_get_logits_topk_ith is valid for its rows. A batch with a
-    // single output still gets its full logits. When the vocab is split over several devices (tensor
+    // their token ids, and with a single sequence (n_seq_max == 1) a batch with several outputs (e.g. a
+    // speculative verification) no longer copies its full logits: only llama_get_logits_topk_ith is valid
+    // for its rows. A batch with a single output, and every batch of a context with several sequences,
+    // still gets its full logits as well. The output is per context: with several sequences k is the
+    // largest one any of them needs, and 0 does not remove the top-k rows the graph already outputs. When the vocab is split over several devices (tensor
     // parallelism) every shard selects its own k candidates, so a row holds k * n_shards candidates in
     // no particular order, a superset of its top k. 0 disables it.
     LLAMA_API void llama_set_logits_topk(struct llama_context * ctx, int32_t k);

@@ -2,7 +2,7 @@
 //
 // Adapted from 1Cat-vLLM csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu (Apache-2.0). The QPN8
 // execution layout is derived from dnv2003/v100-skinny (MIT) and its block-scale adaptation
-// in haohervchb/sglang-V100. See LICENSE.v100-skinny in this directory.
+// in haohervchb/sglang-V100. See licenses/LICENSE-v100-skinny in the repository root.
 
 #pragma once
 
@@ -49,15 +49,31 @@ bool ggml_cuda_q8_skinny_mul_mat_multi_supported(const ggml_tensor * const src0s
 // input: gate = up(F16(silu(scale * down(input)))), with the arithmetic of the unfused nodes
 // (q8 skinny down, SCALE -> UNARY(SILU), F32 -> F16, q8 skinny up), so gate is bitwise the same.
 // The down projection must take the split path (a narrow repacked weight, M <= 16).
+// pre_mixed, if not null: the gated DSV4_HC_PRE that reads the up output right after it, mixed =
+// pre_scale * sum_c xn[c] * sigmoid(gate[c]) over the hc = 4 streams of the F32 normed input pre_xn
+// ([n_embd, 4, m]), into pre_mixed ([n_embd, m]) and, if not null, its F16 copy pre_mixed_f16: the up
+// kernel computes it in its epilogue with the expressions of dsv4_hc_pre_f32, bitwise the same
+// (ggml_cuda_q8_skinny_hc_up_pre_supported() must hold).
 bool ggml_cuda_q8_skinny_hc_down_up_supported(const ggml_tensor * w_down, const ggml_tensor * w_up, int64_t m);
 void ggml_cuda_q8_skinny_hc_down_up(ggml_backend_cuda_context & ctx, const ggml_tensor * w_down, const ggml_tensor * w_up,
-                                    const half * input, int64_t m, float scale, float * gate);
+                                    const half * input, int64_t m, float scale, float * gate,
+                                    const float * pre_xn = nullptr, float * pre_mixed = nullptr,
+                                    half * pre_mixed_f16 = nullptr, float pre_scale = 0.0f);
+bool ggml_cuda_q8_skinny_hc_up_pre_supported(const ggml_tensor * w_up, int64_t m, int64_t hc);
+// The up projection alone with the hc_pre epilogue (lo: the F16 input [K, m]); see above.
+void ggml_cuda_q8_skinny_hc_up_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * w_up, const half * lo, int64_t m,
+                                   float * gate, const float * xn, float * mixed, half * mixed_f16, float pre_scale);
 
 // A gated pair followed by its down projection, dst = down(swiglu(gate(src1), up(src1))): the pair
 // (split path, a narrow weight, M <= 16) writes silu(gate) * up rounded to F16 and the down
 // projection reads it, instead of an F32 GLU output and a conversion; bitwise the same. Returns
 // false if the shapes are not covered, the caller then runs the nodes unfused.
+// side_w/side_dst, if not null: a narrow F32 projection of the same src1 (the qwen4exp shared expert
+// gate, F32 [K, rows], M <= 4) that ggml_cuda_mul_mat would run on the split narrow GEMV
+// (ggml_cuda_mul_mat_vec_f_split_covers()); extra CTAs of the pair launch compute it with that GEMV's
+// arithmetic, bitwise the same. The pair's tiles plus its rows must fit GGML_CUDA_MAX_SPLIT_TILES.
 bool ggml_cuda_q8_skinny_gated_down(ggml_backend_cuda_context & ctx, const ggml_tensor * gate_w, const ggml_tensor * up_w,
-                                    const ggml_tensor * src1, const ggml_tensor * down_w, ggml_tensor * dst);
+                                    const ggml_tensor * src1, const ggml_tensor * down_w, ggml_tensor * dst,
+                                    const ggml_tensor * side_w = nullptr, ggml_tensor * side_dst = nullptr);
 
 void ggml_cuda_q8_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStream_t stream);

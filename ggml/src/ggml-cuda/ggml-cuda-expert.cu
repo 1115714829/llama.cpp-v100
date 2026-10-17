@@ -276,11 +276,11 @@ static int ggml_cuda_expert_tensor_kind(const ggml_tensor * t) {
         return -1;
     }
     // hash the name prefix, only used for logging
-    int kind = 0;
+    uint32_t kind = 0;
     for (const char * q = t->name; q < p; ++q) {
-        kind = kind * 31 + (unsigned char) *q;
+        kind = kind * 31u + (unsigned char) *q;
     }
-    return kind;
+    return (int) (kind & 0x7fffffffu);
 }
 
 // device kernels

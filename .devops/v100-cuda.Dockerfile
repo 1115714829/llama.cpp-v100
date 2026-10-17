@@ -48,8 +48,7 @@ RUN mkdir -p /app/licenses && \
     cp -a build/bin/llama-server build/bin/llama-cli build/bin/llama-quantize build/bin/lib*.so* /app/ && \
     cp -a /usr/lib64/libnccl.so* /app/ && \
     cp LICENSE README.md /app/ && \
-    cp licenses/* ggml/src/ggml-cuda/LICENSE.v100-skinny ggml/src/ggml-cuda/gdn-chunk-sm70/LICENSE-tilelang \
-       ggml/src/ggml-cuda/sm70-vendor/LICENSE-* /app/licenses/
+    cp -a licenses/* /app/licenses/
 
 # ---------- ffmpeg (video input) and numactl, from conda-forge ----------
 FROM ${BASE_CUDA_DEV_CONTAINER} AS tools

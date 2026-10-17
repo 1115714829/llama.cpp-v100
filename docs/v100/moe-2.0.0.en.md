@@ -1,6 +1,6 @@
 # Qwen3.8-Flash-Next (large MoE) + MTP
 
-[简体中文](moe-2.0.0.md) | **English** | [← Home README](../../README.en.md) | [27B dense model](27b.en.md) | [2.0.0 large MoE](moe-2.0.0.en.md) | [Changelog (Chinese)](../../CHANGELOG.md)
+[简体中文](moe-2.0.0.md) | **English** | [← Home README](../../README.en.md) | [27B dense model](27b.en.md) | [large MoE](moe-2.0.0.en.md) | [Changelog (Chinese)](../../CHANGELOG.md)
 
 2.0.0 adds V100-specific support for the large MoE model Qwen3.8-Flash-Next. This page covers: supported configurations and implementation overview, measured results, model download, official sampling recommendations, launch commands, the expert routing profile, host memory and VRAM, build and Docker, and known limitations. The last section, "[Quick deployment (for AI assistants and beginners)](#quick-deployment-for-ai-assistants-and-beginners)", gives a parameter-impact table, decision steps and a symptom-to-fix table.
 
@@ -12,13 +12,38 @@
 
 Structure from the official model card ([Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)): a 125B-parameter language model with about 6B activated per token; plus a 51B-parameter n-gram embedding table (at layer 2, looked up by bigrams and trigrams) and a 4B-parameter MTP layer (1 layer); 48 layers, each group of 4 being 3 Gated DeltaNet (linear attention) layers plus 1 Qwen Sparse Attention (QSA) layer; 512 experts per layer, 10 routed experts per token plus 1 shared expert; native context 262144. The official model has a vision encoder; this project only tested text input. What this project does on V100:
 
-- **Multi-GPU split and expert placement**: with `--split-mode tensor`, routed experts are distributed across GPUs by expert (expert parallelism), and the dense parts — attention, linear attention, shared experts and so on — are tensor-parallel. At startup, the experts resident in VRAM for each layer (expert slots) are chosen automatically from the VRAM left on each GPU after the rest of the model, the KV cache and the compute buffers; the remaining experts live in pinned host memory that the GPU reads directly and are still computed on the GPU (during decode a kernel copies them straight into VRAM slots, without the host), so `--n-cpu-moe` / `-ot` are not needed. The expert routing profile (`--expert-profile`) uses routing statistics to decide which experts stay in VRAM and to rebalance the experts across GPUs so they do similar amounts of work.
-- **n-gram embedding table and sparse attention**: the n-gram embedding table and the token embedding table live in mapped pinned host memory, shared by all GPUs as one copy and looked up directly by the GPU; they take no VRAM. QSA scoring, top-k selection and sparse attention all have V100 kernels; attention runs only over the selected positions, and compute buffers do not grow linearly with context.
-- **MTP speculative decoding**: the draft chain runs back to back on the GPU and returns its result once per round; the draft layer attends only to the most recent `--spec-draft-window` positions (default 32768); the draft context can use a smaller physical batch (`--spec-draft-ubatch`).
-
+- **Multiple GPUs and memory**: GPUs work together under `--split-mode tensor`; at startup the program decides from each GPU's free VRAM what stays in VRAM, and the rest lives in host memory while still being computed on the GPU, with no need for `--n-cpu-moe` / `-ot`. An expert routing profile (`--expert-profile`) keeps the most used parts in VRAM first.
+- **Sparse attention and MTP speculative decoding**: both have V100-specific implementations, so a 262144 context runs on 16 GB GPUs; the MTP draft window and draft physical batch can be set separately (`--spec-draft-window`, `--spec-draft-ubatch`).
 ---
 
 ## Measured results
+
+### 2.0.1 measured results (alternated with 2.0.0 in the same window)
+
+Conditions: IBM AC922 (2 × POWER9, 96 GB of host memory) + 6 × Tesla V100-SXM2-16GB; Qwen3.8-Flash-Next UD-Q4_K_XL with an MTP draft (Q4_K_M, 3 per round), 6 GPUs, context 262144. The prompts are about 200K tokens of real code, about 16K tokens of real code and a short prompt, with 1024 / 768 / 256 output tokens; **temperature 0, thinking off**. 2.0.1 and 2.0.0 were measured alternately in the same time window (same machine, same set of prompts), with a fresh server per case and the machine dedicated to the measurement. The 2.0.1 column includes the BF16 storage of the routing weights and the VRAM peak fix; the 2.0.0 column is a same-window measurement of the 2.0.0 release-line build and agrees with "Measured at the 2.0.0 release" below.
+
+| Case | 2.0.0 | 2.0.1 | Change |
+|---|---|---|---|
+| Prefill, about 200K tokens (tok/s) | 2344 | 3464 | +48% |
+| Prefill, about 16K tokens (tok/s) | 2053 | 2823 | +38% |
+| Decode, about 200K tokens (tok/s) | 109.9 | 118.5 | +8% |
+| Decode time per round, about 200K tokens (ms) | 25.60 | 23.04 | −10% |
+| Decode, about 16K tokens (tok/s) | 117.9 | 139.6 | +18% |
+| Decode time per round, about 16K tokens (ms) | 24.59 | 21.92 | −11% |
+| Decode, short prompt (tok/s) | 135.5 | 151.0 | +11% |
+| Decode time per round, short prompt (ms) | 26.62 | 23.89 | −10% |
+
+Prefill of about 200K tokens is on par with the best figure measured for this project before (3459 tok/s). Acceptance was measured separately with 24 prompts and a Q4_K_M draft: accepted tokens per round went 2.752 → 2.734 at temperature 0 and 2.592 → 2.579 at temperature 0.6, both within measurement noise, while the time per round on the same prompt batch went 24.4 → 21.3 ms (temperature 0) and 26.1 → 23.2 ms (temperature 0.6).
+
+VRAM peak per GPU (highest of all GPUs, MiB):
+
+| Case | 2.0.0 | 2.0.1 |
+|---|---|---|
+| Large MoE, about 200K tokens | 14838 | 14804 |
+| Large MoE, about 16K tokens | 14838 | 14804 |
+| Large MoE, short prompt | 14655 | 14624 |
+
+### Measured at the 2.0.0 release
 
 Standard test machine: 2026-10-11, IBM Power AC922 (2 × POWER9, 96 GB memory) + 6 × Tesla V100-SXM2-16GB, CUDA 12.4, release build `4d50148cc`; UD-Q4_K_XL + MTP shared-Q4_K_M (3 drafted tokens per round) with the expert routing profile, using command A below; non-streaming, temperature 0, thinking off, a fresh server for every request (cold prefix), two rounds ("a / b" in the table are the two rounds; the output was identical in both). Real code = the source of an open-source C++ project plus a one-sentence summary request.
 
@@ -46,7 +71,7 @@ Standard test machine: 2026-10-11, IBM Power AC922 (2 × POWER9, 96 GB memory) +
 | MTP draft (optional) | `MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` (~2.8 GB) | same | same |
 
 - Put the 4 shards in one directory and point `-m` at the first shard (`-00001-of-00004`). The expert routing profile `flash-next-profile.txt` comes with the Release (see "Expert routing profile").
-- An MTP draft with `shared` in its name contains only the MTP layer and borrows the token embedding and output head from the main model, so it must be used with the same main model. unsloth recommends shared-Q8_0; this project uses the smaller shared-Q4_K_M: measured, shared-Q8_0 gives the same decode speed and acceptance, uses about 150 MiB more VRAM per GPU, and prefills ~200K tokens about 2% slower.
+- An MTP draft with `shared` in its name must be used with the same main model. unsloth recommends shared-Q8_0; this project uses the smaller shared-Q4_K_M: measured, shared-Q8_0 gives the same decode speed and acceptance, uses about 150 MiB more VRAM per GPU, and prefills ~200K tokens about 2% slower.
 - `scripts/v100-get-models.sh` only downloads the 27B files; download the large MoE with direct links (resumable; on the AC922, wrap it in `numactl --membind=0,8` so page cache does not land in GPU memory nodes):
 
 ```bash
@@ -102,9 +127,54 @@ Command A without `numactl --membind=0,8` and with `CUDA_VISIBLE_DEVICES=0,1,2,3
 
 ---
 
+## MTP draft window
+
+Available since 2.0.0.
+
+The draft layer of MTP speculative decoding (`--spec-type draft-mtp`) attends only to the most recent positions instead of the whole main context. The window size is set with `--spec-draft-window N`; the default is 32768, and 0 means every position. The draft only proposes candidates; the emitted tokens are decided by the target model after verification, so the draft may see less context than the target.
+
+| | |
+|---|---|
+| Option | `--spec-draft-window N` (environment variable `LLAMA_ARG_SPEC_DRAFT_WINDOW`) |
+| Default | `32768`; `0` = the draft layer attends to every position |
+| Negative values | rejected as an invalid value at startup |
+
+The window is enabled by default because:
+
+- Both the compute and the cache of the draft grow with the window size. Without a limit, the per-step draft compute and its cache grow with the main context, which slows down decoding at contexts of hundreds of thousands of tokens and takes VRAM.
+- With the window, the per-step draft compute and cache have a fixed upper bound that does not depend on the main context length.
+- While the prompt is shorter than the window, every position is visible to the draft and the output is token-for-token identical to a run without the option, so the default changes nothing for common usage.
+- The typical configuration of this project runs contexts of tens of thousands to hundreds of thousands of tokens; enabling it by default makes the default configuration a working configuration.
+
+Effect on VRAM and decoding:
+
+- **VRAM**: the draft context cache is sized to the window plus one physical batch of slack, so the longer the main context and the smaller the window, the more is saved. The target model's own KV cache is not affected. With 0 the draft cache is sized to the main context length.
+- **Decoding**: each draft step computes only the positions inside the window; the longer the context, the more visible. There is no difference when the context is within the window.
+- **Prefill**: the draft only replays the positions inside the window; the prefix beyond the window is no longer replayed position by position.
+- **Acceptance rate**: positions inside the window stay fully visible to the draft; earlier positions beyond the window are not, which can lower the acceptance rate at long contexts, partly offsetting the decoding gain. Acceptance rate and decoding figures are in "Measured results" above.
+
+To turn the window off, or to change its size, add the option to the server command line:
+
+```bash
+llama-server ... --spec-type draft-mtp -md <draft file> --spec-draft-window 0      # off: the draft layer attends to every position
+llama-server ... --spec-type draft-mtp -md <draft file> --spec-draft-window 8192   # example value: smaller window, smaller draft cache
+```
+
+This option only applies to the draft context of MTP speculative decoding. Speculative decoding that uses a separate draft model (for example DFlash2 on 27B) does not use it, and passing it there changes nothing.
+
+---
+
+## --fit-mmproj
+
+New in 2.0.1.
+
+Whether `--fit` counts the estimated VRAM of the multimodal projector (mmproj) into the per-GPU margin it leaves free (environment variable `LLAMA_ARG_FIT_MMPROJ`). The default is `on`: with `--fit`, the projector's estimated VRAM is counted into the per-GPU margin as before; with `off` it is not, and you must reserve the projector's memory yourself with `--fit-target`. Under tensor parallelism (`--split-mode tensor`) fit does not run at all, so this option has no effect there.
+
+---
+
 ## Expert routing profile
 
-The expert weights of an MoE model often add up to more than the VRAM, so only some experts can stay resident. The default placement ignores how often experts are used and gives every layer the same number of VRAM slots, but in real requests the experts are chosen at very different rates; with expert parallelism, each layer also waits for the GPU with the most work. `--expert-profile FILE` addresses both with a plain-text profile of three or four numbers per line, `layer expert count [launches]`:
+The expert weights of an MoE model often add up to more than the VRAM, so only some experts can stay resident. The default placement ignores how often experts are used and gives every layer the same number of VRAM slots, but in real requests the experts are chosen at very different rates; with several GPUs the work per GPU is also uneven. `--expert-profile FILE` addresses both with a plain-text profile of three or four numbers per line, `layer expert count [launches]`:
 
 - `count`: how many times the expert in that layer was routed to. At startup the experts of each layer are redistributed across GPUs by it so the GPUs get similar amounts of work.
 - `launches` (optional): the number of matrix-multiplication launches routed to the expert; one launch counts once however many tokens it carries. During decode, every launch that uses an expert in host memory must first copy it into VRAM, so when this column is present each layer keeps the experts with the most `launches` (ties broken by `count`) resident in VRAM; if any line has a 4th column, the whole file is used this way. With only 3 columns, `count` decides; experts that do not get a VRAM slot go to host memory.
@@ -176,14 +246,14 @@ The capability / speed / VRAM columns describe what happens when you change (or 
 | `-ngl 999`, `--split-mode tensor`, `-fa on`, `-ctk q8_0 -ctv q8_0`; no `--tensor-split` | All layers on GPU (experts that do not fit go to host memory automatically and are still computed on the GPU); routed experts distributed by expert, dense parts tensor-parallel; Flash Attention; 8-bit KV cache; even split | `--n-cpu-moe` / `-ot` are not needed; `layer` and other split modes and `q4_0` KV were not tested in this version | — | Without `-ctk/-ctv` the KV cache is F16 and the expert slots shrink accordingly | As written | Do not change |
 | `-c` | Context length (model native 262144) | Prompt plus output of one request is at most this many tokens | Smaller: the freed VRAM goes to expert slots, fewer experts in host memory, faster decode (measured: at `-c 32768` only 881 MiB of experts remain in host memory) | 1437 MiB of context per GPU at 262144, less when smaller | 262144 | Lower it for faster decode when long context is not needed |
 | `-b 2048 -ub 2048` | Logical / physical batch: tokens fed to the model per step during prefill | — | Larger is slower: measured (without MTP) `-ub 4096` gives −27% prefill on ~200K tokens and `8192` gives −43% (bigger compute buffers squeeze the expert slots) | 691 MiB compute buffer per GPU at 2048, more when larger | 2048 | Do not change |
-| `-md` (`--model-draft`) | MTP draft file with only the MTP layer, borrowing the main model's token embedding and output head | Must be used with the same main model; the draft only proposes, the target model decides the output | Measured: shared-Q8_0 and shared-Q4_K_M give the same decode speed and acceptance; ~200K-token prefill about 2% slower with Q8_0 | Draft 316–330 MiB per GPU; shared-Q8_0 about 150 MiB more per GPU | shared-Q4_K_M | Do not change |
+| `-md` (`--model-draft`) | MTP draft file | Must be used with the same main model; the draft only proposes, the target model decides the output | Measured: shared-Q8_0 and shared-Q4_K_M give the same decode speed and acceptance; ~200K-token prefill about 2% slower with Q8_0 | Draft 316–330 MiB per GPU; shared-Q8_0 about 150 MiB more per GPU | shared-Q4_K_M | Do not change |
 | `--spec-type draft-mtp` | Speculative decoding with the model's MTP layer | The draft only proposes; the target model decides the output | Faster decode (draft acceptance on this page: short prompt 87%, ~16K tokens 63%, ~200K tokens 61%); when on, the draft also processes the prompt | Draft, draft compute buffer and draft context take about 0.4–0.45 GB per GPU in total; expert slots shrink accordingly | On | Only when VRAM is really short: drop `-md` and all `--spec-…` parameters |
 | `--spec-draft-n-max` | Maximum drafted tokens per round (default 3) | — | Measured: 3 is fastest; drafting more costs more in verification than it gains | Larger means a larger verification batch | 3 | Do not change (the official vLLM recipe also uses 3) |
 | `--spec-draft-ubatch` | Physical batch size of the draft context (inherits `-ub` by default) | — | — | 93 MiB draft compute buffer per GPU at 256; 170 MiB when inheriting `-ub 2048` | 256 | Do not change |
 | `--spec-draft-sampling` | `greedy`: the draft takes the most likely token (default); `probabilistic`: drafts by probability with rejection sampling by the target | With either method, output follows the target model's sampling with the request's parameters | Only `greedy` was tested on this page | — | `greedy` | Do not change |
 | `--spec-draft-window` | The MTP draft layer attends only to the most recent N positions (default 32768, 0 = all) | — | Larger or 0: the draft gets slower at long context | Larger or 0: the draft KV grows | Omit (32768) | Do not change |
 | `--expert-profile` | Expert routing profile: decides the VRAM-resident experts per layer and the experts each GPU gets (see "Expert routing profile") | Changes placement only, not the math | Slower without it: measured, the profile made ~16K-token decode 12% faster and cold ~200K-token prefill 8% faster | No change | A profile collected from content close to the actual use | Re-collect when the model or the main use case changes: run the server with `--dump-expert-routing <file>` on real load, exit normally, then `cat <file>.dev* > profile.txt` |
-| `-fitt` (`--fit-target`) | Runtime VRAM headroom left on each GPU at startup (800 MiB by default with expert parallelism); the rest goes to expert slots | — | Larger: fewer expert slots, more experts in host memory, slower decode | Larger runtime headroom | Omit (800) | Raise it if VRAM runs out after running for a long time |
+| `-fitt` (`--fit-target`) | Runtime VRAM headroom left on each GPU at startup (800 MiB by default for this model); the rest goes to expert slots | — | Larger: fewer expert slots, more experts in host memory, slower decode | Larger runtime headroom | Omit (800) | Raise it if VRAM runs out after running for a long time |
 | `--cache-ram` | Host-memory prompt cache limit (MiB, default 8192, 0 = off) | Conversations used in turn can restore their prefix from host memory instead of recomputing it | Faster first token on a hit | No VRAM; uses host memory | Omit (8192) | Lower it when host memory is tight (the 6 × 16 GB configuration already pins about 42 GiB) |
 | `--jinja`, `--chat-template-kwargs` | Use the model's own chat template; set server defaults for template parameters | Thinking is on by default, `'{"enable_thinking":false}'` turns it off; thinking effort is the request parameter `reasoning_effort` (`xhigh` default, `medium`, `low`) | Turning thinking off or lowering the effort generates fewer tokens and finishes sooner | — | `--jinja`; thinking by use case | Turn thinking off when not needed |
 | `--temp`, `--top-p`, `--top-k`, `--min-p`, `--presence-penalty`, `--repeat-penalty` | Server default sampling parameters (request parameters take precedence) | Official: thinking mode 1.0 / 0.95 / 20 / 0 / 0 / 1.0; non-thinking mode 0.7 / 0.8 / 20 / 0 / 1.5 / 1.0 (see "Official sampling recommendations") | Draft acceptance drops above temperature 0; measured at temperature 0.7, decode is 12%–17% lower | — | Official values | Pick the set for thinking / non-thinking mode |

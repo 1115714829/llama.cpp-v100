@@ -1496,6 +1496,9 @@ struct ggml_backend_cuda_context {
     // an outer capture records everything enqueued on the main stream, graphs are evaluated directly
     // see ggml_backend_cuda_capture_begin()
     bool capture_external = false;
+    // the graphs belong to a prefill-sized ubatch split into subgraphs by the meta backend: evaluated
+    // directly, without a CUDA graph cache entry, see ggml_backend_set_graph_uncached_t
+    bool graph_uncached   = false;
 
     // meta backend assist description mounted for the next graph execution, see ggml-backend.h;
     // nullptr leaves every existing path unchanged
@@ -1516,6 +1519,11 @@ struct ggml_backend_cuda_context {
         int             n_local = 0;
     };
     std::unordered_map<uint64_t, expert_lut_entry> expert_luts;
+
+    // The MUL_MAT_ID node whose output the weighted reduction reads without the zero rows of the
+    // other devices: ggml_cuda_try_fuse sets it for the node it is about to launch when that
+    // reduction is matched and fused, and ggml_cuda_mul_mat_id leaves those rows alone for it.
+    const struct ggml_tensor * moe_reduce_local_slots = nullptr;
 
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context

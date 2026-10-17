@@ -295,13 +295,16 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
+    ggml_cuda_pool_alloc<int32_t> expert_fill(ctx.pool(), ne02);
 
     // the expert map of the node: which routed id is which local expert of the weight (an expert
     // store view addresses its weights from the view start through the pointer table the caller
     // passes, so the ids stay view-local numbers)
     const ggml_cuda_expert_lut lut = ggml_cuda_mul_mat_id_lut(ctx, dst);
 
-    if (ggml_mul_mat_id_is_expert_parallel(dst)) {
+    // M3: the weighted reduction of this node's output (moe_reduce_local_slots) reads the ids and
+    // skips the slots of the other devices itself, so nothing has to zero their rows.
+    if (ggml_mul_mat_id_is_expert_parallel(dst) && ctx.moe_reduce_local_slots != dst) {
         // the grouped kernel only writes the local entries, zero the others
         ggml_cuda_mmid_zero_nonlocal((float *) dst->data, (const int32_t *) ids->data, lut,
             ne12, (int) n_expert_used, dst->ne[0], ids->nb[1] / (int64_t) sizeof(int32_t),
@@ -313,8 +316,8 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
         const int si1  = ids->nb[1] / ggml_type_size(ids->type);
         const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/false,
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(),
+            expert_bounds.get(), expert_fill.get(), ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/false,
             lut, stream);
         CUDA_CHECK(cudaGetLastError());
     }

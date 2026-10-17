@@ -2948,6 +2948,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_FIT"));
     add_opt(common_arg(
+        { "-fit-mmproj", "--fit-mmproj" }, "[on|off]",
+        string_format("whether --fit adds the estimated memory of the multimodal projector (mmproj) to the per-device "
+            "margin it leaves free ('on' or 'off', default: '%s'); with 'off' the projector memory must be reserved "
+            "with --fit-target yourself", params.fit_mmproj ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.fit_mmproj = true;
+            } else if (is_falsey(value)) {
+                params.fit_mmproj = false;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --fit-mmproj: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_env("LLAMA_ARG_FIT_MMPROJ"));
+    add_opt(common_arg(
         { "-fitp", "--fit-print" }, "[on|off]",
         string_format("print the estimated required memory ('on' or 'off', default: '%s')", params.fit_params_print ? "on" : "off"),
         [](common_params & params, const std::string & value) {

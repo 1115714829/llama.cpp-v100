@@ -156,8 +156,23 @@ static __device__ __forceinline__ void qsa_find_digit(const int * hist, const in
     __syncthreads();
 }
 
+// a kept pool b at slot wpos of a row: its kpool member cells (cell rows) or the pool index itself (pool rows,
+// ggml_qsa_select_pool); the kernels below keep the slots ascending by pool either way
+template <bool POOL_ONLY>
+static __device__ __forceinline__ void qsa_topk_emit(int32_t * __restrict__ o, const int64_t wpos, const int64_t b,
+                                                     const int32_t * __restrict__ pidx, const int kpool) {
+    if constexpr (POOL_ONLY) {
+        o[wpos] = (int32_t) b;
+    } else {
+        for (int c = 0; c < kpool; ++c) {
+            o[wpos*kpool + c] = pidx[b*kpool + c];
+        }
+    }
+}
+
 // The tail cells and the -1 padding after the kept pools, shared by the 1024-thread kernels. n_kept pools have been
-// written by the caller; thread 0 appends tidx[qi] then the block fills the rest.
+// written by the caller; thread 0 appends tidx[qi] then the block fills the rest. POOL_ONLY rows have no tail.
+template <bool POOL_ONLY>
 static __device__ __forceinline__ void qsa_topk_epilogue(const int32_t * __restrict__ tidx, const int64_t s_tidx,
                                                          const int kpool, const int sentinel, const int n_kept,
                                                          const int qi, int32_t * __restrict__ o, const int n_sel,
@@ -165,11 +180,14 @@ static __device__ __forceinline__ void qsa_topk_epilogue(const int32_t * __restr
     const int t = threadIdx.x;
     __syncthreads();
     if (t == 0) {
-        int n = n_kept*kpool;
-        for (int c = 0; c < kpool - 1; ++c) {
-            const int32_t cell = tidx[qi*s_tidx + c];
-            if (cell != sentinel) {
-                o[n++] = cell;
+        int n = n_kept;
+        if constexpr (!POOL_ONLY) {
+            n *= kpool;
+            for (int c = 0; c < kpool - 1; ++c) {
+                const int32_t cell = tidx[qi*s_tidx + c];
+                if (cell != sentinel) {
+                    o[n++] = cell;
+                }
             }
         }
         *s_digit = n;
@@ -181,10 +199,10 @@ static __device__ __forceinline__ void qsa_topk_epilogue(const int32_t * __restr
 }
 
 // ---- one block per token: keep the n_top highest scores of the pools [lo, hi), equal scores by ascending pool, and write
-// their cells in ascending pool order, then the tail cells, then -1. Each query's pools are read once: 1,024 threads
-// hold up to PER consecutive pools' keys in registers; radix threshold, ties to the lowest pool, block-wide scans.
-// Ported from Strata's block_topk_reg_kernel.
-template <int PER>
+// their cells in ascending pool order, then the tail cells, then -1 (POOL_ONLY: the pool indices, then -1). Each query's
+// pools are read once: 1,024 threads hold up to PER consecutive pools' keys in registers; radix threshold, ties to the
+// lowest pool, block-wide scans. Ported from Strata's block_topk_reg_kernel.
+template <int PER, bool POOL_ONLY>
 static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_reg_kernel(
         const float * __restrict__ scores, const int64_t n_pool,
         const int32_t * __restrict__ rng, const int64_t s_rng,
@@ -208,11 +226,9 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_reg_kernel(
 
     if (nv <= n_top) {                     // every pool is selected: write their cells, ascending
         for (int64_t b = lo + t; b < hi; b += QSA_TOPK_T) {
-            for (int c = 0; c < kpool; ++c) {
-                o[(b - lo)*kpool + c] = pidx[b*kpool + c];
-            }
+            qsa_topk_emit<POOL_ONLY>(o, b - lo, b, pidx, kpool);
         }
-        qsa_topk_epilogue(tidx, s_tidx, kpool, sentinel, (int) nv, qi, o, n_sel, &s_digit);
+        qsa_topk_epilogue<POOL_ONLY>(tidx, s_tidx, kpool, sentinel, (int) nv, qi, o, n_sel, &s_digit);
         return;
     }
 
@@ -279,19 +295,15 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_reg_kernel(
             break;
         }
         if (key[j] > thr) {
-            for (int c = 0; c < kpool; ++c) {
-                o[wpos*kpool + c] = pidx[b*kpool + c];
-            }
+            qsa_topk_emit<POOL_ONLY>(o, wpos, b, pidx, kpool);
             wpos++;
         } else if (key[j] == thr && eq_left > 0) {
-            for (int c = 0; c < kpool; ++c) {
-                o[wpos*kpool + c] = pidx[b*kpool + c];
-            }
+            qsa_topk_emit<POOL_ONLY>(o, wpos, b, pidx, kpool);
             wpos++;
             eq_left--;
         }
     }
-    qsa_topk_epilogue(tidx, s_tidx, kpool, sentinel, tot, qi, o, n_sel, &s_digit);
+    qsa_topk_epilogue<POOL_ONLY>(tidx, s_tidx, kpool, sentinel, tot, qi, o, n_sel, &s_digit);
 }
 
 // ---- a query with more pools than the register kernel holds: the register kernel's threads and block scans, with each
@@ -301,6 +313,7 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_reg_kernel(
 // w * 32 * per. The selection rule is the register kernel's (radix threshold, ties to the lowest pool): identical ids.
 // Ported from Strata's block_topk_wide_kernel.
 #define QSA_TOPK_UNROLL 4
+template <bool POOL_ONLY>
 static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_wide_kernel(
         const float * __restrict__ scores, const int64_t n_pool,
         const int32_t * __restrict__ rng, const int64_t s_rng,
@@ -327,11 +340,9 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_wide_kernel(
 
     if (nv <= n_top) {                     // every pool is selected: write their cells, ascending
         for (int64_t b = lo + t; b < hi; b += QSA_TOPK_T) {
-            for (int c = 0; c < kpool; ++c) {
-                o[(b - lo)*kpool + c] = pidx[b*kpool + c];
-            }
+            qsa_topk_emit<POOL_ONLY>(o, b - lo, b, pidx, kpool);
         }
-        qsa_topk_epilogue(tidx, s_tidx, kpool, sentinel, (int) nv, qi, o, n_sel, &s_digit);
+        qsa_topk_epilogue<POOL_ONLY>(tidx, s_tidx, kpool, sentinel, (int) nv, qi, o, n_sel, &s_digit);
         return;
     }
 
@@ -446,17 +457,14 @@ static __global__ void __launch_bounds__(QSA_TOPK_T) qsa_topk_wide_kernel(
                 const int y = __shfl_up_sync(0xffffffffu, ps, o2);
                 if (lane >= o2) ps += y;
             }
-            int32_t * dst = o + (int64_t) (run_sel + ps - my_sel)*kpool;
             for (int j = 0; j < my_sel; ++j) {
-                for (int c = 0; c < kpool; ++c) {
-                    dst[j*kpool + c] = pidx[b*kpool + c];
-                }
+                qsa_topk_emit<POOL_ONLY>(o, (int64_t) (run_sel + ps - my_sel) + j, b, pidx, kpool);
             }
             run_eq  += __shfl_sync(0xffffffffu, pe, 31);
             run_sel += __shfl_sync(0xffffffffu, ps, 31);
         }
     }
-    qsa_topk_epilogue(tidx, s_tidx, kpool, sentinel, s_nkept, qi, o, n_sel, &s_digit);
+    qsa_topk_epilogue<POOL_ONLY>(tidx, s_tidx, kpool, sentinel, s_nkept, qi, o, n_sel, &s_digit);
 }
 
 // ---- the same top-k over many blocks, for the few queries of a decode or verify step: a query's pools in chunks of
@@ -611,6 +619,7 @@ static __global__ void __launch_bounds__(QSA_MB_THREADS) qsa_mb_count_kernel(con
     }
 }
 
+template <bool POOL_ONLY>
 static __global__ void __launch_bounds__(QSA_MB_THREADS) qsa_mb_write_kernel(const qsa_mb_args a) {
     __shared__ int s_warp[33];
     __shared__ int s_base[3];
@@ -690,22 +699,23 @@ static __global__ void __launch_bounds__(QSA_MB_THREADS) qsa_mb_write_kernel(con
                 eq_left--;
             }
             if (keep) {
-                for (int cc = 0; cc < a.kpool; ++cc) {
-                    o[wpos*a.kpool + cc] = a.pidx[b*a.kpool + cc];
-                }
+                qsa_topk_emit<POOL_ONLY>(o, wpos, b, a.pidx, a.kpool);
                 wpos++;
             }
         }
     }
 
-    if (c == 0) { // the tail cells after all kept pools, then -1
+    if (c == 0) { // the tail cells after all kept pools (none in POOL_ONLY rows), then -1
         __syncthreads();
         if (t == 0) {
-            int n = s_base[2]*a.kpool;
-            for (int cc = 0; cc < a.kpool - 1; ++cc) {
-                const int32_t cell = a.tidx[qi*a.s_tidx + cc];
-                if (cell != a.sentinel) {
-                    o[n++] = cell;
+            int n = s_base[2];
+            if constexpr (!POOL_ONLY) {
+                n *= a.kpool;
+                for (int cc = 0; cc < a.kpool - 1; ++cc) {
+                    const int32_t cell = a.tidx[qi*a.s_tidx + cc];
+                    if (cell != a.sentinel) {
+                        o[n++] = cell;
+                    }
                 }
             }
             s_base[0] = n;
@@ -723,6 +733,7 @@ static int64_t qsa_topk_mb_scratch(const int64_t n_tok, const int64_t n_pool) {
     return (int64_t) QSA_RS_PASSES*n_tok*QSA_RS_BINS + n_tok*n_chunk*2 + n_tok*4;
 }
 
+template <bool POOL_ONLY>
 static void qsa_topk_mb(const float * scores, const int64_t n_pool, const int32_t * rng, const int64_t s_rng,
                         const int32_t * pidx, const int kpool, const int32_t * tidx, const int64_t s_tidx,
                         const int n_top, const int sentinel, int32_t * out, const int n_sel, const int n_tok,
@@ -743,16 +754,43 @@ static void qsa_topk_mb(const float * scores, const int64_t n_pool, const int32_
     qsa_mb_hist_kernel<1><<<grid, QSA_MB_THREADS, 0, stream>>>(a);
     qsa_mb_hist_kernel<2><<<grid, QSA_MB_THREADS, 0, stream>>>(a);
     qsa_mb_count_kernel<<<grid, QSA_MB_THREADS, 0, stream>>>(a);
-    qsa_mb_write_kernel<<<grid, QSA_MB_THREADS, 0, stream>>>(a);
+    qsa_mb_write_kernel<POOL_ONLY><<<grid, QSA_MB_THREADS, 0, stream>>>(a);
+}
+
+// the top-k of one pass of nt queries, writing cell rows or (POOL_ONLY) pool rows: n_pool bounds every query's visible
+// range, so it picks the kernel
+template <bool POOL_ONLY>
+static void qsa_select_topk(const float * scores, const int64_t n_pool, const int32_t * rng, const int64_t s_rng,
+                            const int32_t * pidx, const int kpool, const int32_t * tidx, const int64_t s_tidx,
+                            const int n_top, const int sentinel, int32_t * o, const int n_sel, const int64_t nt,
+                            const bool use_mb, int * mb_scratch, cudaStream_t stream) {
+#define QSA_TOPK_ARGS scores, n_pool, rng, s_rng, pidx, kpool, tidx, s_tidx, n_top, sentinel, o, n_sel
+    if (n_pool <= (int64_t) QSA_TOPK_T*4) {
+        qsa_topk_reg_kernel<4, POOL_ONLY><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
+    } else if (n_pool <= (int64_t) QSA_TOPK_T*8) {
+        qsa_topk_reg_kernel<8, POOL_ONLY><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
+    } else if (n_pool <= (int64_t) QSA_TOPK_T*16) {
+        qsa_topk_reg_kernel<16, POOL_ONLY><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
+    } else if (n_pool <= (int64_t) QSA_TOPK_REG_MAX) {
+        qsa_topk_reg_kernel<24, POOL_ONLY><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
+    } else if (use_mb) {
+        qsa_topk_mb<POOL_ONLY>(QSA_TOPK_ARGS, (int) nt, mb_scratch, stream);
+    } else {
+        qsa_topk_wide_kernel<POOL_ONLY><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
+    }
+#undef QSA_TOPK_ARGS
 }
 
 void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // pool rows (ggml_qsa_select_pool): the sources are q, k, pool_rng, pool_cells and a row holds the kept pools
+    const bool pool_only = ggml_get_op_params_i32(dst, 3) == 1;
+
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1]; // key table, read in place through pool_cells
-    const ggml_tensor * pidx  = dst->src[2];
-    const ggml_tensor * tidx  = dst->src[3];
-    const ggml_tensor * prng  = dst->src[4];
-    const ggml_tensor * pcell = dst->src[5];
+    const ggml_tensor * pidx  = pool_only ? nullptr     : dst->src[2];
+    const ggml_tensor * tidx  = pool_only ? nullptr     : dst->src[3];
+    const ggml_tensor * prng  = pool_only ? dst->src[2] : dst->src[4];
+    const ggml_tensor * pcell = pool_only ? dst->src[3] : dst->src[5];
 
     const float head_scale = ggml_get_op_params_f32(dst, 0);
     const int   n_top      = ggml_get_op_params_i32(dst, 1);
@@ -760,8 +798,12 @@ void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
     const int64_t n_tokens = q->ne[2];
     const int64_t n_pool   = pcell->ne[0];
-    const int     kpool    = (int) pidx->ne[0];
+    const int     kpool    = pool_only ? 0 : (int) pidx->ne[0];
     const int     n_sel    = (int) dst->ne[0];
+
+    const int32_t * pidx_d = pool_only ? nullptr : (const int32_t *) pidx->data;
+    const int64_t   s_tidx = pool_only ? 0 : tidx->nb[1]/sizeof(int32_t);
+    const int64_t   s_rng  = prng->nb[1]/sizeof(int32_t);
 
     cudaStream_t stream = ctx.stream();
 
@@ -780,38 +822,30 @@ void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         ggml_cuda_lightning_indexer_scores(q_d, q->nb[1], q->nb[2], nt, k, (const int32_t *) pcell->data, n_pool,
                                            head_scale, scores.get(), n_pool*sizeof(float), stream);
 
-        // n_pool bounds every query's visible range, so it picks the kernel
         const int32_t * rng = (const int32_t *) ((const char *) prng->data + t0*prng->nb[1]);
-        const int32_t * tx  = (const int32_t *) ((const char *) tidx->data + t0*tidx->nb[1]);
+        const int32_t * tx  = pool_only ? nullptr : (const int32_t *) ((const char *) tidx->data + t0*tidx->nb[1]);
         int32_t       * o   = (int32_t *) ((char *) dst->data + t0*dst->nb[1]);
-#define QSA_TOPK_ARGS scores.get(), n_pool, rng, prng->nb[1]/sizeof(int32_t), (const int32_t *) pidx->data, kpool, \
-                      tx, tidx->nb[1]/sizeof(int32_t), n_top, sentinel, o, n_sel
-        if (n_pool <= (int64_t) QSA_TOPK_T*4) {
-            qsa_topk_reg_kernel<4><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
-        } else if (n_pool <= (int64_t) QSA_TOPK_T*8) {
-            qsa_topk_reg_kernel<8><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
-        } else if (n_pool <= (int64_t) QSA_TOPK_T*16) {
-            qsa_topk_reg_kernel<16><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
-        } else if (n_pool <= (int64_t) QSA_TOPK_REG_MAX) {
-            qsa_topk_reg_kernel<24><<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
-        } else if (use_mb) {
-            qsa_topk_mb(QSA_TOPK_ARGS, (int) nt, mb_scratch.get(), stream);
+        if (pool_only) {
+            qsa_select_topk<true>(scores.get(), n_pool, rng, s_rng, pidx_d, kpool, tx, s_tidx, n_top, sentinel, o, n_sel,
+                                  nt, use_mb, mb_scratch.get(), stream);
         } else {
-            qsa_topk_wide_kernel<<<nt, QSA_TOPK_T, 0, stream>>>(QSA_TOPK_ARGS);
+            qsa_select_topk<false>(scores.get(), n_pool, rng, s_rng, pidx_d, kpool, tx, s_tidx, n_top, sentinel, o, n_sel,
+                                   nt, use_mb, mb_scratch.get(), stream);
         }
-#undef QSA_TOPK_ARGS
     }
     CUDA_CHECK(cudaGetLastError());
 }
 
 bool ggml_cuda_qsa_select_supported(int device, const ggml_tensor * dst) {
     GGML_UNUSED(device);
+    const bool pool_only = ggml_get_op_params_i32(dst, 3) == 1;
+
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
-    const ggml_tensor * pidx  = dst->src[2];
-    const ggml_tensor * tidx  = dst->src[3];
-    const ggml_tensor * prng  = dst->src[4];
-    const ggml_tensor * pcell = dst->src[5];
+    const ggml_tensor * pidx  = pool_only ? nullptr     : dst->src[2];
+    const ggml_tensor * tidx  = pool_only ? nullptr     : dst->src[3];
+    const ggml_tensor * prng  = pool_only ? dst->src[2] : dst->src[4];
+    const ggml_tensor * pcell = pool_only ? dst->src[3] : dst->src[5];
 
     // the scoring kernels are written for 128-wide keys and 4 heads
     if (q->ne[0] != 128 || q->ne[1] != 4 || q->nb[0] != sizeof(float) || q->nb[1] % 16 != 0 || q->nb[2] % 16 != 0) {
@@ -837,7 +871,99 @@ bool ggml_cuda_qsa_select_supported(int device, const ggml_tensor * dst) {
         default:
             return false;
     }
-    return ggml_is_contiguous(pidx) && tidx->nb[0] == sizeof(int32_t) && prng->nb[0] == sizeof(int32_t) &&
+    if (!pool_only && !(ggml_is_contiguous(pidx) && tidx->nb[0] == sizeof(int32_t))) {
+        return false;
+    }
+    return prng->nb[0] == sizeof(int32_t) && ggml_is_contiguous(dst);
+}
+
+// ---- QSA_EXPAND: one block per token turns a pool row (kept pools ascending, -1 padded) into the cell row that
+// QSA_SELECT writes: the member cells of the kept pools, the tail cells, then -1
+#define QSA_EXPAND_THREADS 256
+
+static __global__ void __launch_bounds__(QSA_EXPAND_THREADS) qsa_expand_kernel(
+        const int32_t * __restrict__ ids, const int64_t s_ids, const int n_top,
+        const int32_t * __restrict__ pidx, const int kpool,
+        const int32_t * __restrict__ tidx, const int64_t s_tidx, const int sentinel,
+        int32_t * __restrict__ out, const int n_sel) {
+    __shared__ int s_warp[QSA_EXPAND_THREADS/32];
+    __shared__ int s_n;
+
+    const int qi = blockIdx.x;
+    const int t  = threadIdx.x, lane = t & 31, warp = t >> 5;
+
+    const int32_t * row = ids + qi*s_ids;
+    int32_t       * o   = out + (int64_t) qi*n_sel;
+
+    // the kept pools are a prefix of the row: their count is the number of entries >= 0
+    int cnt = 0;
+    for (int i = t; i < n_top; i += QSA_EXPAND_THREADS) {
+        cnt += row[i] >= 0 ? 1 : 0;
+    }
+#pragma unroll
+    for (int o2 = 16; o2 > 0; o2 >>= 1) {
+        cnt += __shfl_xor_sync(0xffffffffu, cnt, o2);
+    }
+    if (lane == 0) {
+        s_warp[warp] = cnt;
+    }
+    __syncthreads();
+    int n_kept = 0;
+#pragma unroll
+    for (int w = 0; w < QSA_EXPAND_THREADS/32; ++w) {
+        n_kept += s_warp[w];
+    }
+
+    for (int i = t; i < n_kept*kpool; i += QSA_EXPAND_THREADS) {
+        const int r = i / kpool;
+        const int c = i - r*kpool;
+        o[i] = pidx[(int64_t) row[r]*kpool + c];
+    }
+    if (t == 0) {
+        int n = n_kept*kpool;
+        for (int c = 0; c < kpool - 1; ++c) {
+            const int32_t cell = tidx[qi*s_tidx + c];
+            if (cell != sentinel) {
+                o[n++] = cell;
+            }
+        }
+        s_n = n;
+    }
+    __syncthreads();
+    for (int i = s_n + t; i < n_sel; i += QSA_EXPAND_THREADS) {
+        o[i] = -1;
+    }
+}
+
+void ggml_cuda_op_qsa_expand(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * ids  = dst->src[0];
+    const ggml_tensor * pidx = dst->src[1];
+    const ggml_tensor * tidx = dst->src[2];
+
+    const int     sentinel = ggml_get_op_params_i32(dst, 0);
+    const int     n_top    = (int) ids->ne[0];
+    const int64_t n_tokens = ids->ne[1];
+    const int     kpool    = (int) pidx->ne[0];
+    const int     n_sel    = (int) dst->ne[0];
+
+    if (n_tokens == 0) {
+        return;
+    }
+    qsa_expand_kernel<<<n_tokens, QSA_EXPAND_THREADS, 0, ctx.stream()>>>(
+        (const int32_t *) ids->data, ids->nb[1]/sizeof(int32_t), n_top,
+        (const int32_t *) pidx->data, kpool,
+        (const int32_t *) tidx->data, tidx->nb[1]/sizeof(int32_t), sentinel,
+        (int32_t *) dst->data, n_sel);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+bool ggml_cuda_qsa_expand_supported(int device, const ggml_tensor * dst) {
+    GGML_UNUSED(device);
+    const ggml_tensor * ids  = dst->src[0];
+    const ggml_tensor * pidx = dst->src[1];
+    const ggml_tensor * tidx = dst->src[2];
+    return ids->type == GGML_TYPE_I32 && pidx->type == GGML_TYPE_I32 && tidx->type == GGML_TYPE_I32 &&
+        ids->nb[0] == sizeof(int32_t) && ggml_is_contiguous(pidx) && tidx->nb[0] == sizeof(int32_t) &&
         ggml_is_contiguous(dst);
 }
 
