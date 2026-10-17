@@ -216,7 +216,7 @@ Release 附带的画像 `flash-next-profile.txt` 用真实请求采集，下载�
 
 编译方法与 [27B 页](27b.md#编译) 相同；生成画像的脚本还要用到 `llama-perplexity`：`cmake --build build -j --target llama-server llama-quantize llama-perplexity`。
 
-Docker 镜像 `ghcr.io/1115714829/llama.cpp-v100:2.0.0` 的用法见 [27B 页的 Docker 一节](27b.md#docker)，大 MoE 在 Docker 下没有实测。必须加 `--ulimit memlock=-1`，宿主机要有足够的主机内存；画像文件放进挂载的模型目录。镜像里没有 `llama-perplexity`，用校准文本生成画像要在源码编译的环境里做，`--dump-expert-routing` 可以在容器里用。
+Docker 镜像 `ghcr.io/1115714829/llama.cpp-v100:2.0.1` 的用法见 [27B 页的 Docker 一节](27b.md#docker)，大 MoE 在 Docker 下没有实测。必须加 `--ulimit memlock=-1`，宿主机要有足够的主机内存；画像文件放进挂载的模型目录。镜像里没有 `llama-perplexity`，用校准文本生成画像要在源码编译的环境里做，`--dump-expert-routing` 可以在容器里用。
 
 - **C. Docker，6 × V100-16GB，AC922（podman）**：按 27B 页命令 C 准备 podman 与 CDI，镜像名之后换成命令 A 从 `-m` 开始的参数，模型与画像路径改成 `/models/...`，去掉 `--host 127.0.0.1`。
 - **D. Docker，4 × V100-32GB，x86**：同上，按 27B 页命令 D（`--gpus all`，不设 `LLAMA_NUMA_MEMBIND`）。

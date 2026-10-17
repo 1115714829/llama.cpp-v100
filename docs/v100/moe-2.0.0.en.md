@@ -214,7 +214,7 @@ The profile `flash-next-profile.txt` that comes with the Release was collected f
 
 Build as on the [27B page](27b.en.md#build); the profile script also needs `llama-perplexity`: `cmake --build build -j --target llama-server llama-quantize llama-perplexity`.
 
-Usage of the Docker image `ghcr.io/1115714829/llama.cpp-v100:2.0.0` is on the [27B page, Docker section](27b.en.md#docker); the large MoE has not been measured under Docker. `--ulimit memlock=-1` is required and the host needs enough host memory; put the profile file in the mounted model directory. The image has no `llama-perplexity`, so making a profile from a calibration text has to happen in a source build; `--dump-expert-routing` works inside the container.
+Usage of the Docker image `ghcr.io/1115714829/llama.cpp-v100:2.0.1` is on the [27B page, Docker section](27b.en.md#docker); the large MoE has not been measured under Docker. `--ulimit memlock=-1` is required and the host needs enough host memory; put the profile file in the mounted model directory. The image has no `llama-perplexity`, so making a profile from a calibration text has to happen in a source build; `--dump-expert-routing` works inside the container.
 
 - **C. Docker, 6 × V100-16GB, AC922 (podman)**: prepare podman and CDI as in command C on the 27B page, put the arguments of command A from `-m` onward after the image name, change the model and profile paths to `/models/...`, and drop `--host 127.0.0.1`.
 - **D. Docker, 4 × V100-32GB, x86**: the same, following command D on the 27B page (`--gpus all`, no `LLAMA_NUMA_MEMBIND`).

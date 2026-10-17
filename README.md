@@ -58,6 +58,36 @@
 - **源码编译**：见 [27B 详情页的编译一节](docs/v100/27b.md#编译)。
 - **启动命令**：两张详情页按硬件给出可直接复制的完整命令；最后一节“快速部署（给 AI 助手与新手）”（[27B](docs/v100/27b.md#快速部署给-ai-助手与新手) / [大 MoE](docs/v100/moe-2.0.0.md#快速部署给-ai-助手与新手)）列出每个参数对能力 / 速度 / 显存的影响、选配置的判断步骤和常见问题对照，可以把详情页直接交给 AI 助手照着部署。
 
+## Docker 安装
+
+镜像 `ghcr.io/1115714829/llama.cpp-v100:2.0.1`（也可用 `:latest`），同一个标签含 x86_64 与 IBM Power AC922（ppc64le），`docker pull` 按机器架构自动选择。宿主机需要 NVIDIA 驱动 550 或更新。
+
+**1. 拉取镜像**
+
+```bash
+docker pull ghcr.io/1115714829/llama.cpp-v100:2.0.1
+```
+
+**2. 准备 GPU 访问**（只需一次）
+
+- x86：安装 [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)，运行时用 `--gpus all`。
+- AC922：用 podman，`sudo dnf install -y podman podman-docker`，再在源码目录执行 `sudo bash .devops/v100-ac922-cdi.sh` 生成 GPU 描述，运行时用 `--device nvidia.com/gpu=all -e LLAMA_NUMA_MEMBIND=0,8`。
+
+**3. 启动**（以 27B、x86、4 卡为例；`<模型目录>` 写绝对路径）
+
+```bash
+docker run -d --name llama-v100 --gpus all --ipc=host --ulimit memlock=-1 \
+  -p 8080:8080 -v <模型目录>:/models \
+  ghcr.io/1115714829/llama.cpp-v100:2.0.1 \
+  -m /models/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
+  --split-mode tensor --tensor-split 1,1,1,1 \
+  -c 262144 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
+  --model-draft /models/Qwen3.8-27B-DFlash2-F16.gguf \
+  --spec-type draft-dflash --spec-draft-n-max 7 --port 8080
+```
+
+服务起来后访问 `http://<主机>:8080`（OpenAI 兼容接口 `/v1/chat/completions`）。AC922 6 卡、大 MoE 的命令，以及不能访问 ghcr.io 时用 Releases 页面的镜像文件 `docker load` 导入的方法，见 [27B 详情页 Docker 一节](docs/v100/27b.md#docker) 与 [大 MoE 详情页](docs/v100/moe-2.0.0.md#编译与-docker)。
+
 ## 当前版本 2.0.1
 
 在 2.0.0 的基础上继续提升大 MoE 模型的预填充与吐字速度，修复 27B 6 卡长上下文下温度 0 输出跨启动不一致、投机解码多路（`-np > 1`）时服务中止等问题，各卡显存峰值不高于 2.0.0。与 2.0.0 同场对比：约 20 万 token 时大 MoE 预填充 +48%、吐字 +8%，27B 预填充 +3%、吐字 +2%。新增参数 `--fit-mmproj`（默认与此前行为相同）。

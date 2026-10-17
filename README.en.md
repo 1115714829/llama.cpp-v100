@@ -58,6 +58,36 @@ Launch commands, parameters and known limitations are on the detail pages; all m
 - **Build from source**: see the [build section of the 27B page](docs/v100/27b.en.md#build).
 - **Launch commands**: both detail pages give copy-ready full commands per hardware setup; their last section, "Quick deployment (for AI assistants and beginners)", lists each parameter's effect on capability / speed / VRAM, decision steps and a symptom-to-fix table, so you can hand a detail page to an AI assistant to deploy from.
 
+## Docker install
+
+Image `ghcr.io/1115714829/llama.cpp-v100:2.0.1` (or `:latest`); one tag covers x86_64 and IBM Power AC922 (ppc64le), and `docker pull` picks the right one for your machine. The host needs NVIDIA driver 550 or newer.
+
+**1. Pull the image**
+
+```bash
+docker pull ghcr.io/1115714829/llama.cpp-v100:2.0.1
+```
+
+**2. Give containers GPU access** (once)
+
+- x86: install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) and run with `--gpus all`.
+- AC922: use podman: `sudo dnf install -y podman podman-docker`, then in the source tree run `sudo bash .devops/v100-ac922-cdi.sh` to generate the GPU description, and run with `--device nvidia.com/gpu=all -e LLAMA_NUMA_MEMBIND=0,8`.
+
+**3. Start** (27B on 4 GPUs, x86; `<model dir>` must be an absolute path)
+
+```bash
+docker run -d --name llama-v100 --gpus all --ipc=host --ulimit memlock=-1 \
+  -p 8080:8080 -v <model dir>:/models \
+  ghcr.io/1115714829/llama.cpp-v100:2.0.1 \
+  -m /models/Qwen3.8-27B-Q8_0.gguf -ngl 999 \
+  --split-mode tensor --tensor-split 1,1,1,1 \
+  -c 262144 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 \
+  --model-draft /models/Qwen3.8-27B-DFlash2-F16.gguf \
+  --spec-type draft-dflash --spec-draft-n-max 7 --port 8080
+```
+
+Then open `http://<host>:8080` (OpenAI-compatible `/v1/chat/completions`). Commands for 6 GPUs on the AC922 and for the large MoE, and how to `docker load` the image file from the Releases page when ghcr.io is unreachable, are on the [27B page's Docker section](docs/v100/27b.en.md#docker) and the [large MoE page](docs/v100/moe-2.0.0.en.md).
+
 ## Current version 2.0.1
 
 Faster prefill and decode for the large MoE model on top of 2.0.0; fixes for 27B T=0 output differing across restarts at long context on 6 GPUs and for the server aborting with speculative decoding and multiple slots (`-np > 1`); the per-GPU VRAM peak is no higher than 2.0.0. Same-window comparison with 2.0.0 at ~200K tokens: large MoE prefill +48%, decode +8%; 27B prefill +3%, decode +2%. New parameter `--fit-mmproj` (default keeps the previous behavior).
