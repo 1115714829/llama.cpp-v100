@@ -450,6 +450,32 @@ uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
 void llama_file::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
 void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 
+// drop the page cache of [first, last) of the file: the bytes have been copied out of it and
+// nothing reads them again. Linux only, no-op elsewhere. Silent: the file pages are a cache,
+// not a correctness question. Returns the number of bytes released.
+size_t llama_file::drop_page_cache(size_t first, size_t last) {
+#ifdef __linux__
+    const int fd = file_id();
+    if (fd < 0) {
+        return 0;
+    }
+    const size_t page_size = (size_t) sysconf(_SC_PAGESIZE);
+    first = first & ~(page_size - 1);
+    last  = std::min((last + page_size - 1) & ~(page_size - 1), size());
+    if (first >= last) {
+        return 0;
+    }
+    if (posix_fadvise(fd, first, last - first, POSIX_FADV_DONTNEED)) {
+        return 0;
+    }
+    return last - first;
+#else
+    GGML_UNUSED(first);
+    GGML_UNUSED(last);
+    return 0;
+#endif
+}
+
 // llama_mmap
 
 #if defined(_POSIX_MAPPED_FILES) || defined(_WIN32)
@@ -615,6 +641,41 @@ struct llama_mmap::impl {
 #endif
     }
 
+    // release the pages of [first, last) of the mapping and drop the page cache of the file: a
+    // mapped page keeps the page cache of the file alive, so posix_fadvise alone drops nothing.
+    // returns the number of bytes released: the mapping pages and the file pages are the same
+    // pages, so both must go for the range to be released
+    size_t release_page_cache(size_t first, size_t last) {
+#ifdef __linux__
+        if (fd_own == -1) {
+            return 0;
+        }
+        const size_t page_size = sysconf(_SC_PAGESIZE);
+        first = first & ~(page_size - 1);
+        last  = std::min((last + page_size - 1) & ~(page_size - 1), size);
+        if (first >= last) {
+            return 0;
+        }
+        // the pages of the mapping go first: they are read from the file again when they are
+        // needed, the mapping is read only
+        bool mapped_ok = true;
+        if (madvise((uint8_t *) addr + first, last - first, MADV_DONTNEED)) {
+            // a locked mapping can not be dropped (EINVAL), the pages stay
+            LLAMA_LOG_WARN("warning: madvise(.., MADV_DONTNEED) failed: %s\n", strerror(errno));
+            mapped_ok = false;
+        }
+        if (posix_fadvise(fd_own, first, last - first, POSIX_FADV_DONTNEED)) {
+            LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n", strerror(errno));
+            return 0;
+        }
+        return mapped_ok ? last - first : 0;
+#else
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        return 0;
+#endif
+    }
+
     ~impl() {
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
@@ -689,6 +750,12 @@ struct llama_mmap::impl {
         GGML_UNUSED(last);
     }
 
+    size_t release_page_cache(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        return 0;
+    }
+
     ~impl() {
         if (hMapping) {
             if (addr) {
@@ -724,6 +791,12 @@ struct llama_mmap::impl {
         GGML_UNUSED(first);
         GGML_UNUSED(last);
     }
+
+    size_t release_page_cache(size_t first, size_t last) {
+        GGML_UNUSED(first);
+        GGML_UNUSED(last);
+        return 0;
+    }
 #endif
 
     void * addr;
@@ -738,6 +811,8 @@ size_t llama_mmap::size() const { return pimpl->size; }
 void * llama_mmap::addr() const { return pimpl->addr; }
 
 void llama_mmap::drop_page_cache(size_t first, size_t last) { pimpl->drop_page_cache(first, last); }
+
+size_t llama_mmap::release_page_cache(size_t first, size_t last) { return pimpl->release_page_cache(first, last); }
 
 void llama_mmap::unmap_fragment(size_t first, size_t last) { pimpl->unmap_fragment(first, last); }
 

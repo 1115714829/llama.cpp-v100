@@ -21,6 +21,7 @@ This repository is released under GPL-3.0 from 2.0.0 on (see `LICENSE` in the re
 | `ggml/src/ggml-cuda/sm70-vendor/cute/`, `sm70-vendor/cutlass/` | [CUTLASS] @ `62750a2b` | BSD-3-Clause | `licenses/LICENSE-cute-cutlass` |
 | `ggml/src/ggml-cuda/gdn-chunk-sm70/gdn-chunk-cumsum-hv12.cuh`, `gdn-chunk-kkt.cuh`, `gdn-chunk-fwd.cuh` | FlashQLA kernels in [1Cat-vLLM] `flash_qla/`, compiled for sm_70 by [TileLang] 0.1.13 | MIT (FlashQLA, TileLang); Apache-2.0 (1Cat-vLLM) | `licenses/LICENSE-FlashQLA`; `licenses/LICENSE-tilelang`; `licenses/LICENSE-1Cat-vLLM` |
 | `ggml/src/ggml-cuda/gdn-chunk-sm70/tl_templates/` | [TileLang] templates | MIT | `licenses/LICENSE-tilelang` |
+| `src/llama-ple-reader.cpp`, `src/llama-ple-reader.h` | [Strata] `src/ngram/ple_reader.cpp` (block level dedup, offset ordering, row copy-out), `src/platform/direct_file.cpp:263-366` (blocking pread pool); [Strata-AC922] `include/strata/platform/thread_affinity.hpp` (`release_inherited_pin`) | MIT | `licenses/LICENSE-strata` |
 | MTP draft borrowing the target's tensors: `src/llama-model-loader.cpp`, `src/llama-model-loader.h`, `src/llama-context.cpp`, `src/llama-cparams.h`, `src/models/qwen4exp.cpp`, `include/llama.h`, `common/speculative.cpp`, `conversion/base.py`, `convert_hf_to_gguf.py` (comments "from unsloth PR #142/#240") | [unsloth llama.cpp] PR #142, #240 | MIT (same as llama.cpp) | `licenses/LICENSE-llama.cpp` |
 | `vendor/nlohmann/` (from upstream llama.cpp) | nlohmann/json | MIT | `licenses/LICENSE-jsonhpp` |
 

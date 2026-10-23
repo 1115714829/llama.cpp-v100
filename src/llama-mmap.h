@@ -34,6 +34,10 @@ struct llama_file {
     void read_aligned_chunk(void * dest, size_t size);
     uint32_t read_u32();
 
+    // drop the page cache of [first, last) of the file (Linux only, no-op elsewhere).
+    // returns the number of bytes released, 0 when nothing was released
+    size_t drop_page_cache(size_t first, size_t last);
+
     void write_raw(const void * ptr, size_t len) const;
     void write_u32(uint32_t val) const;
 
@@ -60,6 +64,11 @@ struct llama_mmap {
 
     // drop the page cache of [first, last) of the file (Linux only, no-op elsewhere)
     void drop_page_cache(size_t first, size_t last);
+
+    // release the pages of [first, last) of the mapping and drop the page cache of the file:
+    // a mapped page keeps the page cache of the file alive (Linux only, no-op elsewhere).
+    // returns the number of bytes released, 0 when nothing was released
+    size_t release_page_cache(size_t first, size_t last);
 
     static const bool SUPPORTED;
 

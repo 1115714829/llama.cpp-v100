@@ -65,6 +65,7 @@ common_params_fit_status common_fit_params(
                                                              // (COMMON_FIT_TARGET_DEFAULT; the expert parallel fit budgets the
                                                              // runtime growth itself and adds a smaller one)
                            uint32_t   n_ctx_min,             // minimum context size to set when trying to reduce memory use
+                           int32_t    cache_ram_mib,          // size of the prompt cache of the server in MiB (--cache-ram), 0 when there is none and -1 when it has no limit: it is not pinned host memory and it does not take part in the decision, the fit only accounts it and warns when it is bigger than the memory the nodes have left
       const common_fit_extra_model * extra,                  // model to fit alongside the main one, nullptr if there is none
                      ggml_log_level   log_level);            // minimum log level to print during fitting, lower levels go to debug log
 

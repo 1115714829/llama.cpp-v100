@@ -119,6 +119,17 @@ if (NOT MSVC)
     target_compile_options(mtmd PRIVATE -Wno-cast-qual)
 endif()
 
+# gcc 12 reports a false positive -Wstringop-overflow in the third-party
+# miniaudio mp3 decoder (dr_mp3): iscf[gr->n_long_sfb + i + 1] is written into
+# iscf[40] and the index bound cannot be proven. Third-party code must not
+# block our -Werror build, so keep the warning but make it non-fatal.
+# Scope: only the compilation unit that includes miniaudio.h (mtmd-helper.cpp)
+# and only this one warning. All other files and all other warnings stay under
+# -Werror.
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set_source_files_properties(mtmd-helper.cpp PROPERTIES COMPILE_OPTIONS "-Wno-error=stringop-overflow")
+endif()
+
 if (ANDROID)
     # miniaudio.h defines ma_android_sdk_version() without a prior prototype
     target_compile_options(mtmd PRIVATE -Wno-missing-prototypes)

@@ -2,6 +2,9 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-ple-reader.h"
+
+#include "ggml-alloc.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1349,9 +1352,20 @@ class llm_graph_input_qwen4exp_ple : public llm_graph_input_i {
 public:
     llm_graph_input_qwen4exp_ple(const llama_model & model,
                         const llama_kv_cache_context * mctx) : model(model), mctx(mctx) {}
-    virtual ~llm_graph_input_qwen4exp_ple() = default;
+    virtual ~llm_graph_input_qwen4exp_ple() {
+        // the host buffer of the rows of the table goes away with the graph that reads them
+        if (ctx_src) {
+            ggml_free(ctx_src);
+            ctx_src = nullptr;
+        }
+        if (buf_src) {
+            ggml_backend_buffer_free(buf_src);
+            buf_src = nullptr;
+        }
+    }
 
     void set_input(const llama_ubatch * ubatch) override;
+    void prepare(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
@@ -1359,6 +1373,7 @@ public:
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * src  = nullptr;   // the rows of the table in the host memory, host read mode only
 
     const llama_model & model;
 
@@ -1367,9 +1382,29 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+
+    // the rows of the n-gram table that the tokens of the ubatch gather
+    void compute_rows(const llama_ubatch * ubatch, std::vector<int32_t> & idx);
+
+    // host read mode: the table stays in the GGUF file, the rows of the ubatch are read from the
+    //   disk into stage and copied into the host buffer of the gather
+    bool host_read = false;
+    bool prepared  = false;
+    std::vector<int32_t> idx;    // the rows of the table, in the order of the gather
+    std::vector<uint8_t>  stage; // the raw bytes of those rows
+    std::vector<int32_t>  iota;  // the identity gather of the host read mode
+    int n_prepared = 0;
+
+    // host read mode: the host buffer that holds the rows of the table the batch gathers. The
+    //   gather of the graph reads it on the CPU, like the pinned path reads the mapped table, so
+    //   the two modes run the same graph and give the same numbers. The buffer is a host buffer of
+    //   its own, so the compute buffers of the two modes hold the same tensors at the same places.
+    ggml_context * ctx_src = nullptr;
+    ggml_backend_buffer_t          buf_src = nullptr;
 };
 
-void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
+// the rows of the n-gram table that the tokens of the ubatch gather
+void llm_graph_input_qwen4exp_ple::compute_rows(const llama_ubatch * ubatch, std::vector<int32_t> & idx) {
     const auto & hparams = model.hparams;
 
     // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
@@ -1390,7 +1425,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t eos      = hparams.ple_eos_token_id;
     const int64_t n_prev   = n_gram - 1;
 
-    std::vector<int32_t> idx(n_heads * n_tokens);
+    idx.resize(n_heads * n_tokens);
 
     GGML_ASSERT(mctx != nullptr);
 
@@ -1429,6 +1464,83 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+}
+
+// read the rows of the table that the ubatch needs, before the graph runs: the read overlaps with
+//   the computation of the previous ubatch
+void llm_graph_input_qwen4exp_ple::prepare(const llama_ubatch * ubatch) {
+    if (!host_read) {
+        return; // the pinned path gathers the rows from the host memory in set_input()
+    }
+
+    if (!ubatch || ubatch->n_tokens == 0) {
+        return; // an empty batch has no rows to read
+    }
+
+    llama_ple_reader * reader = model.ple_reader.get();
+    if (!reader) {
+        GGML_ABORT("%s: the n-gram table reader is missing, the table cannot be read from the disk\n", __func__);
+    }
+
+    compute_rows(ubatch, idx);
+
+    stage.resize(idx.size()*reader->row_bytes);
+    if (!reader->read_rows(idx.data(), idx.size(), stage.data())) {
+        GGML_ABORT("%s: cannot read the rows of the n-gram table from the disk\n", __func__);
+    }
+
+    prepared = true;
+
+    {
+        const llama_ple_reader::stats st = reader->get_stats();
+        // the line of every batch is for the debug log, the line of the accumulated counters is
+        //   rare: a decode step would otherwise fill the log with one line per token
+        if (n_prepared % 1024 == 0) {
+            LLAMA_LOG_INFO("%s: n-gram table rows: %llu rows, %llu distinct, %llu reads, %llu bytes, %.1f ms wall, %.3f ms max latency\n",
+                    __func__, (unsigned long long) st.rows, (unsigned long long) st.distinct,
+                    (unsigned long long) st.reads, (unsigned long long) st.bytes, st.wall_ms, st.max_latency_ms);
+        } else {
+            LLAMA_LOG_DEBUG("%s: n-gram table rows: %llu rows, %llu distinct, %llu reads, %llu bytes, %.1f ms wall, %.3f ms max latency\n",
+                    __func__, (unsigned long long) st.rows, (unsigned long long) st.distinct,
+                    (unsigned long long) st.reads, (unsigned long long) st.bytes, st.wall_ms, st.max_latency_ms);
+        }
+    }
+
+    ++n_prepared;
+}
+
+void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
+    if (host_read) {
+        if (!ubatch || ubatch->n_tokens == 0) {
+            return; // an empty batch has no rows to read, the buffer keeps the rows of the last one
+        }
+
+        if (!prepared) {
+            prepare(ubatch);
+        }
+        prepared = false;
+
+        // the gather is the identity here: the host buffer already holds the rows of the table
+        if ((int64_t) iota.size() != rows->ne[0]) {
+            iota.resize(rows->ne[0]);
+            for (int64_t i = 0; i < rows->ne[0]; ++i) {
+                iota[i] = (int32_t) i;
+            }
+        }
+
+        if (stage.size() != ggml_nbytes(src)) {
+            GGML_ABORT("%s: the n-gram table rows are %zu bytes, but the input is %zu bytes\n",
+                    __func__, stage.size(), ggml_nbytes(src));
+        }
+
+        // the rows stay in the host memory: the gather of the graph reads them there
+        ggml_backend_tensor_set(src, stage.data(), 0, stage.size());
+        ggml_backend_tensor_set(rows, iota.data(), 0, iota.size()*ggml_element_size(rows));
+
+        return;
+    }
+
+    compute_rows(ubatch, idx);
 
     {
         ggml_tensor * ple = model.per_layer_tok_embd;
@@ -1505,13 +1617,64 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
 
+    // host read mode: the table stays in the GGUF file, the rows of the ubatch are read from the
+    //   disk into a host buffer, so the gather below becomes the identity
+    const bool host_read = model.ple_reader != nullptr;
+
+    ggml_tensor * ple_src = model.per_layer_tok_embd;
+
+    if (host_read) {
+        if (!ple_src) {
+            GGML_ABORT("%s: the n-gram table is missing, its rows cannot be read from the disk\n", __func__);
+        }
+
+        // the rows the reader returns must have the size of a row of the table, otherwise the
+        // gather below would read the wrong bytes
+        const size_t row_bytes = ggml_row_size(ple_src->type, hparams.ple_head_dim);
+        if (model.ple_reader->row_bytes != row_bytes) {
+            GGML_ABORT("%s: the n-gram table row size is %zu bytes, but the tensor row is %zu bytes\n",
+                    __func__, model.ple_reader->row_bytes, row_bytes);
+        }
+
+        ple_inp->host_read = true;
+
+        // The rows of the table stay in the host memory and the gather of the graph reads them
+        // there, like the pinned path reads the mapped table: the two modes run the same graph,
+        // so they give the same numbers. The buffer is a host buffer of its own, so the compute
+        // buffers of the two modes hold the same tensors at the same places.
+        const int64_t n_rows = n_heads*n_tokens;
+        ggml_init_params src_params = {
+            /* .mem_size   = */ 2*ggml_tensor_overhead(),
+            /* .mem_buffer = */ nullptr,
+            /* .no_alloc   = */ true,
+        };
+        ple_inp->ctx_src = ggml_init(src_params);
+        if (!ple_inp->ctx_src) {
+            GGML_ABORT("%s: cannot create the context of the n-gram table rows\n", __func__);
+        }
+        ple_inp->src = ggml_new_tensor_2d(ple_inp->ctx_src, ple_src->type, hparams.ple_head_dim, n_rows);
+        ggml_set_name(ple_inp->src, "ple_rows_host");
+        if (n_rows > 0) {
+            ple_inp->buf_src = ggml_backend_alloc_ctx_tensors_from_buft(ple_inp->ctx_src,
+                    ggml_backend_get_default_buffer_type(backend_cpu));
+            if (!ple_inp->buf_src) {
+                GGML_ABORT("%s: cannot allocate the host memory of the n-gram table rows\n", __func__);
+            }
+        }
+        ple_src = ple_inp->src;
+    }
+
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
     ggml_tensor * rows = ple_inp->rows;
     res->add_input(std::move(ple_inp));
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    ggml_tensor * emb = ggml_get_rows(ctx0, ple_src, rows);
+    if (host_read) {
+        // the gather runs on the CPU, like the pinned path: the rows are in the host memory
+        ggml_backend_sched_set_tensor_backend(sched, emb, backend_cpu);
+    }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 

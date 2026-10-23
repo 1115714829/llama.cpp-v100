@@ -581,6 +581,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_names.push_back(fname);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -649,6 +650,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_names.push_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -700,6 +702,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(file));
+        file_names.push_back(std::string()); // a file behind a handle has no path
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -2205,6 +2208,35 @@ bool llama_model_loader::load_all_data(
     size_t n_devread_bytes = 0;
     int64_t ms_devread = 0;
 
+    // the page cache of the model file that was released after the experts were loaded, and the
+    // number of ranges it was: reported at the end of the load in the read-disk mode only
+    size_t n_bytes_dropped = 0;
+    size_t n_ranges_dropped = 0;
+
+    // Release the page cache of a range of a file: the bytes have been copied out of it and
+    // nothing reads them again. In the read-disk mode the pages of the mapping go too: a mapped
+    // page keeps the page cache of the file alive, so posix_fadvise alone drops nothing, and the
+    // page cache of the model must not stay on the nodes the experts live on.
+    // Only the bytes the kernel released are counted.
+    const auto release_page_cache = [&](llama_mmap * mapping, uint16_t file_idx, size_t first, size_t size) -> size_t {
+        size_t released = 0;
+        if (mapping != nullptr) {
+            released = mapping->release_page_cache(first, first + size);
+        } else {
+            released = files.at(file_idx)->drop_page_cache(first, first + size);
+        }
+        n_bytes_dropped += released;
+        if (released > 0) {
+            ++n_ranges_dropped;
+        }
+        return released;
+    };
+
+    // the mapping of a file, null when the file was not mapped
+    const auto mapping_of = [&](uint16_t file_idx) -> llama_mmap * {
+        return file_idx < mappings.size() ? mappings.at(file_idx).get() : nullptr;
+    };
+
     for (struct ggml_tensor * cur : tensors) {
         const std::string cur_name = ggml_get_name(cur);
 
@@ -2235,9 +2267,20 @@ bool llama_model_loader::load_all_data(
 
             // the weights are now in a buffer the device reads directly, drop the page cache of
             // the two source ranges, they are not mapped into a buffer
-            if (use_mmap && cur->buffer != nullptr && is_device_readable_buft(ggml_backend_buffer_get_type(cur->buffer))) {
+            if (ple_host_read) {
+                // the read-disk mode: the experts are in the meta buffer when the model is split
+                // over more than one card, so the buffer is not device readable, but the file
+                // pages of the experts must go anyway: they are the largest part of the model
+                // file and they would stay on the nodes the experts live on
                 for (const auto * src : { &merged.gate, &merged.up }) {
-                    mappings.at(src->idx)->drop_page_cache(src->offs, src->offs + src->size);
+                    release_page_cache(use_mmap ? mappings.at(src->idx).get() : nullptr,
+                        src->idx, src->offs, src->size);
+                }
+            } else if (cur->buffer != nullptr && is_device_readable_buft(ggml_backend_buffer_get_type(cur->buffer))) {
+                for (const auto * src : { &merged.gate, &merged.up }) {
+                    if (use_mmap) {
+                        mappings.at(src->idx)->drop_page_cache(src->offs, src->offs + src->size);
+                    }
                 }
             }
 
@@ -2283,6 +2326,12 @@ bool llama_model_loader::load_all_data(
             }
 
             ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+
+            if (ple_host_read) {
+                // the read-disk mode: the rows came from the file into a private buffer, nothing
+                // reads the file pages of this tensor again
+                release_page_cache(mapping_of(weight->idx), weight->idx, weight->offs, n_size);
+            }
 
             size_done += n_size;
             continue;
@@ -2416,9 +2465,16 @@ bool llama_model_loader::load_all_data(
                     n_devread_bytes += n_size;
                 }
 
-                // the weights are now in a buffer the device reads directly, drop the page cache
-                if (devread) {
-                    mapping->drop_page_cache(weight->offs, weight->offs + n_size);
+                // the weights are now in a buffer the device reads directly, drop the page cache.
+                // The experts of the store were copied out of the mapping into the host arena of
+                // the store, so their file pages are garbage too: the read-disk mode releases
+                // them, the pinned mode leaves the page cache of the model alone.
+                if (devread || (ple_host_read && is_expert)) {
+                    if (ple_host_read) {
+                        release_page_cache(mapping.get(), weight->idx, weight->offs, n_size);
+                    } else {
+                        mapping->drop_page_cache(weight->offs, weight->offs + n_size);
+                    }
                 }
             }
         } else {
@@ -2434,6 +2490,11 @@ bool llama_model_loader::load_all_data(
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                         return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
                     }));
+                }
+                if (ple_host_read && is_expert) {
+                    // the read-disk mode: the experts of the store were copied into the host buffer
+                    // of the store: nothing reads the file pages of this tensor again
+                    release_page_cache(mapping_of(weight->idx), weight->idx, weight->offs, n_size);
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
@@ -2505,6 +2566,12 @@ bool llama_model_loader::load_all_data(
                     if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }
+                    if (ple_host_read && is_expert) {
+                        // the read-disk mode: the experts of the store were copied into the host
+                        // arena of the store: nothing reads the file pages of this tensor again,
+                        // and they are the largest part of the model
+                        release_page_cache(mapping_of(weight->idx), weight->idx, weight->offs, n_size);
+                    }
                 }
             }
         }
@@ -2549,6 +2616,13 @@ bool llama_model_loader::load_all_data(
             const double t_s = std::max<int64_t>(ms_devread, 1)/1e6;
             LLAMA_LOG_INFO("%s: copied %.2f GiB into the device-readable host buffers in %.1f s (%.1f GiB/s)\n",
                     __func__, n_devread_bytes/1024.0/1024.0/1024.0, t_s, n_devread_bytes/1024.0/1024.0/1024.0/t_s);
+        }
+        if (ple_host_read) {
+            // the n-gram table is read from the file, so the page cache of the model must not
+            // stay on the nodes the experts live on: the number of bytes released is the proof
+            LLAMA_LOG_INFO("%s: released the page cache of the model file: %llu bytes (%.2f GiB) in %zu ranges\n",
+                    __func__, (unsigned long long) n_bytes_dropped,
+                    (double) n_bytes_dropped/1024.0/1024.0/1024.0, n_ranges_dropped);
         }
 
         // unmap offloaded tensors and metadata

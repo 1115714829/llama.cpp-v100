@@ -84,6 +84,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+
 #include <array>
 #include <atomic>
 #include <charconv>
@@ -102,6 +103,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+// the two entry points the pinned host buffer type of the context uses when fit placed the
+// segmented host arenas over the nodes (defined with the rest of the host NUMA placement below)
+void * ggml_cuda_numa_host_alloc(int device, size_t size, int node);
+int  ggml_cuda_numa_pinned_host_node(void);
+
 #include <string>
 #include <thread>
 #include <vector>
@@ -120,6 +127,12 @@
 #endif
 #ifndef MPOL_DEFAULT
 #define MPOL_DEFAULT 0
+#endif
+#ifndef MPOL_INTERLEAVE
+#define MPOL_INTERLEAVE 3
+#endif
+#ifndef MPOL_PREFERRED
+#define MPOL_PREFERRED 1
 #endif
 
 // on Linux the CUDA mapped host memory is allocated with cudaHostAlloc under a
@@ -2228,7 +2241,11 @@ static void * ggml_cuda_host_malloc(size_t size) {
 }
 
 static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * ptr = ggml_cuda_host_malloc(size);
+    // the pinned host buffers of the context are the third locked host allocation of the load:
+    // when fit counted them in its node plan, the allocation runs on the node it recorded, the
+    // same way an expert arena does. Otherwise it is the plain allocation below.
+    const int node = ggml_cuda_numa_pinned_host_node();
+    void * ptr = node >= 0 ? ggml_cuda_numa_host_alloc(0, size, node) : ggml_cuda_host_malloc(size);
 
     if (ptr == nullptr) {
         // fallback to cpu buffer
@@ -2357,31 +2374,144 @@ static bool ggml_cuda_numa_node_is_host(int node, const char ** reason) {
     return true;
 }
 
-// total host memory of a NUMA node in bytes, -1 if unknown
+// the sum of the high watermarks of the zones of a NUMA node, in bytes: the memory the kernel
+// keeps for itself above the watermark of every zone of the node. /proc/zoneinfo holds the
+// watermark of every zone in pages, twice (a summary at the top of the file and the detail
+// below), so the value of a zone is kept once. -1 when the file is not there, 0 when the kernel
+// reports no watermark at all.
+static int64_t ggml_cuda_numa_zone_high_bytes(int node) {
+    FILE * f = fopen("/proc/zoneinfo", "r");
+    if (f == nullptr) {
+        return -1;
+    }
+
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        fclose(f);
+        return -1;
+    }
+
+    // the high watermark of every zone of the node, in pages
+    std::map<std::string, unsigned long> high;
+    int         cur_node = -1;
+    std::string cur_zone;
+
+    char line[256] = {};
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        const char * p = line;
+        while (*p == ' ' || *p == '\t') {
+            ++p;
+        }
+        if (strncmp(p, "Node ", 5) == 0) {
+            int  n    = -1;
+            char zone[64] = {};
+            if (sscanf(p, "Node %d, zone %63s", &n, zone) == 2) {
+                cur_node = n;
+                cur_zone = zone;
+            }
+            continue;
+        }
+        if (strncmp(p, "high", 4) != 0 || (p[4] != ' ' && p[4] != '\t')) {
+            continue;
+        }
+        char * end = nullptr;
+        const unsigned long pages = strtoul(p + 4, &end, 10);
+        if (end == p + 4) {
+            continue;
+        }
+        while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') {
+            ++end;
+        }
+        if (*end != '\0') {
+            continue; // not the watermark line
+        }
+        if (cur_node != node) {
+            continue;
+        }
+        auto it = high.find(cur_zone);
+        if (it == high.end() || it->second < pages) {
+            high[cur_zone] = pages;
+        }
+    }
+    fclose(f);
+
+    unsigned long total = 0;
+    for (const auto & kv : high) {
+        total += kv.second;
+    }
+
+    return (int64_t) total * (int64_t) page_size;
+}
+
+// the memory of a NUMA node, as the kernel reports it:
 //
-// MemTotal is a fixed quantity of the machine, unlike MemFree plus the page cache, so the
-// placement plan does not change from one run to the next. The margin is subtracted by the
-// caller.
-static int64_t ggml_cuda_numa_mem_total(int node) {
+//   total  MemTotal of the node
+//   avail  what the node can give away: what it has free plus the file pages it can drop
+//          (Active(file) + Inactive(file)) minus the high watermark of its zones, the memory
+//          the kernel keeps for itself
+//   file   the file pages it can drop
+//   high   the high watermark of the zones of the node: the memory the kernel keeps for itself
+//          and can not give away
+//
+// The device memory nodes of the GPUs hold no file pages, so the figure of a host node is the
+// host memory it can still give away. All three are -1 when unknown.
+//
+// This is a measurement, not a property of the machine: it changes with the page cache and with
+// what else runs on the node, so it is only used where the MemTotal of the node would overstate
+// what is there.
+struct ggml_cuda_numa_mem {
+    int64_t total = -1;
+    int64_t avail = -1;
+    int64_t file  = -1;
+    int64_t high  = -1;
+};
+
+static ggml_cuda_numa_mem ggml_cuda_numa_mem_read(int node) {
+    ggml_cuda_numa_mem mem;
+
     char path[128];
     snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/meminfo", node);
 
     FILE * f = fopen(path, "r");
     if (f == nullptr) {
-        return -1;
+        return mem;
     }
 
-    int64_t total_kb = -1;
+    int64_t total_kb         = -1;
+    int64_t free_kb          = -1;
+    int64_t active_file_kb   = 0;
+    int64_t inactive_file_kb = 0;
     char line[256] = {};
     while (fgets(line, sizeof(line), f) != nullptr) {
         long long kb = 0;
         if (sscanf(line, "Node %*d MemTotal: %lld kB", &kb) == 1) {
             total_kb = (int64_t) kb;
+        } else if (sscanf(line, "Node %*d MemFree: %lld kB", &kb) == 1) {
+            free_kb = (int64_t) kb;
+        } else if (sscanf(line, "Node %*d Active(file): %lld kB", &kb) == 1) {
+            active_file_kb = (int64_t) kb;
+        } else if (sscanf(line, "Node %*d Inactive(file): %lld kB", &kb) == 1) {
+            inactive_file_kb = (int64_t) kb;
         }
     }
     fclose(f);
 
-    return total_kb >= 0 ? total_kb * 1024 : -1;
+    if (total_kb < 0 || free_kb < 0) {
+        return mem;
+    }
+
+    mem.total = total_kb * 1024;
+    mem.file  = (active_file_kb + inactive_file_kb) * 1024;
+
+    // the watermark of the zones of the node: the kernel keeps that memory for itself, so the
+    // node can not give it away
+    const int64_t high = ggml_cuda_numa_zone_high_bytes(node);
+    mem.high = high > 0 ? high : 0;
+
+    const int64_t free_and_file = (free_kb + active_file_kb + inactive_file_kb) * 1024;
+    mem.avail = free_and_file > mem.high ? free_and_file - mem.high : 0;
+
+    return mem;
 }
 
 // highest NUMA node number in /sys/devices/system/node/possible, used to size the node mask.
@@ -2446,6 +2576,30 @@ static bool ggml_cuda_mempolicy_save(ggml_cuda_mempolicy_saved & saved) {
     }
     saved.valid = true;
     return true;
+}
+
+// the NUMA nodes the calling thread may allocate memory from: the memory policy decides it
+// (numactl --membind=0,8 binds the process to the nodes of the sockets it names). A node the
+// process may not allocate from holds memory it can not use, so the free memory of that node
+// tells nothing about what the placement may take. Every node is allowed when the policy says
+// nothing.
+static bool ggml_cuda_numa_node_allowed(int node) {
+    const int bits = 8 * (int) sizeof(unsigned long);
+    std::vector<unsigned long> nodemask(ggml_cuda_numa_max_node()/bits + 2, 0);
+    const unsigned long maxnode = (unsigned long) nodemask.size() * bits + 1;
+
+    int mode = MPOL_DEFAULT;
+    if (syscall(SYS_get_mempolicy, &mode, nodemask.data(), maxnode, (void *) nullptr, 0) != 0) {
+        return true; // the policy is unknown: no node is excluded
+    }
+    if (mode != MPOL_BIND && mode != MPOL_INTERLEAVE) {
+        // MPOL_DEFAULT takes every node, MPOL_PREFERRED only prefers one of them
+        return true;
+    }
+    if (node < 0 || (size_t) (node/bits) >= nodemask.size()) {
+        return false;
+    }
+    return (nodemask[node/bits] >> (node % bits)) & 1ul;
 }
 
 // restore a policy saved by ggml_cuda_mempolicy_save(); no-op when nothing was saved. The
@@ -2681,6 +2835,17 @@ static void ggml_cuda_numa_fill_on_node(void * ptr, size_t size, int node, int v
 #define GGML_CUDA_MAPPED_PROBE_REPS  3              // reads per assignment, the median is kept
 #define GGML_CUDA_MAPPED_NUMA_MARGIN (4ull << 30)   // host memory kept free on every node
 
+// the margin of the segmented placement: the kernel memory that can not be reclaimed, the page
+// tables and the ordinary resident host memory of the process all have to stay on every node,
+// while the page cache does not count (it can be dropped). It is only read after the plan of
+// one node per device turned out not to hold the arenas and the fixed allocations, so the
+// capacity of the plan (and its log) is unchanged.
+#define GGML_CUDA_MAPPED_NUMA_MARGIN_PHYS_MIN  (2ull << 30) // host memory kept free on every node
+#define GGML_CUDA_MAPPED_NUMA_MARGIN_PHYS_PCT  4           // percent of MemTotal kept free on top
+
+// the load may allocate a little more per tensor than fit measured (page and pitch rounding)
+#define GGML_CUDA_MAPPED_NUMA_TENSOR_TOLERANCE (1ull << 20) // 1 MiB
+
 // return values that are not a NUMA node number (GGML_CUDA_NUMA_NODE_ANY / _FAIL) are
 // defined in ggml-cuda-expert.cuh and shared with the expert host arena
 
@@ -2724,11 +2889,31 @@ struct ggml_cuda_numa_probe_dev {
     unsigned int * sink     = nullptr;
 };
 
+struct ggml_cuda_numa_fixed {
+    bool    valid     = false;   // fit reported the fixed pinned host bytes of this machine
+    bool    segmented = false;   // the plan of one node per device could not hold them, so the
+                                 // arenas are placed per tensor over the nodes
+    int     node_w    = -1;      // node index of the mapped weights table
+    int     node_p    = -1;      // node index of the pinned host buffers of the context
+    int64_t w = 0;               // bytes of the mapped weights table (one block)
+    int64_t p = 0;               // bytes of the pinned host buffers of the context
+};
+
 struct ggml_cuda_mapped_numa_state {
     bool probed = false;
 
     std::vector<int>     nodes;   // host NUMA nodes with memory and CPUs
     std::vector<int64_t> cap;    // [node] bytes the planner may fill (MemTotal minus the margin)
+    std::vector<int64_t> cap_phys; // [node] MemTotal minus the physical margin, the segmented
+                                   // placement reads it, the plan above never does
+    std::vector<int64_t> free_bytes; // [node] free memory of the node at the time of the
+                                     // discovery (what it has free and the file pages it can
+                                     // drop)
+    std::vector<int64_t> file_bytes; // [node] file pages of the node at the time of the
+                                     // discovery (the page cache of the files it read)
+    std::vector<int64_t> high_bytes; // [node] the sum of the high watermarks of the zones of
+                                     // the node at the time of the discovery: the memory the
+                                     // kernel keeps for itself
     std::vector<int>     topo;   // [physical device] node of the PCI slot, -1 when unknown
     std::vector<int>     phys_of; // [device] physical device it runs on
 
@@ -2755,6 +2940,24 @@ struct ggml_cuda_mapped_numa_state {
     std::vector<size_t> placed_node;                  // [node index]
     std::vector<std::vector<size_t>> placed_dev_node; // [device][node index]
 
+    // the fixed pinned host allocations fit reported (the mapped weights table and the pinned
+    // host buffers of the context): where they go and, when the plan could not hold them,
+    // where the arenas go instead
+    ggml_cuda_numa_fixed fixed;
+
+    // the n-gram table is read from the model file: the host memory is placed by the free memory
+    // of the nodes and the pinned host buffers of the contexts go to the node the fit picked,
+    // even when the arenas are not segmented
+    bool ple_host_read = false;
+
+    // the segmented placement: the segments of every physical device in the order the load
+    // walks them, the segment the device is filling and the bytes each of its segments may
+    // still take (the segments of one device are its own, the room of a node was handed out
+    // once, when the table was solved)
+    std::vector<std::vector<ggml_cuda_numa_plan::segment_entry>> seg; // [physical device]
+    std::vector<size_t>    seg_index; // [physical device] segment being filled
+    std::vector<std::vector<int64_t>> seg_left; // [physical device][segment] bytes left in it
+
     // node the first arena of a device got, and the pages move_pages confirmed there: the final
     // placement log compares the node with the plan and reports the samples per device
     std::vector<int>    arena_node;    // [device] node number of the arenas, -1 when none
@@ -2770,6 +2973,17 @@ static int ggml_cuda_mapped_numa_index(int node) {
     const std::vector<int> & nodes = ggml_cuda_mapped_numa.nodes;
     const auto it = std::find(nodes.begin(), nodes.end(), node);
     return it == nodes.end() ? -1 : (int) (it - nodes.begin());
+}
+
+// the memory of a node that this process can still use: what the node has free and the file
+// pages it can drop, minus the high watermark of its zones (the memory the kernel keeps for
+// itself).
+// The MemTotal of the node is the fallback when the measurement is unknown.
+static int64_t ggml_cuda_numa_node_available(const ggml_cuda_mapped_numa_state & state, size_t n) {
+    if (n >= state.free_bytes.size() || state.free_bytes[n] < 0) {
+        return n < state.cap.size() ? state.cap[n] : 0;
+    }
+    return state.free_bytes[n];
 }
 
 // release the stream, the events and the sink of the concurrent read of one device
@@ -3056,15 +3270,36 @@ static void ggml_cuda_numa_discover(ggml_cuda_mapped_numa_state & state) {
     // the capacity of a node is its MemTotal minus the margin: a fixed property of the machine,
     // unlike MemFree plus the page cache, so the plan does not change from one run to the next
     state.cap.assign(state.nodes.size(), 0);
+    state.cap_phys.assign(state.nodes.size(), 0);
+    state.free_bytes.assign(state.nodes.size(), -1);
+    state.file_bytes.assign(state.nodes.size(), -1);
+    state.high_bytes.assign(state.nodes.size(), -1);
     for (size_t n = 0; n < state.nodes.size(); n++) {
-        const int64_t total = ggml_cuda_numa_mem_total(state.nodes[n]);
-        if (total < 0) {
+        const ggml_cuda_numa_mem mem = ggml_cuda_numa_mem_read(state.nodes[n]);
+        if (mem.total < 0) {
             GGML_LOG_ERROR("%s: NUMA node %d: MemTotal unknown, the host arenas get no NUMA policy\n",
                 __func__, state.nodes[n]);
             state.nodes.clear();
             break;
         }
+        const int64_t total = mem.total;
+        if (!ggml_cuda_numa_node_allowed(state.nodes[n])) {
+            // the memory policy of the process does not allow this node: the process can not
+            // allocate there, so the node holds nothing for the placement
+            state.cap[n]       = 0;
+            state.cap_phys[n]  = 0;
+            GGML_LOG_INFO("%s: NUMA node %d: %.1f GiB of %.1f GiB for the host arenas (the memory policy of the process does not allow this node)\n",
+                __func__, state.nodes[n], 0.0, (double) total / 1024.0/1024.0/1024.0);
+            continue;
+        }
         state.cap[n] = total - (int64_t) GGML_CUDA_MAPPED_NUMA_MARGIN;
+        state.cap_phys[n] = total - std::max((int64_t) GGML_CUDA_MAPPED_NUMA_MARGIN_PHYS_MIN,
+            total * GGML_CUDA_MAPPED_NUMA_MARGIN_PHYS_PCT / 100);
+        // the free memory of the node at this moment: what it has free and the file pages it can
+        // drop, minus the high watermark of its zones (the memory the kernel keeps for itself).
+        state.free_bytes[n] = mem.avail;
+        state.file_bytes[n] = mem.file;
+        state.high_bytes[n] = mem.high;
         GGML_LOG_INFO("%s: NUMA node %d: %.1f GiB of %.1f GiB for the host arenas (MemTotal minus a %.1f GiB margin)\n",
             __func__, state.nodes[n], (double) state.cap[n] / 1024.0/1024.0/1024.0,
             (double) total / 1024.0/1024.0/1024.0,
@@ -3227,8 +3462,15 @@ static bool ggml_cuda_numa_plan_locked(const std::vector<size_t> & dev_bytes, bo
     }
 
     ggml_cuda_numa_plan::result res;
+    // the node of the PCI slot of every device as an index into the node table: the solver
+    // takes the index, the state keeps the node number (0 and 8 on an AC922, the node numbers
+    // are not the indexes)
+    std::vector<int> topo_index(n_dev, -1);
+    for (size_t d = 0; d < n_dev; d++) {
+        topo_index[d] = ggml_cuda_mapped_numa_index(state.topo[d]);
+    }
     const int ret = ggml_cuda_numa_plan::plan(n_dev, n_nodes, bytes.data(), state.cap.data(),
-        t_ms.data(), state.topo.data(), &res);
+        t_ms.data(), topo_index.data(), &res);
     if (ret != 1) {
         // the nodes together do not hold the arenas: report what is needed, what is there and
         // the gap, instead of placing them anywhere
@@ -3478,6 +3720,45 @@ int ggml_cuda_numa_reserve(int device, size_t size) {
         ggml_cuda_numa_discover(ggml_cuda_mapped_numa);
     }
 
+    ggml_cuda_mapped_numa_state & state = ggml_cuda_mapped_numa;
+
+    if (state.fixed.valid && state.fixed.segmented) {
+        // the arenas of this device walk its own segments, one arena at a time, in the order
+        // the table was solved (which is the order the load allocates them). An arena that does
+        // not fit in what is left of the current segment takes the next one, which the solver
+        // gave it exactly for that: no byte is stranded behind a segment boundary.
+        const int phys = state.phys_of[device];
+        const std::vector<ggml_cuda_numa_plan::segment_entry> & tbl = state.seg[phys];
+        if (tbl.empty() || phys >= (int) state.seg_left.size()) {
+            GGML_LOG_ERROR("%s: device %d has no segment, the host arenas of the segmented placement have no node\n",
+                __func__, device);
+            return GGML_CUDA_NUMA_NODE_FAIL;
+        }
+
+        std::vector<int64_t> & left = state.seg_left[phys];
+        size_t i = std::min(state.seg_index[phys], tbl.size() - 1);
+        while (i < tbl.size() && (int64_t) size > left[i]) {
+            if (i + 1 < tbl.size()) {
+                left[i + 1] += left[i];   // what is left here carries over, nothing is stranded
+            }
+            left[i] = 0;
+            i++;
+        }
+        if (i >= tbl.size()) {
+            GGML_LOG_ERROR("%s: device %d: %.2f MiB of host arena do not fit its %.zu segments, %.2f MiB are left in the last one\n",
+                __func__, device, (double) size / 1024.0/1024.0, tbl.size(),
+                (double) left[tbl.size() - 1] / 1024.0/1024.0);
+            return GGML_CUDA_NUMA_NODE_FAIL;
+        }
+
+        left[i] -= (int64_t) size;
+        state.seg_index[phys] = i;
+
+        const int node_num = state.nodes[tbl[i].node];
+        ggml_cuda_numa_commit_locked(device, node_num, size);
+        return node_num;
+    }
+
     const int node = ggml_cuda_numa_plan_node_locked(device, size);
     if (node != GGML_CUDA_NUMA_NODE_FAIL) {
         ggml_cuda_numa_commit_locked(device, node, size);
@@ -3505,6 +3786,25 @@ int ggml_cuda_numa_fixed_alloc(size_t size) {
         return GGML_CUDA_NUMA_NODE_ANY;
     }
 
+    if (state.fixed.valid && state.fixed.segmented) {
+        // fit counted the table in its node plan and placed it there: the segmented placement
+        // keeps that node, only the arenas changed. The room of the node was already reduced by
+        // the bytes of the table when the segments were solved, so the table is checked against
+        // its own reservation and takes nothing from the room of the arenas.
+        // the solver already took the bytes of the table off the capacity of that node
+        const int node = state.fixed.node_w;
+        if (node < 0 || (int64_t) size > state.fixed.w + (int64_t) GGML_CUDA_MAPPED_NUMA_TENSOR_TOLERANCE) {
+            GGML_LOG_ERROR("%s: %.2f GiB of mapped host memory do not fit on NUMA node %d, fit left %.2f GiB for it\n",
+                __func__, (double) size / 1024.0/1024.0/1024.0, node < 0 ? -1 : state.nodes[node],
+                node < 0 ? 0.0 : (double) state.fixed.w / 1024.0/1024.0/1024.0);
+            return GGML_CUDA_NUMA_NODE_FAIL;
+        }
+        state.cap[node] -= (int64_t) size;
+        GGML_LOG_INFO("%s: mapped weights tables: %.2f GiB on NUMA node %d (placed by fit, the arenas are segmented)\n",
+                __func__, (double) size / 1024.0/1024.0/1024.0, state.nodes[node]);
+        return state.nodes[node];
+    }
+
     size_t best = 0;
     size_t best_free = 0;
     for (size_t n = 0; n < state.nodes.size(); n++) {
@@ -3525,8 +3825,9 @@ int ggml_cuda_numa_fixed_alloc(size_t size) {
         return GGML_CUDA_NUMA_NODE_FAIL;
     }
 
-    state.cap[best]         -= (int64_t) size;
-    state.placed_node[best] += size;
+    // the table leaves the capacity of its node for the expert arenas; placed_node holds the live
+    // arena allocations only, so the free bytes cap - placed_node count the table once
+    state.cap[best] -= (int64_t) size;
 
     std::string capacity;
     for (size_t n = 0; n < state.nodes.size(); n++) {
@@ -3546,6 +3847,23 @@ int ggml_cuda_numa_fixed_alloc(size_t size) {
 // the CUDA<n>_Mapped buffer type
 void * ggml_cuda_numa_host_alloc(int device, size_t size, int node) {
     return ggml_backend_cuda_mapped_buffer_alloc_numa(device, size, node);
+}
+
+// node the pinned host buffers of the context go to: fit recorded it when it placed the arenas
+// per tensor, GGML_CUDA_NUMA_NODE_ANY otherwise (allocate without a policy). In the read-disk
+// mode the node of the fit is used in any case: the fit counted the buffers on that node and
+// the machine must hold them there.
+int ggml_cuda_numa_pinned_host_node(void) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
+
+    const ggml_cuda_mapped_numa_state & state = ggml_cuda_mapped_numa;
+    if (!state.fixed.valid || state.fixed.node_p < 0) {
+        return GGML_CUDA_NUMA_NODE_ANY;
+    }
+    if (!state.fixed.segmented && !state.ple_host_read) {
+        return GGML_CUDA_NUMA_NODE_ANY;
+    }
+    return state.nodes[state.fixed.node_p];
 }
 
 // startup log of the host placement: one line per device with the node of the plan and the
@@ -3650,22 +3968,194 @@ void ggml_cuda_numa_log_final_placement(void) {
     GGML_LOG_INFO("%s: final placement: nodes %s, %.1f MiB in total, estimated step time %.1f ms (every device on its own fastest node %.1f ms, placement %s)\n",
         __func__, assign.c_str(), (double) total / 1024.0/1024.0, state.plan_ms, state.plan_ms_fast,
         state.plan.from_fit ? "committed by fit" : "planned by the load");
+
+    if (state.fixed.valid && state.fixed.segmented) {
+        // the arenas of a device are spread over several nodes: report where its bytes actually
+        // went, node by node
+        for (size_t d = 0; d < state.placed_dev_node.size(); d++) {
+            std::string parts;
+            for (size_t n = 0; n < state.nodes.size(); n++) {
+                const int64_t bytes = (int64_t) state.placed_dev_node[d][n];
+                if (bytes == 0) {
+                    continue;
+                }
+                parts += (parts.empty() ? "node " : " + node ") + std::to_string(state.nodes[n]) +
+                    " " + std::to_string(bytes/1024/1024) + " MiB";
+            }
+            if (parts.empty()) {
+                continue;
+            }
+            GGML_LOG_INFO("%s: device %d -> %s (segmented placement)\n", __func__, (int) d, parts.c_str());
+        }
+    }
+}
+
+// The host NUMA nodes and what a placement needs to know about them, read without logging and
+// without touching the state of the placement: the fit asks whether one node per device holds
+// the host memory before the placement is planned, and that question must not plan anything.
+struct ggml_cuda_numa_host_info {
+    std::vector<int>     nodes;  // the host NUMA nodes, in the order of the online node list
+    std::vector<int64_t> cap;    // [node] bytes the node may hold (MemTotal minus the margin)
+    std::vector<int64_t> avail;  // [node] bytes the node can give away now (free + file pages - zone watermark)
+    std::vector<int>     topo;   // [physical device] node of the PCI slot, -1 when unknown
+};
+
+// read the host NUMA nodes, their capacity, their free memory and the PCI slot node of every
+// device. The same nodes and the same capacity the placement uses, but nothing is logged and
+// nothing is committed: false when the platform gives no NUMA information.
+static bool ggml_cuda_numa_host_info_query(ggml_cuda_numa_host_info & info) {
+    for (int node : ggml_cuda_online_numa_nodes()) {
+        const char * reason = nullptr;
+        if (!ggml_cuda_numa_node_is_host(node, &reason)) {
+            continue;
+        }
+        const ggml_cuda_numa_mem mem = ggml_cuda_numa_mem_read(node);
+        if (mem.total < 0) {
+            return false;
+        }
+        info.nodes.push_back(node);
+        if (!ggml_cuda_numa_node_allowed(node)) {
+            // the memory policy of the process does not allow this node: the process can not
+            // allocate there, so the node holds nothing for the placement
+            info.cap.push_back(0);
+            info.avail.push_back(0);
+            continue;
+        }
+        info.cap.push_back(mem.total - (int64_t) GGML_CUDA_MAPPED_NUMA_MARGIN);
+        info.avail.push_back(mem.avail);
+    }
+    if (info.nodes.empty()) {
+        return false;
+    }
+
+    const int device_count = ggml_backend_cuda_get_device_count();
+    info.topo.assign(device_count, -1);
+    for (int device = 0; device < device_count; device++) {
+        info.topo[ggml_cuda_get_physical_device(device)] = ggml_cuda_numa_topology_node(device);
+    }
+    return true;
+}
+
+// fit-side query: does the placement of one node per device hold the host arenas, the mapped
+// weights and the pinned host buffers of the contexts together? The question is asked before
+// the placement is planned, so this call plans nothing, logs nothing and commits nothing: it
+// only runs the same solver the check below runs.
+//
+//   devices      [allocation] device of every arena
+//   sizes        [allocation] bytes of every arena
+//   n_alloc      number of allocations
+//   fixed_mapped bytes of the mapped weights table, one block on one node
+//   fixed_pinned bytes of the pinned host buffers of the contexts, one block on one node
+//   node_need    [node] receives the bytes the placement needs on every node
+//   node_avail   [node] receives the bytes the node may hold
+//   node_free    [node] receives the bytes the node can give away right now
+//   node_ids     [node] receives the number of every node
+//   n_nodes      receives the capacity of the arrays on entry and the number of nodes on exit
+//
+// Returns 1 when the placement holds them, 0 when it does not, and -1 when the platform gives
+// no NUMA information (the caller then keeps the placement it has).
+static int ggml_backend_cuda_host_nodes_fit_query(
+        const int * devices, const size_t * sizes, size_t n_alloc,
+        int64_t fixed_mapped, int64_t fixed_pinned,
+        int64_t * node_need, int64_t * node_avail, int64_t * node_free, int * node_ids, size_t * n_nodes) {
+    ggml_cuda_numa_host_info info;
+    if (!ggml_cuda_numa_host_info_query(info)) {
+        if (n_nodes != nullptr) {
+            *n_nodes = 0;
+        }
+        return -1;
+    }
+
+    const size_t n_nodes_all  = info.nodes.size();
+    const int    device_count = ggml_backend_cuda_get_device_count();
+    if (device_count <= 0) {
+        if (n_nodes != nullptr) {
+            *n_nodes = 0;
+        }
+        return -1;
+    }
+
+    // the host bytes of every physical device: the virtual devices that share a GPU read the
+    // same node at the same rate, so their bytes are added up
+    std::vector<size_t> bytes(device_count, 0);
+    for (size_t i = 0; i < n_alloc; i++) {
+        const int device = devices[i];
+        if (device < 0 || device >= device_count) {
+            if (n_nodes != nullptr) {
+                *n_nodes = 0;
+            }
+            return -1;
+        }
+        bytes[ggml_cuda_get_physical_device(device)] += sizes[i];
+    }
+
+    // the node of the PCI slot of every device, as an index into the node table
+    std::vector<int> local_node(device_count, -1);
+    for (size_t d = 0; d < (size_t) device_count; d++) {
+        if (info.topo[d] < 0) {
+            continue;
+        }
+        const auto it = std::find(info.nodes.begin(), info.nodes.end(), info.topo[d]);
+        if (it != info.nodes.end()) {
+            local_node[d] = (int) (it - info.nodes.begin());
+        }
+    }
+
+    std::vector<int64_t> used;
+    const bool fits = ggml_cuda_numa_plan::fixed_fits((size_t) device_count, bytes.data(), local_node.data(),
+        n_nodes_all, info.cap.data(), fixed_mapped, fixed_pinned, nullptr, nullptr, nullptr, &used);
+
+    // what the placement needs on every node, what the node may hold and what it can give away
+    // right now: the caller reports the deficit of every node, not only of the one that overflows
+    if (n_nodes != nullptr) {
+        const size_t cap   = *n_nodes;
+        const size_t n_out = std::min(cap, n_nodes_all);
+        for (size_t n = 0; n < n_out; n++) {
+            if (node_need  != nullptr) {
+                node_need[n]  = used[n];
+            }
+            if (node_avail != nullptr) {
+                node_avail[n] = info.cap[n];
+            }
+            if (node_free != nullptr) {
+                node_free[n] = info.avail[n];
+            }
+            if (node_ids  != nullptr) {
+                node_ids[n]  = info.nodes[n];
+            }
+        }
+        *n_nodes = n_out;
+    }
+
+    return fits ? 1 : 0;
 }
 
 // fit-side check of the expert host arenas over the host NUMA nodes: given the host complement
 // allocations of all devices, plan the machine the same way the real load does (the plan is a
 // function of the per device bytes, the node capacities and the measured read times), commit the
-// plan for the load and report the bytes it puts on every node. On success the bytes placed on
+// plan for the load and report the bytes it puts on every node. fixed_mapped and fixed_pinned are
+// the two fixed pinned host allocations of the load (the mapped weights table and the pinned host
+// buffers of the context), which share the nodes with the arenas. On success the bytes placed on
 // every node are written to node_bytes/node_ids (up to the capacity in *n_nodes, which receives
 // the actual number of nodes). Returns 1 when the placement fits, -1 when the nodes can not hold
 // the arenas (fail_bytes receives the bytes needed, fail_avail the capacity of all nodes
 // together), and 0 when there is no NUMA information at all (the caller then falls back to a
 // plain total check). The real load reads the plan this call committed, so a fit that passes
 // does not fail later and does not place the machine from partial information.
+//
+// ple_host_read tells the check that the n-gram table stays in the model file and is read row by
+// row: the mapped weights are then the token embedding table alone, and the nodes are placed by
+// the free memory they have left instead of their MemTotal.
+//
+// node_avail receives the bytes every node may hold (the capacity the placement was checked
+// against), also when the check fails, so that the caller can report the deficit of every node
+// and not only the totals.
 static int ggml_backend_cuda_expert_check_host_nodes(
         const int * devices, const size_t * sizes, size_t n_alloc,
-        int64_t * node_bytes, int * node_ids, size_t * n_nodes,
-        int * fail_node, size_t * fail_bytes, int64_t * fail_avail) {
+        int64_t fixed_mapped, int64_t fixed_pinned,
+        int64_t * node_bytes, int64_t * node_avail, int * node_ids, size_t * n_nodes,
+        int * fail_node, size_t * fail_bytes, int64_t * fail_avail,
+        int ple_host_read) {
     std::lock_guard<std::mutex> lock(ggml_cuda_mapped_numa_mutex);
 
     if (!ggml_cuda_mapped_numa.probed) {
@@ -3688,6 +4178,115 @@ static int ggml_backend_cuda_expert_check_host_nodes(
         bytes[device] += sizes[i];
     }
 
+    // the bytes every node needs and every node may hold, for the caller: the deficit of every
+    // node, not only of the one that overflows
+    const auto fill_nodes = [&](const std::vector<int64_t> & need, const std::vector<int64_t> & avail) {
+        if (n_nodes == nullptr) {
+            return;
+        }
+        const size_t cap   = *n_nodes;
+        const size_t n_out = std::min(cap, n_nodes_all);
+        for (size_t n = 0; n < n_out; n++) {
+            if (node_bytes != nullptr) {
+                node_bytes[n] = need.size()  > n ? need[n]  : 0;
+            }
+            if (node_avail != nullptr) {
+                node_avail[n] = avail.size() > n ? avail[n] : 0;
+            }
+            if (node_ids != nullptr) {
+                node_ids[n] = state.nodes[n];
+            }
+        }
+        *n_nodes = n_out;
+    };
+
+    // the n-gram table is read from the model file: the host memory is placed by the free memory
+    // of the nodes and the pinned host buffers of the contexts go to the node the fit picked, even
+    // when the arenas are not segmented
+    state.ple_host_read = ple_host_read != 0;
+
+    if (ple_host_read) {
+        // the n-gram table stays in the model file and is read row by row, so the host memory is
+        // placed by the free memory the nodes have and not by their MemTotal: the MemTotal of a
+        // node is what the machine could hold, the free memory is what is there now. The margin
+        // of the machine stays on top of it: the node keeps the memory the kernel holds above the
+        // watermark of its zones and the margin besides. The segmented placement keeps a gigabyte
+        // of the free memory for the kernel.
+        std::string per_node;
+        for (size_t n = 0; n < n_nodes_all; n++) {
+            const bool     measured  = n < state.free_bytes.size() && state.free_bytes[n] >= 0;
+            const int64_t  available = ggml_cuda_numa_node_available(state, n);
+            const int64_t  margin    = (int64_t) GGML_CUDA_MAPPED_NUMA_MARGIN;
+            const int64_t  keep      = (int64_t) (1ull << 30);
+            const int64_t  file      = state.file_bytes[n] > 0 ? state.file_bytes[n] : 0;
+            const int64_t  high      = state.high_bytes[n] > 0 ? state.high_bytes[n] : 0;
+            if (measured) {
+                state.cap[n]       = std::min(state.cap[n],       available > margin ? available - margin : 0);
+                state.cap_phys[n]  = std::min(state.cap_phys[n],  available > keep   ? available - keep   : 0);
+            }
+            per_node += (per_node.empty() ? "" : ", ") + std::to_string(state.nodes[n]) + ": " +
+                std::to_string(state.cap[n] / (1024*1024)) + " MiB of the " +
+                std::to_string(available / (1024*1024)) + " MiB the node can give away";
+            if (measured) {
+                per_node += " (" + std::to_string(file / (1024*1024)) + " MiB of file pages, " +
+                    std::to_string(high / (1024*1024)) + " MiB of the kernel zone watermark)";
+            }
+        }
+        GGML_LOG_INFO("%s: the n-gram table is read from the model file, the host memory is placed by the free memory of the nodes: %s\n",
+            __func__, per_node.c_str());
+    }
+
+    // the node of the PCI slot of every device: the placement the machine is built for
+    std::vector<int> local_node(n_devices, -1);
+    for (size_t d = 0; d < n_devices; d++) {
+        local_node[d] = d < state.topo.size() ? ggml_cuda_mapped_numa_index(state.topo[d]) : -1;
+    }
+
+    // the need of every node when the arenas go to the node of their own card: the placement the
+    // load uses when it fits. The two fixed pinned host allocations take node memory too: the
+    // weights go to the node with the most room left after the experts and the pinned buffers to
+    // the node with the most room left after them, the way fixed_fits picks them.
+    const auto slot_local_need = [&](const std::vector<size_t> & dev_bytes, const std::vector<int64_t> & cap,
+            int & out_node_w, int & out_node_p) {
+        std::vector<int64_t> need(n_nodes_all, 0);
+        for (size_t d = 0; d < n_devices && d < dev_bytes.size(); d++) {
+            int n = local_node[d];
+            if (n < 0 || (size_t) n >= n_nodes_all) {
+                // the platform reports no slot for the device: it takes the node with the most room
+                n = 0;
+                for (size_t m = 1; m < n_nodes_all; m++) {
+                    if (cap[m] > cap[n]) {
+                        n = (int) m;
+                    }
+                }
+            }
+            need[n] += (int64_t) dev_bytes[d];
+        }
+
+        // the node with the most room left after the experts
+        int node_w = 0;
+        for (size_t n = 1; n < n_nodes_all; n++) {
+            if (cap[n] - need[n] > cap[node_w] - need[node_w]) {
+                node_w = (int) n;
+            }
+        }
+        need[node_w] += fixed_mapped;
+
+        // the node with the most room left after the weights are on it
+        int node_p = 0;
+        for (size_t n = 1; n < n_nodes_all; n++) {
+            if (cap[n] - need[n] > cap[node_p] - need[node_p]) {
+                node_p = (int) n;
+            }
+        }
+        need[node_p] += fixed_pinned;
+
+        out_node_w = node_w;
+        out_node_p = node_p;
+
+        return need;
+    };
+
     if (!ggml_cuda_numa_plan_locked(bytes, /*from_fit =*/ true)) {
         // the plan already logged the deficit per node; report the totals to the caller
         int64_t need_total = 0;
@@ -3698,6 +4297,12 @@ static int ggml_backend_cuda_expert_check_host_nodes(
         for (size_t n = 0; n < n_nodes_all; n++) {
             cap_total += state.cap[n];
         }
+        // the plan has no solution, so the bytes are not split over the nodes: the caller gets the
+        // need of every node (the placement of one node per device, which is what the load would
+        // use if it fit), the capacity of every node and the total it needs
+        int node_w = 0;
+        int node_p = 0;
+        fill_nodes(slot_local_need(ggml_cuda_numa_fold_locked(bytes), state.cap, node_w, node_p), state.cap);
         if (fail_node  != nullptr) {
             *fail_node = -1;
         }
@@ -3710,6 +4315,40 @@ static int ggml_backend_cuda_expert_check_host_nodes(
         return -1;
     }
 
+    // the two fixed pinned host allocations take node memory too: they go on the node with the
+    // most free capacity left, the way ggml_cuda_numa_fixed_alloc() places them. The check is
+    // done on the placement every device keeps on the node of its PCI slot, not on the measured
+    // one: the read times are a measurement, and a measurement that can not tell the placements
+    // apart must not turn a machine that holds the arenas and the two fixed blocks into one that
+    // does not. A placement that holds them changes nothing: the load places the table and the
+    // buffers as before and every log of the placement stays the same.
+    state.fixed.valid     = true;
+    state.fixed.segmented = false;
+    state.fixed.w         = fixed_mapped;
+    state.fixed.p         = fixed_pinned;
+
+    std::vector<int> slot_node(n_devices, -1);
+    const bool fits = ggml_cuda_numa_plan::fixed_fits(n_devices, state.plan.bytes.data(),
+        local_node.data(), n_nodes_all, state.cap.data(), fixed_mapped, fixed_pinned,
+        &state.fixed.node_w, &state.fixed.node_p, slot_node.data());
+    state.fixed.segmented = !fits;
+
+    if (fits && state.plan_have_local) {
+        // the nodes hold the slot local placement: the load puts the arena of every device on
+        // the node of its own card, whatever the measured plan said. The plan moves a device to
+        // a foreign node when the read times of the two nodes are close, and a device that
+        // reads its arena across the socket pays for it: the placement must not depend on the
+        // measurement. A plan that already places every device on its own node stays as it is.
+        bool differs = false;
+        for (size_t d = 0; d < n_devices; d++) {
+            differs = differs || d >= state.plan.node.size() || state.plan.node[d] != slot_node[d];
+        }
+        if (differs) {
+            state.plan.node = slot_node;
+            state.plan_ms   = state.plan_ms_local; // the step time of the slot local placement
+        }
+    }
+
     // bytes of the plan per node
     std::vector<int64_t> used(n_nodes_all, 0);
     for (size_t d = 0; d < state.plan.node.size(); d++) {
@@ -3718,12 +4357,131 @@ static int ggml_backend_cuda_expert_check_host_nodes(
         }
     }
 
+    if (!fits) {
+        // the placement of one node per device can not hold the arenas and the fixed pinned host
+        // memory together. Place the arenas per tensor over the nodes instead: every device
+        // fills the node of its PCI slot first and spills the rest onto the node with the most
+        // room left, which is a function of the bytes, the capacities and the topology alone.
+        int64_t slack = 0;
+        for (size_t i = 0; i < n_alloc; i++) {
+            slack = std::max(slack, (int64_t) sizes[i]);
+        }
+
+        // the node of the table and of the pinned host buffers on the physical capacity: the
+        // node with the most room, then the node with the most room left (the lowest index on
+        // a tie), the same rule ggml_cuda_numa_fixed_alloc() uses on the plan capacity, and the
+        // bytes the arenas and the two fixed blocks need on every node
+        int node_w = 0;
+        int node_p = 0;
+        const std::vector<int64_t> need = slot_local_need(state.plan.bytes, state.cap_phys, node_w, node_p);
+
+        // solve the table the way the load walks it: arena by arena, in allocation order
+        std::vector<int>    alloc_dev(n_alloc, 0);
+        std::vector<size_t> alloc_size(n_alloc, 0);
+        for (size_t i = 0; i < n_alloc; i++) {
+            alloc_dev[i]  = devices[i];
+            alloc_size[i] = sizes[i];
+        }
+        std::vector<std::vector<ggml_cuda_numa_plan::segment_entry>> seg;
+        if (ggml_cuda_numa_plan::segment(n_devices, state.plan.bytes.data(), alloc_dev.data(),
+                alloc_size.data(), n_alloc, local_node.data(), n_nodes_all, state.cap_phys.data(),
+                fixed_mapped, fixed_pinned, slack, &seg) != 1) {
+            int64_t need_total   = 0;
+            int64_t cap_phys_tot = 0;
+            for (size_t n = 0; n < n_nodes_all; n++) {
+                need_total   += need[n];
+                cap_phys_tot += state.cap_phys[n];
+            }
+            GGML_LOG_ERROR("%s: the host arenas and the fixed pinned host memory do not fit the nodes, not even segmented: %.1f MiB mapped weights, %.1f MiB pinned host buffers\n",
+                __func__, (double) fixed_mapped / 1024.0/1024.0, (double) fixed_pinned / 1024.0/1024.0);
+            for (size_t n = 0; n < n_nodes_all; n++) {
+                GGML_LOG_ERROR("%s:   NUMA node %d: %.1f MiB needed, %.1f MiB of the physical capacity of %.1f MiB\n",
+                    __func__, state.nodes[n], (double) need[n] / 1024.0/1024.0,
+                    (double) state.cap_phys[n] / 1024.0/1024.0, (double) state.cap_phys[n] / 1024.0/1024.0);
+            }
+            fill_nodes(need, state.cap_phys);
+            if (fail_node  != nullptr) {
+                *fail_node = -1;
+            }
+            if (fail_bytes != nullptr) {
+                *fail_bytes = (size_t) need_total;
+            }
+            if (fail_avail != nullptr) {
+                *fail_avail = cap_phys_tot;
+            }
+            return -1;
+        }
+
+        state.fixed.segmented = true;
+        state.fixed.node_w    = node_w;
+        state.fixed.node_p    = node_p;
+        state.seg             = std::move(seg);
+        state.seg_index.assign(n_devices, 0);
+        state.seg_left.assign(n_devices, std::vector<int64_t>());
+        for (size_t d = 0; d < n_devices; d++) {
+            for (const ggml_cuda_numa_plan::segment_entry & e : state.seg[d]) {
+                state.seg_left[d].push_back(e.bytes);
+            }
+        }
+
+        GGML_LOG_INFO("%s: the plan of one node per device does not hold the arenas and the fixed pinned host memory, the arenas are placed per tensor over the nodes\n",
+            __func__);
+        GGML_LOG_INFO("%s:   %.1f MiB mapped weights on node %d, %.1f MiB pinned host buffers on node %d, %.1f MiB of per-tensor slack on every node\n",
+            __func__, (double) fixed_mapped / 1024.0/1024.0, state.nodes[node_w],
+            (double) fixed_pinned / 1024.0/1024.0, state.nodes[node_p], (double) slack / 1024.0/1024.0);
+        for (size_t d = 0; d < n_devices; d++) {
+            if (state.seg[d].empty()) {
+                continue;
+            }
+            std::string parts;
+            for (const ggml_cuda_numa_plan::segment_entry & s : state.seg[d]) {
+                parts += (parts.empty() ? "node " : " + node ") + std::to_string(state.nodes[s.node]) +
+                    " " + std::to_string(s.bytes/1024/1024) + " MiB";
+            }
+            GGML_LOG_INFO("%s:   device %d -> %s\n", __func__, (int) d, parts.c_str());
+        }
+        for (size_t n = 0; n < n_nodes_all; n++) {
+            int64_t left_n = state.cap_phys[n];
+            left_n -= (n == (size_t) node_w ? fixed_mapped : 0);
+            left_n -= (n == (size_t) node_p ? fixed_pinned : 0);
+            left_n -= slack;
+            for (size_t d = 0; d < n_devices; d++) {
+                for (const ggml_cuda_numa_plan::segment_entry & e : state.seg[d]) {
+                    if (e.node == (int) n) {
+                        left_n -= e.bytes;
+                    }
+                }
+            }
+            GGML_LOG_INFO("%s:   NUMA node %d: %.1f MiB of %.1f MiB of the physical capacity still free\n",
+                __func__, state.nodes[n], (double) left_n / 1024.0/1024.0,
+                (double) state.cap_phys[n] / 1024.0/1024.0);
+        }
+    }
+
     if (n_nodes != nullptr) {
         const size_t cap = *n_nodes;
         const size_t n_out = std::min(cap, n_nodes_all);
+        // the bytes the placement puts on every node: the plan of the machine, or the segments
+        // when the arenas are placed per tensor over the nodes
+        std::vector<int64_t> placed = used;
+        std::vector<int64_t> avail  = state.cap;
+        if (state.fixed.segmented) {
+            placed.assign(n_nodes_all, 0);
+            avail  = state.cap_phys;
+            for (size_t d = 0; d < state.seg.size(); d++) {
+                for (const ggml_cuda_numa_plan::segment_entry & e : state.seg[d]) {
+                    if (e.node >= 0 && (size_t) e.node < n_nodes_all) {
+                        placed[e.node] += e.bytes;
+                    }
+                }
+            }
+        }
         for (size_t n = 0; n < n_out; n++) {
             if (node_bytes != nullptr) {
-                node_bytes[n] = used[n];
+                node_bytes[n] = placed[n];
+            }
+            if (node_avail != nullptr) {
+                node_avail[n] = avail[n];
             }
             if (node_ids != nullptr) {
                 node_ids[n] = state.nodes[n];
@@ -3793,6 +4551,10 @@ void * ggml_cuda_numa_host_alloc(int device, size_t size, int node) {
 #endif
 }
 
+int ggml_cuda_numa_pinned_host_node(void) {
+    return GGML_CUDA_NUMA_NODE_ANY;
+}
+
 void ggml_cuda_numa_log_placement(const char * what) {
     GGML_UNUSED(what);
 }
@@ -3802,20 +4564,45 @@ void ggml_cuda_numa_log_final_placement(void) {
 
 static int ggml_backend_cuda_expert_check_host_nodes(
         const int * devices, const size_t * sizes, size_t n_alloc,
-        int64_t * node_bytes, int * node_ids, size_t * n_nodes,
-        int * fail_node, size_t * fail_bytes, int64_t * fail_avail) {
+        int64_t fixed_mapped, int64_t fixed_pinned,
+        int64_t * node_bytes, int64_t * node_avail, int * node_ids, size_t * n_nodes,
+        int * fail_node, size_t * fail_bytes, int64_t * fail_avail,
+        int ple_host_read) {
     GGML_UNUSED(devices);
     GGML_UNUSED(sizes);
     GGML_UNUSED(n_alloc);
+    GGML_UNUSED(fixed_mapped);
+    GGML_UNUSED(fixed_pinned);
     GGML_UNUSED(node_bytes);
+    GGML_UNUSED(node_avail);
     GGML_UNUSED(node_ids);
     GGML_UNUSED(fail_node);
     GGML_UNUSED(fail_bytes);
     GGML_UNUSED(fail_avail);
+    GGML_UNUSED(ple_host_read);
     if (n_nodes != nullptr) {
         *n_nodes = 0;
     }
     return 0;
+}
+
+static int ggml_backend_cuda_host_nodes_fit_query(
+        const int * devices, const size_t * sizes, size_t n_alloc,
+        int64_t fixed_mapped, int64_t fixed_pinned,
+        int64_t * node_need, int64_t * node_avail, int64_t * node_free, int * node_ids, size_t * n_nodes) {
+    GGML_UNUSED(devices);
+    GGML_UNUSED(sizes);
+    GGML_UNUSED(n_alloc);
+    GGML_UNUSED(fixed_mapped);
+    GGML_UNUSED(fixed_pinned);
+    GGML_UNUSED(node_need);
+    GGML_UNUSED(node_avail);
+    GGML_UNUSED(node_free);
+    GGML_UNUSED(node_ids);
+    if (n_nodes != nullptr) {
+        *n_nodes = 0;
+    }
+    return -1;
 }
 #endif // !defined(GGML_CUDA_MAPPED_NUMA)
 
@@ -11782,6 +12569,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_expert_check_host_nodes") == 0) {
         return (void *)ggml_backend_cuda_expert_check_host_nodes;
+    }
+    if (strcmp(name, "ggml_backend_cuda_host_nodes_fit_query") == 0) {
+        return (void *)ggml_backend_cuda_host_nodes_fit_query;
     }
     if (strcmp(name, "ggml_backend_expert_store_model_loaded") == 0) {
         return (void *)ggml_backend_cuda_expert_verify_all;

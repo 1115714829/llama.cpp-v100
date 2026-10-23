@@ -13573,6 +13573,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, n, 5, 4, 1, 1, false, false));
         test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, n, 5, 4, 7, 1, false, false));
     }
+    // the n-gram table of the PLE layer: a 160-value row, gathered with 64 rows in a decode step
+    // and with 32768 rows in a prefill block
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, 160,    64,    64, 1, 1, false, false));
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, 160, 32768, 32768, 1, 1, false, false));
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)

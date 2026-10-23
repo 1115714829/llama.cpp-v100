@@ -5,6 +5,7 @@
 #include "llama-graph.h"
 #include "llama-hparams.h"
 #include "llama-memory.h"
+#include "llama-ple-reader.h"
 #include "llama-vocab.h"
 
 #include <map>
@@ -762,6 +763,10 @@ struct llama_model {
 
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
+
+    // the reader of the n-gram table: it reads the rows the graph needs from the model file,
+    // when the table does not fit into pinned host memory (see llama_model_params::ple_host_read)
+    std::unique_ptr<llama_ple_reader> ple_reader;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;

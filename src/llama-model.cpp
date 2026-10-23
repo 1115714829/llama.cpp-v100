@@ -27,8 +27,10 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <cfloat>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1932,7 +1934,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // device-readable mapped host memory and read it there. this is a capability branch (only
     // CUDA offers a mapped weights buffer); without it the table stays in a CPU mmap buffer
     // and GET_ROWS runs on the CPU
-    if (hparams.ple_n_heads > 0) {
+    // when the table is read from the model file row by row (ple_host_read), it stays in the
+    // CPU mmap buffer in any case: it is neither pinned nor mapped into the page tables
+    if (hparams.ple_n_heads > 0 && !params.ple_host_read) {
         for (uint32_t il = 0; il < (uint32_t) n_layer_all; ++il) {
             if (hparams.is_ple(il)) {
                 ml.lazy.dev = pimpl->dev_layer[il].dev;
@@ -2130,7 +2134,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
-    if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
+    // the prefetch touches the pages of the table: when the table is read from the model file
+    // row by row, its pages must stay untouched (the reader reads them with O_DIRECT)
+    if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd) && !params.ple_host_read) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
 
         can_prefetch.insert(per_layer_tok_embd);
@@ -2398,6 +2404,70 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    // the reader of the n-gram table: the table stays in the model file and the reader reads the
+    // rows the graph needs from it, so the table takes no pinned host memory. Every failure here
+    // stops the load: a model that says it reads the table from the file and cannot is worse
+    // than one that never tried, because the graph would read the table from the page cache.
+    if (params.ple_host_read) {
+        if (per_layer_tok_embd == nullptr) {
+            throw std::runtime_error(format("%s: the n-gram table is read from the model file, but the model has none", __func__));
+        }
+        const llama_model_loader::llama_tensor_weight * w = ml.get_weight(per_layer_tok_embd->name);
+        if (w == nullptr) {
+            throw std::runtime_error(format("%s: the n-gram table '%s' is not in the model file", __func__, per_layer_tok_embd->name));
+        }
+        if (w->idx >= ml.file_names.size() || ml.file_names[w->idx].empty()) {
+            throw std::runtime_error(format("%s: the n-gram table '%s' is in a file without a path", __func__, per_layer_tok_embd->name));
+        }
+        if (per_layer_tok_embd->ne[0] != w->tensor->ne[0] || per_layer_tok_embd->ne[1] != w->tensor->ne[1]) {
+            throw std::runtime_error(format("%s: the n-gram table '%s' of the model is [%lld, %lld] and the one in the file is [%lld, %lld]",
+                __func__, per_layer_tok_embd->name,
+                (long long) per_layer_tok_embd->ne[0], (long long) per_layer_tok_embd->ne[1],
+                (long long) w->tensor->ne[0], (long long) w->tensor->ne[1]));
+        }
+        if (per_layer_tok_embd->type != w->tensor->type) {
+            // the reader returns the bytes of the file, so the table of the file must have the
+            // type of the tensor: a table that is converted while loading would be read as the
+            // bytes of the file
+            throw std::runtime_error(format("%s: the n-gram table '%s' of the model has the type %s, the one in the file has the type %s",
+                __func__, per_layer_tok_embd->name,
+                ggml_type_name(per_layer_tok_embd->type), ggml_type_name(w->tensor->type)));
+        }
+
+        ple_reader = std::make_unique<llama_ple_reader>();
+        ple_reader->file      = ml.file_names[w->idx];
+        ple_reader->offset    = w->offs;
+        ple_reader->n_rows    = (size_t) w->tensor->ne[1];
+        ple_reader->row_bytes = ggml_row_size(w->tensor->type, w->tensor->ne[0]);
+
+        // check the file here, so that a wrong path or a wrong offset stops the load instead of
+        // the first decode; the reader itself is opened at the end of the load
+        const size_t table_bytes = ple_reader->n_rows * ple_reader->row_bytes;
+        const size_t file_size    = ml.files[w->idx]->size();
+        FILE * f = fopen(ple_reader->file.c_str(), "rb");
+        if (f == nullptr) {
+            throw std::runtime_error(format("%s: the n-gram table '%s' is in '%s', which cannot be opened: %s",
+                __func__, per_layer_tok_embd->name, ple_reader->file.c_str(), strerror(errno)));
+        }
+        fclose(f);
+        if (ple_reader->offset > file_size || table_bytes > file_size - ple_reader->offset) {
+            throw std::runtime_error(format("%s: the n-gram table '%s' is at offset %zu with %zu rows of %zu bytes, which does not fit the %zu bytes of '%s'",
+                __func__, per_layer_tok_embd->name, ple_reader->offset, ple_reader->n_rows,
+                ple_reader->row_bytes, file_size, ple_reader->file.c_str()));
+        }
+
+        LLAMA_LOG_INFO("%s: the n-gram table '%s' is read from '%s' at offset %zu: %zu rows of %zu bytes\n",
+            __func__, per_layer_tok_embd->name, ple_reader->file.c_str(), ple_reader->offset,
+            ple_reader->n_rows, ple_reader->row_bytes);
+
+        // open the file and start the read threads now: a table that can not be read stops the
+        // load here, not in the middle of the first request
+        if (!ple_reader->init()) {
+            throw std::runtime_error(format("%s: the n-gram table '%s' in '%s' can not be read",
+                __func__, per_layer_tok_embd->name, ple_reader->file.c_str()));
         }
     }
 
@@ -3444,6 +3514,7 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
         /*.no_expert_store             =*/ false,
+        /*.ple_host_read               =*/ false,
     };
 
     return result;

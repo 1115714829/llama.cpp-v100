@@ -317,9 +317,20 @@ endif()
 if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-numa-plan.cpp)
     target_include_directories(test-numa-plan PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+
+    llama_build_and_test(test-numa-segment.cpp)
+    target_include_directories(test-numa-segment PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 endif()
 
 llama_build_and_test(test-sched-pipeline.cpp)
+
+# the PLE n-gram table reader; llama-ple-reader.h lives in src, so the test includes it directly.
+# the reader needs the internal symbols of the library, so it is not built when the library is
+# shared on Windows
+if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+    llama_build_and_test(test-ple-reader.cpp)
+    target_include_directories(test-ple-reader PRIVATE ${PROJECT_SOURCE_DIR}/src)
+endif()
 
 # Multi-GPU AllReduce comm test; skips when CUDA or < 2 devices are available.
 llama_build(test-cuda-allreduce.cpp)

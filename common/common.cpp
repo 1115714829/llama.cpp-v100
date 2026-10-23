@@ -1284,6 +1284,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 fit_margins.data(),
                 params.fit_params_target_set,
                 params.fit_params_min_ctx,
+                params.cache_ram_mib,
                 has_draft || spec_mtp ? &extra : nullptr,
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR)
                 == COMMON_PARAMS_FIT_STATUS_ERROR) {

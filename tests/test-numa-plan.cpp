@@ -110,8 +110,8 @@ bool test_capacity(void) {
     return true;
 }
 
-// times that differ by one percent make every assignment a tie: the result must be the
-// lexicographically smallest one and the same on every call
+// times that differ by one percent make every assignment a tie: the result must spread the
+// devices over the nodes and be the same on every call
 bool test_tie_is_deterministic(void) {
     const std::vector<size_t> bytes = { GiB, GiB };
     const double  t[2*2] = { 1.00, 0.99, 1.00, 0.99 };
@@ -134,7 +134,75 @@ bool test_tie_is_deterministic(void) {
             return false;
         }
     }
-    if (!expect(__func__, first.node, { 0, 0 })) {
+    // every assignment has the same cost, so the tie is broken by the spread: one device per node
+    if (!expect(__func__, first.node, { 0, 1 })) {
+        return false;
+    }
+    return true;
+}
+
+// the tie of the two cards of the same socket: the two nodes read the same within the
+// measurement error, so every assignment has the same cost. the old rule took the
+// lexicographically smallest one and piled both arenas on node 0; the arenas of the two cards
+// must go to different nodes instead, and the spread must not cost anything
+bool test_tie_spreads_the_devices(void) {
+    const int64_t MiB = 1024ll*1024ll;
+    const size_t  bytes[2] = { (size_t) (30249*MiB), (size_t) (30243*MiB) };
+    // the nodes read the same within the noise of the probe
+    const double  t[2*2] = { 4.30, 4.32, 3.30, 3.31 };
+    // both cards are in the slots of node 0
+    const int     topo[2] = { 0, 0 };
+    // the nodes hold both arenas, so every assignment fits
+    const int64_t cap[2]  = { (int64_t) 96*1024*MiB, (int64_t) 96*1024*MiB };
+
+    result r;
+    if (ggml_cuda_numa_plan::plan(2, 2, bytes, cap, t, topo, &r) != 1) {
+        fprintf(stderr, "%s: the plan failed\n", __func__);
+        return false;
+    }
+    if (!expect(__func__, r.node, { 0, 1 })) {
+        return false;
+    }
+    if (r.node[0] == r.node[1]) {
+        fprintf(stderr, "%s: both arenas are on node %d\n", __func__, r.node[0]);
+        return false;
+    }
+    // the spread does not cost anything: the cost of the assignment that piles them on one node
+    // is the same, so the spread was free
+    const int piled[2] = { 0, 0 };
+    const double c_piled = ggml_cuda_numa_plan::cost_of(piled, 2, 2, bytes, t);
+    if (c_piled < 0.0 || r.cost > c_piled*ggml_cuda_numa_plan::TIE) {
+        fprintf(stderr, "%s: the spread costs %f, the piled placement %f\n", __func__, r.cost, c_piled);
+        return false;
+    }
+    return true;
+}
+
+// the placement of the six card machine of the ac922-1: the read times of the probe, the host
+// complement of every device and the node capacities are the ones of the run of job #162
+// (server/ac922-1/162-2card-tip-7ec77fba6-b2-measure/numa-c6-moe-16k-tip-p1.log). the placement
+// must not change: the six cards keep their arena on the node of their PCI slot
+bool test_six_cards_ac9221(void) {
+    const int64_t MiB = 1024ll*1024ll;
+    const size_t  n_dev = 6;
+    const size_t  bytes[6] = { (size_t) (1897*MiB), (size_t) (1832*MiB), (size_t) (1994*MiB),
+                                (size_t) (1890*MiB), (size_t) (1841*MiB), (size_t) (2007*MiB) };
+    const double  t[6*2] = { 8.3, 13.6,   8.1, 13.5,   7.7, 15.6,
+                             13.4, 8.0,  13.1, 8.3,   15.2, 8.6 };
+    const int     topo[6] = { 0, 0, 0, 1, 1, 1 };
+    const int64_t cap[2]  = { (int64_t) (44762*MiB), (int64_t) (44847*MiB) };
+
+    result r;
+    if (ggml_cuda_numa_plan::plan(n_dev, 2, bytes, cap, t, topo, &r) != 1) {
+        fprintf(stderr, "%s: the plan failed\n", __func__);
+        return false;
+    }
+    if (!expect(__func__, r.node, { 0, 0, 0, 1, 1, 1 })) {
+        return false;
+    }
+    if (r.node_bytes[0] != (int64_t) (5723*MiB) || r.node_bytes[1] != (int64_t) (5738*MiB)) {
+        fprintf(stderr, "%s: node bytes %lld/%lld MiB\n", __func__,
+            (long long) (r.node_bytes[0]/MiB), (long long) (r.node_bytes[1]/MiB));
         return false;
     }
     return true;
@@ -285,6 +353,8 @@ int main(void) {
     if (!test_exhaustive_best() ||
         !test_capacity()      ||
         !test_tie_is_deterministic() ||
+        !test_tie_spreads_the_devices() ||
+        !test_six_cards_ac9221() ||
         !test_does_not_fit()  ||
         !test_descent()       ||
         !test_committed_plan()) {

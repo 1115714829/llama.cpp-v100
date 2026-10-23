@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <cinttypes>
@@ -316,21 +317,111 @@ static void common_expert_record_plan(ggml_backend_buffer_type_t buft, size_t sl
     }
 }
 
+// the two fixed pinned host allocations of a load: the mapped weights table (one block every
+// device reads) and the pinned host buffers of the context and of the draft context. They take
+// node memory like the expert arenas, so the NUMA check of the arenas budgets them next to them.
+static void common_fit_host_fixed(ggml_backend_dev_t dev, const llama_model * model,
+        const llama_context * ctx, const llama_context * ctx_dft,
+        int64_t * mapped, int64_t * pinned) {
+    *mapped = 0;
+    *pinned = 0;
+
+    if (model != nullptr) {
+        for (const auto & kv : llama_internal_get_tensor_map(model)) {
+            const ggml_tensor * t = kv.second;
+            if (t == nullptr || t->view_src != nullptr || ggml_nelements(t) == 0) {
+                continue;
+            }
+            if ((t->flags & GGML_TENSOR_FLAG_EXPERT) != 0) {
+                continue;
+            }
+            if (t->buffer != nullptr && ggml_backend_buft_is_device_mapped(ggml_backend_buffer_get_type(t->buffer))) {
+                *mapped += (int64_t) ggml_nbytes(t);
+            }
+        }
+    }
+
+    if (dev == nullptr) {
+        return;
+    }
+    const ggml_backend_buffer_type_t pinned_buft = ggml_backend_dev_host_buffer_type(dev);
+    for (const llama_context * c : { ctx, ctx_dft }) {
+        if (c == nullptr) {
+            continue;
+        }
+        for (const auto & [buft, data] : llama_get_memory_breakdown(c)) {
+            if (buft == pinned_buft) {
+                *pinned += (int64_t) (data.context + data.compute);
+            }
+        }
+    }
+}
+
+// the bytes of the n-gram (PLE) table and of the token embedding table of a model: the table is
+// the mapped weight of the PLE layer, the embedding table the mapped weight of the input layer.
+// The table is counted only where the fit counts it too: in the mapped host memory, which the
+// device offers only when it has a mapped weights buffer. The embedding table is not in the
+// mapped weights of the no-alloc preview (the input layer keeps the CPU buffer there), so the
+// fit counts it by hand.
+static void common_fit_ple_bytes(const llama_model * model, int64_t * ple_bytes, int64_t * embd_bytes) {
+    *ple_bytes  = 0;
+    *embd_bytes = 0;
+    for (const auto & kv : llama_internal_get_tensor_map(model)) {
+        const ggml_tensor * t = kv.second;
+        if (t == nullptr) {
+            continue;
+        }
+        if (kv.first == "per_layer_token_embd.weight") {
+            if (t->buffer != nullptr && ggml_backend_buft_is_device_mapped(ggml_backend_buffer_get_type(t->buffer))) {
+                *ple_bytes = (int64_t) ggml_nbytes(t);
+            }
+        } else if (kv.first == "token_embd.weight") {
+            *embd_bytes = (int64_t) ggml_nbytes(t);
+        }
+    }
+}
+
+// the deficit of every node, for the error message of a failed check: what every node needs,
+// what it may hold and the gap of every node
+static std::string common_fit_host_nodes_per_node(const int64_t * node_bytes, const int64_t * node_avail,
+        const int * node_ids, size_t n_nodes, int64_t MiB) {
+    std::string per_node;
+    for (size_t n = 0; n < n_nodes; n++) {
+        const int64_t need  = node_bytes[n];
+        const int64_t avail = node_avail[n];
+        const int64_t gap   = need > avail ? need - avail : 0;
+        per_node += (per_node.empty() ? "" : ", ") + std::string("node ") + std::to_string(node_ids[n]) + ": need " +
+            std::to_string(need/MiB) + " MiB, have " + std::to_string(avail/MiB) + " MiB, gap " +
+            std::to_string(gap/MiB) + " MiB";
+    }
+    if (per_node.empty()) {
+        per_node = "no NUMA node";
+    }
+    return per_node;
+}
+
 // NUMA check of the expert host arenas: hand the host complement allocations of all devices to
 // the backend, which plans the machine once (the same plan the real load reads) from the per
 // device bytes, the node capacities (MemTotal minus the margin) and the read times measured
 // while all the devices read at the same time. A successful check commits that plan for the
 // load: the arenas of the model then follow it, and the load never plans the machine again from
-// the bytes of the device that allocates first. On success the bytes the plan places on every
-// node are written to node_bytes/node_ids (up to the capacity in *n_nodes, which receives the
-// actual number of nodes). Returns 1 when the placement fits, -1 when the nodes cannot hold the
-// arenas (the bytes needed and the capacity of all nodes together are returned), and 0 when
-// there is no NUMA information at all; the caller then falls back to a plain total check.
+// the bytes of the device that allocates first. fixed_mapped and fixed_pinned are the mapped
+// weights table and the pinned host buffers, which share the nodes with the arenas. ple_host_read
+// tells the backend that the n-gram table stays in the model file, so the mapped weights are the
+// token embedding table alone and the nodes are placed by the free memory they have left. On
+// success the bytes the plan places on every node are written to node_bytes/node_ids (up to the
+// capacity in *n_nodes, which receives the actual number of nodes), and the bytes every node may
+// hold to node_avail. Returns 1 when the placement fits, -1 when the nodes cannot hold the
+// arenas (the bytes needed, the capacity of all nodes together and the capacity of every node
+// come back), and 0 when there is no NUMA information at all; the caller then falls back to a
+// plain total check.
 static int common_expert_check_host_nodes(
         const std::vector<ggml_backend_dev_t> & devs,
         const std::vector<int> & seq_dev,
         const std::vector<size_t> & seq_size,
-        int64_t * node_bytes, int * node_ids, size_t * n_nodes,
+        int64_t fixed_mapped, int64_t fixed_pinned,
+        bool ple_host_read,
+        int64_t * node_bytes, int64_t * node_avail, int * node_ids, size_t * n_nodes,
         int * fail_node, size_t * fail_bytes, int64_t * fail_avail) {
     if (seq_dev.empty()) {
         if (n_nodes != nullptr) {
@@ -347,14 +438,190 @@ static int common_expert_check_host_nodes(
         return 0;
     }
     typedef int (*ggml_backend_expert_check_host_nodes_t)(
-        const int *, const size_t *, size_t, int64_t *, int *, size_t *, int *, size_t *, int64_t *);
+        const int *, const size_t *, size_t, int64_t, int64_t, int64_t *, int64_t *, int *, size_t *, int *, size_t *, int64_t *, int);
     auto check = (ggml_backend_expert_check_host_nodes_t)
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_check_host_nodes");
     if (check == nullptr) {
         return 0;
     }
-    return check(seq_dev.data(), seq_size.data(), seq_dev.size(),
-        node_bytes, node_ids, n_nodes, fail_node, fail_bytes, fail_avail);
+    return check(seq_dev.data(), seq_size.data(), seq_dev.size(), fixed_mapped, fixed_pinned,
+        node_bytes, node_avail, node_ids, n_nodes, fail_node, fail_bytes, fail_avail, ple_host_read ? 1 : 0);
+}
+
+// NUMA query: does the placement of one node per device hold the host arenas, the mapped
+// weights and the pinned host buffers of the contexts together? The query plans nothing, logs
+// nothing and commits nothing, so the fit can ask it before it decides anything. The bytes the
+// placement needs on every node, what the node holds and what it can give away right now come
+// back, so that the caller can report the deficit of every node.
+// Returns 1 when the placement holds them, 0 when it does not, and -1 when the platform gives
+// no NUMA information (the caller then keeps what it has).
+static int common_expert_host_nodes_fit_query(
+        const std::vector<ggml_backend_dev_t> & devs,
+        const std::vector<int> & seq_dev,
+        const std::vector<size_t> & seq_size,
+        int64_t fixed_mapped, int64_t fixed_pinned,
+        int64_t * node_need, int64_t * node_avail, int64_t * node_free, int * node_ids, size_t * n_nodes) {
+    if (seq_dev.empty()) {
+        if (n_nodes != nullptr) {
+            *n_nodes = 0;
+        }
+        return 1; // no expert host arena at all
+    }
+    if (seq_dev[0] < 0 || (size_t) seq_dev[0] >= devs.size() || devs[(size_t) seq_dev[0]] == nullptr) {
+        if (n_nodes != nullptr) {
+            *n_nodes = 0;
+        }
+        return -1;
+    }
+    ggml_backend_dev_t dev = devs[(size_t) seq_dev[0]];
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (reg == nullptr) {
+        if (n_nodes != nullptr) {
+            *n_nodes = 0;
+        }
+        return -1;
+    }
+    typedef int (*ggml_backend_host_nodes_fit_query_t)(
+        const int *, const size_t *, size_t, int64_t, int64_t, int64_t *, int64_t *, int64_t *, int *, size_t *);
+    auto query = (ggml_backend_host_nodes_fit_query_t)
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_host_nodes_fit_query");
+    if (query == nullptr) {
+        if (n_nodes != nullptr) {
+            *n_nodes = 0;
+        }
+        return -1;
+    }
+    return query(seq_dev.data(), seq_size.data(), seq_dev.size(), fixed_mapped, fixed_pinned,
+        node_need, node_avail, node_free, node_ids, n_nodes);
+}
+
+// the anonymous memory of this process: what it holds outside the file pages of the model. The
+// runtime grows past it (the prompt cache and the buffers of the contexts), so the figure is a
+// lower bound. 0 when the platform does not tell.
+static int64_t common_fit_process_anon_bytes() {
+#if defined(__linux__)
+    FILE * f = fopen("/proc/self/status", "r");
+    if (f == nullptr) {
+        return 0;
+    }
+    int64_t kb = 0;
+    char line[256] = {};
+    while (fgets(line, sizeof(line), f) != nullptr) {
+        long long v = 0;
+        if (sscanf(line, "RssAnon: %lld kB", &v) == 1) {
+            kb = (int64_t) v;
+            break;
+        }
+    }
+    fclose(f);
+    return kb * 1024;
+#else
+    return 0;
+#endif
+}
+
+// The n-gram table does not fit into the pinned host memory of the machine: the table stays in
+// the model file and is read row by row, and the mapped weights are the token embedding table
+// alone. Returns true when the fit switched to reading the table from the file.
+static bool common_fit_ple_host_read(
+        llama_model_params * mparams,
+        const std::vector<ggml_backend_dev_t> & devs,
+        const std::vector<int> & seq_dev,
+        const std::vector<size_t> & seq_size,
+        int64_t * fixed_mapped, int64_t fixed_pinned,
+        int64_t ple_bytes, int64_t embd_bytes, int32_t cache_ram_mib) {
+    constexpr int64_t MiB = 1024*1024;
+
+    if (ple_bytes <= 0) {
+        return false; // the model has no n-gram table
+    }
+
+    constexpr size_t max_nodes = 64;
+    int64_t node_need [max_nodes] = {};
+    int64_t node_avail[max_nodes] = {};
+    int64_t node_free [max_nodes] = {};
+    int     node_ids [max_nodes] = {};
+    size_t  n_nodes = max_nodes;
+    // the load pins the token embedding table in both modes: the no-alloc preview of the fit does
+    // not see it (the input layer keeps the CPU buffer there), so the query counts it by hand
+    const int fits = common_expert_host_nodes_fit_query(devs, seq_dev, seq_size,
+        *fixed_mapped + embd_bytes, fixed_pinned, node_need, node_avail, node_free, node_ids, &n_nodes);
+    if (fits != 0) {
+        // it fits, or the platform gives no NUMA information: the table stays in memory
+        return false;
+    }
+
+    mparams->ple_host_read = true;
+    *fixed_mapped = *fixed_mapped - ple_bytes + embd_bytes;
+
+    // what every node would have to hold and what it holds: the deficit of every node, not only
+    // of the one that overflows
+    std::string per_node;
+    for (size_t n = 0; n < n_nodes; n++) {
+        const int64_t gap = node_need[n] > node_avail[n] ? node_need[n] - node_avail[n] : 0;
+        per_node += (per_node.empty() ? "" : ", ") + std::to_string(node_ids[n]) + ": need " +
+            std::to_string(node_need[n]/MiB) + " MiB, have " + std::to_string(node_avail[n]/MiB) +
+            " MiB, gap " + std::to_string(gap/MiB) + " MiB";
+    }
+    if (per_node.empty()) {
+        per_node = "no NUMA node";
+    }
+
+    LOG_INF("%s: the n-gram table (%.0f MiB) does not fit into the pinned host memory: the placement of one node per device needs %s; the table stays in the model file and is read row by row\n",
+        __func__, (double) ple_bytes/MiB, per_node.c_str());
+
+    // The host memory that is not pinned takes the memory the nodes have left: the anonymous
+    // memory of the process and the row cache of the reader. They do not take part in the
+    // placement, but a machine that can not hold them can not run the model, so the fit reports
+    // them and warns when they do not fit.
+    // The prompt cache of the server (--cache-ram) is only accounted: its limit is a cap, not an
+    // allocation, and the formal service runs with a limit of 24 GiB, so counting it in the
+    // decision would make the decision of the fit depend on it (design r202-ple-host-read, rule 8
+    // of section 4: the memory that is not pinned is accounted, it does not take part in the
+    // decision).
+    int64_t need_total = 0;
+    int64_t free_total = 0;
+    for (size_t n = 0; n < n_nodes; n++) {
+        need_total += node_need[n];
+        // what the node can give away right now; the query reports zero for a node the memory
+        // policy of the process does not allow: the model can not place anything there
+        free_total += node_free[n] >= 0 ? node_free[n] : node_avail[n];
+    }
+    need_total -= ple_bytes; // the table stays in the file, it is not pinned host memory
+    const int64_t anon      = common_fit_process_anon_bytes();
+    const int64_t cache_ram = cache_ram_mib > 0 ? (int64_t) cache_ram_mib * MiB : 0;
+    const int64_t row_cache = 0; // the reader reads the rows into the upload buffer, it caches none
+    const int64_t other     = anon + row_cache;
+    const int64_t slack     = free_total - need_total - other;
+    LOG_INF("%s: the host memory of the nodes: %.0f MiB free, %.0f MiB pinned host memory, %.0f MiB of it not pinned (%.0f MiB anonymous, %.0f MiB prompt cache, %.0f MiB row cache), %.0f MiB left after the anonymous memory and the row cache\n",
+        __func__, (double) free_total/MiB, (double) need_total/MiB, (double) (other + cache_ram)/MiB,
+        (double) anon/MiB, (double) cache_ram/MiB, (double) row_cache/MiB, (double) slack/MiB);
+    if (cache_ram_mib < 0) {
+        LOG_WRN("%s: the prompt cache has no limit, it can take the memory the nodes have left\n", __func__);
+    } else if (slack >= 0 && cache_ram > slack) {
+        // the limit of the prompt cache is bigger than what the nodes have left: the cache grows
+        // into the memory of the model as long as the requests fill it. Lowering the limit helps
+        // only when the nodes have room for the pinned memory: it does not take part in the
+        // decision, so it is not a way out of a shortfall
+        LOG_WRN("%s: the prompt cache of the server can take %.0f MiB, but the nodes have only %.0f MiB left for it: lower --cache-ram\n",
+            __func__, (double) cache_ram/MiB, (double) slack/MiB);
+    }
+    if (slack < 0) {
+        LOG_WRN("%s: the host memory of the nodes is %.0f MiB short of what the model needs on top of the pinned host memory\n",
+            __func__, (double) (-slack)/MiB);
+        // the machine may be a little short: the anonymous memory of the process grows with the
+        // run and the page cache of the model gives some of it back. Four gigabytes are too much.
+        if (slack < -(int64_t) (4*1024*1024*1024ll)) {
+            throw std::runtime_error(
+                "expert store host complement: the host memory of the nodes is " + std::to_string((-slack)/MiB) +
+                " MiB short of what the model needs on top of the pinned host memory (" +
+                std::to_string(anon/MiB) + " MiB anonymous, " + std::to_string(row_cache/MiB) +
+                " MiB row cache) and the prompt cache of the server can take another " +
+                std::to_string(cache_ram/MiB) + " MiB; "
+                "reduce the context size, use more devices or a lower quantization");
+        }
+    }
+    return true;
 }
 
 // collect the per-device memory breakdown of one loaded model: one entry per device of
@@ -428,7 +695,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         std::vector<common_expert_tensor> * expert_tensors = nullptr,
         const common_fit_extra_model * extra = nullptr,
         std::vector<llama_device_memory_data> * extra_mem = nullptr,
-        std::vector<ggml_backend_dev_t> * extra_devs = nullptr) {
+        std::vector<ggml_backend_dev_t> * extra_devs = nullptr,
+        int64_t * host_fixed_mapped = nullptr, int64_t * host_fixed_pinned = nullptr,
+        int64_t * ple_bytes = nullptr, int64_t * embd_bytes = nullptr) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -467,6 +736,23 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     std::vector<llama_device_memory_data> ret(nd + 1);
 
     collect_device_memory_breakdown(model, ctx, ret);
+
+    // the fixed pinned host bytes of the load are measured here, while the model and the context
+    // are alive: the mapped weights table and the pinned host buffers of the context
+    int64_t fixed_mapped = 0;
+    int64_t fixed_pinned = 0;
+    if (host_fixed_mapped != nullptr && host_fixed_pinned != nullptr) {
+        common_fit_host_fixed(llama_model_get_device(model, 0), model, ctx, nullptr,
+            &fixed_mapped, &fixed_pinned);
+    }
+
+    // the n-gram table and the token embedding table of the model: the table is the mapped weight
+    // of the PLE layer, the embedding table the mapped weight of the input layer. The no-alloc
+    // preview does not see the embedding table (the input layer keeps the CPU buffer there), so
+    // the fit counts it by hand.
+    if (ple_bytes != nullptr && embd_bytes != nullptr) {
+        common_fit_ple_bytes(model, ple_bytes, embd_bytes);
+    }
 
     {
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -588,6 +874,16 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
         collect_device_memory_breakdown(model_extra, ctx_extra, ret_extra);
 
+        // the pinned host buffers of the draft context join the ones of the target context; the
+        // mapped weights table is only counted for the target model, like the EP branch does
+        if (host_fixed_pinned != nullptr) {
+            int64_t draft_mapped = 0;
+            int64_t draft_pinned = 0;
+            common_fit_host_fixed(llama_model_get_device(model_extra, 0), model_extra, ctx_extra,
+                nullptr, &draft_mapped, &draft_pinned);
+            fixed_pinned += draft_pinned;
+        }
+
         // the device feature sinks are raw backend buffers, so no memory breakdown covers
         // them. Reserve their bytes on the devices the real load allocates them on
         {
@@ -633,6 +929,10 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     if (extra != nullptr) {
         // the measured target context dies here, do not leave a dangling ctx_other behind
         extra->cparams->ctx_other = nullptr;
+    }
+    if (host_fixed_mapped != nullptr && host_fixed_pinned != nullptr) {
+        *host_fixed_mapped = fixed_mapped;
+        *host_fixed_pinned = fixed_pinned;
     }
     llama_free(ctx);
     llama_model_free(model);
@@ -750,7 +1050,8 @@ void common_fit_log_memory_stage_devs(struct ggml_backend_device ** devs, int nd
 // cache, the compute buffers and the margin to the expert slots of that device.
 static void common_fit_ep(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
-        const size_t * margins_raw, bool margins_set, enum ggml_log_level log_level, const common_fit_extra_model * extra) {
+        const size_t * margins_raw, bool margins_set, enum ggml_log_level log_level,
+        int32_t cache_ram_mib, const common_fit_extra_model * extra) {
     constexpr int64_t MiB = 1024*1024;
 
     llama_model_params mparams_copy = *mparams;
@@ -816,7 +1117,8 @@ static void common_fit_ep(
     std::vector<int64_t> dev_model(nd, 0);
     // host memory the GPUs read in place (the mapped weights: the PLE table and the token
     // embedding table, one shared allocation for all cards): every card maps it into its page
-    // table, see COMMON_FIT_GPU_PTE
+    // table, see COMMON_FIT_GPU_PTE. The bytes are counted by common_fit_host_fixed() below,
+    // once the draft context exists too.
     int64_t mapped_host = 0;
     for (const auto & kv : llama_internal_get_tensor_map(model)) {
         const ggml_tensor * t = kv.second;
@@ -827,7 +1129,6 @@ static void common_fit_ep(
             continue;
         }
         if (t->buffer != nullptr && ggml_backend_buft_is_device_mapped(ggml_backend_buffer_get_type(t->buffer))) {
-            mapped_host += (int64_t) ggml_nbytes(t);
             continue;
         }
         if (t->buffer == nullptr || common_buft_is_host_memory(ggml_backend_buffer_get_type(t->buffer))) {
@@ -942,18 +1243,14 @@ static void common_fit_ep(
 
     // compute bytes: the meta device reports one number per buffer type for the whole model.
     // The pinned host buffers of the context (compute, output) take no VRAM, but with unified
-    // addressing every card maps them into its page table, like the mapped weights.
-    ggml_backend_buffer_type_t pinned_buft = ggml_backend_dev_host_buffer_type(simple_devs[0]);
+    // addressing every card maps them into its page table, like the mapped weights; their bytes
+    // are counted by common_fit_host_fixed() below.
     int64_t compute_total = 0;
-    int64_t pinned_host   = 0;
     {
         const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx);
         for (const auto & [buft, data] : mb) {
             if (common_buft_is_host_memory(buft)) {
                 // host memory, no device VRAM
-                if (buft == pinned_buft) {
-                    pinned_host += (int64_t) (data.context + data.compute);
-                }
                 continue;
             }
             compute_total += (int64_t) data.compute;
@@ -970,6 +1267,8 @@ static void common_fit_ep(
     std::vector<int64_t> draft_ctx_dev(nd, 0);
     int64_t draft_compute_total  = 0;
     int64_t sinks_total          = 0;
+    int64_t pinned_host          = 0;
+    bool    host_fixed_counted   = false;
     if (extra != nullptr) {
         // the draft context runs at the context size of the target, like the real draft load
         // (cparams.n_ctx = llama_n_ctx(ctx_tgt) in common_speculative_init_result)
@@ -1082,9 +1381,6 @@ static void common_fit_ep(
             const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx_extra);
             for (const auto & [buft, data] : mb) {
                 if (common_buft_is_host_memory(buft)) {
-                    if (buft == pinned_buft) {
-                        pinned_host += (int64_t) (data.context + data.compute);
-                    }
                     continue;
                 }
                 draft_compute_total  += (int64_t) data.compute;
@@ -1114,10 +1410,29 @@ static void common_fit_ep(
             }
         }
 
+        // the fixed pinned host bytes of the load: the mapped weights table and the pinned host
+        // buffers of the target and the draft context (both contexts are still alive here)
+        common_fit_host_fixed(simple_devs[0], model, ctx, ctx_extra, &mapped_host, &pinned_host);
+        host_fixed_counted = true;
+
         llama_free(ctx_extra);
         llama_model_free(model_extra);
         extra->cparams->ctx_other = nullptr;
     }
+
+    if (!host_fixed_counted) {
+        // no draft context was measured above, so the pinned buffers of the target context are
+        // still uncounted
+        common_fit_host_fixed(simple_devs[0], model, ctx, nullptr, &mapped_host, &pinned_host);
+    }
+
+    // the n-gram table and the token embedding table of the model: the table is the mapped weight
+    // of the PLE layer, the embedding table the mapped weight of the input layer. The no-alloc
+    // preview does not see the embedding table (the input layer keeps the CPU buffer there), so
+    // the fit counts it by hand.
+    int64_t ple_bytes  = 0;
+    int64_t embd_bytes = 0;
+    common_fit_ple_bytes(model, &ple_bytes, &embd_bytes);
 
     // what the communication contexts of the measured contexts took on every card: the real
     // target and draft contexts create the same ones after the free sample below
@@ -1248,22 +1563,59 @@ static void common_fit_ep(
     // depend on the budgets: plan once without them, then budget the page tables of that
     // complement. Shrinking the slots by that amount moves at most as many bytes to the host on
     // every card, whose page tables are budgeted on top (closed form of the second round).
-    const int64_t pt_fixed = page_table(mapped_host + pinned_host);
-    int64_t host_first = 0;
-    for (size_t j = 0; j < nd; j++) {
-        host_first += (int64_t) plan_device(j, comm_dev[j] + pt_fixed + margin_dev[j], nullptr, SIZE_MAX).host_bytes;
+    // The plan of every device, for a given page table reserve: the host complement of every
+    // device and the budget of its expert slots. The plan is a pure function of the budget, so
+    // it can be made again when the reserve changes (the n-gram table leaves the pinned host
+    // memory and the page tables of the cards shrink with it).
+    const auto plan_devices = [&](const int64_t & pt_fixed_in, std::vector<std::vector<size_t>> & host_each_out, int64_t & pt_hc_out) {
+        int64_t host_first = 0;
+        for (size_t j = 0; j < nd; j++) {
+            host_first += (int64_t) plan_device(j, comm_dev[j] + pt_fixed_in + margin_dev[j], nullptr, SIZE_MAX).host_bytes;
+        }
+        int64_t pt_hc = page_table(host_first);
+        pt_hc += page_table((int64_t) nd * pt_hc);
+        pt_hc_out = pt_hc;
+
+        std::vector<ep_plan> plans(nd);
+        for (size_t j = 0; j < nd; j++) {
+            const int64_t reserve = comm_dev[j] + pt_fixed_in + pt_hc + margin_dev[j];
+            plans[j] = plan_device(j, reserve, &host_each_out[j], SIZE_MAX);
+        }
+        return plans;
+    };
+
+    int64_t pt_fixed = page_table(mapped_host + pinned_host);
+    int64_t pt_hc    = 0;
+    std::vector<ep_plan> plans = plan_devices(pt_fixed, host_each, pt_hc);
+
+    // the n-gram table in the pinned host memory: the placement of one node per device has to
+    // hold the expert arenas, the table and the pinned host buffers of the contexts together.
+    // When it does not, the table stays in the model file and is read row by row, and the mapped
+    // weights are the token embedding table alone.
+    if (ple_bytes > 0) {
+        std::vector<int>    seq_dev;
+        std::vector<size_t> seq_size;
+        for (size_t j = 0; j < nd; j++) {
+            for (const size_t bytes : host_each[j]) {
+                seq_dev.push_back((int) j);
+                seq_size.push_back(bytes);
+            }
+        }
+        if (common_fit_ple_host_read(mparams, simple_devs, seq_dev, seq_size, &mapped_host,
+                pinned_host, ple_bytes, embd_bytes, cache_ram_mib)) {
+            // the mapped weights are smaller now: the page tables of the cards are smaller and
+            // the slots are bigger, so the plan is made again
+            pt_fixed = page_table(mapped_host + pinned_host);
+            pt_hc    = 0;
+            plans = plan_devices(pt_fixed, host_each, pt_hc);
+        }
     }
-    int64_t pt_hc = page_table(host_first);
-    pt_hc += page_table((int64_t) nd * pt_hc);
 
     // VRAM balance first: one card running out takes the whole service down, so every card
     // gets the slot budget of the tightest card (the per-card peaks then line up at that card's
     // instead of the loosest card's runtime reserve). Equal budgets leave the plans unchanged.
-    std::vector<ep_plan> plans(nd);
-    for (size_t j = 0; j < nd; j++) {
-        const int64_t reserve = comm_dev[j] + pt_fixed + pt_hc + margin_dev[j];
-        plans[j] = plan_device(j, reserve, &host_each[j], SIZE_MAX);
-    }
+    // The plans above are the full plans of every card (plan_devices, and again after the n-gram
+    // table left the pinned host memory), so only the equalization is left to do here.
     std::vector<size_t> slot_budgets_own(nd, 0);
     size_t slot_equal = SIZE_MAX;
     for (size_t j = 0; j < nd; j++) {
@@ -1350,21 +1702,25 @@ static void common_fit_ep(
         }
         constexpr size_t max_nodes = 64;
         int64_t node_bytes[max_nodes] = {};
+        int64_t node_avail[max_nodes] = {};
         int     node_ids  [max_nodes] = {};
         size_t  n_nodes   = max_nodes;
         int     fail_node  = -1;
         size_t  fail_bytes = 0;
         int64_t fail_avail = 0;
         const int check = common_expert_check_host_nodes(simple_devs, seq_dev, seq_size,
-            node_bytes, node_ids, &n_nodes, &fail_node, &fail_bytes, &fail_avail);
+            mapped_host, pinned_host, mparams->ple_host_read,
+            node_bytes, node_avail, node_ids, &n_nodes, &fail_node, &fail_bytes, &fail_avail);
         if (check < 0) {
             const int64_t deficit = (int64_t) fail_bytes - fail_avail;
             throw std::runtime_error(
                 "expert store host complement: the host arenas need " + std::to_string(fail_bytes/MiB) +
                 " MiB of NUMA node memory, the nodes hold " + std::to_string(fail_avail/MiB) +
-                " MiB (MemTotal of every node minus the reserved margin; short by " +
+                " MiB (including " + std::to_string(mapped_host/MiB) + " MiB mapped weights and " +
+                std::to_string(pinned_host/MiB) + " MiB pinned buffers; short by " +
                 std::to_string((deficit > 0 ? deficit : 0)/MiB) +
-                " MiB); reduce the context size, use more devices or a lower quantization");
+                " MiB); per node: " + common_fit_host_nodes_per_node(node_bytes, node_avail, node_ids, n_nodes, MiB) +
+                "; reduce the context size, use more devices or a lower quantization");
         }
         if (check > 0) {
             std::string per_node;
@@ -1391,7 +1747,7 @@ static void common_params_fit_impl(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
         float * tensor_split, struct llama_model_tensor_buft_override * tensor_buft_overrides,
         size_t * margins_s, const size_t * margins_raw, bool margins_set, uint32_t n_ctx_min,
-        const common_fit_extra_model * extra, enum ggml_log_level log_level) {
+        int32_t cache_ram_mib, const common_fit_extra_model * extra, enum ggml_log_level log_level) {
     constexpr int64_t MiB = 1024*1024;
     typedef std::vector<llama_device_memory_data> dmds_t;
     const llama_model_params default_mparams = llama_model_default_params();
@@ -1463,6 +1819,17 @@ static void common_params_fit_impl(
         }
     };
 
+    // the fixed pinned host bytes of the last measurement (the mapped weights table and the
+    // pinned host buffers of the context and of the draft context): the NUMA check of the host
+    // complement budgets them next to the arenas
+    int64_t host_fixed_mapped = 0;
+    int64_t host_fixed_pinned = 0;
+
+    // the n-gram table and the token embedding table of the model: the table is the mapped weight
+    // of the PLE layer, the embedding table the mapped weight of the input layer
+    int64_t ple_bytes  = 0;
+    int64_t embd_bytes = 0;
+
     // measure the main model and account the extra model on top of it. The extra model is
     // never measured on its own: borrowing its shared tensors needs the main model alive,
     // so it is measured by the same impl call whenever its cached memory is stale (the
@@ -1481,7 +1848,8 @@ static void common_params_fit_impl(
 
         dmds = common_get_device_memory_data_impl(
             path_model, mparams_over != nullptr ? mparams_over : mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level,
-            expert_tensors, extra, need_extra ? &measured_extra : nullptr, need_extra ? &devs_extra : nullptr);
+            expert_tensors, extra, need_extra ? &measured_extra : nullptr, need_extra ? &devs_extra : nullptr,
+            &host_fixed_mapped, &host_fixed_pinned, &ple_bytes, &embd_bytes);
 
         add_extra_memory(dmds, measured_extra, devs_extra);
     };
@@ -1519,7 +1887,7 @@ static void common_params_fit_impl(
         if (hp_nex == 0) {
             throw common_params_fit_exception("llama_params_fit is not implemented for SPLIT_MODE_TENSOR, abort");
         }
-        common_fit_ep(path_model, mparams, cparams, margins_raw, margins_set, log_level, extra);
+        common_fit_ep(path_model, mparams, cparams, margins_raw, margins_set, log_level, cache_ram_mib, extra);
         return;
     }
 
@@ -2409,22 +2777,34 @@ static void common_params_fit_impl(
 
             constexpr size_t max_nodes = 64;
             int64_t node_bytes[max_nodes] = {};
+            int64_t node_avail[max_nodes] = {};
             int     node_ids  [max_nodes] = {};
             size_t  n_nodes   = max_nodes;
             int     fail_node  = -1;
             size_t  fail_bytes = 0;
             int64_t fail_avail = 0;
+
+            // the n-gram table in the pinned host memory: the placement of one node per device
+            // has to hold the expert arenas, the table and the pinned host buffers of the
+            // contexts together. When it does not, the table stays in the model file and is read
+            // row by row, and the mapped weights are the token embedding table alone.
+            common_fit_ple_host_read(mparams, devs, seq_dev, seq_size, &host_fixed_mapped,
+                host_fixed_pinned, ple_bytes, embd_bytes, cache_ram_mib);
+
             const int check = common_expert_check_host_nodes(devs, seq_dev, seq_size,
-                node_bytes, node_ids, &n_nodes, &fail_node, &fail_bytes, &fail_avail);
+                host_fixed_mapped, host_fixed_pinned, mparams->ple_host_read,
+                node_bytes, node_avail, node_ids, &n_nodes, &fail_node, &fail_bytes, &fail_avail);
             if (check < 0) {
                 // a physical limit, not a fallback: report the deficit at error level
                 const int64_t deficit = (int64_t) fail_bytes - fail_avail;
                 throw std::runtime_error(
                     "expert store host complement: the host arenas need " + std::to_string(fail_bytes/MiB) +
                     " MiB of NUMA node memory, the nodes hold " + std::to_string(fail_avail/MiB) +
-                    " MiB (MemTotal of every node minus the reserved margin; short by " +
+                    " MiB (including " + std::to_string(host_fixed_mapped/MiB) + " MiB mapped weights and " +
+                    std::to_string(host_fixed_pinned/MiB) + " MiB pinned buffers; short by " +
                     std::to_string((deficit > 0 ? deficit : 0)/MiB) +
-                    " MiB); reduce the context size, use more devices or a lower quantization");
+                    " MiB); per node: " + common_fit_host_nodes_per_node(node_bytes, node_avail, node_ids, n_nodes, MiB) +
+                    "; reduce the context size, use more devices or a lower quantization");
             }
             if (check == 0) {
                 const int64_t host_free   = dmds_full.back().free;
@@ -2908,6 +3288,7 @@ enum common_params_fit_status common_fit_params(
         size_t * margins,
         bool margins_set,
         uint32_t n_ctx_min,
+        int32_t cache_ram_mib,
         const common_fit_extra_model * extra,
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
@@ -2927,7 +3308,7 @@ enum common_params_fit_status common_fit_params(
     common_params_fit_status status = COMMON_PARAMS_FIT_STATUS_SUCCESS;
     try {
         common_params_fit_impl(path_model, mparams, cparams, tensor_split, tensor_buft_overrides, margins_layer.data(),
-            margins, margins_set, n_ctx_min, extra, log_level);
+            margins, margins_set, n_ctx_min, cache_ram_mib, extra, log_level);
         LOG_TRC("%s: successfully fit params to free device memory\n", __func__);
     } catch (const common_params_fit_exception & e) {
         LOG_WRN("%s: failed to fit params to free device memory: %s\n", __func__, e.what());

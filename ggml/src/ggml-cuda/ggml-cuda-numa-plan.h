@@ -25,8 +25,10 @@
 
 namespace ggml_cuda_numa_plan {
 
-// an assignment within this factor of the best one counts as tied, and the lexicographically
-// smallest tied assignment wins: measurement noise must not decide the placement
+// an assignment within this factor of the best one counts as tied, and the tied assignment that
+// spreads the devices over the most nodes wins, the lexicographically smallest of those: the
+// measurement noise must not decide the placement, and two devices on one node share its
+// bandwidth while a device that reads across the socket pays for it
 static constexpr double TIE = 1.02;
 
 // number of assignments per device: up to this many assignments are enumerated, above it the
@@ -77,6 +79,25 @@ static bool lex_less(const std::vector<int> & a, const std::vector<int> & b) {
     return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end());
 }
 
+// number of distinct nodes the reading devices of an assignment use. the devices read their arena
+// at the same time, so two of them on one node share its bandwidth, and a device that reads across
+// the socket pays for it: an assignment that spreads the devices over more nodes is the better one
+// when the costs are tied. seen is a scratch buffer of n_nodes entries.
+static int nodes_used(const std::vector<int> & a, const std::vector<size_t> & part, size_t n_nodes,
+        std::vector<char> & seen) {
+    seen.assign(n_nodes, 0);
+    int n = 0;
+    for (size_t d : part) {
+        const int node = a[d];
+        if (node < 0 || (size_t) node >= n_nodes || seen[(size_t) node]) {
+            continue;
+        }
+        seen[(size_t) node] = 1;
+        n++;
+    }
+    return n;
+}
+
 // node with the lowest read time of one device, lowest index on a tie, -1 when the device
 // cannot read any node
 static int fastest_of(size_t device, size_t n_nodes, const double * t_ms) {
@@ -105,6 +126,10 @@ static int fastest_of(size_t device, size_t n_nodes, const double * t_ms) {
 //              every other placed device reads at the same time, negative when unusable
 //   topo_node  [device] node of the PCI slot of the device, -1 when the platform has no
 //              PCI to NUMA topology; only used for the cost_local comparison
+//
+// The assignments whose cost is within the tie band of the best one are tied: the one that spreads
+// the devices over the most nodes wins, the lexicographically smallest of those. The result does
+// not depend on the order the assignments are looked at.
 //
 // Returns 1 and fills `out` on success, 0 when there is no device or no node at all, and -1
 // when no assignment fits into the node capacities (out is then left empty and the caller
@@ -198,9 +223,17 @@ static int plan(size_t n_dev, size_t n_nodes,
                 best = a;
             }
         }
-        // then take the first assignment in lexicographic order that is within the tie band
+        // then take the assignment of the tie band that spreads the devices over the most nodes:
+        // the devices read their arena at the same time, so two of them on one node share its
+        // bandwidth and a device that reads across the socket pays for it. the lexicographically
+        // smallest assignment of the band would pile them on the lowest node, which is the wrong
+        // one when the measurement cannot tell the placements apart. among the assignments that
+        // spread the devices the most, the lexicographically smallest one wins: the enumeration
+        // does not run in lexicographic order, so the comparison is explicit.
         if (best_cost >= 0.0) {
             const double limit = best_cost*TIE;
+            std::vector<char> seen;
+            int best_nodes = -1;
             for (uint64_t idx = 0; idx < count; idx++) {
                 std::vector<int> c(n_dev);
                 uint64_t v = idx;
@@ -212,9 +245,13 @@ static int plan(size_t n_dev, size_t n_nodes,
                     continue;
                 }
                 const double cc = cost_of(c.data(), n_dev, n_nodes, dev_bytes, t_ms);
-                if (cc >= 0.0 && cc <= limit) {
+                if (cc < 0.0 || cc > limit) {
+                    continue;
+                }
+                const int nodes = nodes_used(c, part, n_nodes, seen);
+                if (nodes > best_nodes || (nodes == best_nodes && lex_less(c, best))) {
+                    best_nodes = nodes;
                     best = c;
-                    break;
                 }
             }
         }
@@ -340,35 +377,297 @@ static int plan(size_t n_dev, size_t n_nodes,
         return -1; // nothing fits into the node capacities
     }
 
-    // ties are resolved by taking the lexicographically smallest assignment within the band of
-    // the best cost, so that measurement noise cannot decide the placement
-    std::vector<int> lex = best;
-    if (fits_of(lex.data(), n_dev, n_nodes, dev_bytes, node_cap, used)) {
-        for (size_t d : part) {
-            for (int n = 0; n < lex[d]; n++) {
-                std::vector<int> trial = lex;
-                trial[d] = n;
-                if (!fits_of(trial.data(), n_dev, n_nodes, dev_bytes, node_cap, used)) {
-                    continue;
-                }
-                const double c = cost_of(trial.data(), n_dev, n_nodes, dev_bytes, t_ms);
-                if (c >= 0.0 && c <= best_cost*TIE) {
-                    lex = trial;
-                    fits_of(lex.data(), n_dev, n_nodes, dev_bytes, node_cap, used);
-                    break;
+    if (!exhaustive) {
+        // too many assignments to enumerate: the ties are resolved by taking the lexicographically
+        // smallest assignment within the band of the best cost, so that measurement noise cannot
+        // decide the placement. the spread over the nodes is not decided here: the assignments that
+        // are tied are not known, only the one the descent ended at.
+        std::vector<int> lex = best;
+        if (fits_of(lex.data(), n_dev, n_nodes, dev_bytes, node_cap, used)) {
+            for (size_t d : part) {
+                for (int n = 0; n < lex[d]; n++) {
+                    std::vector<int> trial = lex;
+                    trial[d] = n;
+                    if (!fits_of(trial.data(), n_dev, n_nodes, dev_bytes, node_cap, used)) {
+                        continue;
+                    }
+                    const double c = cost_of(trial.data(), n_dev, n_nodes, dev_bytes, t_ms);
+                    if (c >= 0.0 && c <= best_cost*TIE) {
+                        lex = trial;
+                        fits_of(lex.data(), n_dev, n_nodes, dev_bytes, node_cap, used);
+                        break;
+                    }
                 }
             }
         }
+        best = lex;
     }
 
-    out->node = lex;
+    out->node = best;
     fits_of(out->node.data(), n_dev, n_nodes, dev_bytes, node_cap, out->node_bytes);
     out->cost = cost_of(out->node.data(), n_dev, n_nodes, dev_bytes, t_ms);
     return 1;
 }
 
-// the plan the load uses, once it is committed
+// The node of the two fixed pinned host allocations of a load (the mapped weights table and the
+// pinned host buffers of the context) next to the arenas of the devices, and whether they hold
+// together.
+//
+// The check is done on the placement every device keeps on the node of its PCI slot, not on the
+// measured one: the read times are a measurement, and a measurement that can not tell the
+// placements apart must not turn a machine that holds the arenas and the two fixed blocks into
+// one that does not. A machine that holds them needs no segmented placement.
+//
+//   n_dev       number of devices
+//   dev_bytes   [device] host bytes the device reads
+//   local_node  [device] node index of the PCI slot of the device, negative when the platform
+//               has no topology: the device then takes the node with the most room
+//   n_nodes     number of host NUMA nodes
+//   node_cap    [node] bytes the node may hold
+//   fixed_w     bytes of the mapped weights table, one block on one node
+//   fixed_p     bytes of the pinned host buffers of the context, one block on one node
+//   node_w      receives the node of the mapped weights table
+//   node_p      receives the node of the pinned host buffers
+//   dev_node    receives the node of every device
+//   used_out    receives the bytes the placement puts on every node (may be null)
+//
+// The mapped weights table goes on the node with the most room and the pinned host buffers on
+// the node with the most room left, the lowest index wins a tie.
+static bool fixed_fits(size_t n_dev, const size_t * dev_bytes, const int * local_node,
+        size_t n_nodes, const int64_t * node_cap, int64_t fixed_w, int64_t fixed_p,
+        int * node_w, int * node_p, int * dev_node, std::vector<int64_t> * used_out = nullptr) {
+    if (n_nodes == 0) {
+        return false;
+    }
 
+    // the arenas of the devices on the node of their PCI slot
+    std::vector<int64_t> used(n_nodes, 0);
+    for (size_t d = 0; d < n_dev; d++) {
+        int n = local_node != nullptr ? local_node[d] : -1;
+        if (n < 0 || (size_t) n >= n_nodes) {
+            n = 0;
+            for (size_t m = 1; m < n_nodes; m++) {
+                if (node_cap[m] > node_cap[n]) {
+                    n = (int) m;
+                }
+            }
+        }
+        if (dev_node != nullptr) {
+            dev_node[d] = n;
+        }
+        used[n] += (int64_t) dev_bytes[d];
+    }
+
+    int w = 0;
+    for (size_t n = 1; n < n_nodes; n++) {
+        if (node_cap[n] - used[n] > node_cap[w] - used[w]) {
+            w = (int) n;
+        }
+    }
+    used[w] += fixed_w;
+    int p = 0;
+    for (size_t n = 1; n < n_nodes; n++) {
+        if (node_cap[n] - used[n] > node_cap[p] - used[p]) {
+            p = (int) n;
+        }
+    }
+    used[p] += fixed_p;
+
+    if (node_w != nullptr) {
+        *node_w = w;
+    }
+    if (node_p != nullptr) {
+        *node_p = p;
+    }
+
+    if (used_out != nullptr) {
+        *used_out = used;
+    }
+
+    for (size_t n = 0; n < n_nodes; n++) {
+        if (used[n] > node_cap[n]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// the segmented placement, used when no assignment of one node per device holds the arenas and
+// the fixed pinned host allocations together: every device fills the node of its PCI slot first
+// and spills the rest onto the nodes with the most room left, the largest device first so that
+// the big arenas keep their local node. The load then walks the segments per device in this
+// order, one arena at a time.
+
+struct segment_entry {
+    int     node;   // node index the arena bytes of this segment go to
+    int64_t bytes;  // bytes of the segment
+
+    bool operator==(const segment_entry & other) const {
+        return node == other.node && bytes == other.bytes;
+    }
+};
+
+// Segment the host bytes of every device over the nodes.
+//
+// Two steps, the same two the load walks:
+//   1. every device takes its bytes from the node of its PCI slot first and spills the rest onto
+//      the nodes with the most room left (largest device first). That hands the room of a node
+//      out once: the segments of a device are its own, no device may eat the room of another.
+//   2. the arenas of a device are placed one by one, in the order of the allocation sequence. An
+//      arena that does not fit in what is left of the segment takes the next segment, and the
+//      bytes left in the old one join it, so no byte of the quota is stranded behind a boundary.
+//
+//   n_dev       number of devices
+//   dev_bytes   [device] host bytes the device reads
+//   alloc_dev   [allocation] device of every arena in allocation order (may be null)
+//   alloc_size  [allocation] bytes of every arena in allocation order
+//   n_alloc     length of alloc_dev/alloc_size, 0 to place the device totals as one arena each
+//   local_node  [device] node index of the PCI slot of the device, negative when the platform
+//               has no topology: the device then starts on the node with the most room
+//   n_nodes     number of host NUMA nodes
+//   node_cap    [node] bytes the node may hold (the physical capacity, MemTotal minus the margin)
+//   fixed_w     bytes of the mapped weights table, one block on one node
+//   fixed_p     bytes of the pinned host buffers of the context, one block on one node
+//   slack       bytes kept free on every node for the arenas, so that an arena a little larger
+//               than the figure fit used still fits
+//
+// Returns 1 and fills out, 0 when the nodes can not hold them (out is then left empty and the
+// caller reports the need against the capacity).
+static int segment(size_t n_dev, const size_t * dev_bytes, const int * alloc_dev,
+        const size_t * alloc_size, size_t n_alloc, const int * local_node,
+        size_t n_nodes, const int64_t * node_cap, int64_t fixed_w, int64_t fixed_p,
+        int64_t slack, std::vector<std::vector<segment_entry>> * out) {
+    out->assign(n_dev, std::vector<segment_entry>());
+    if (n_dev == 0 || n_nodes == 0) {
+        return 0;
+    }
+
+    // the mapped weights table goes on the node with the most room, then the pinned host
+    // buffers on the node with the most room left; the slack is the same on every node, so it
+    // does not change which node that is
+    std::vector<int64_t> room(n_nodes);
+    for (size_t n = 0; n < n_nodes; n++) {
+        room[n] = node_cap[n] - slack;
+    }
+    int node_w = 0;
+    for (size_t n = 1; n < n_nodes; n++) {
+        if (room[n] > room[node_w]) {
+            node_w = (int) n; // the lowest index wins a tie
+        }
+    }
+    room[node_w] -= fixed_w;
+    int node_p = 0;
+    for (size_t n = 1; n < n_nodes; n++) {
+        if (room[n] > room[node_p]) {
+            node_p = (int) n;
+        }
+    }
+    room[node_p] -= fixed_p;
+
+    // step 1: the quota of every device, node by node
+    std::vector<std::vector<int>> quota_node(n_dev);
+    std::vector<std::vector<int64_t>> quota_left(n_dev);
+    std::vector<size_t> order(n_dev);
+    for (size_t d = 0; d < n_dev; d++) {
+        order[d] = d;
+    }
+    std::sort(order.begin(), order.end(), [&](size_t x, size_t y) {
+        if (dev_bytes[x] != dev_bytes[y]) {
+            return dev_bytes[x] > dev_bytes[y];
+        }
+        return x < y;
+    });
+
+    for (size_t d : order) {
+        int64_t rest = (int64_t) dev_bytes[d];
+        if (rest <= 0) {
+            continue;
+        }
+        const int local = local_node != nullptr ? local_node[d] : -1;
+        if (local >= 0 && (size_t) local < n_nodes && room[local] > 0) {
+            const int64_t take = std::min(rest, room[local]);
+            quota_node[d].push_back(local);
+            quota_left[d].push_back(take);
+            room[local] -= take;
+            rest         -= take;
+        }
+        while (rest > 0) {
+            int best = -1;
+            for (size_t n = 0; n < n_nodes; n++) {
+                if (room[n] > 0 && (best < 0 || room[n] > room[best])) {
+                    best = (int) n;
+                }
+            }
+            if (best < 0) {
+                out->clear();
+                return 0;
+            }
+            const int64_t take = std::min(rest, room[best]);
+            quota_node[d].push_back(best);
+            quota_left[d].push_back(take);
+            room[best] -= take;
+            rest        -= take;
+        }
+    }
+
+    // step 2: the arenas, in allocation order. A segment that can not hold the arena whole
+    // hands what is left of it to the next segment of the same device.
+    std::vector<size_t> at(n_dev, 0);
+    for (size_t i = 0; i < n_alloc; i++) {
+        const int     d    = alloc_dev != nullptr ? alloc_dev[i] : 0;
+        const int64_t size = (int64_t) alloc_size[i];
+        if (d < 0 || (size_t) d >= n_dev || size <= 0) {
+            continue;
+        }
+        size_t k = at[d];
+        while (k < quota_node[d].size() && size > quota_left[d][k]) {
+            if (k + 1 < quota_node[d].size()) {
+                quota_left[d][k + 1] += quota_left[d][k];
+            }
+            quota_left[d][k] = 0;
+            k++;
+        }
+        if (k >= quota_node[d].size()) {
+            out->clear();
+            return 0;
+        }
+        quota_left[d][k] -= size;
+        at[d] = k;
+
+        std::vector<segment_entry> & tbl = (*out)[d];
+        if (tbl.empty() || tbl.back().node != quota_node[d][k]) {
+            tbl.push_back({ quota_node[d][k], size });
+        } else {
+            tbl.back().bytes += size;
+        }
+    }
+
+    // no allocation sequence: place the device totals as they are, one arena each
+    if (n_alloc == 0) {
+        for (size_t d : order) {
+            if (quota_node[d].empty()) {
+                continue;
+            }
+            size_t k = 0;
+            int64_t rest = (int64_t) dev_bytes[d];
+            while (rest > 0) {
+                if (k >= quota_node[d].size()) {
+                    out->clear();
+                    return 0;
+                }
+                const int64_t take = std::min(rest, quota_left[d][k]);
+                (*out)[d].push_back({ quota_node[d][k], take });
+                quota_left[d][k] -= take;
+                rest             -= take;
+                k++;
+            }
+        }
+    }
+
+    return 1;
+}
+
+// the plan the load uses, once it is committed
 // the load may read a few MiB more or less than the plan was made for: the expert store rounds
 // every arena up to its expert pitch and every arena is a whole number of pages, and the fit
 // figure and the allocation are computed by the same plan function

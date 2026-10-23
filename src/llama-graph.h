@@ -110,6 +110,14 @@ public:
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
+    // prepare the private data of this input for the given ubatch, before the graph is run
+    //   this may read from the disk or the network, so it is called before the previous graph is
+    //   synchronized: the work then overlaps with the computation of the previous ubatch
+    //   it must not write the input tensors, that is the job of set_input()
+    virtual void prepare(const llama_ubatch * ubatch) {
+        GGML_UNUSED(ubatch);
+    }
+
     // return true if the resulting input tensors using the provided graph parameters would be
     //   the same as the previous input tensors that we have currently stored in the object
     virtual bool can_reuse(const llm_graph_params & params) {
@@ -985,6 +993,7 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+    void prepare_inputs(const llama_ubatch * ubatch);
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it

@@ -2761,6 +2761,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
 
+    // prepare the private data of the inputs (e.g. the rows of the n-gram table that are read from
+    //   the disk): this runs before the previous graph is synchronized below, so the work overlaps
+    //   with the computation of the previous ubatch
+    res->prepare_inputs(&ubatch);
+
     if (!pipeline) {
         // with a single input copy the user inputs are staged and uploaded to the backends
         // asynchronously, and the next graph reuses the staging area, so the previous upload may still

@@ -359,6 +359,7 @@ extern "C" {
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
         bool no_expert_store; // keep the routed experts as plain device weights instead of the expert store (draft models: small and used every step)
+        bool ple_host_read;   // read the n-gram table from the model file row by row instead of holding it in pinned host memory: set by fit when the pinned host plan does not hold the table
     };
 
     struct llama_sampler_seq_config {

@@ -118,6 +118,9 @@ struct llama_model_loader {
     // do not mark the routed experts: they stay plain device weights instead of going into
     // the expert store (draft models, which use every expert every step)
     bool no_expert_store = false;
+    // the n-gram table is read from the model file row by row: the page cache of the experts is
+    // released after they are loaded, so it does not take the memory of the nodes they live on
+    bool ple_host_read = false;
 
     // handle TENSOR_READ_LAZY
     // use case: keep PLE / engrams embd tensors on disk, read them on demand
@@ -181,6 +184,9 @@ struct llama_model_loader {
     bool nextn_shared_target_tensors = false;
 
     llama_files files;
+    // the path of every file of the model, in the order of files: the reader of the n-gram table
+    // opens the file the table is in
+    std::vector<std::string> file_names;
     llama_ftype ftype;
     llama_fver  fver;
 
