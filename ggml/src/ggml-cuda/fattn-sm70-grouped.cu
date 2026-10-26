@@ -116,7 +116,9 @@ static void ggml_cuda_flash_attn_ext_sm70_grouped_launch(ggml_backend_cuda_conte
     if (n_kv_heads == 0 || grid_x == 0) {
         return; // defensive: the dispatch predicate already rejects 0 heads
     }
-    const int splits = std::max(1, std::min(80 / grid_x, (n_kv + 63) / 64));
+    // One CTA fits per SM (shared memory), so fill exactly one wave: a second partial wave doubles the time.
+    const int nsm    = ggml_cuda_info().devices[ctx.device].nsm;
+    const int splits = std::max(1, std::min(nsm / grid_x, (n_kv + 63) / 64));
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params, sizeof(float));
