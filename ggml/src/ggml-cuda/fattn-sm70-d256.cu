@@ -40,8 +40,8 @@ static_assert(SM70_D256_KV_WINDOW % SM70_D256_BLOCK_M == 0, "window is not a mul
 // the meta backend partitions the K/V view of an assist with the same window
 static_assert(SM70_D256_KV_WINDOW == GGML_BACKEND_META_ASSIST_KV_WINDOW, "assist window mismatch");
 
-// SplitKV2: when the CTAs of one KV window (or of the dense launch) do not
-// fill the device (one CTA per SM, the kernel is register-bound), the KV range
+// SplitKV2: when the CTAs of one KV window (or of the dense launch) leave a
+// partial last wave (one CTA per SM, the kernel is register-bound), the KV range
 // is split into this many segments and all run in one launch. The partial
 // buffers are always sized for this many slices; one segment must hold at
 // least SM70_D256_SPLIT_MIN_BLOCKS KV blocks or the range is left unsplit (the
@@ -51,10 +51,12 @@ static_assert(SM70_D256_KV_WINDOW == GGML_BACKEND_META_ASSIST_KV_WINDOW, "assist
 constexpr int SM70_D256_KV_SPLITS = 2;
 constexpr int SM70_D256_SPLIT_MIN_BLOCKS = 32;
 
-// All CC 7.0 devices (GV100) have 80 SMs. The split predicate needs the SM
-// count at alloc_size time, which has no device id, so both the scratch layout
-// and the launcher use this constant and can not diverge.
-constexpr int SM70_D256_NSM = 80;
+// Split only when the split CTAs (half the work each) need fewer full-length waves.
+static bool sm70_d256_split_saves_waves(int64_t ctas, int nsm) {
+    const int64_t waves       = (ctas + nsm - 1) / nsm;
+    const int64_t split_waves = (SM70_D256_KV_SPLITS * ctas + nsm - 1) / nsm;
+    return split_waves < SM70_D256_KV_SPLITS * waves;
+}
 
 // Q f32 -> f16 staging. grid = (q_pad, batch*hkv, gqa), block = 128 threads
 // (one float2 of the 256-wide row each). Qs layout, which is what the kernel
@@ -362,10 +364,9 @@ __global__ void sm70_d256_assist_split_kernel(int * __restrict__ kv_limit, ggml_
 //   [p_sum f32: same]
 //   [acc_max f32: one per row][acc_sum f32: one per row]
 // alloc_size and the launcher both go through sm70_d256_get_scratch() so the
-// offsets and the need_f16 predicates can not diverge. The partial buffers are
-// always sized for SM70_D256_KV_SPLITS slices: alloc_size has no device id to
-// evaluate the launcher's SM-count predicate with, and over-allocating cannot
-// under-write.
+// offsets and the need_f16 predicates can not diverge. Both pass the SM count
+// of the same device, so the split predicate also agrees. The partial buffers
+// are always sized for SM70_D256_KV_SPLITS slices.
 struct sm70_d256_scratch {
     size_t total;            // full buffer size: nnbytes(dst) + extra
     size_t qs_offset;        // relative to dst->data + ggml_nbytes(dst)
@@ -389,7 +390,7 @@ struct sm70_d256_scratch {
     ggml_cuda_flash_attn_ext_f16_extra_data f16_extra;
 };
 
-static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst) {
+static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst, int nsm) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -405,8 +406,8 @@ static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst) {
         && (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0)
         && K->ne[1] > SM70_D256_KV_WINDOW;
 
-    // The dense path (no fixed-size mirror) takes the same KV split when one
-    // launch would not fill the device. kv_len follows the launcher: a range
+    // The dense path (no fixed-size mirror) takes the same KV split when it
+    // saves waves. kv_len follows the launcher: a range
     // mask spans the whole K/V view, an explicit mask only its own columns.
     const int q_pad = (int) GGML_PAD(Q->ne[1], SM70_D256_BLOCK_M);
     const int64_t kv_len = mask == nullptr ? 0
@@ -416,8 +417,8 @@ static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst) {
     const int64_t kv_blocks =
         (kv_len + SM70_D256_MASK_BLOCK_N - 1) / SM70_D256_MASK_BLOCK_N;
     const bool split_dense = !windowed
-        && launch_ctas < 4 * SM70_D256_NSM
-        && kv_blocks >= 2 * SM70_D256_SPLIT_MIN_BLOCKS;
+        && kv_blocks >= 2 * SM70_D256_SPLIT_MIN_BLOCKS
+        && sm70_d256_split_saves_waves(launch_ctas, nsm);
     const bool partial = windowed || split_dense;
 
     sm70_d256_scratch s = {};
@@ -1122,8 +1123,8 @@ bool ggml_cuda_sm70_d256_assist_run(void * backend, const ggml_backend_meta_assi
     return true;
 }
 
-size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
-    return sm70_d256_get_scratch(dst).total;
+size_t ggml_cuda_sm70_d256_alloc_size(int device, const ggml_tensor * dst) {
+    return sm70_d256_get_scratch(dst, ggml_cuda_info().devices[device].nsm).total;
 }
 
 // Scratch offsets of the windowed partial path, exposed to the meta backend so that the idle rank
@@ -1133,7 +1134,8 @@ bool ggml_cuda_sm70_d256_assist_scratch_layout(const ggml_tensor * dst, ggml_bac
     if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT || layout == nullptr) {
         return false;
     }
-    const sm70_d256_scratch scratch = sm70_d256_get_scratch(dst);
+    // the windowed layout does not depend on the SM count
+    const sm70_d256_scratch scratch = sm70_d256_get_scratch(dst, ggml_cuda_info().devices[ggml_cuda_get_device()].nsm);
     if (!scratch.windowed) {
         return false;
     }
@@ -1168,7 +1170,8 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
-    const sm70_d256_scratch scratch = sm70_d256_get_scratch(dst);
+    const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    const sm70_d256_scratch scratch = sm70_d256_get_scratch(dst, nsm);
     char * base = (char *) dst->data + ggml_nbytes(dst);
     half  * Qs = (half  *) (base + scratch.qs_offset);
     float * Os = (float *) (base + scratch.os_offset);
@@ -1246,11 +1249,10 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
 
         // One window launches q_pad/64 * batch * heads_q CTAs and the kernel
         // is register-bound to 1 CTA/SM. SplitKV2 splits each window's KV
-        // range in two when that does not fill the device (4 CTAs per SM is
-        // the point where the tail wave stops dominating).
+        // range in two when that saves waves.
         const int m_blocks = q_pad / SM70_D256_BLOCK_M;
         const int window_ctas = m_blocks * batch * heads_q;
-        const bool split_window = window_ctas < 4 * SM70_D256_NSM;
+        const bool split_window = sm70_d256_split_saves_waves(window_ctas, nsm);
 
         // The window partition spans the whole K/V view. In assist owner mode the device-side
         // split caps each window at [0, s) (visit_hi below); a window past s writes -inf

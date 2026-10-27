@@ -16020,6 +16020,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // 24 Q heads x 13 / 16 q blocks = 312 / 384 CTAs: the KV split depends on the SM count (split on 72 SMs, not on 80)
+    for (int nb : { 832, 1024 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, true,  0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 1));
+    }
+
     // the same production shapes with the real-model causal mask (zero prefix,
     // -inf suffix), including the permuted Q layout the model uses
     for (int kv : { 4096, 32768 }) {
