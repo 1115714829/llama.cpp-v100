@@ -906,7 +906,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
         case BEST_FATTN_KERNEL_SM70_D256:
             if constexpr (GGML_CUDA_SM70_D256_COMPILED) {
-                return ggml_cuda_sm70_d256_alloc_size(dst);
+                return ggml_cuda_sm70_d256_alloc_size(device, dst);
             }
             break;
         case BEST_FATTN_KERNEL_NONE:

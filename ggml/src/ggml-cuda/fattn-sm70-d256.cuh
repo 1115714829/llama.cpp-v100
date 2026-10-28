@@ -13,7 +13,7 @@
 #endif
 
 bool   ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst);
-size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst);
+size_t ggml_cuda_sm70_d256_alloc_size(int device, const ggml_tensor * dst);
 void   ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // Assist: the idle rank (role 1) pulls and attends the owner's KV tail [s, kv_end) on its own
