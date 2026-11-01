@@ -2313,6 +2313,7 @@ bool llama_context::enable_draft_ring(int32_t n_max, bool with_p) {
     draft_ring_ptop    = with_p;
     draft_ring_n_max   = n_max;
     draft_ring_i       = 0;
+    draft_ring_poisoned = false;
 
     // the chain steps overlap on the decode scheduler: it records this event after the host input
     // copies of every graph and process_ubatch waits for it instead of the whole scheduler
@@ -2342,6 +2343,7 @@ void llama_context::draft_ring_begin(const llama_token * ids, size_t n) {
     ggml_backend_tensor_set_async(backend_draft_ring, t_draft_ring, t_draft_ring_stage->data, 0, n*sizeof(llama_token));
 
     draft_ring_i = 0;
+    draft_ring_poisoned = false;
 }
 
 const llama_token * llama_context::draft_ring_tokens(int32_t step) const {
@@ -3409,7 +3411,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         // dchain: the argmax tokens of a draft step land in the readback row of this step of the chain
         // (llama_draft_ring_begin resets the row); the chain reads them once after its last step
         if (res->t_draft_top1 && n_outputs > 0 && t_draft_ring_tok != nullptr) {
-            GGML_ASSERT(draft_ring_i < draft_ring_n_max && "more draft steps than the ring holds: llama_draft_ring_begin missing?");
+            if (draft_ring_poisoned || draft_ring_i >= draft_ring_n_max) {
+                // desync: a draft-top-1 decode ran outside its ring window (a concurrent chain
+                // interleaved on the shared draft context, or a state reset that skipped
+                // llama_draft_ring_begin). Skip the readback and keep the ring out of use until
+                // the next begin re-arms it: the chain loses its draft candidates and the verifier
+                // falls back to sample-and-match. Not fatal - one desynced speculation step must
+                // not abort the server and take down every parallel slot.
+                if (!draft_ring_poisoned) {
+                    LLAMA_LOG_WARN("%s: draft ring desync (i=%d, n_max=%d), skipping top-1 readback until llama_draft_ring_begin\n",
+                                   __func__, draft_ring_i, draft_ring_n_max);
+                }
+                draft_ring_poisoned = true;
+            } else {
             GGML_ASSERT(n_outputs <= (int32_t) cparams.n_seq_max);
             ggml_backend_t backend_ring = ggml_backend_sched_get_tensor_backend(sched_res, res->t_draft_top1);
             const size_t row = (size_t) draft_ring_i * cparams.n_seq_max;
@@ -3419,6 +3433,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
             ev_outputs_backend = backend_ring;
             draft_ring_i++;
+            }
         }
 
         // extract embeddings

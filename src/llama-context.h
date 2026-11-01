@@ -557,6 +557,7 @@ private:
     bool                    draft_ring_ptop    = false;
     int32_t                 draft_ring_n_max   = 0;
     int32_t                 draft_ring_i       = 0;       // readback row of the next draft step
+    bool                    draft_ring_poisoned = false;  // ring desynced: skip top-1 readback until draft_ring_begin re-arms it
 
     // dchain: recorded by the decode scheduler right after it handed the host inputs of a graph to
     // the device stream (ggml_backend_sched_set_inputs_event); process_ubatch waits for it instead
