@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <climits>
+#include <clocale>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -1984,7 +1985,7 @@ int main(int argc, char ** argv) {
     if (use_draft) {
         auto mparams_sidecar = common_model_params_to_llama(params);
         mparams_sidecar.load_mtp = true;
-        mparams_sidecar.no_expert_store = true; // the draft experts are plain device weights
+        mparams_sidecar.no_expert_store = true;
         model_draft.reset(llama_model_load_from_file(params.speculative.draft.mparams.path.c_str(), mparams_sidecar));
         if (model_draft == nullptr) {
             LOG_ERR("%s: failed to load the draft model '%s'\n", __func__, params.speculative.draft.mparams.path.c_str());

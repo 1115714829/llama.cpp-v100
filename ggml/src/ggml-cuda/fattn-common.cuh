@@ -194,8 +194,8 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_1(
         const int shift = k_KQ & (QI8_1/2);
 
         int v;
-        // block_q4_1 is 20 B and the KV row stride only keeps qs 2 B aligned, so two 16 bit
-        // loads instead of one 32 bit load (a misaligned dword load faults on sm_70).
+
+
         ggml_cuda_memcpy_1<sizeof(int), 2>(&v, K_q4_1[ib].qs + sizeof(int)*iqs4);
         v = (v >> shift) & 0x0F0F0F0F;
         const int u = Q_q8[k_KQ_0/nthreads];
@@ -417,8 +417,8 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
 
     int q;
     static_assert(ne == 2 || ne == 4, "bad ne");
-    // Two 16 bit loads: the 18 B block leaves qs 2 B aligned, and a misaligned 32 bit
-    // load faults on sm_70.
+
+
     ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
 #if defined(GGML_USE_HIP)
     // Keep this VMEM read close to its packed-byte dequantization. Hoisting it too far
@@ -430,11 +430,11 @@ static __device__ __forceinline__ void dequantize_V_q4_0(const void * __restrict
 
 #ifdef FP16_AVAILABLE
     if constexpr (std::is_same_v<T, half>) {
-        // Vectorized nibble decode: byte_perm packs adjacent nibbles into f16 slots of
-        // 1024 + n (bit pattern 0x6400 | n), hsub2 by 1032 yields n - 8 exactly, so the
-        // half values match make_half2(q8[l0], q8[l0+1]) bit for bit.
+
+
+
         const half2 d = __half2half2(x[ib].d);
-        const unsigned bias_bits = 0x64086408u; // f16 1032, 1032
+        const unsigned bias_bits = 0x64086408u;
         const half2 bias = *reinterpret_cast<const half2 *>(&bias_bits);
 
 #pragma unroll
@@ -469,8 +469,8 @@ static __device__ __forceinline__ void dequantize_V_q4_1(const void * __restrict
 
     int q;
     static_assert(ne == 2 || ne == 4, "bad ne");
-    // block_q4_1 is 20 B and the KV row stride only keeps qs 2 B aligned, so two 16 bit
-    // loads instead of one 32 bit load (a misaligned dword load faults on sm_70).
+
+
     ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
     q >>= 4*shift;
     q &= 0x0F0F0F0F;

@@ -46,34 +46,34 @@ static constexpr int    GGML_CUDA_AR_PUSH_MAX_RANKS    = 8;
 static constexpr int    GGML_CUDA_AR_PUSH_BLOCKS       = 80;
 static constexpr int    GGML_CUDA_AR_PUSH_THREADS      = 128;
 static constexpr int    GGML_CUDA_AR_PUSH_EPOCHS       = 2;
-static constexpr size_t GGML_CUDA_AR_PUSH_MAX_BYTES    = 512 * 1024; // limit on the f32 input
+static constexpr size_t GGML_CUDA_AR_PUSH_MAX_BYTES    = 512 * 1024;
 static constexpr size_t GGML_CUDA_AR_PUSH_SIGNAL_BYTES =
     ((GGML_CUDA_AR_PUSH_BLOCKS * sizeof(uint32_t) + 127) / 128) * 128;
 
-static constexpr uint16_t GGML_CUDA_AR_PUSH_SENTINEL_H  = 0xFFFFu;     // empty half word
-static constexpr uint16_t GGML_CUDA_AR_PUSH_ESCAPE_H    = 0x7FFFu;     // quiet NaN, still distinguishable from an empty half
-static constexpr uint32_t GGML_CUDA_AR_PUSH_SENTINEL    = 0xFFFFFFFFu; // empty f32 word, also the byte pattern of an empty slot
-static constexpr uint32_t GGML_CUDA_AR_PUSH_ESCAPE      = 0x7FFFFFFFu; // quiet NaN, still distinguishable from an empty slot
+static constexpr uint16_t GGML_CUDA_AR_PUSH_SENTINEL_H  = 0xFFFFu;
+static constexpr uint16_t GGML_CUDA_AR_PUSH_ESCAPE_H    = 0x7FFFu;
+static constexpr uint32_t GGML_CUDA_AR_PUSH_SENTINEL    = 0xFFFFFFFFu;
+static constexpr uint32_t GGML_CUDA_AR_PUSH_ESCAPE      = 0x7FFFFFFFu;
 
 struct ggml_cuda_ar_push {
     size_t n;
     int    devices[GGML_CUDA_AR_PUSH_MAX_RANKS];
     char * bufs[GGML_CUDA_AR_PUSH_MAX_RANKS];
-    // 4, 5 or 6 ranks in two cliques of two or three, with intra-clique links
-    // cheaper than cross-clique links; see the hier kernels below.
+
+
     bool   hier;
-    int    clique_slot[GGML_CUDA_AR_PUSH_MAX_RANKS]; // position inside the clique, 0 or 1 (4 ranks) / 0..2 (6 ranks)
-    int    clique_peer[GGML_CUDA_AR_PUSH_MAX_RANKS]; // other rank of the same clique (4 ranks only)
-    int    pair[GGML_CUDA_AR_PUSH_MAX_RANKS];        // rank with the same clique_slot in the other clique
-    int    clique_id[GGML_CUDA_AR_PUSH_MAX_RANKS];   // 0 for the clique of rank 0, 1 for the other
-    int    clique_members[GGML_CUDA_AR_PUSH_MAX_RANKS][3]; // own clique ranks ordered by clique_slot (5 and 6 ranks only)
+    int    clique_slot[GGML_CUDA_AR_PUSH_MAX_RANKS];
+    int    clique_peer[GGML_CUDA_AR_PUSH_MAX_RANKS];
+    int    pair[GGML_CUDA_AR_PUSH_MAX_RANKS];
+    int    clique_id[GGML_CUDA_AR_PUSH_MAX_RANKS];
+    int    clique_members[GGML_CUDA_AR_PUSH_MAX_RANKS][3];
 };
 
 struct ggml_cuda_ar_push_ptrs {
     char * ptrs[GGML_CUDA_AR_PUSH_MAX_RANKS];
 };
 
-// One 16-byte pack, viewed either as raw words (sentinel check) or as payload.
+
 union ggml_cuda_ar_push_pack {
     uint4  bits;
     float4 vals;
@@ -96,14 +96,14 @@ static __device__ __forceinline__ void ggml_cuda_ar_push_st_volatile(uint4 * p, 
                  : "memory");
 }
 
-// A half word equal to the sentinel is rewritten to a quiet NaN so it stays a
-// NaN but can no longer be mistaken for an empty slot.
+
+
 static __device__ __forceinline__ uint16_t ggml_cuda_ar_push_to_half(const float x) {
     const uint16_t h = __half_as_ushort(__float2half_rn(x));
     return h == GGML_CUDA_AR_PUSH_SENTINEL_H ? GGML_CUDA_AR_PUSH_ESCAPE_H : h;
 }
 
-// input == output (in-place), so no __restrict__ on either pointer.
+
 template <int nranks>
 static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda_ar_push_f32(
         const ggml_cuda_ar_push_ptrs bufs, const float * input, float * output, const int rank, const int n_packs) {
@@ -114,11 +114,11 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
                         (size_t) epoch * nranks * GGML_CUDA_AR_PUSH_MAX_BYTES;
     const int stride = gridDim.x * blockDim.x;
 
-    // Push: write my pack into slot [epoch][rank] of every rank.
+
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         uint4 v = reinterpret_cast<const uint4 *>(input)[i];
-        // A payload word equal to the sentinel is rewritten to a quiet NaN so
-        // it stays a NaN but can no longer be mistaken for an empty slot.
+
+
         if (v.x == GGML_CUDA_AR_PUSH_SENTINEL) { v.x = GGML_CUDA_AR_PUSH_ESCAPE; }
         if (v.y == GGML_CUDA_AR_PUSH_SENTINEL) { v.y = GGML_CUDA_AR_PUSH_ESCAPE; }
         if (v.z == GGML_CUDA_AR_PUSH_SENTINEL) { v.z = GGML_CUDA_AR_PUSH_ESCAPE; }
@@ -132,9 +132,9 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
         }
     }
 
-    // Poll until every source filled its slot for this pack, then sum, store
-    // and restore the sentinels. All ranks sum in the same source order so the
-    // results are bitwise identical.
+
+
+
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         ggml_cuda_ar_push_pack packs[nranks];
         bool ready = false;
@@ -180,9 +180,9 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     }
 }
 
-// Same collective as ggml_cuda_ar_push_f32, but the payload travels as f16 on
-// push and is accumulated in f32. Only the first half of each slot is used.
-// input == output (in-place), so no __restrict__ on either pointer.
+
+
+
 template <int nranks>
 static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda_ar_push_f32_via_f16(
         const ggml_cuda_ar_push_ptrs bufs, const float * input, float * output, const int rank, const int n_packs) {
@@ -193,7 +193,7 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
                         (size_t) epoch * nranks * GGML_CUDA_AR_PUSH_MAX_BYTES;
     const int stride = gridDim.x * blockDim.x;
 
-    // Push: convert my pack to f16 and write it into slot [epoch][rank] of every rank.
+
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         const float4 lo = reinterpret_cast<const float4 *>(input)[2 * i];
         const float4 hi = reinterpret_cast<const float4 *>(input)[2 * i + 1];
@@ -211,9 +211,9 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
         }
     }
 
-    // Poll until every source filled its slot for this pack, then sum in f32,
-    // store and restore the sentinels. All ranks sum in the same source order
-    // so the results are bitwise identical.
+
+
+
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         ggml_cuda_ar_push_pack packs[nranks];
         bool ready = false;
@@ -262,12 +262,12 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     }
 }
 
-// Hierarchical variant of the f16 kernel for 4 ranks in two cliques of two.
-// Each rank pushes its f16 payload to itself and to its clique peer into slot
-// [clique_slot]; both clique members then poll slots 0 and 1, sum them in that
-// order and round the result to f16 once. The rounded value is written to the
-// pair rank's slot 2 and added to the partner's rounded value in clique order.
-// input == output (in-place), so no __restrict__ on either pointer.
+
+
+
+
+
+
 static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda_ar_push_f32_via_f16_hier(
         const ggml_cuda_ar_push_ptrs bufs, const float * input, float * output, const int rank, const int n_packs,
         const int clique_slot, const int clique_peer, const int pair, const int clique_id) {
@@ -279,8 +279,8 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
                         (size_t) epoch * nranks * GGML_CUDA_AR_PUSH_MAX_BYTES;
     const int stride = gridDim.x * blockDim.x;
 
-    // Push: convert my pack to f16 and write it into slot [clique_slot] of
-    // myself and of my clique peer.
+
+
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         const float4 lo = reinterpret_cast<const float4 *>(input)[2 * i];
         const float4 hi = reinterpret_cast<const float4 *>(input)[2 * i + 1];
@@ -298,9 +298,9 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
         ggml_cuda_ar_push_st_volatile(peer + i, v);
     }
 
-    // Poll my slots 0 and 1, sum them in slot order and round the partial sum
-    // to f16 once. Every rank uses the rounded value, so the f32 partial sums
-    // are bitwise identical across the clique.
+
+
+
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         ggml_cuda_ar_push_pack packs[2];
         bool ready = false;
@@ -330,8 +330,8 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
             (uint32_t) ggml_cuda_ar_push_to_half(partial[4]) | ((uint32_t) ggml_cuda_ar_push_to_half(partial[5]) << 16),
             (uint32_t) ggml_cuda_ar_push_to_half(partial[6]) | ((uint32_t) ggml_cuda_ar_push_to_half(partial[7]) << 16));
 
-        // Cross-clique exchange: send my rounded partial sum to the pair rank
-        // and poll its slot 2 for the partner's rounded partial sum.
+
+
         uint4 * cross = reinterpret_cast<uint4 *>(
             bufs.ptrs[pair] + base + 2 * GGML_CUDA_AR_PUSH_MAX_BYTES);
         ggml_cuda_ar_push_st_volatile(cross + i, rounded.bits);
@@ -349,8 +349,8 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
             }
         }
 
-        // Fixed clique 0 + clique 1 order, so the sum is bitwise identical
-        // everywhere. Store the result and restore my three slots.
+
+
         float total[8];
         #pragma unroll
         for (int k = 0; k < 8; ++k) {
@@ -377,18 +377,18 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     }
 }
 
-// Clique member ranks ordered by clique_slot; passed by value to the hier3 kernel.
+
 struct ggml_cuda_ar_push_clique3 {
     int rank[3];
 };
 
-// Hierarchical variant of the f16 kernel for 6 ranks in two cliques of three.
-// Each rank pushes its f16 payload to all three clique members into slot
-// [clique_slot]; every member then polls slots 0, 1 and 2, sums them in that
-// order and rounds the result to f16 once. The rounded value is written to the
-// pair rank's slot 3 and added to the partner's rounded value in clique order,
-// so all six ranks get bitwise identical results.
-// input == output (in-place), so no __restrict__ on either pointer.
+
+
+
+
+
+
+
 static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda_ar_push_f32_via_f16_hier3(
         const ggml_cuda_ar_push_ptrs bufs, const float * input, float * output, const int rank, const int n_packs,
         const int clique_slot, const int pair, const int clique_id, const ggml_cuda_ar_push_clique3 members) {
@@ -400,8 +400,8 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
                         (size_t) epoch * nranks * GGML_CUDA_AR_PUSH_MAX_BYTES;
     const int stride = gridDim.x * blockDim.x;
 
-    // Push: convert my pack to f16 and write it into slot [clique_slot] of
-    // every clique member, including myself.
+
+
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         const float4 lo = reinterpret_cast<const float4 *>(input)[2 * i];
         const float4 hi = reinterpret_cast<const float4 *>(input)[2 * i + 1];
@@ -419,9 +419,9 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
         }
     }
 
-    // Poll my slots 0, 1 and 2, sum them in slot order and round the partial
-    // sum to f16 once. Every rank uses the rounded value, so the f32 partial
-    // sums are bitwise identical across the clique.
+
+
+
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         ggml_cuda_ar_push_pack packs[3];
         bool ready = false;
@@ -452,8 +452,8 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
             (uint32_t) ggml_cuda_ar_push_to_half(partial[4]) | ((uint32_t) ggml_cuda_ar_push_to_half(partial[5]) << 16),
             (uint32_t) ggml_cuda_ar_push_to_half(partial[6]) | ((uint32_t) ggml_cuda_ar_push_to_half(partial[7]) << 16));
 
-        // Cross-clique exchange: send my rounded partial sum to the pair rank
-        // and poll its slot 3 for the partner's rounded partial sum.
+
+
         uint4 * cross = reinterpret_cast<uint4 *>(
             bufs.ptrs[pair] + base + 3 * GGML_CUDA_AR_PUSH_MAX_BYTES);
         ggml_cuda_ar_push_st_volatile(cross + i, rounded.bits);
@@ -471,8 +471,8 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
             }
         }
 
-        // Fixed clique 0 + clique 1 order, so the sum is bitwise identical
-        // everywhere. Store the result and restore my four slots.
+
+
         float total[8];
         #pragma unroll
         for (int k = 0; k < 8; ++k) {
@@ -499,24 +499,24 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     }
 }
 
-// Hierarchical variant of the f16 kernel for 5 ranks in cliques of three
-// (with rank 0) and two. Each rank pushes its f16 payload to every member of
-// its clique into slot [clique_slot]; every member then polls its clique slots,
-// sums them in slot order and rounds the result to f16 once, so all members of
-// a clique share the same rounded partial sums. The pack range is split in two
-// segments by pack index. The two pair ranks with clique_slot 0 (one per
-// clique) and the two pair ranks with clique_slot 1 exchange the rounded
-// partial sum of their segment through slot 3, so every pack crosses the
-// expensive clique boundary once per direction. A rank that does not receive
-// the other clique's segment from its pair gets it from a clique mate: in the
-// clique of two the members swap the segment they received through slot 4, and
-// in the clique of three member 0 forwards its segment to member 2 through
-// slot 3 and to member 1 through slot 4, while member 1 forwards its segment
-// to members 0 and 2 through slot 4. Each rank then adds its own clique's
-// rounded partial sum and the other clique's rounded partial sum of the pack;
-// f32 addition is commutative, so all five ranks get bitwise identical
-// results.
-// input == output (in-place), so no __restrict__ on either pointer.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda_ar_push_f32_via_f16_hier5(
         const ggml_cuda_ar_push_ptrs bufs, const float * input, float * output, const int rank, const int n_packs,
         const int clique_slot, const int pair, const int clique_id, const ggml_cuda_ar_push_clique3 members) {
@@ -530,8 +530,8 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     const int clique_size = clique_id == 0 ? 3 : 2;
     const int seg_split = n_packs / 2;
 
-    // Push: convert my pack to f16 and write it into slot [clique_slot] of
-    // every clique member, including myself.
+
+
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         const float4 lo = reinterpret_cast<const float4 *>(input)[2 * i];
         const float4 hi = reinterpret_cast<const float4 *>(input)[2 * i + 1];
@@ -549,8 +549,8 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     }
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
-        // Poll my clique slots in slot order, sum them in f32 and round the
-        // partial sum to f16 once; all members of a clique use the same value.
+
+
         ggml_cuda_ar_push_pack packs[3];
         bool ready = false;
         while (!ready) {
@@ -588,9 +588,9 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
             (uint32_t) ggml_cuda_ar_push_to_half(partial[4]) | ((uint32_t) ggml_cuda_ar_push_to_half(partial[5]) << 16),
             (uint32_t) ggml_cuda_ar_push_to_half(partial[6]) | ((uint32_t) ggml_cuda_ar_push_to_half(partial[7]) << 16));
 
-        // Cross-clique exchange: the pair of ranks with clique_slot s swap the
-        // rounded partial sum of segment s through slot 3. Members with
-        // clique_slot 2 have no pair and send nothing.
+
+
+
         const int seg = i < seg_split ? 0 : 1;
         const bool cross = clique_slot < 2 && seg == clique_slot;
         ggml_cuda_ar_push_pack other;
@@ -614,9 +614,9 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
 
         int recv_slot = -1;
         if (clique_id == 0) {
-            // Three members: member s forwards the other clique's segment s to
-            // the members that miss it, through slot 4 (and slot 3 for member 2
-            // on segment 0, whose slot 3 is unused).
+
+
+
             if (clique_slot == 0) {
                 if (seg == 0) {
                     uint4 * s1 = reinterpret_cast<uint4 *>(
@@ -643,8 +643,8 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
                 recv_slot = seg == 0 ? 3 : 4;
             }
         } else {
-            // Two members: they swap the segment they received from the other
-            // clique through slot 4.
+
+
             if (clique_slot == 0) {
                 if (seg == 0) {
                     uint4 * peer = reinterpret_cast<uint4 *>(
@@ -677,8 +677,8 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
             }
         }
 
-        // Own clique's rounded partial sum + the other clique's rounded
-        // partial sum; every rank computes the same pair of values.
+
+
         float total[8];
         #pragma unroll
         for (int k = 0; k < 8; ++k) {
@@ -751,8 +751,8 @@ ggml_cuda_ar_push * ggml_cuda_ar_push_init(const int * devices, size_t n) {
         return nullptr;
     }
 
-    // Virtual (MIG-style) device splits would give several ranks the same
-    // physical GPU; a pure device-to-device collective cannot work there.
+
+
     const ggml_cuda_device_info & info = ggml_cuda_info();
     if (info.device_count != info.physical_device_count) {
         GGML_LOG_DEBUG("%s: virtual devices in use; push AllReduce disabled\n", __func__);
@@ -783,10 +783,10 @@ ggml_cuda_ar_push * ggml_cuda_ar_push_init(const int * devices, size_t n) {
         ar->devices[i] = devices[i];
     }
 
-    // Look for two cliques of two ranks: the intra-clique links must be the
-    // cheapest the devices report and the cross-clique links must be more
-    // expensive. cl0 holds the clique of rank 0, cl1 the other one, both
-    // sorted by rank. Without such a split the flat kernel is used.
+
+
+
+
     int cl0[2] = { -1, -1 };
     int cl1[2] = { -1, -1 };
     if (n == 4) {
@@ -848,10 +848,10 @@ ggml_cuda_ar_push * ggml_cuda_ar_push_init(const int * devices, size_t n) {
             }
         }
     } else if (n == 5) {
-        // Same idea for five ranks in cliques of three and two, e.g. three
-        // GPUs on one CPU socket and two on the other. Rank 0 anchors the
-        // clique of three; try all six choices for its two partners. Without
-        // such a split the flat kernel is used.
+
+
+
+
         int perf[5][5] = {};
         bool perf_ok = true;
         for (int i = 0; i < 5 && perf_ok; ++i) {
@@ -1076,8 +1076,8 @@ void ggml_cuda_ar_push_free(ggml_cuda_ar_push * ar) {
     delete ar;
 }
 
-// Admission checks for one rank's tensor, shared by the all-rank and the per-rank
-// entry points. On success n_packs is the pack count for the launch.
+
+
 static bool ggml_cuda_ar_push_can_impl(const ggml_tensor * t, bool exact, int & n_packs) {
     if (t == nullptr ||
         t->type != GGML_TYPE_F32 ||
@@ -1114,9 +1114,9 @@ bool ggml_cuda_ar_push_can(const ggml_cuda_ar_push * ar, const ggml_tensor * t, 
     return ggml_cuda_ar_push_can_impl(t, exact, n_packs);
 }
 
-// Enqueue one rank's part of the reduction. No synchronization: the kernel
-// spins on the peer ranks, so waiting for one rank here would deadlock the
-// whole collective.
+
+
+
 static void ggml_cuda_ar_push_launch_rank(
         ggml_cuda_ar_push * ar, ggml_backend_t backend, size_t rank, ggml_tensor * t, bool exact, int n_packs) {
     GGML_ASSERT(rank < ar->n);
@@ -1184,8 +1184,8 @@ bool ggml_cuda_ar_push_allreduce(
         return true;
     }
 
-    // Check every rank before launching any of them, so an unsupported input
-    // cannot leave the collective half-enqueued.
+
+
     int n_packs = 0;
     for (size_t i = 0; i < n; ++i) {
         if (tensors[i] == nullptr ||
@@ -1195,8 +1195,8 @@ bool ggml_cuda_ar_push_allreduce(
         }
     }
 
-    // No synchronization in this loop: the kernel spins on the peer ranks, so
-    // waiting for one rank here would deadlock the whole collective.
+
+
     for (size_t i = 0; i < n; ++i) {
         ggml_cuda_ar_push_launch_rank(ar, backends[i], i, tensors[i], exact, n_packs);
     }

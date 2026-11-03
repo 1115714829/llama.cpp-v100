@@ -5190,7 +5190,7 @@ namespace ggml::cpu::repack {
 class extra_buffer_type : ggml::cpu::extra_buffer_type {
     bool supports_op(ggml_backend_dev_t, const struct ggml_tensor * op) override {
         if (ggml_mul_mat_id_get_epilogue(op) != GGML_MUL_MAT_ID_EPILOGUE_NONE) {
-            // the repacked kernels are plain F32 matmuls without an epilogue
+
             return false;
         }
         if (    op->op == GGML_OP_MUL_MAT &&

@@ -1,17 +1,17 @@
-// moe-route-stats : record per-layer MoE expert routing counts and a decode trace from a live request
-//
-// usage: llama-moe-route-stats -m model.gguf -f prompt.txt -o routes.bin [-ngl 99 -sm layer -c 32768 -n 512]
-//
-// the output file layout (native endian):
-//   char     magic[4] = "MRS1"
-//   uint32   n_layer, n_expert, n_used
-//   uint32   n_prefill_tokens, n_decode_tokens
-//   uint32   count_prefill[n_layer][n_expert]
-//   uint32   count_decode [n_layer][n_expert]
-//   uint16   ids_decode[n_decode_tokens][n_layer][n_used]
-//
-// prompt prefill and greedy decoding are counted separately. For both phases the tool also
-// prints the hit rate of two expert cache policies (global top-N pairs, per-layer top-N/n_layer).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #include "arg.h"
 #include "common.h"
@@ -38,14 +38,14 @@ struct moe_stats {
     int n_used = 0;
 
     bool prefill = true;
-    int64_t decode_base = 0; // trace row of the next decode batch
+    int64_t decode_base = 0;
 
-    std::vector<uint32_t> count_prefill; // [n_layer][n_expert]
+    std::vector<uint32_t> count_prefill;
     std::vector<uint32_t> count_decode;
 
-    std::vector<uint16_t> trace; // [decode tokens][n_layer][n_used]
+    std::vector<uint16_t> trace;
 
-    std::vector<uint32_t> ids; // host scratch for the current tensor
+    std::vector<uint32_t> ids;
 };
 
 static moe_stats g_stats;
@@ -58,7 +58,7 @@ static bool moe_route_cb(struct ggml_tensor * t, bool ask, void * user_data) {
     }
 
     if (strncmp(t->name, MOE_TOPK_PREFIX, strlen(MOE_TOPK_PREFIX)) != 0) {
-        return true; // not our tensor, continue the graph
+        return true;
     }
 
     moe_stats & st = g_stats;
@@ -80,7 +80,7 @@ static bool moe_route_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         return true;
     }
 
-    // ffn_moe_topk is usually a view of the argsort result: rows are n_expert apart, read the strided span
+
     if (t->nb[0] != ggml_element_size(t)) {
         static bool warned = false;
         if (!warned) {
@@ -101,7 +101,7 @@ static bool moe_route_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         return true;
     }
 
-    // the tensor can live on the GPU, always copy it back
+
     const size_t nbytes = ggml_nbytes(t);
     st.ids.resize((nbytes + sizeof(uint32_t) - 1) / sizeof(uint32_t));
     ggml_backend_tensor_get(t, st.ids.data(), 0, nbytes);
@@ -120,7 +120,7 @@ static bool moe_route_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         for (int64_t k = 0; k < n_ids; ++k) {
             const int32_t ex = *(const int32_t *) (data + i * t->nb[1] + k * t->nb[0]);
             if (ex < 0 || ex >= st.n_expert) {
-                continue; // layers without MoE (or corrupted ids) count as zero
+                continue;
             }
 
             if (st.prefill) {
@@ -151,7 +151,7 @@ static void print_cache_hit_rates(const char * phase, const std::vector<uint32_t
         return;
     }
 
-    // global top-N (layer, expert) pairs
+
     std::vector<int64_t> sorted(count.begin(), count.end());
     std::sort(sorted.begin(), sorted.end(), std::greater<int64_t>());
 
@@ -168,7 +168,7 @@ static void print_cache_hit_rates(const char * phase, const std::vector<uint32_t
         LOG_INF("  N = %5d : %6.2f%%\n", n, 100.0 * (double) hit / (double) total);
     }
 
-    // per-layer top-(N/n_layer) experts
+
     LOG_INF("%s : cache hit rate, per-layer top-(N/n_layer):\n", phase);
     for (int i = 0; i < n_cache_sizes; ++i) {
         const int n         = cache_sizes[i];
@@ -206,7 +206,7 @@ static bool save_stats(const std::string & fname, const moe_stats & st, uint32_t
     f.write((const char *) st.count_prefill.data(), st.count_prefill.size() * sizeof(uint32_t));
     f.write((const char *) st.count_decode.data(),  st.count_decode.size()  * sizeof(uint32_t));
 
-    // pad with 0xFFFF if some trace rows are missing (no decode callback ever fired)
+
     std::vector<uint16_t> trace = st.trace;
     const size_t trace_size = (size_t) n_decode_tokens * st.n_layer * st.n_used;
     if (trace.size() < trace_size) {
@@ -310,7 +310,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // prefill in chunks of the logical batch size
+
     const int n_batch = params.n_batch > 0 ? std::min(params.n_batch, (int) llama_n_batch(ctx)) : (int) llama_n_batch(ctx);
 
     LOG_INF("%s : %zu prompt tokens, prefill in chunks of %d\n", __func__, tokens.size(), n_batch);
@@ -325,7 +325,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // greedy decoding, one token at a time so that each trace row is a single step
+
     llama_sampler * smpl = llama_sampler_init_greedy();
 
     llama_token id = llama_sampler_sample(smpl, ctx, -1);

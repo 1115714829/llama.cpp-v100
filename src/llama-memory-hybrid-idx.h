@@ -12,12 +12,12 @@
 // llama_memory_hybrid_idx
 //
 
-// llama_memory_hybrid plus an indexer cache for block-sparse attention (glm5-next k-pool DSA, qwen4exp QSA)
-// two layouts:
-//  - per cell (glm5-next): a third kv cache with one indexer row per token, a side buffer over the attention cells: same
-//    size, padding, streams and slots, so cell j is one token in both
-//  - compact (qwen4exp, indexer_kpool_compact): one pooled key per complete pool, and the raw keys of the cells whose
-//    pool may still need them in a small ring, see kpool_store
+
+
+
+
+
+
 
 class llama_memory_hybrid_idx : public llama_memory_hybrid {
 public:
@@ -65,7 +65,7 @@ public:
 
     void clear(bool data) override;
 
-    // the indexer cache tracks the attention cache cell for cell, so it takes the same n_kv rule
+
     void set_kq_range_allowed(bool allowed) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
@@ -89,14 +89,14 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer, or keeps it compact
 
-    // Whether the model keeps an indexer cache, in either layout.
+
     bool has_idx() const;
 
-    // The compact layout's storage, nullptr in the per-cell layout.
+
     struct kpool_store;
     const kpool_store * get_kstore() const { return kstore.get(); }
 
-    // The cache whose cells the pool layout follows: the indexer cache, or in the compact layout the attention cache.
+
     const llama_kv_cache * get_idx_cells() const;
 
     // The model's indexer pool size.
@@ -114,32 +114,32 @@ public:
     const kpool_layout & kpool_layout_update();
     const kpool_layout & kpool_layout_get() const;
 
-    // The graph's pool count for a layout of n_pool_real pools over the cells in use now: padded like the n_kv of a
-    // ubatch that does not view the whole cache, so a decode step changes it only where its n_kv changes. Always
-    // above n_pool_real: the last padded pool is unused. With full, the count is over the whole cache, matching the
-    // n_kv of a 2+ token range-mask ubatch, so the prompt blocks share one shape (see kpool_build_state).
+
+
+
+
     uint32_t kpool_n_pool(uint32_t n_pool_real, bool full = false) const;
 
-    // For tests: kpool_n_pool for the current layout.
+
     uint32_t kpool_n_pool_layout() const;
 
-    // For tests: the first way the current layout's pool count breaks its bounds (no padded pool after the real ones,
-    // more pools than the reserved graph holds), empty if none. Call it where kpool_layout_diff is called.
+
+
     std::string kpool_n_pool_check() const;
 
-    // For tests: the first difference between the layout as the last update left it and one rebuilt from scratch
-    // over the cache as it is now, empty if none. Call it after a decode, before the next sequence edit.
+
+
     std::string kpool_layout_diff() const;
 
-    // For tests: picks the cells of padded new-pool entries over the current layout as set_input_kpool does, for
-    // counts up to every cell that is no rep, and returns the first pick that is out of range, a pool's rep, taken
-    // twice or short of the count, empty if none. Call it where kpool_layout_diff is called.
-    // The compact layout pads into rows of its own and has nothing to check here.
+
+
+
+
     std::string kpool_pad_check() const;
 
-    // For tests: the first inconsistency of the compact layout's pooled slots (a pool without one, reference counts,
-    // the registry of identical pools) and raw-key ring (a cell whose pool may still need its raw key without one),
-    // empty if none. Call it where kpool_layout_diff is called.
+
+
+
     std::string kpool_store_check() const;
 
     // The pooled keys persist in the idx cache across batches. A sequence edit can regroup the pools
@@ -177,33 +177,33 @@ private:
     // whether the current layout has cells shared between sequences (kpool_layout is incomplete here, so out of line)
     bool kpool_layout_shared() const;
 
-    // brings lay up to date with the cache, keeping each sequence's cells before its stale position
-    // dropped: if set, gets the pooled slots of the pools that no longer stand, with the global cell each ended at
-    // (compact layout)
+
+
+
     void kpool_layout_build(kpool_layout & lay, const stale_pos_t & stale, std::vector<std::pair<int32_t, int64_t>> * dropped) const;
 
-    // compact layout, see kpool_store:
-    // brings the layout up to date after the cells changed, the sequences edited from their stale positions: a pool that
-    // now stands takes the slot of an identical one, or a new slot that the next ubatch pools into (fresh); the slots
-    // of the pools that no longer stand are released after that, so a pool rebuilt as it was keeps its key
-    // false if the table has no slot left for a new pool (its pools keep slot -1, the caller fails the batch)
+
+
+
+
+
     bool kstore_sync(const stale_pos_t & stale, std::vector<std::pair<llama_seq_id, uint32_t>> & fresh);
-    // the same after an edit, which never needs a pool computed: no fresh pool is allowed
+
     void kstore_sync_edit(const stale_pos_t & stale, const char * what);
-    // whether seq_rm(seq_id, p0, p1) leaves a layout the compact cache can keep: a tail cut whose new incomplete pool has
-    // its raw keys in the ring, a sequence removed whole, or nothing removed
+
+
     bool kstore_seq_rm_ok(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
-    // the ubatch at hand, after the layout took its cells: pools to compute (fresh), raw-key rows for its cells, and
-    // the rows of every cell no pool can need any more released. false if a fresh pool misses a raw key
+
+
     bool kstore_apply(const llama_kv_cache::slot_info & sinfo, std::vector<std::pair<llama_seq_id, uint32_t>> & fresh);
     void kstore_clear(bool data);
-    // whether seq_id (every sequence if < 0) has cells at positions in [p0, p1)
+
     bool kstore_has_cells(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
-    // forgets sequence s: the slots of its pools are released and its layout emptied (its cells are about to change)
+
     void kstore_drop_seq(llama_seq_id s);
-    // the same for every sequence if seq_id < 0
+
     void kstore_forget(llama_seq_id seq_id);
-    // a copy across streams: dst takes src's layout in its own stream, with src's slots and raw-key rows
+
     void kstore_copy_stream(llama_seq_id src, llama_seq_id dst);
     void kstore_state_write(llama_io_write_i & io, llama_seq_id seq_id, bool partial) const;
     void kstore_state_read (llama_io_read_i  & io, llama_seq_id seq_id, bool partial);
@@ -216,7 +216,7 @@ private:
 
     stale_pos_t mem_idx_stale = stale_pos_clean();
 
-    // applies a ubatch to the compact layout, see kstore_apply
+
     friend class llama_memory_hybrid_idx_context;
 };
 
@@ -224,21 +224,21 @@ class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
 public:
     class kpool_access {
     public:
-        // the per-token rows of the pools' members: cache rows of the cells (per-cell layout), ring rows (compact)
+
         ggml_tensor * gather_key_gate(ggml_tensor * idxs) const;
         ggml_tensor * scatter_pooled(ggml_tensor * values, ggml_tensor * idxs) const;
         ggml_tensor * gather_pooled(ggml_tensor * idxs) const;
-        // the pooled keys in place, [n_embd, 1, n_rows]: the key table of ggml_qsa_select, rows picked by pool_cells
+
         ggml_tensor * pooled_table() const { return pooled_rows; }
-        // compact layout: stores the raw keys [n_embd, n_tokens] of the ubatch in their ring rows, see set_input_kring
+
         ggml_tensor * store_raw(ggml_tensor * values, ggml_tensor * idxs) const;
 
     private:
         friend class llama_memory_hybrid_idx_context;
 
-        // per-cell layout: k holds the per-token rows and the pooled key side by side
+
         kpool_access(ggml_context * ctx, ggml_tensor * k, int64_t n_embd);
-        // compact layout: the raw-key ring and the pooled table
+
         kpool_access(ggml_context * ctx, ggml_tensor * ring, ggml_tensor * pooled, int64_t n_embd);
 
         ggml_context * ctx;
@@ -282,10 +282,10 @@ public:
     // llama_memory_hybrid_idx_context specific API
     //
 
-    // nullptr with no indexer, and in the compact layout, which has no per-cell indexer cache
+
     const llama_kv_cache_context * get_idx() const;
 
-    // whether the model keeps an indexer cache, in either layout
+
     bool has_idx() const;
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
@@ -295,14 +295,14 @@ public:
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused, see kpool_n_pool.
     uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
-    ggml_tensor * gather_mla_rows(ggml_context * ctx, ggml_tensor * idxs, int64_t n_rows, int64_t n_embd, int32_t il) const;
+    // sel_mask (F32 [n_sel, 1, 1, n_tokens], can be null): 0 for the live selection slots, -inf for the dead ones
     // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
     // pool_rng (I32 [2, n_tokens]): the pools [lo, hi) each token sees, for ggml_qsa_select; with it pool_mask may be
     // null and the padded member and tail cells are -1 instead of the n_kv sentinel
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
-                         ggml_tensor * gather_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
+                         ggml_tensor * sel_mask, bool gather, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr, ggml_tensor * pool_rng = nullptr) const;
-    // compact layout: the ring row of each ubatch token's raw key, I64 [n_tokens], token order as the slot info's
+
     void set_input_kring(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
 private:

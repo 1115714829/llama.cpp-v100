@@ -78,9 +78,9 @@ __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], co
     }
 }
 
-// v[idx] = x with idx known only at run time: an unrolled compare instead of an indexed store, so
-// the per-lane arrays of topk_moe_cuda stay in registers (an indexed store puts the whole array on
-// the stack and every pass of the selection loop reads it back from local memory)
+
+
+
 template <int n>
 __device__ __forceinline__ void topk_moe_set(float (&v)[n], const int idx, const float x) {
 #pragma unroll
@@ -91,9 +91,9 @@ __device__ __forceinline__ void topk_moe_set(float (&v)[n], const int idx, const
     }
 }
 
-// The first maximum of the lane's values wt[i] (expert threadIdx.x + i * WARP_SIZE): the right half
-// of a node wins only when strictly greater, so on ties the smaller expert index stays, the same
-// choice as the sequential scan with a strict compare.
+
+
+
 template <int n>
 __device__ __forceinline__ void topk_moe_lane_argmax(const float (&wt)[n], float & max_val, int & max_expert) {
     static_assert((n & (n - 1)) == 0, "the tree pairs the entries");
@@ -118,9 +118,9 @@ __device__ __forceinline__ void topk_moe_lane_argmax(const float (&wt)[n], float
     max_expert = threadIdx.x + e[0] * WARP_SIZE;
 }
 
-// quantize_q8_1 of quantize.cu on one CUDA block of the activation x (one row per token): the same
-// 256 consecutive values of a row per block, the same lane per value, the same warp reductions and
-// rounding, so the q8_1 blocks are those quantize_row_q8_1_cuda writes.
+
+
+
 static __device__ __forceinline__ void topk_moe_quantize_block(const ggml_cuda_topk_moe_quant & q, const int qb) {
     constexpr int per_block = TOPK_MOE_ROWS_PER_BLOCK*WARP_SIZE;
     const int64_t blocks_per_row = q.ne0 / per_block;
@@ -132,10 +132,17 @@ static __device__ __forceinline__ void topk_moe_quantize_block(const ggml_cuda_t
     float       sum  = xi;
 
     amax = warp_reduce_max<QK8_1>(amax);
+#if !(defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 700))
     sum  = warp_reduce_sum<QK8_1>(sum);
+#endif
 
     const float  d  = amax / 127.0f;
     const int8_t qv = amax == 0.0f ? 0 : roundf(xi / d);
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 700)
+
+    sum  = warp_reduce_sum<QK8_1>((float) qv);
+#endif
 
     const int64_t i_cont = t*q.ne0 + i0;
     block_q8_1 * y = (block_q8_1 *) q.x_q8 + i_cont / QK8_1;
@@ -166,7 +173,7 @@ __global__ void topk_moe_cuda(const float *         logits,
                               const float           scale_val,
                               const topk_moe_config config,
                               const ggml_cuda_topk_moe_quant quant) {
-    // the last quant.n_blocks blocks quantize the activation of the MoE gate_up projection
+
     if (quant.n_blocks > 0 && (int) blockIdx.x >= (int) gridDim.x - quant.n_blocks) {
         topk_moe_quantize_block(quant, (int) blockIdx.x - ((int) gridDim.x - quant.n_blocks));
         return;
@@ -293,9 +300,9 @@ __global__ void topk_moe_cuda(const float *         logits,
         } else {
             if constexpr (n_experts % WARP_SIZE == 0 && experts_per_thread > 1 &&
                           (experts_per_thread & (experts_per_thread - 1)) == 0) {
-                // every entry is a valid expert (and the count pairs up): the first maximum of the lane
-                // (the smallest index on ties, as the sequential scan below picks) by a balanced tree,
-                // depth log2 instead of a chain of experts_per_thread - 1 dependent compares
+
+
+
                 topk_moe_lane_argmax<experts_per_thread>(wt, max_val, max_expert);
             } else {
 #pragma unroll
@@ -324,8 +331,8 @@ __global__ void topk_moe_cuda(const float *         logits,
         }
 
         if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
-            // k < WARP_SIZE for every model in practice (k is warp uniform): one move instead of the
-            // compare chain over the whole array
+
+
             if (k < WARP_SIZE) {
                 output_weights[0] = max_val;
             } else {
@@ -436,7 +443,6 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
             break;
         default:
             GGML_ASSERT(false && "fatal error");
-            break;
     }
 }
 

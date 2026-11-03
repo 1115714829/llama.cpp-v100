@@ -1,38 +1,38 @@
-// bench-q8-skinny-cold: sm_70 Q8_0 skinny GEMV timing with cold weights (DRAM, not L2).
-//
-// test-backend-ops perf repeats one MUL_MAT on one weight, so a weight below the 6 MiB L2 of a
-// V100 (the Flash-Next HC down/up projections are 3.4 MiB, the shared expert 1.7 MiB) is timed
-// from L2. In a real decode step every weight is read from DRAM once. This program builds one
-// graph with R independent copies of the pattern (R distinct weights and inputs, R chosen so
-// that the weights of one graph exceed --min-mib), runs it through the CUDA backend (the same
-// fusion matcher, skinny prepass and CUDA graph as the server) and reports the time per copy:
-// the input conversion, the kernel and the gap to the next node, as in the decode graph.
-//
-// Patterns:
-//   single  MUL_MAT(W[K,N], x[K,M])                                q8_skinny_kernel
-//   gated   SWIGLU(MUL_MAT(G, x), MUL_MAT(U, x))                    q8_skinny_gated_kernel
-//   ffn     MUL_MAT(D, SWIGLU(MUL_MAT(G, x), MUL_MAT(U, x)))         gated pair + down projection
-//   ffng    ffn followed by the F32 [K, 1] shared expert gate of the same x (qwen4exp order)
-//   multi   MUL_MAT(W_i, x) for 2..4 weights sharing one input     q8_skinny_multi_kernel
-//   hcpost  gated DSV4_HC_POST -> RMS_NORM -> MUL (the hyper-connection combine and next mixer norm)
-//   hcmix   hcpost followed by the Q8_0 down projection, SCALE -> SILU and the up projection
-//   hcmixi  hcmix with the F32 inject projection of the same input expanded right before the down
-//           projection (qwen4exp build_hc_mix order)
-//   hcmixp  hcmixi followed by the gated hc_pre mixer and the Q8_0 GDN qkv/z projections of its result
-//   hcmixq  hcmixp without the inject after the norm, the post input of the combine being the previous
-//           mixer's F32 inject projection (qwen4exp graph order)
-//   hcpre   gated DSV4_HC_PRE followed by the Q8_0 projections of the block input (GDN qkv + z)
-//   gnorm   RMS_NORM -> MUL -> SIGMOID -> MUL (the GDN gated norm) followed by the Q8_0 ssm_out
-//   agate   CONT -> SIGMOID -> MUL (the attention output gate) followed by the Q8_0 wo
-//   stail   SIGMOID -> MUL -> ADD (the shared expert tail: moe + shexp * sigmoid(gate per token)), F32 only
-// Not part of the CMake build. Build against a llama.cpp build tree:
-//   g++ -O2 -std=c++17 -I<src>/ggml/include tests/bench-q8-skinny-cold.cpp -o bench-q8-skinny-cold \
-//       -L<build>/bin -lggml -lggml-base -lggml-cuda -Wl,-rpath,<build>/bin
-// Usage:
-//   bench-q8-skinny-cold [--dev 0] [--iters 30] [--min-mib 256] [--set moe|27b|mmvf|hc|hand|all] [--what <case>] [--m 1,4,8] [--dump <prefix>]
-// Output: one line per case: pattern, K, N list, M, R, us per copy, GB/s of weight bytes.
-// --dump writes the F32 results of the first copy per case to <prefix>-<case>-m<M>.bin, to
-// compare two kernel variants bit for bit (the weights and inputs are the same in every run).
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -51,16 +51,16 @@
 
 struct bench_case {
     const char *         set;
-    const char *         pattern; // "single", "gated", "multi"
+    const char *         pattern;
     const char *         what;
     int64_t              k;
-    std::vector<int64_t> n;       // one entry for single, the gate/up width for gated, 2..4 for multi
+    std::vector<int64_t> n;
     ggml_type            type = GGML_TYPE_Q8_0;
 };
 
 static std::vector<bench_case> make_cases() {
     return {
-        // Qwen3.8-Flash-Next under a 6-card tensor split, per card
+
         { "moe", "single", "hc_down",       10240, { 320 } },
         { "moe", "single", "hc_up",           320, { 10240 } },
         { "moe", "gated",  "shexp_gate_up",  2560, { 640 } },
@@ -74,33 +74,33 @@ static std::vector<bench_case> make_cases() {
         { "moe", "multi",  "gdn_qkv_z_3h",   2560, { 1920, 1152 } },
         { "moe", "multi",  "gdn_qkv_z_2h",   2560, { 1280, 768 } },
         { "moe", "multi",  "qsa_q_k_v",      2560, { 2048, 256, 256 } },
-        // the hyper-connection combine (gated DSV4_HC_POST) and the next mixer's RMS_NORM -> MUL
+
         { "hc", "hcpost", "hc_post_norm",  2560, { 4 }, GGML_TYPE_F32 },
-        // the whole mixer opening: the combine, the norm, the Q8_0 down/up projections (n = { hc, lr })
+
         { "hc", "hcmix",  "hc_mix",        2560, { 4, 320 }, GGML_TYPE_Q8_0 },
-        // the same with the F32 inject projection [n_embd*hc, hc] of the normed input
+
         { "hc", "hcmixi", "hc_mix_inject", 2560, { 4, 320 }, GGML_TYPE_Q8_0 },
         { "hc", "hcmixp", "hc_mix_pre",    2560, { 4, 320 }, GGML_TYPE_Q8_0 },
         { "hc", "hcmixq", "hc_mix_injprev", 2560, { 4, 320 }, GGML_TYPE_Q8_0 },
-        // a fused producer handing its result to the next Q8_0 projection: k = n_embd (hcpre, n = { hc,
-        // projection widths }) or the projection K (gnorm, agate: n = { head_dim, N })
+
+
         { "hand", "hcpre", "hcpre_gdn_3h",   2560, { 4, 1920, 1152 } },
         { "hand", "hcpre", "hcpre_gdn_2h",   2560, { 4, 1280, 768 } },
         { "hand", "gnorm", "gnorm_out_3h",   1152, { 128, 2560 } },
         { "hand", "gnorm", "gnorm_out_2h",    768, { 128, 2560 } },
         { "hand", "agate", "agate_wo",       1024, { 256, 2560 } },
         { "hand", "stail", "shexp_tail",     2560, { 1 }, GGML_TYPE_F32 },
-        // the F32/BF16 projections of the decode graph (mul_mat_vec_f)
+
         { "mmvf", "single", "hc_inject",     10240, { 4 },   GGML_TYPE_F32 },
         { "mmvf", "single", "gate_inp",       2560, { 512 }, GGML_TYPE_F32 },
         { "mmvf", "single", "gate_inp_shexp", 2560, { 1 },   GGML_TYPE_F32 },
         { "mmvf", "single", "ssm_beta",       2560, { 8 },   GGML_TYPE_F32 },
-        // the GDN ssm_beta and ssm_alpha slices of one layer (3-head / 2-head card), one input
+
         { "mmvf", "multi",  "ssm_beta_alpha_3h", 2560, { 9, 9 }, GGML_TYPE_F32 },
         { "mmvf", "multi",  "ssm_beta_alpha_2h", 2560, { 6, 6 }, GGML_TYPE_F32 },
         { "mmvf", "single", "idx_q_proj",     2560, { 512 }, GGML_TYPE_BF16 },
         { "mmvf", "single", "idx_k_proj",     2560, { 128 }, GGML_TYPE_BF16 },
-        // Qwen3.8-27B under a 4-card tensor split, per card (regression check)
+
         { "27b", "gated",  "ffn_gate_up",    5120, { 4352 } },
         { "27b", "single", "ffn_down",       4352, { 5120 } },
         { "27b", "single", "ssm_out",        1536, { 5120 } },
@@ -125,9 +125,9 @@ static void fill_weight(std::vector<uint8_t> & bytes, ggml_type type, int64_t k,
     }
 }
 
-// DSV4_HC_POST with the qwen4exp gate (post = 2*sigmoid(inject/hc)) followed by RMS_NORM -> MUL, as
-// the combine of one block and the start of the next mixer; k = n_embd, n = { hc }. The bytes are
-// those read and written by the unfused pair.
+
+
+
 static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m, int iters, double min_mib,
                          int * r_out, double * gb_out, const std::string & dump) {
     const bool    injp   = strcmp(c.pattern, "hcmixq") == 0;
@@ -157,7 +157,7 @@ static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m
         posts[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, m);
         ggml_tensor * post_in = posts[i];
         if (injp) {
-            // the previous mixer's inject projection of its normed input, read by the gate of the combine
+
             xprev[i]  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, m);
             w_injp[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd*hc, hc);
             post_in   = ggml_mul_mat(ctx, w_injp[i], xprev[i]);
@@ -166,13 +166,13 @@ static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m
         ggml_tensor * hp   = ggml_dsv4_hc_post(ctx, xs[i], res[i], post, nullptr);
         ggml_tensor * xn   = ggml_mul(ctx, ggml_rms_norm(ctx, hp, 1e-6f), gamma);
         if (mix) {
-            // build_hc_mix up to the gate
+
             w_down[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q8_0, n_embd*hc, n_lr);
             w_up[i]   = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q8_0, n_lr, n_embd*hc);
             ggml_tensor * x2   = ggml_reshape_2d(ctx, xn, n_embd*hc, m);
             ggml_tensor * inject = nullptr;
             if (inj) {
-                // expanded before the down projection, as build_hc_mix does
+
                 w_inj[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, n_embd*hc, hc);
                 inject   = ggml_mul_mat(ctx, w_inj[i], x2);
                 ggml_build_forward_expand(gf, inject);
@@ -182,7 +182,7 @@ static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m
             ggml_build_forward_expand(gf, gate);
             ggml_tensor * mixed = nullptr, * pq = nullptr, * pz = nullptr;
             if (pre) {
-                // build_hc_mix's hc_pre, then build_qkvz's projections of the mixed stream, next to each other
+
                 mixed = ggml_dsv4_hc_pre_gated(ctx, ggml_reshape_3d(ctx, x2, n_embd, hc, m), ggml_reshape_3d(ctx, gate, n_embd, hc, m),
                                                1.0f / (float) hc);
                 w_q[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_Q8_0, n_embd, 1920);
@@ -298,13 +298,13 @@ static double run_hcpost(ggml_backend_t backend, const bench_case & c, int64_t m
     return us;
 }
 
-// A producer (hcpre, gnorm, agate) and the Q8_0 projection(s) that read its result next. The bytes are
-// those of the weights and of the producer inputs.
+
+
 static double run_handoff(ggml_backend_t backend, const bench_case & c, int64_t m, int iters, double min_mib,
                           int * r_out, double * gb_out, const std::string & dump) {
     const bool hcpre = strcmp(c.pattern, "hcpre") == 0;
     const bool gnorm = strcmp(c.pattern, "gnorm") == 0;
-    std::vector<int64_t> proj_n;   // the projection widths
+    std::vector<int64_t> proj_n;
     int64_t proj_k = c.k;
     size_t  in_floats = 0;
     if (hcpre) {
@@ -425,7 +425,7 @@ static double run_handoff(ggml_backend_t backend, const bench_case & c, int64_t 
     return us;
 }
 
-// The shared expert tail, out = moe + shexp * sigmoid(gate), gate one value per token; k = n_embd.
+
 static double run_stail(ggml_backend_t backend, const bench_case & c, int64_t m, int iters, double min_mib,
                         int * r_out, double * gb_out, const std::string & dump) {
     const size_t copy_bytes = sizeof(float) * (size_t) (3 * c.k * m + m);
@@ -503,12 +503,12 @@ static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, 
         return run_stail(backend, c, m, iters, min_mib, r_out, gb_out, dump);
     }
 
-    // weights of one copy of the pattern
+
     std::vector<int64_t> ws;
     if (gated) {
         ws = { c.n[0], c.n[0] };
         if (ffn) {
-            ws.push_back(c.n[0]); // the down projection [n, k]: the bytes of a [k, n] weight
+            ws.push_back(c.n[0]);
         }
     } else {
         ws = c.n;
@@ -532,22 +532,22 @@ static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, 
     std::vector<ggml_tensor *> x(r), w_sg(r);
     for (int i = 0; i < r; ++i) {
         for (size_t j = 0; j < ws.size(); ++j) {
-            // the down projection of the ffn pattern maps the pair width back to k
+
             w[i].push_back(ffn && j == 2 ? ggml_new_tensor_2d(ctx_w, c.type, c.n[0], c.k)
                                          : ggml_new_tensor_2d(ctx_w, c.type, c.k, ws[j]));
         }
         if (ffng) {
             w_sg[i] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, c.k, 1);
         }
-        // Q8_0 copies get their own input, so that the multi-weight matcher does not merge
-        // neighbouring copies; the F32/BF16 GEMV is never merged and shares one hot input,
-        // as in the decode graph where the input was just written
-        // (a multi copy also gets its own input: the F32 multi-weight matcher would merge copies too)
+
+
+
+
         x[i] = (c.type == GGML_TYPE_Q8_0 || multi || i == 0) ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c.k, m) : x[0];
     }
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
-    std::vector<ggml_tensor *> first_outs; // the results of copy 0, for --dump
+    std::vector<ggml_tensor *> first_outs;
     for (int i = 0; i < r; ++i) {
         if (gated) {
             ggml_tensor * up   = ggml_mul_mat(ctx, w[i][1], x[i]);
@@ -561,7 +561,7 @@ static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, 
                 first_outs.push_back(out);
             }
             if (ffng) {
-                // after the down projection, as build_layer_ffn orders the shared expert gate
+
                 ggml_tensor * sg = ggml_mul_mat(ctx, w_sg[i], x[i]);
                 ggml_build_forward_expand(gf, sg);
                 if (i == 0) {
@@ -626,7 +626,7 @@ static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, 
         }
     }
 
-    // the first compute repacks the weights, the next two warm up the graph capture
+
     for (int i = 0; i < 3; ++i) {
         ggml_backend_graph_compute(backend, gf);
     }
@@ -641,7 +641,7 @@ static double run_case(ggml_backend_t backend, const bench_case & c, int64_t m, 
     *gb_out = (double) copy_bytes / (us * 1e3);
 
     if (!dump.empty()) {
-        // raw F32 results of copy 0, to compare two kernel variants bit for bit
+
         const std::string path = dump + "-" + c.what + "-m" + std::to_string(m) + ".bin";
         FILE * f = fopen(path.c_str(), "wb");
         for (ggml_tensor * o : first_outs) {

@@ -20,57 +20,57 @@
 
 #if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
 
-// Per-token routing trace (RTRC format).
-//
-// The ids of every MUL_MAT_ID launch are copied into a per-device ring buffer by a tiny
-// device kernel; the host queues a descriptor plus a CUDA event and a background thread
-// drains the ring (event wait, device-to-host copy, file append) without ever synchronizing
-// the decode stream.
-//
-// One trace file per device: with a layer split every device appends only its own layers,
-// and the step counter is derived from the layer order inside one device, so the files stay
-// independent. The path gets a ".devN" suffix when the process has more than one device.
-//
-// The trace records the raw (global) expert ids of the ids tensor, before the expert offset
-// is applied, so an eventual expert-parallel run keeps global ids.
-//
-// Nothing is allocated, no kernel is launched and no thread exists while the trace is off.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 namespace {
 
-// header is 32 bytes, little endian, layout: "RTRC", version (u16), header_bytes (u16),
-// n_layer, n_expert, k, flags (u32 each), n_records (u64). Every record that follows is four
-// u32 (step, layer, n_tokens, record flags) and then n_tokens * k i32 expert ids.
+
+
+
 constexpr uint32_t TRACE_VERSION      = 1;
 constexpr uint32_t TRACE_HEADER_BYTES = 32;
 
-// per-record flags beyond the file header: bit0 is the gating weights (unused here, the
-// format reserves it), bit1 marks a prefill record (n_tokens > 1). The reader ignores
-// unknown bits, and n_tokens already tells the two apart.
+
+
+
 constexpr uint32_t TRACE_REC_PREFILL = 1u << 1;
 
-// records in flight per device; the pool of events bounds the memory and the drop rate
+
 constexpr size_t TRACE_MAX_EVENTS = 1024;
 
 struct trace_record {
     uint32_t step;
     uint32_t layer;
     uint32_t n_tokens;
-    int64_t  off;     // ring element offset, already masked
-    uint32_t n;       // number of ids
+    int64_t  off;
+    uint32_t n;
     cudaEvent_t ev;
 };
 
 struct trace_device_state {
     int     device = -1;
     int32_t * ring_dev = nullptr;
-    int64_t cap  = 0;   // ring elements, power of two
+    int64_t cap  = 0;
     int64_t mask = 0;
 
     std::mutex      m;
     std::condition_variable cv;
-    int64_t         head = 0; // next element offset assigned by the launch thread
-    int64_t         tail = 0; // first element still owned by a queued record
+    int64_t         head = 0;
+    int64_t         tail = 0;
     std::deque<trace_record> queue;
     std::vector<cudaEvent_t> ev_all;
     std::vector<cudaEvent_t> ev_free;
@@ -78,15 +78,15 @@ struct trace_device_state {
     bool            stop = false;
     int64_t         dropped = 0;
 
-    uint32_t step = 0;          // forward pass counter, incremented when the layer order restarts
-    uint32_t k    = 0;          // n_expert_used, fixed for the run
-    uint32_t step_of_layer = 0; // step value the current layer belongs to
-    int      last_layer = -1;   // last layer recorded, -1 before the first record
+    uint32_t step = 0;
+    uint32_t k    = 0;
+    uint32_t step_of_layer = 0;
+    int      last_layer = -1;
     bool     has_last   = false;
 
-    std::vector<int32_t> stage; // host copy buffer of one record
+    std::vector<int32_t> stage;
 
-    // output file, owned by the drain thread after init
+
     FILE *   file = nullptr;
     uint32_t n_layer  = 0;
     uint32_t n_expert = 0;
@@ -96,8 +96,8 @@ struct trace_device_state {
 std::mutex g_trace_mutex;
 trace_device_state * g_trace_dev[GGML_CUDA_MAX_DEVICES] = {};
 
-// 1: on, 0: off. The flag lives in the expert store module and is set by the CLI before the
-// model loads, so this is a lock-free load on the per-launch path.
+
+
 static bool trace_enabled_cached() {
     return ggml_expert_store_trace_enabled();
 }
@@ -106,8 +106,8 @@ static void put16(uint8_t * p, uint16_t v) { memcpy(p, &v, 2); }
 static void put32(uint8_t * p, uint32_t v) { memcpy(p, &v, 4); }
 static void put64(uint8_t * p, uint64_t v) { memcpy(p, &v, 8); }
 
-// rewrite the 32-byte header of the device file. The drain thread is the only writer after
-// init, so no lock is needed; fseek flushes the buffered records first.
+
+
 static void trace_write_header(trace_device_state * state) {
     if (state->file == nullptr) {
         return;
@@ -119,7 +119,7 @@ static void trace_write_header(trace_device_state * state) {
     put32(hdr + 8, state->n_layer);
     put32(hdr + 12, state->n_expert);
     put32(hdr + 16, state->k);
-    put32(hdr + 20, 0); // no gating weights in this version
+    put32(hdr + 20, 0);
     put64(hdr + 24, state->n_records);
 
     fflush(state->file);
@@ -131,8 +131,8 @@ static void trace_write_header(trace_device_state * state) {
     fflush(state->file);
 }
 
-// open the trace file of one device. A file that already holds a valid header is appended to,
-// so several short runs (llama-cli, restarted server) accumulate one trace.
+
+
 static void trace_open_file(trace_device_state * state, bool multi_device) {
     const std::string base = ggml_expert_store_get_trace_path();
     if (base.empty()) {
@@ -185,8 +185,8 @@ static void trace_open_file(trace_device_state * state, bool multi_device) {
     GGML_LOG_INFO("%s: device %d: writing a routing trace to '%s'\n", __func__, state->device, path.c_str());
 }
 
-// drain one descriptor: wait for its kernel, copy the ids out of the ring (handling a wrap)
-// and append the record to the device file. Runs on the device drain thread.
+
+
 static void drain_record(trace_device_state * state, const trace_record & rec) {
     if (rec.ev != nullptr) {
         CUDA_CHECK(cudaEventSynchronize(rec.ev));
@@ -202,9 +202,9 @@ static void drain_record(trace_device_state * state, const trace_record & rec) {
     }
 
     if (state->file != nullptr) {
-        // grow the header bounds first: a process killed after this point still leaves a file
-        // whose header covers every record that reaches the disk. The header is only rewritten
-        // when the shape grows, so the drain thread does not fflush per record.
+
+
+
         const uint32_t n_layer  = std::max(state->n_layer, rec.layer + 1);
         uint32_t n_expert = state->n_expert;
         for (uint32_t i = 0; i < rec.n; ++i) {
@@ -228,7 +228,7 @@ static void drain_record(trace_device_state * state, const trace_record & rec) {
         }
     }
 
-    // the ring segment is free again once the bytes are on the host
+
     {
         std::lock_guard<std::mutex> slock(state->m);
         state->tail += rec.n;
@@ -269,7 +269,7 @@ static trace_device_state * get_device_state(int device) {
     }
 
     const int size_mib = ggml_expert_store_get_trace_size_mib();
-    // ring elements as a power of two, so the kernel masks instead of dividing
+
     int64_t cap = ((int64_t) size_mib * 1024 * 1024) / (int64_t) sizeof(int32_t);
     int64_t pow2 = 1;
     while (pow2 * 2 <= cap) {
@@ -300,7 +300,7 @@ static trace_device_state * get_device_state(int device) {
     return state;
 }
 
-// kernel: copy the raw ids of the launch into the ring. One thread per (token, slot).
+
 __global__ void routing_trace_kernel(
         const int32_t * __restrict__ ids, const int64_t n_entries, const int n_expert_used,
         const int64_t ids_stride, int32_t * __restrict__ ring, const int64_t base, const int64_t mask) {
@@ -313,8 +313,8 @@ __global__ void routing_trace_kernel(
     ring[(base + i) & mask] = ids[token * ids_stride + slot];
 }
 
-// layer number of an expert tensor from its name ("blk.<n>.ffn_*_exps"), the same rule the
-// expert store uses; -1 when the name carries none
+
+
 static int trace_tensor_layer(const ggml_tensor * t) {
     const char * p = strstr(t->name, "blk.");
     if (p == nullptr) {
@@ -349,7 +349,7 @@ void ggml_cuda_routing_trace_record(const ggml_tensor * src0, const ggml_tensor 
     if (src0 == nullptr || ids == nullptr || ids->type != GGML_TYPE_I32) {
         return;
     }
-    // expert weight layout: one expert per ne[2] slice
+
     if (src0->ne[2] <= 1) {
         return;
     }
@@ -370,26 +370,26 @@ void ggml_cuda_routing_trace_record(const ggml_tensor * src0, const ggml_tensor 
         return;
     }
 
-    // One lock for the whole booking: the ring offset and the queue entry must be created in
-    // the same order, otherwise an out-of-order drain would free the wrong segment. The lock
-    // covers a small kernel launch only, never a wait.
+
+
+
     std::lock_guard<std::mutex> lock(state->m);
 
     if (state->k == 0) {
         state->k = (uint32_t) k;
     } else if (state->k != (uint32_t) k) {
-        // one trace file carries one k; a changing top-k would make the records unreadable,
-        // so this is a configuration error and not something to paper over
+
+
         GGML_ABORT("%s: n_expert_used changed from %u to %lld during the trace\n",
             __func__, state->k, (long long) k);
     }
-    // gate/up/down of one layer share the routing; record each forward-pass layer once
+
     if (state->has_last && layer == state->last_layer) {
         return;
     }
-    // One forward pass executes the layers of one device in ascending order exactly once, so a
-    // layer below the previous one marks the start of the next step. This groups the layers of
-    // one forward pass without a host hook into llama_decode.
+
+
+
     if (state->has_last && layer < state->last_layer) {
         state->step++;
     }
@@ -402,7 +402,7 @@ void ggml_cuda_routing_trace_record(const ggml_tensor * src0, const ggml_tensor 
         return;
     }
 
-    // acquire an event from the pool; the pool bounds how many records may be in flight
+
     cudaEvent_t ev = nullptr;
     if (!state->ev_free.empty()) {
         ev = state->ev_free.back();
@@ -421,7 +421,7 @@ void ggml_cuda_routing_trace_record(const ggml_tensor * src0, const ggml_tensor 
 
     const int64_t free_elems = state->cap - (state->head - state->tail);
     if (free_elems < n) {
-        // ring full: drop this batch instead of waiting on the decode path
+
         state->dropped++;
         state->ev_free.push_back(ev);
         return;
@@ -495,9 +495,9 @@ void ggml_cuda_routing_trace_shutdown_all(void) {
     }
 }
 
-#else // !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#else
 
-// HIP/MUSA: the routing trace is part of the CUDA expert path and is not implemented there.
+
 bool ggml_cuda_routing_trace_enabled(void) {
     return false;
 }
@@ -519,4 +519,4 @@ void ggml_cuda_routing_trace_shutdown_device(int device) {
 void ggml_cuda_routing_trace_shutdown_all(void) {
 }
 
-#endif // !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
+#endif

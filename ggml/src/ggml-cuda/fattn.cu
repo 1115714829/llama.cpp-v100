@@ -127,9 +127,9 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
-// Expands a range mask (I32 [4, ne1, ne2, ne3], row i holds two [lo, hi) pairs) into the dense f16
-// mask it describes: 0 where a column lies in either pair, -INF elsewhere. dst is contiguous
-// [n_kv, ne1, ne2, ne3].
+
+
+
 static __global__ void flash_attn_range_to_dense_mask(
         const char * __restrict__ range, half * __restrict__ dst, const int64_t n_kv,
         const int64_t ne1, const int64_t ne2, const int64_t ne3,
@@ -154,7 +154,7 @@ static __global__ void flash_attn_range_to_dense_mask(
     }
 }
 
-// The dense f16 mask a range mask describes, as a tensor description: contiguous [n_kv, ne1, ne2, ne3].
+
 static ggml_tensor ggml_cuda_fattn_dense_mask_desc(const ggml_tensor * mask, int64_t n_kv) {
     ggml_tensor m = *mask;
     m.type  = GGML_TYPE_F16;
@@ -453,7 +453,6 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
         } break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 
@@ -581,9 +580,9 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
     }
 }
 
-// On Volta the MMA kernel has no device code for fewer than 32 columns and the dynamic shared
-// memory of wide tiles can exceed the device limit. Check the variant the MMA dispatch would pick
-// so that the kernel selection can fall back to the tile kernel instead of failing to launch.
+
+
+
 static bool ggml_cuda_flash_attn_ext_mma_f16_volta_fits(const int device, const ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -600,8 +599,8 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_volta_fits(const int device, const 
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
 
-    // Mirrors the ncols2 selection of ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2 and the
-    // special cases of ggml_cuda_flash_attn_ext_mma_f16.
+
+
     int ncols2;
     if (DKQ == 192) {
         ncols2 = gqa_ratio % 16 == 0 ? 16 : 8;
@@ -633,7 +632,7 @@ static bool ggml_cuda_flash_attn_ext_mma_f16_volta_fits(const int device, const 
         }
     }
 
-    // Mirrors the ncols1 selection of ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1 on Volta.
+
     int ncols1;
     if (ncols2 <= 16 && Q->ne[1] <= 16/ncols2) {
         ncols1 = 16/ncols2;
@@ -659,16 +658,16 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     const int cc = ggml_cuda_info().devices[device].cc;
 
-    // The non-uniform 3-card head mapping is only implemented by the sm70 grouped kernel.
-    // Never let another kernel treat a marked node as uniform GQA.
+
+
     if (ggml_get_op_params_i32(dst, 5) != 0 && !ggml_cuda_flash_attn_ext_sm70_grouped_supported(dst, cc)) {
-        return BEST_FATTN_KERNEL_NONE; // the caller aborts, see ggml_cuda_flash_attn_ext_impl
+        return BEST_FATTN_KERNEL_NONE;
     }
 
     if (dst->src[3] && dst->src[3]->type == GGML_TYPE_I32) {
-        // the sm70 kernels read a range mask directly; the others need the dense f16
-        // mask it describes, and their selection only inspects the mask layout, so
-        // select them for a dense mask description
+
+
+
         if (ggml_cuda_flash_attn_ext_sm70_grouped_supported(dst, cc)) {
             return BEST_FATTN_KERNEL_SM70_GROUPED;
         }
@@ -687,9 +686,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         return BEST_FATTN_KERNEL_SM70_GROUPED;
     }
 
-    // D256 Split-D prefill (q >= 17) for Volta. The kernel is compiled by a
-    // dedicated sm_70-only object target that is absent from builds without
-    // sm_70, so skip it here in those builds.
+
+
+
     if constexpr (GGML_CUDA_SM70_D256_COMPILED) {
         if (ggml_cuda_sm70_d256_supported(cc, dst)) {
             return BEST_FATTN_KERNEL_SM70_D256;
@@ -828,7 +827,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         // that are too narrow or need too much shared memory are not usable on Volta
         // (see ggml_cuda_flash_attn_ext_mma_f16_volta_fits).
         if (Q->ne[1] * gqa_ratio_eff <= 16 || !ggml_cuda_flash_attn_ext_mma_f16_volta_fits(device, dst)) {
-            // The tile kernel is the only fallback and for 576/512 it exists only for GQA ratios that are a multiple of 4.
+
             if (K->ne[0] == 576 && gqa_ratio % 4 != 0) {
                 return BEST_FATTN_KERNEL_NONE;
             }
@@ -902,7 +901,7 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
             need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
         } break;
-        case BEST_FATTN_KERNEL_SM70_GROUPED: // K/V are read directly
+        case BEST_FATTN_KERNEL_SM70_GROUPED:
             break;
         case BEST_FATTN_KERNEL_SM70_D256:
             if constexpr (GGML_CUDA_SM70_D256_COMPILED) {
@@ -926,14 +925,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 
     const ggml_tensor * mask = dst->src[3];
     if (mask && mask->type == GGML_TYPE_I32) {
-        // the sm70 kernels read the range natively, every other kernel needs the dense f16 mask
+
         const best_fattn_kernel kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
         if (kernel == BEST_FATTN_KERNEL_SM70_GROUPED || kernel == BEST_FATTN_KERNEL_SM70_D256) {
             ggml_cuda_flash_attn_ext_impl(ctx, dst);
             return;
         }
 
-        // expand the range mask into the dense f16 mask the other kernels expect, then run the regular path
+
         const int64_t n_kv = dst->src[1]->ne[1];
 
         ggml_cuda_pool_alloc<half> mask_f16(ctx.pool(), n_kv*mask->ne[1]*mask->ne[2]*mask->ne[3]);

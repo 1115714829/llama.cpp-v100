@@ -161,6 +161,7 @@ enum llm_type {
 };
 
 std::string llama_rope_scaling_type_name(llama_rope_scaling_type rope_scaling_type);
+std::string llama_rope_section_order_name(llama_rope_section_order rope_section_order);
 
 // Map a GGUF activation-name string to llm_ffn_op_type. Returns `fallback` if
 // the string is empty or not recognized.
@@ -309,6 +310,10 @@ struct llama_layer {
     struct ggml_tensor * wv_enc    = nullptr;
     struct ggml_tensor * wo_enc    = nullptr;
     struct ggml_tensor * wqkv_gate = nullptr;
+    // K2 Horizon MoVA
+    struct ggml_tensor * attn_v_gate   = nullptr;
+    struct ggml_tensor * attn_v_gate_b = nullptr;
+    struct ggml_tensor * attn_v_exps   = nullptr;
 
     // relative position bias
     struct ggml_tensor * attn_rel_b       = nullptr;
@@ -381,6 +386,20 @@ struct llama_layer {
     struct ggml_tensor * dflash_attn_conv_proj = nullptr;
     struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
     struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
+
+    struct ggml_tensor * lilicorr_attn_norm       = nullptr;
+    struct ggml_tensor * lilicorr_mlp_norm        = nullptr;
+    struct ggml_tensor * lilicorr_attn_in_proj    = nullptr;
+    struct ggml_tensor * lilicorr_attn_in_proj_b  = nullptr;
+    struct ggml_tensor * lilicorr_attn_out_proj   = nullptr;
+    struct ggml_tensor * lilicorr_attn_out_proj_b = nullptr;
+    struct ggml_tensor * lilicorr_attn_out_proj_s = nullptr;
+    struct ggml_tensor * lilicorr_mlp_0           = nullptr;
+    struct ggml_tensor * lilicorr_mlp_0_b         = nullptr;
+    struct ggml_tensor * lilicorr_mlp_0_s         = nullptr;
+    struct ggml_tensor * lilicorr_mlp_2           = nullptr;
+    struct ggml_tensor * lilicorr_mlp_2_b         = nullptr;
+    struct ggml_tensor * lilicorr_mlp_2_s         = nullptr;
 
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
@@ -621,8 +640,8 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
-// 3-card attention load balancing: each device takes a contiguous slice of the Q heads
-// plus two overlapping KV heads, so that every device gets the same number of Q heads
+
+
 bool attn_kv_overlap_3card(const llama_hparams & hparams, const llama_model & model, uint32_t il);
 
 struct llama_prec_policy {
@@ -638,26 +657,64 @@ struct llama_prec_policy {
     void load(llama_model_loader & ml, const llama_model & model);
 };
 
+// transform of a folded weight, applied to the matmul input: optional sign flip, then the normalized block Hadamard rotation
+struct llama_hadamard_transform {
+    ggml_tensor * rot;
+    ggml_tensor * signs; // nullptr for identity sign mode
+
+    // if perm_rep > 1, permute the input from tiled head order [hd, nk, rep] to grouped order [hd, rep, nk] before signs and rotation
+    int64_t perm_hd  = 0;
+    int64_t perm_nk  = 0;
+    int64_t perm_rep = 0;
+
+    // ssm_out of a gated delta net gets its value heads in tiled order, but the fold used grouped order
+    // record the head geometry for that permutation, return false if it does not match the input width
+    bool set_gdn_v_perm(int64_t n_in, int64_t n_v, int64_t n_k) {
+        if (n_k <= 0 || n_v <= 0 || n_v % n_k != 0 || n_in % n_v != 0) {
+            return false;
+        }
+        perm_hd  = n_in / n_v;
+        perm_nk  = n_k;
+        perm_rep = n_v / n_k;
+        return true;
+    }
+};
+using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
+
+struct llama_hadamard {
+    // names and sign data come from the GGUF metadata in load_hparams, the transforms are made in load_tensors
+    std::unordered_map<std::string, uint32_t> weight_blocks;
+    std::unordered_map<std::string, uint32_t> inverse_blocks;
+
+    std::map<uint32_t, std::vector<int32_t>> sign_data;
+
+    bool gdn_v_grouped = false;
+    bool tied_output = false;
+
+    llama_hadamard_rotations rot; // folded weight -> activation transform
+    llama_hadamard_rotations inv; // latent lookup table -> inverse transform
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
     std::string name = "n/a";
 
-    // r-mtpdev: the arch graph_mtp reads the nextn h rows from the device sink (t_embd_h_src
-    // branch in the MTP graph). Set by the model loader of architectures that implement it;
-    // the h sink is not usable without it
+
+
+
     bool h_nextn_sink_ok = false;
 
-    // dchain: the arch graph_mtp can take its input tokens from the device draft ring and write the
-    // argmax of its logits back into it (t_draft_ring branch in the MTP graph). Set by the model
-    // loader of architectures that implement it; the draft token chain stays on the host without it
+
+
+
     bool draft_ring_ok = false;
 
-    // the merged gate_up expert weight of every layer is loaded with its rows interleaved, so the
-    // graph reads it with the fused SwiGLU matmul instead of the split gate and up views.
-    // Set by the model loader of the architectures that load it that way, see
-    // TENSOR_GATE_UP_INTERLEAVE and ggml_mul_mat_id_swiglu
+
+
+
+
     bool gate_up_fused_swiglu = false;
 
     llama_hparams hparams = {};
@@ -665,6 +722,11 @@ struct llama_model {
 
     // per-tensor activation precision policy
     llama_prec_policy prec_policy;
+
+    llama_hadamard hdmd;
+
+    // see llama_model_set_attn_rot
+    bool attn_rot = true;
 
     // for classifier models
     std::vector<std::string> classifier_labels;
@@ -737,6 +799,36 @@ struct llama_model {
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;
 
+    struct ggml_tensor * lilicorr_token_proj          = nullptr;
+    struct ggml_tensor * lilicorr_token_proj_b        = nullptr;
+    struct ggml_tensor * lilicorr_token_proj_s        = nullptr;
+    struct ggml_tensor * lilicorr_pass_hidden_proj    = nullptr;
+    struct ggml_tensor * lilicorr_pass_hidden_proj_b  = nullptr;
+    struct ggml_tensor * lilicorr_pass_hidden_proj_s  = nullptr;
+    struct ggml_tensor * lilicorr_feature_norm        = nullptr;
+    struct ggml_tensor * lilicorr_feature_norm_b      = nullptr;
+    struct ggml_tensor * lilicorr_feature_mlp_1       = nullptr;
+    struct ggml_tensor * lilicorr_feature_mlp_1_b     = nullptr;
+    struct ggml_tensor * lilicorr_feature_mlp_3       = nullptr;
+    struct ggml_tensor * lilicorr_feature_mlp_3_b     = nullptr;
+    struct ggml_tensor * lilicorr_slot_embedding      = nullptr;
+    struct ggml_tensor * lilicorr_rank_embedding      = nullptr;
+    struct ggml_tensor * lilicorr_attention_bias      = nullptr;
+    struct ggml_tensor * lilicorr_context_proj        = nullptr;
+    struct ggml_tensor * lilicorr_context_proj_b      = nullptr;
+    struct ggml_tensor * lilicorr_context_proj_s      = nullptr;
+    struct ggml_tensor * lilicorr_output_norm         = nullptr;
+    struct ggml_tensor * lilicorr_anchor_norm         = nullptr;
+    struct ggml_tensor * lilicorr_factor_input_proj   = nullptr;
+    struct ggml_tensor * lilicorr_factor_input_proj_b = nullptr;
+    struct ggml_tensor * lilicorr_out_head            = nullptr;
+    struct ggml_tensor * lilicorr_out_head_b          = nullptr;
+    struct ggml_tensor * lilicorr_in_head             = nullptr;
+    struct ggml_tensor * lilicorr_in_head_b           = nullptr;
+    struct ggml_tensor * lilicorr_anchor_out_head     = nullptr;
+    struct ggml_tensor * lilicorr_anchor_out_head_b   = nullptr;
+
+
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;
 
@@ -764,8 +856,8 @@ struct llama_model {
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
 
-    // the reader of the n-gram table: it reads the rows the graph needs from the model file,
-    // when the table does not fit into pinned host memory (see llama_model_params::ple_host_read)
+
+
     std::unique_ptr<llama_ple_reader> ple_reader;
 
     // statically allocated context for assigning
@@ -806,7 +898,7 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
-    // true if any tensor override sends a weight to a non-GPU (host) buffer
+
     bool has_host_tensor_overrides() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
@@ -816,8 +908,8 @@ struct llama_model {
 
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
 
-    // true if the model graph feeds the attention mask to ggml_flash_attn_ext only,
-    // so an I32 [lo, hi) range mask can replace the dense one
+
+
     bool kq_range_mask_supported() const;
 
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
@@ -882,6 +974,19 @@ struct llama_model_base : public llama_model {
     void create_tensor_qkv(llama_layer & layer, int bid,
                 int64_t n_embd_, int64_t n_embd_q_, int64_t n_embd_k_, int64_t n_embd_v_,
                 int flags);
+
+    // helper: tensor flags for a file that holds the trunk, the NextN layers, or both
+    struct nextn_flags_t {
+        int trunk; // TENSOR_NOT_REQUIRED when the file holds only the NextN layers
+        int mtp;   // TENSOR_NOT_REQUIRED when the file holds only the trunk, TENSOR_SKIP when MTP is not loaded
+    };
+    nextn_flags_t nextn_flags(llama_model_loader & ml, llm_tensor trunk_probe = LLM_TENSOR_ATTN_NORM) const;
+
+    // helper: read the prism.hadamard metadata and record which weights are folded
+    void load_hparams_hadamard(llama_model_loader & ml);
+
+    // helper: make the prism.hadamard rotation and sign tensors for the folded weights
+    void load_tensors_hadamard();
 
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);

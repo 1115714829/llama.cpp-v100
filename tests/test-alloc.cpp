@@ -642,16 +642,16 @@ static void test_reallocation() {
     }
 }
 
-// A leaf that no node reads (an input kept allocated for set_input, a spare copy of a double-buffered input) is
-// placed from the leaf allocations alone. When it grows between two graphs that are otherwise the same,
-// ggml_gallocr_alloc_graph must lay the graph out again instead of writing the leaf past its old size.
+
+
+
 static void test_unread_leaf_grows() {
     dummy_backend    backend = dummy_backend_init(256, /*align*/ 4);
     ggml_gallocr_ptr galloc;
     {
         auto [ctx, graph, ctx_ptr] = make_context();
         ggml_tensor * x[4];
-        x[0] = make_input_with_size(ctx, 16); // no node reads it
+        x[0] = make_input_with_size(ctx, 16);
         x[1] = make_input_with_size(ctx, 16);
         x[2] = make_input_with_size(ctx, 16);
         x[3] = ggml_add(ctx, x[1], x[2]);
@@ -665,7 +665,7 @@ static void test_unread_leaf_grows() {
     {
         auto [ctx, graph, ctx_ptr] = make_context();
         ggml_tensor * x[4];
-        x[0] = make_input_with_size(ctx, 64); // the unread leaf grew, nothing else changed
+        x[0] = make_input_with_size(ctx, 64);
         x[1] = make_input_with_size(ctx, 16);
         x[2] = make_input_with_size(ctx, 16);
         x[3] = ggml_add(ctx, x[1], x[2]);
@@ -685,16 +685,16 @@ static void test_unread_leaf_grows() {
     }
 }
 
-// ggml_gallocr_get_node_slot reports where ggml-alloc placed a node and how much room it set aside there:
-// the address of the tensor and a slot at least as large as the tensor, rounded to the alignment of the
-// buffer; nothing for a view. Two nodes allocated one after the other get slots back to back, and a
-// smaller graph that reuses the reserved layout keeps the larger slots of the reserved graph
+
+
+
+
 static void test_node_slot() {
     const size_t align = 16;
     dummy_backend    backend = dummy_backend_init(1024, align);
     ggml_gallocr_ptr galloc;
 
-    // checks the slot of every node, returns the slots of the two squares
+
     const auto check_slots = [&](ggml_cgraph * graph, ggml_tensor * q0, ggml_tensor * q1,
                                  size_t * off0, size_t * size0, size_t * off1, size_t * size1) {
         for (int i = 0; i < graph->n_nodes; ++i) {
@@ -723,11 +723,11 @@ static void test_node_slot() {
         GGML_ASSERT(!ggml_gallocr_get_node_slot(galloc.get(), graph->n_nodes, nullptr, nullptr, nullptr, nullptr));
     };
 
-    // q0 and q1 are the two sources of the same node, so ggml-alloc allocates them one after the other
+
     const auto build = [](ggml_context * ctx, ggml_cgraph * graph, size_t bytes, ggml_tensor ** q0, ggml_tensor ** q1) {
         ggml_tensor * x0 = make_input_with_size(ctx, bytes);
         ggml_tensor * x1 = make_input_with_size(ctx, bytes);
-        // outputs are never reused in place, so the squares get memory of their own
+
         ggml_set_output(x0);
         ggml_set_output(x1);
         *q0 = ggml_sqr(ctx, x0);
@@ -750,10 +750,10 @@ static void test_node_slot() {
         check_all_allocated(graph);
         check_slots(graph, q0, q1, &off0, &size0, &off1, &size1);
         GGML_ASSERT(size0 == 48 && size1 == 48);
-        GGML_ASSERT(off0 + size0 == off1); // allocated one after the other
+        GGML_ASSERT(off0 + size0 == off1);
     }
     {
-        // the same graph with shorter inputs fits the reserved layout: the slots keep their 48 bytes
+
         auto [ctx, graph, ctx_ptr] = make_context();
         ggml_tensor * q0 = nullptr;
         ggml_tensor * q1 = nullptr;

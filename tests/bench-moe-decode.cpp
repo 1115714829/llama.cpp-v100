@@ -1,26 +1,26 @@
-// bench-moe-decode: the MoE FFN half layer of a Flash-Next decode/verify step on one device of an
-// expert parallel split, with cold weights, through the CUDA backend.
-//
-// A real verify step runs this pattern 48 times per round on every device: the F32 router GEMV,
-// the fused softmax/top-k/weight normalization, the gate_up MUL_MAT_ID with the SwiGLU epilogue
-// (row interleaved Q4_K weight), the down MUL_MAT_ID (Q5_1/Q8_0) and the weighted sum over the
-// slots. The device holds a contiguous slice of the experts (expert_offset = shard * slice), and
-// the MUL_MAT_ID nodes carry the expert parallel flags, so the kernels see the routing of a real
-// device: about 1/D of the (token, slot) pairs are local.
-//
-// The graph holds L independent copies of the pattern (distinct inputs and router weights, the
-// expert tensors shared: every copy routes to different experts, so the expert reads stay cold),
-// is run through the CUDA backend (the same fusion matcher and CUDA graph as the server) and the
-// time per copy is reported. --dump writes the outputs of the first copy (moe_out, ids, weights)
-// to compare two builds bit for bit; the inputs are seeded, so every run sees the same values.
-//
-// Not part of the CMake build. Build against a llama.cpp build tree:
-//   g++ -O2 -std=c++17 -I<src>/ggml/include tests/bench-moe-decode.cpp -o bench-moe-decode \
-//       -L<build>/bin -lggml -lggml-base -lggml-cuda -Wl,-rpath,<build>/bin
-// Usage:
-//   bench-moe-decode [--dev 0] [--iters 50] [--n 1,4] [--devices 4] [--shard 1] [--layers 24]
-//                    [--what full|experts] [--down q5_1|q8_0] [--gu q4_k|q5_k|q8_0] [--dump <prefix>]
-// Output: one line per n: what, n, devices, layers, us per copy, local pairs per copy.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -114,7 +114,7 @@ static run_result run(ggml_backend_t backend, const std::string & what, int64_t 
         ggml_tensor * selected = nullptr;
         ggml_tensor * weights  = nullptr;
         if (full) {
-            // build_moe_ffn: softmax gating, top-k, normalized weights (fused into topk_moe)
+
             gate_inp[l] = ggml_new_tensor_2d(ctx_w, GGML_TYPE_F32, N_EMBD, N_EXPERT);
             ggml_tensor * logits = ggml_mul_mat(ctx, gate_inp[l], xs[l]);
             ggml_tensor * probs  = ggml_soft_max(ctx, logits);
@@ -228,8 +228,8 @@ static run_result run(ggml_backend_t backend, const std::string & what, int64_t 
     const auto t1 = std::chrono::steady_clock::now();
     const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / iters / layers;
 
-    // local pairs of the first copy (the routing is the same in every build); the routed ids are a
-    // strided view of the argsort result in the full pattern, so read them row by row
+
+
     std::vector<int32_t> ids_h(N_USED * n);
     for (int64_t t = 0; t < n; ++t) {
         ggml_backend_tensor_get(ids0, ids_h.data() + t*N_USED, t*ids0->nb[1], N_USED * sizeof(int32_t));

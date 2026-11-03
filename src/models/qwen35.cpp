@@ -34,9 +34,9 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
 void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
 
-    const bool mtp_only = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.attn_norm.weight") == nullptr);
-    const int trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
-    int mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0;
+    const auto nf = nextn_flags(ml);
+    const int trunk_flags = nf.trunk;
+    const int mtp_flags   = nf.mtp;
 
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
 
@@ -176,7 +176,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
             cur = build_layer_attn(inp->get_attn(), cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids && cparams.embeddings_nextn_masked) {
+        if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
             cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
         }
@@ -213,7 +213,7 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
+    if (crop_after_nextn(inp_out_ids)) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
 
@@ -235,13 +235,11 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }
 
-// 3-card attention load balancing: the Q heads of a device form two GQA groups that each map
-// to whole KV heads, so each group runs one flash attention on its local KV heads and the
-// results are concatenated back into the global head order
+
+
+
 static ggml_tensor * build_attn_3card_impl(
         llm_graph_context &       ctx,
         llm_graph_input_attn_kv * inp,
@@ -280,11 +278,11 @@ static ggml_tensor * build_attn_3card_impl(
     const int64_t n_gqa    = ctx.hparams.n_gqa(il);
     const int64_t n_head_d = n_head / 3;
     const int64_t n_stream = k->ne[3];
-    const int64_t n_q      = q_cur->ne[2] / n_stream; // query tokens per stream
+    const int64_t n_q      = q_cur->ne[2] / n_stream;
 
-    // The grouped verify kernel applies the per-device Q head boundary itself, so a verify batch
-    // needs a single flash attention per device and no concatenation. Prefill and single-token
-    // decode keep the two-group path: the split-D and vec kernels only do a uniform GQA mapping.
+
+
+
     if (n_q >= 2 && n_q <= 16) {
         ggml_tensor * q = ggml_view_4d(ctx.ctx0, q_cur, n_embd_head, n_head, n_q, n_stream,
                 q_cur->nb[1], q_cur->nb[2], q_cur->nb[3]/n_stream, 0);
@@ -300,7 +298,7 @@ static ggml_tensor * build_attn_3card_impl(
 
         ggml_flash_attn_ext_set_n_kv_max(out, 0);
         ggml_prec_set_acc(out, GGML_PREC_F32);
-        ggml_flash_attn_ext_set_q_head_boundary(out, -1); // the split backend fills g0 per device
+        ggml_flash_attn_ext_set_q_head_boundary(out, -1);
 
         ggml_tensor * cur = ggml_reshape_2d(ctx.ctx0, out, out->ne[0]*out->ne[1], out->ne[2]*out->ne[3]);
         ggml_build_forward_expand(ctx.gf, cur);
@@ -308,12 +306,12 @@ static ggml_tensor * build_attn_3card_impl(
         return cur;
     }
 
-    // one node per (device, GQA group) pair, the windows are in global head coordinates:
-    // a window is only non-zero on the device that holds its Q heads
+
+
     ggml_tensor * outs[6];
     for (int64_t d = 0; d < 3; ++d) {
-        const int64_t q0_d  = d*n_head_d;       // global index of the first Q head of this device
-        const int64_t kv0_d = q0_d / n_gqa;     // global index of the first KV head of this device
+        const int64_t q0_d  = d*n_head_d;
+        const int64_t kv0_d = q0_d / n_gqa;
         int64_t g0 = n_gqa - q0_d % n_gqa;
         if (g0 > n_head_d) {
             g0 = n_head_d;
@@ -347,8 +345,8 @@ static ggml_tensor * build_attn_3card_impl(
         }
     }
 
-    // concatenate the two groups of each device first, then the devices: every device runs one
-    // real concatenation plus two that only copy its 8 heads (a flat chain would copy them four times)
+
+
     ggml_tensor * dev[3];
     for (int d = 0; d < 3; ++d) {
         dev[d] = ggml_concat(ctx.ctx0, outs[2*d], outs[2*d + 1], /*dim=*/ 1);
@@ -367,10 +365,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35::graph::build_qkvz(
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
-    // Expand the projections that share this input back to back, so that the CUDA backend can
-    // run them with one input conversion and one multi-weight kernel. ggml reuses compute
-    // buffers in node order, so a projection expanded apart from the others could have its
-    // output overwritten before its consumers read it.
+
+
+
+
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
     ggml_build_forward_expand(gf, qkv_mixed);
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
@@ -466,9 +464,9 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
                     nullptr, nullptr, nullptr,
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
 
-        // 6-card attention load balancing: allow the meta backend to hand the KV tail of this
-        // layer to the idle devices; the host-side gate in graph_params keeps the plain node
-        // until the batch really spans the assist threshold
+
+
+
         if (fa_assist) {
             const auto & fused = res->get_fused_nodes();
             for (size_t i = n_fused; i < fused.size(); i++) {
@@ -525,7 +523,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
-    // same reason as in build_qkvz: keep the beta/alpha projections adjacent to the qkv ones
+
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     ggml_build_forward_expand(gf, beta);
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
@@ -549,8 +547,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
 
-    // compute the gating right after its projections, so that the q/k normalization directly
-    // precedes the gated delta net and the CUDA backend can fold it into the gdn kernel
+
+
     ggml_build_forward_expand(gf, beta);
     ggml_build_forward_expand(gf, gate);
 
@@ -563,8 +561,8 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
 
-    // keep the conv nodes adjacent: the CUDA backend fuses the state gather, the concat, the
-    // snapshot copies and conv + silu into a single kernel (see ggml_cuda_try_ssm_conv_rollback_fusion)
+
+
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
@@ -697,7 +695,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
     // TODO: extract in a common llm_graph_context::build_inp_embd_h()
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd);
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
@@ -713,6 +711,16 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
         ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
 
         tok_embd = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
+
+        // a Hadamard-latent table stores rotated rows; restore the primal basis
+        if (hdmd) {
+            if (const auto it = hdmd->inv.find(tok_embd_w); it != hdmd->inv.end()) {
+                tok_embd = llama_mul_mat_hadamard(ctx0, tok_embd, it->second.rot);
+                if (it->second.signs) {
+                    tok_embd = ggml_mul(ctx0, tok_embd, it->second.signs);
+                }
+            }
+        }
     } else {
         tok_embd = inp->embd;
     }
@@ -838,5 +846,4 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
-    ggml_build_forward_expand(gf, cur);
 }

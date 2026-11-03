@@ -16,10 +16,10 @@ struct ggml_cuda_topk_moe_args {
     bool scale{};
 };
 
-// The q8_1 quantization of the MoE gate_up activation done in the routing launch (extra blocks after
-// the routing rows): x is [ne00] F32 per token with row stride s_row (floats), x_q8 the q8_1 rows of
-// ne0 values (ne0: the padded row length, a multiple of TOPK_MOE_ROWS_PER_BLOCK*WARP_SIZE),
-// n_blocks = tokens * ne0 / (TOPK_MOE_ROWS_PER_BLOCK*WARP_SIZE). n_blocks = 0: routing only.
+
+
+
+
 struct ggml_cuda_topk_moe_quant {
     const float * x        = nullptr;
     void *        x_q8     = nullptr;

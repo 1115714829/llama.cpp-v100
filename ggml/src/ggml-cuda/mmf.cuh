@@ -111,8 +111,8 @@ static __global__ void mul_mat_f(
     const int sample_x    = sample_dst / sample_ratio;
     const int sample_y    = sample_dst;
 
-    // expert store: the weight base comes from the device pointer table, the channel stride
-    // within src0 is then not used
+
+
     if (has_ids && expert_ptrs != nullptr) {
         x = (const T *) expert_ptrs[channel_x] + int64_t(sample_x) *stride_sample_x + row0*stride_row;
     } else {
@@ -378,8 +378,8 @@ static __global__ void mul_mat_f_ids(
     const int sample_x    = sample_dst / sample_ratio;
     const int sample_y    = sample_dst;
 
-    // expert store: the weight base comes from the device pointer table, the channel stride
-    // within src0 is then not used
+
+
     if (expert_ptrs != nullptr) {
         x = (const T *) expert_ptrs[channel_x] + int64_t(sample_x) *stride_sample_x + row0*stride_row;
     } else {
@@ -754,9 +754,8 @@ void mul_mat_f_cuda(
                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, block_nums, block_dims, nbytes_shared_total, stream,
                 ids_data, expert_ptrs);
         } break;
-        default: {
+        default:
             GGML_ABORT("fatal error");
-        } break;
     }
 
     GGML_UNUSED_VARS(nchannels_y);
@@ -858,9 +857,8 @@ static void mul_mat_f_switch_cols_per_block(
                 stride_col_id, stride_row_id, nchannels_x, nchannels_y,  nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, stream, ids_data, expert_ptrs);
         } break;
-        default: {
+        default:
             GGML_ABORT("fatal error");
-        } break;
     }
 }
 

@@ -329,6 +329,17 @@ void ggml_log_callback_default(enum ggml_log_level level, const char * text, voi
 #endif
 
 
+// the thread sanitizer does not intercept vm_allocate and vm_deallocate, so it produces false positives
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define GGML_TSAN_ENABLED 1
+#endif
+#else
+#if defined(__SANITIZE_THREAD__)
+#define GGML_TSAN_ENABLED 1
+#endif
+#endif
+
 void * ggml_aligned_malloc(size_t size) {
 #if defined(__s390x__)
     const int alignment = 256;
@@ -346,7 +357,7 @@ void * ggml_aligned_malloc(size_t size) {
     void * aligned_memory = NULL;
   #ifdef GGML_USE_CPU_HBM
     int result = hbw_posix_memalign(&aligned_memory, alignment, size);
-  #elif TARGET_OS_OSX
+  #elif TARGET_OS_OSX && !defined(GGML_TSAN_ENABLED)
     GGML_UNUSED(alignment);
     kern_return_t alloc_status = vm_allocate((vm_map_t) mach_task_self(), (vm_address_t *) &aligned_memory, size, VM_FLAGS_ANYWHERE);
     int result = EFAULT;
@@ -393,7 +404,7 @@ void ggml_aligned_free(void * ptr, size_t size) {
     if (ptr != NULL) {
         hbw_free(ptr);
     }
-#elif TARGET_OS_OSX
+#elif TARGET_OS_OSX && !defined(GGML_TSAN_ENABLED)
     if (ptr != NULL) {
         vm_deallocate((vm_map_t)mach_task_self(), (vm_address_t)ptr, size);
     }
@@ -490,9 +501,9 @@ int64_t ggml_bf16_to_fp16_row(const ggml_bf16_t * x, ggml_fp16_t * y, int64_t n)
     int64_t n_clamped = 0;
     for (int64_t i = 0; i < n; ++i) {
         float f = GGML_BF16_TO_FP32(x[i]);
-        // the 7-bit mantissa of a BF16 fits in the 10 bits of an F16, so the conversion is exact
-        // for every value in the F16 range; finite values beyond it are clamped instead of
-        // rounding to Inf (same rule as Strata's bf16_to_f16_kernel)
+
+
+
         if (f > 65504.0f && !isinf(f)) {
             f = 65504.0f;
             n_clamped++;
@@ -2228,6 +2239,7 @@ static struct ggml_tensor * ggml_acc_impl(
 
     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
 
+    GGML_ASSERT(offset < (size_t)(1 << 30));
     int32_t params[] = { nb1, nb2, nb3, offset, inplace ? 1 : 0 };
     ggml_set_op_params(result, params, sizeof(params));
 
@@ -3443,7 +3455,7 @@ static struct ggml_tensor * ggml_mul_mat_id_impl(
     GGML_ASSERT(as->ne[0] == b->ne[0]); // can_mul_mat
     GGML_ASSERT(ids->ne[0] % b->ne[1] == 0); // can broadcast
 
-    // the SwiGLU epilogue consumes the rows of as in pairs and writes one F16 row per pair
+
     const bool swiglu = epilogue == GGML_MUL_MAT_ID_EPILOGUE_SWIGLU;
     GGML_ASSERT(!swiglu || as->ne[1] % 2 == 0);
 
@@ -3456,10 +3468,10 @@ static struct ggml_tensor * ggml_mul_mat_id_impl(
     result->src[2] = ids;
 
     if (swiglu) {
-        // op_params[3] is the src1 precision, [4] the expert offset, [5] the expert parallel flag
-        // and [6] the global expert count, so the epilogue takes the next free slot; [8], [9] and
-        // [10] are the layer, the device and the assignment table of the expert map
-        // (ggml_mul_mat_id_set_layer / _device / _assignment)
+
+
+
+
         ggml_set_op_params_i32(result, 7, (int32_t) epilogue);
     }
 
@@ -3483,7 +3495,7 @@ struct ggml_tensor * ggml_mul_mat_id_swiglu(
 }
 
 int32_t ggml_mul_mat_id_get_epilogue(const struct ggml_tensor * a) {
-    // the fused kernels read the epilogue from a downstream node, which has none
+
     if (a->op != GGML_OP_MUL_MAT_ID) {
         return GGML_MUL_MAT_ID_EPILOGUE_NONE;
     }
@@ -3496,7 +3508,7 @@ void ggml_mul_mat_id_set_expert_parallel(struct ggml_tensor * a, bool enabled) {
 }
 
 bool ggml_mul_mat_id_is_expert_parallel(const struct ggml_tensor * a) {
-    // the fused kernels read the state from a downstream node, which has no expert parallel state
+
     if (a->op != GGML_OP_MUL_MAT_ID) {
         return false;
     }
@@ -3509,7 +3521,7 @@ void ggml_mul_mat_id_set_expert_offset(struct ggml_tensor * a, int32_t expert_of
 }
 
 int32_t ggml_mul_mat_id_get_expert_offset(const struct ggml_tensor * a) {
-    // the fused kernels read the offset from a downstream node, which has no expert offset
+
     if (a->op != GGML_OP_MUL_MAT_ID) {
         return 0;
     }
@@ -3522,14 +3534,14 @@ void ggml_mul_mat_id_set_n_expert_total(struct ggml_tensor * a, int32_t n_expert
 }
 
 int32_t ggml_mul_mat_id_get_n_expert_total(const struct ggml_tensor * a) {
-    // the fused kernels read the state from a downstream node, which has no expert parallel state
+
     if (a->op != GGML_OP_MUL_MAT_ID) {
         return 0;
     }
     return ggml_get_op_params_i32(a, 6);
 }
 
-// op_params[7] is the epilogue, so the expert map selectors take the two slots after it
+
 void ggml_mul_mat_id_set_layer(struct ggml_tensor * a, int32_t layer) {
     GGML_ASSERT(a->op == GGML_OP_MUL_MAT_ID);
     ggml_set_op_params_i32(a, 8, layer);
@@ -4778,7 +4790,8 @@ struct ggml_tensor * ggml_conv_1d(
                 ggml_reshape_2d(ctx, im2col, im2col->ne[0], (im2col->ne[2] * im2col->ne[1])), // [N, OL, IC * K] => [N*OL, IC * K]
                 ggml_reshape_2d(ctx, a, (a->ne[0] * a->ne[1]), a->ne[2]));                    // [OC，IC, K] => [OC, IC * K]
 
-    result = ggml_reshape_3d(ctx, result, im2col->ne[1], a->ne[2], im2col->ne[2]); // [N, OC, OL]
+    result = ggml_reshape_3d(ctx, result, im2col->ne[1], im2col->ne[2], a->ne[2]); // [OC, N, OL]
+    result = ggml_cont(ctx, ggml_permute(ctx, result, 0, 2, 1, 3));                // [N, OC, OL]
 
     return result;
 }
@@ -5664,7 +5677,7 @@ struct ggml_tensor * ggml_flash_attn_ext(
         GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_I32);
         GGML_ASSERT(ggml_is_contiguous(mask));
         if (mask->type == GGML_TYPE_I32) {
-            // range mask: two [lo, hi) pairs of visible KV columns per query row
+
             GGML_ASSERT(mask->ne[0] == 4);
             GGML_ASSERT(mask->ne[1] >= q->ne[1]);
             GGML_ASSERT(max_bias == 0.0f);
@@ -6643,7 +6656,7 @@ struct ggml_tensor * ggml_lightning_indexer(
     return result;
 }
 
-// ggml_qsa_select
+
 
 struct ggml_tensor * ggml_qsa_select(
         struct ggml_context * ctx,
@@ -6680,7 +6693,7 @@ struct ggml_tensor * ggml_qsa_select(
     ggml_set_op_params_f32(result, 0, head_scale);
     ggml_set_op_params_i32(result, 1, n_top_pool);
     ggml_set_op_params_i32(result, 2, sentinel);
-    ggml_set_op_params_i32(result, 3, 0); // cells
+    ggml_set_op_params_i32(result, 3, 0);
 
     result->op     = GGML_OP_QSA_SELECT;
     result->src[0] = q;
@@ -6693,7 +6706,7 @@ struct ggml_tensor * ggml_qsa_select(
     return result;
 }
 
-// ggml_qsa_select_pool
+
 
 struct ggml_tensor * ggml_qsa_select_pool(
         struct ggml_context * ctx,
@@ -6720,9 +6733,9 @@ struct ggml_tensor * ggml_qsa_select_pool(
     ggml_set_op_params_f32(result, 0, head_scale);
     ggml_set_op_params_i32(result, 1, n_top_pool);
     ggml_set_op_params_i32(result, 2, sentinel);
-    ggml_set_op_params_i32(result, 3, 1); // pools
+    ggml_set_op_params_i32(result, 3, 1);
 
-    // the sources stay contiguous: the pool row needs no member or tail cells; pool_cells last, as for the cell rows
+
     result->op     = GGML_OP_QSA_SELECT;
     result->src[0] = q;
     result->src[1] = k;
@@ -6732,7 +6745,7 @@ struct ggml_tensor * ggml_qsa_select_pool(
     return result;
 }
 
-// ggml_qsa_expand
+
 
 struct ggml_tensor * ggml_qsa_expand(
         struct ggml_context * ctx,
@@ -6765,7 +6778,7 @@ struct ggml_tensor * ggml_qsa_expand(
     return result;
 }
 
-// ggml_qsa_attn
+
 
 struct ggml_tensor * ggml_qsa_attn(
         struct ggml_context * ctx,
@@ -6953,19 +6966,19 @@ struct ggml_tensor * ggml_dsv4_hc_post(
 
 ////////////////////////////////////////////////////////////////////////////////
 
-// ggml_seq_token_share
+
 
 void ggml_seq_token_share(int64_t T, int64_t n, int64_t j, int64_t * t0, int64_t * nj) {
     GGML_ASSERT(T >= 0);
     GGML_ASSERT(n > 0);
     GGML_ASSERT(j >= 0 && j < n);
 
-    const int64_t tp = (T + n - 1) / n; // ceil(T/n)
+    const int64_t tp = (T + n - 1) / n;
     *t0 = j * tp;
     *nj = (j < n - 1) ? tp : T - tp * (n - 1);
 }
 
-// ggml_seq_scatter
+
 
 struct ggml_tensor * ggml_seq_scatter(
         struct ggml_context * ctx,
@@ -6982,8 +6995,8 @@ struct ggml_tensor * ggml_seq_scatter(
     for (int i = 0; i < GGML_MAX_DIMS; i++) {
         ne[i] = a->ne[i];
     }
-    // this backend keeps only the [t0, t0 + n) slice of the token axis; under the meta backend
-    // the per-device node carries its own (t0, n) and this shape becomes the per-device ne
+
+
     ne[axis] = n;
 
     struct ggml_tensor * result = ggml_new_tensor(ctx, a->type, GGML_MAX_DIMS, ne);
@@ -6998,7 +7011,7 @@ struct ggml_tensor * ggml_seq_scatter(
     return result;
 }
 
-// ggml_seq_gather
+
 
 struct ggml_tensor * ggml_seq_gather(
         struct ggml_context * ctx,
@@ -7919,7 +7932,7 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
         /*.uid          =*/ 0,
-        /*.uid_prev     =*/ 0,
+        0,
     };
 
     ggml_hash_set_reset(&cgraph->visited_hash_set);
@@ -7948,7 +7961,7 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.visited_hash_set =*/ cgraph0->visited_hash_set,
         /*.order            =*/ cgraph0->order,
         /*.uid              =*/ 0,
-        /*.uid_prev         =*/ 0,
+        0,
     };
 
     return cgraph;

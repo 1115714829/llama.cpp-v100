@@ -69,8 +69,8 @@ static __global__ void k_get_rows_kq(
     }
 }
 
-// like k_get_rows_kq, but iterates QK4_NL (32 value) sub-blocks so the row size
-// only needs to be a multiple of QK4_NL, not of QK_K
+
+
 template<typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
 static __global__ void k_get_rows_kq32(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
@@ -479,7 +479,6 @@ static void ggml_cuda_get_rows_switch_src0_type(
             break;
         default:
             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
-            break;
     }
 }
 
@@ -508,7 +507,6 @@ void get_rows_cuda(
             break;
         default:
             GGML_ABORT("%s: unsupported dst type: %s\n", __func__, ggml_type_name(dst_type));
-            break;
     }
 }
 

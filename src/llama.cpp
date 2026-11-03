@@ -155,10 +155,10 @@ int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
-// the devices llama uses when no explicit device list is given: RPC servers first, then
-// discrete GPUs, integrated GPUs only when no discrete GPU exists. Same selection as the
-// model load applies, exposed so callers that need to know where a model will run (e.g.
-// the speculative draft params) can match it without duplicating the rules.
+
+
+
+
 std::vector<ggml_backend_dev_t> llama_default_devices() {
     std::vector<ggml_backend_dev_t> rpc_servers;
     std::vector<ggml_backend_dev_t> gpus;

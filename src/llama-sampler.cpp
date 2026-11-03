@@ -1086,6 +1086,12 @@ static void llama_sampler_greedy_backend_apply(
     struct ggml_tensor * curl = ggml_argmax(ctx, logits);
     ggml_set_name(curl, "greedy_argmax");
 
+    if (data->candidates != nullptr) {
+        struct ggml_tensor * candidates = ggml_reshape_2d(ctx, data->candidates, 1, ggml_nelements(data->candidates));
+        curl = ggml_get_rows(ctx, candidates, curl);
+        ggml_set_name(curl, "greedy_sampled_token");
+    }
+
     data->sampled = curl;
 }
 
@@ -1423,7 +1429,7 @@ float llama_sampler_dist_draw_u(struct llama_sampler * smpl) {
 
     auto * ctx = (llama_sampler_dist *) smpl->ctx;
 
-    // mt19937 has 32-bit output; take the top 24 bits so the result is in [0, 1)
+
     return (float) (ctx->rng() >> 8) * (1.0f / 16777216.0f);
 }
 

@@ -20,6 +20,9 @@ struct ggml_tensor;
 struct llama_cparams;
 struct llama_layer;
 struct llama_prec_policy;
+struct llama_hadamard;
+
+class llama_moe_cache;
 
 struct llama_memory_context_i;
 
@@ -60,6 +63,7 @@ enum llm_ffn_op_type : int {
     LLM_FFN_RELU_SQR,
     LLM_FFN_SWIGLU,
     LLM_FFN_GEGLU,
+    LLM_FFN_GEGLU_ERF,
     LLM_FFN_REGLU,
     LLM_FFN_SWIGLU_OAI_MOE,
     LLM_FFN_SITU,           // kimi-k3
@@ -110,10 +114,10 @@ public:
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
-    // prepare the private data of this input for the given ubatch, before the graph is run
-    //   this may read from the disk or the network, so it is called before the previous graph is
-    //   synchronized: the work then overlaps with the computation of the previous ubatch
-    //   it must not write the input tensors, that is the job of set_input()
+
+
+
+
     virtual void prepare(const llama_ubatch * ubatch) {
         GGML_UNUSED(ubatch);
     }
@@ -154,10 +158,10 @@ public:
     const int64_t n_embd = 0;
 };
 
-// similar to llm_graph_input_embd but with an additional hidden state input
+// similar to llm_graph_input_embd but with an additional hidden state input, fed from ubatch.embd_state
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:
-    llm_graph_input_embd_h(int64_t n_embd) : n_embd(n_embd) {}
+    llm_graph_input_embd_h(int64_t n_embd, int64_t n_embd_state) : n_embd(n_embd), n_embd_state(n_embd_state) {}
     virtual ~llm_graph_input_embd_h() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -166,23 +170,32 @@ public:
 
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
-    ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch]
 
-    // r-mtpdev: device path, the h rows are gathered from the target sink in the graph. h is not
-    // created then and the column of each row is an input
+
+
+
+    ggml_tensor * mixed_tokens = nullptr; // I32 [n_tok_rows], ids of the token rows
+    ggml_tensor * mixed_slots  = nullptr; // I64 [n_tok_rows], batch index of the token rows
+    ggml_tensor * mixed_embd   = nullptr; // F32 [n_embd, n_batch], embd rows, token rows are overwritten
+
+
+
     ggml_tensor * h_cols = nullptr;       // I32 [n_batch]
-    const int32_t * h_cols_src = nullptr; // host values for h_cols
+    const int32_t * h_cols_src = nullptr;
 
-    // dchain: tokens is a view of the device draft ring (written by the previous draft step), so
-    // set_input does not copy the host tokens
+
+
     bool tokens_device = false;
 
-    const int64_t n_embd = 0;
+    const int64_t n_embd       = 0;
+    const int64_t n_embd_state = 0;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
-    llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
+    llm_graph_input_pos(uint32_t n_pos_per_embd, llama_rope_section_order rope_section_order = LLAMA_ROPE_SECTION_ORDER_TYXZ)
+        : n_pos_per_embd(n_pos_per_embd), rope_section_order(rope_section_order) {}
     virtual ~llm_graph_input_pos() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -192,6 +205,7 @@ public:
     ggml_tensor * pos = nullptr; // I32 [n_batch]
 
     const uint32_t n_pos_per_embd = 1;
+    const llama_rope_section_order rope_section_order = LLAMA_ROPE_SECTION_ORDER_TYXZ;
 };
 
 // temperature tuning, used by llama4
@@ -332,11 +346,11 @@ public:
     ggml_tensor * get_kq_mask()     const { return self_kq_mask_cnv; }
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
 
-    // n_tokens == n_batch
-    ggml_tensor * self_kq_mask         = nullptr; // F32/F16 [n_tokens, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_tokens, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_tokens, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_tokens, n_batch/n_stream, 1, n_stream]
+    // n_tokens == n_batch, n_kv == n_tokens padded to 256
+    ggml_tensor * self_kq_mask         = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_cnv     = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_swa_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -375,8 +389,8 @@ public:
                                               // or I32 [4, n_batch/n_stream, 1, n_stream] range mask
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
-    // whether the graph was built with a range mask allowed, and the n_kv it was built with
-    // note: the range mask shape does not carry n_kv, so it has to be compared separately on reuse
+
+
     bool     allow_range = false;
     uint32_t n_kv_graph  = 0;
 
@@ -450,7 +464,7 @@ public:
     ggml_tensor * get_kq_mask_mla() const { return self_kq_mask_mla_cnv; }
     ggml_tensor * get_kq_mask_lid() const { return self_kq_mask_lid; }
 
-    // the rotation matrix of the indexer cache for layer il
+
     ggml_tensor * get_k_rot_lid(int32_t il) const;
 
     ggml_tensor * self_k_idxs_mla = nullptr; // I64 [n_batch]
@@ -614,7 +628,7 @@ public:
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
-    // the rotation matrix of the raw cache for layer il
+
     ggml_tensor * get_k_rot(int32_t il) const;
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
@@ -663,7 +677,7 @@ public:
     const comp_input & get_hca() const { return inp_hca; }
     const comp_input & get_lid() const { return inp_lid; }
 
-    // rotation matrices of the compressed K caches for layer il
+
     ggml_tensor * get_csa_k_rot(int32_t il) const;
     ggml_tensor * get_hca_k_rot(int32_t il) const;
     ggml_tensor * get_lid_k_rot(int32_t il) const;
@@ -822,8 +836,11 @@ struct llm_graph_params {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_moe_cache        * moe_cache;
 
     const llama_prec_policy * prec_policy = nullptr;
+
+    const llama_hadamard * hdmd = nullptr;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -848,33 +865,33 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
-    // DFlash2 device feature sink, see llama_enable_layer_inp_sink
-    ggml_tensor * t_layer_inp_sink = nullptr;    // target: sink written by this graph
-    ggml_tensor * t_embd_src       = nullptr;    // draft: staging sink read by the injection graph
-    std::vector<uint32_t> layer_inp_sink_layers; // target: row order within the sink
-    size_t token_offset = 0;                     // target: first sink column written by this ubatch
 
-    // r-mtpdev device sink for the nextn hidden state
-    ggml_tensor * t_h_sink      = nullptr;       // both: the local sink, written by this graph
-    ggml_tensor * t_embd_h_src  = nullptr;       // draft: sink read in place by the mtp graph
-    const int32_t * h_src_cols  = nullptr;       // draft: sink column of each h row, host side
-    size_t h_token_offset = 0;                   // draft: first sink column written by this ubatch
-    bool h_sink_is_target = false;               // true: the local sink is the target h sink
-    bool h_sink_write = true;                    // false: this graph does not write the sink
+    ggml_tensor * t_layer_inp_sink = nullptr;
+    ggml_tensor * t_embd_src       = nullptr;
+    std::vector<uint32_t> layer_inp_sink_layers;
+    size_t token_offset = 0;
 
-    // 6-card FA assist: whether this ubatch marks the FA nodes as shareable (see qwen35). The
-    // marked/unmarked nodes are different graphs, so reuse must not cross this flag
+
+    ggml_tensor * t_h_sink      = nullptr;
+    ggml_tensor * t_embd_h_src  = nullptr;
+    const int32_t * h_src_cols  = nullptr;
+    size_t h_token_offset = 0;
+    bool h_sink_is_target = false;
+    bool h_sink_write = true;
+
+
+
     bool fa_assist = false;
 
-    // MTP catch-up builds only the subgraph that produces the K/V cache writes (n_outputs == 0).
-    // A kv-only graph and a full-layer graph have different topologies, so reuse must not cross
-    // this flag. Only the MTP context can set it, all other contexts leave it false
+
+
+
     bool mtp_kv_only = false;
 
-    // dchain: MTP draft token ring (llama_draft_ring_enable). A draft step reads its input tokens
-    // from the ring and writes the argmax of its logits back into it; with draft_ring_ptop the
-    // graph also outputs the probability of that argmax over the top 10 (for the p_min gate)
-    ggml_tensor * t_draft_ring    = nullptr;  // draft: I32 [n_seq_max], MIRRORED on a meta device
+
+
+
+    ggml_tensor * t_draft_ring    = nullptr;
     bool          draft_ring_ptop = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
@@ -892,7 +909,8 @@ struct llm_graph_params {
                 (!ubatch.token && !other.ubatch.token) ||
                 (!ubatch.embd  && !other.ubatch.embd)  ||
                 (ubatch.token && other.ubatch.token && ubatch.embd && other.ubatch.embd)
-            );
+            ) &&
+            (!ubatch.embd_state == !other.ubatch.embd_state);
 
         // when we split the batch using "equal_seqs" we have to verify that the participating sequences are the same
         //   the reason is because the set of attention streams would be different for different sequences
@@ -1007,6 +1025,10 @@ public:
 
     void add_fused_node(llm_graph_fused_node result);
 
+    // Hadamard-transformed activations, keyed by (input, rotation): folded weights that read the same activation share one transform
+    ggml_tensor * get_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot) const;
+    void          set_hdmd_input(const ggml_tensor * cur, const ggml_tensor * rot, ggml_tensor * res);
+
     const std::vector<llm_graph_fused_node> & get_fused_nodes() const { return fused_nodes; }
 
     void set_params(const llm_graph_params & params);
@@ -1019,13 +1041,13 @@ public:
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
-    // top-k logits output (llama_set_logits_topk): [1, k, n_shards, n_outputs] logits and
-    // [k, n_shards, n_outputs] ids local to their vocab shard
+
+
     ggml_tensor * t_logits_topk     = nullptr;
     ggml_tensor * t_logits_topk_ids = nullptr;
 
-    // dchain: MTP draft ring outputs of a draft step, [1, n_outputs]: the argmax token of every row
-    // (global ids, also written into the ring) and, with draft_ring_ptop, its probability over the top 10
+
+
     ggml_tensor * t_draft_top1 = nullptr;
     ggml_tensor * t_draft_ptop = nullptr;
 
@@ -1038,6 +1060,8 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
+
+    std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hdmd_inputs;
 
     ggml_context_ptr ctx_compute;
 
@@ -1118,8 +1142,11 @@ struct llm_graph_context {
     const llama_adapter_loras    * loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
+    const llama_moe_cache        * moe_cache;
 
     const llama_prec_policy * prec_policy;
+
+    const llama_hadamard * hdmd;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1127,21 +1154,21 @@ struct llm_graph_context {
 
     llm_graph_result * res;
 
-    // DFlash2 device feature sink, copied from the graph parameters
-    ggml_tensor * const t_layer_inp_sink;    // target: sink written by this graph
-    ggml_tensor * const t_embd_src;          // draft: staging sink read by the injection graph
+
+    ggml_tensor * const t_layer_inp_sink;
+    ggml_tensor * const t_embd_src;
     const std::vector<uint32_t> layer_inp_sink_layers;
-    const size_t token_offset;               // target: first sink column written by this ubatch
-    ggml_tensor * const t_h_sink;            // r-mtpdev: the local nextn sink written by this graph
-    ggml_tensor * const t_embd_h_src;        // r-mtpdev draft: nextn sink read in place
-    const int32_t * const h_src_cols;        // r-mtpdev draft: sink column of each h row
-    const size_t h_token_offset;             // r-mtpdev draft: first sink column written by this ubatch
-    const bool h_sink_is_target;             // r-mtpdev: true when the local sink is the target h sink
-    const bool h_sink_write;                 // r-mtpdev: false when this graph skips the sink write
-    const bool fa_assist;                    // mark the FA nodes for the 6-card assist path
-    const bool mtp_kv_only;                  // MTP catch-up: build only the K/V subgraph
-    ggml_tensor * const t_draft_ring;        // dchain draft: device token ring read and written by the MTP graph
-    const bool draft_ring_ptop;              // dchain draft: also output the probability of the argmax
+    const size_t token_offset;
+    ggml_tensor * const t_h_sink;
+    ggml_tensor * const t_embd_h_src;
+    const int32_t * const h_src_cols;
+    const size_t h_token_offset;
+    const bool h_sink_is_target;
+    const bool h_sink_write;
+    const bool fa_assist;
+    const bool mtp_kv_only;
+    ggml_tensor * const t_draft_ring;
+    const bool draft_ring_ptop;
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
@@ -1151,6 +1178,16 @@ struct llm_graph_context {
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
 
+    // true when the last layer must be narrowed to the output rows before the nextn hidden state is captured
+    bool crop_before_nextn(const ggml_tensor * inp_out_ids) const {
+        return inp_out_ids != nullptr && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+    }
+
+    // true when the nextn hidden state must be narrowed to the output rows after it is captured
+    bool crop_after_nextn(const ggml_tensor * inp_out_ids) const {
+        return inp_out_ids != nullptr && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+    }
+
     //
     // common
     //
@@ -1159,6 +1196,11 @@ struct llm_graph_context {
              ggml_tensor * cur,
                      int   il) const;
 
+    // apply the activation-side transform of a Hadamard-folded weight, if any
+    ggml_tensor * build_hadamard_input(
+              ggml_tensor * w,
+              ggml_tensor * cur) const;
+
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
               ggml_tensor * w,
@@ -1166,11 +1208,13 @@ struct llm_graph_context {
               ggml_tensor * w_s = nullptr) const;
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
+    // if slots is set, the experts are read from the MoE cache at these slots (see build_moe_cache_slots)
     ggml_tensor * build_lora_mm_id(
               ggml_tensor * w,   // ggml_tensor * as
               ggml_tensor * cur, // ggml_tensor * b
               ggml_tensor * ids,
-              ggml_tensor * w_s = nullptr) const;
+              ggml_tensor * w_s   = nullptr,
+              ggml_tensor * slots = nullptr) const;
 
     ggml_tensor * build_norm(
              ggml_tensor * cur,
@@ -1269,6 +1313,15 @@ struct llm_graph_context {
              ggml_tensor * selected_experts_in = nullptr,
              bool gate_up_swiglu = false) const;
 
+    // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
+    ggml_tensor * build_moe_cache_slots(
+             ggml_tensor * selected_experts,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+             ggml_tensor * gate_up_exps,
+                     int   il) const;
+
     //
     // inputs
     //
@@ -1318,7 +1371,7 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
-    // range_mask: see build_inp_mem_hybrid
+
     llm_graph_input_attn_kv * build_attn_inp_kv(bool range_mask = false) const;
 
     ggml_tensor * build_attn(
@@ -1468,8 +1521,8 @@ struct llm_graph_context {
     // hybrid
     //
 
-    // range_mask: the model feeds the attention mask to ggml_flash_attn_ext only (build_attn), so a
-    // causal ubatch with one sequence per stream may use an I32 [lo, hi) range mask instead of the dense mask
+
+
     llm_graph_input_mem_hybrid * build_inp_mem_hybrid(bool range_mask = false) const;
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
@@ -1485,6 +1538,12 @@ struct llm_graph_context {
             ggml_tensor * cls_out,
             ggml_tensor * cls_out_b,
             ggml_tensor * cls_norm) const;
+
+    //
+    // logits
+    //
+
+    void build_logits() const;
 
     //
     // sampling (backend sampling)
@@ -1503,18 +1562,18 @@ struct llm_graph_context {
             ggml_tensor * dense_2_b,
             ggml_tensor * dense_3) const;
 
-    //
-    // DFlash2 device feature sink
-    //
 
-    // append copies of the extracted layer inputs into the device sink (target side, no-op when not enabled)
+
+
+
+
     void build_layer_inp_sink() const;
 
-    //
-    // r-mtpdev device nextn sink
-    //
 
-    // append a copy of the nextn hidden state into the device sink (no-op when not enabled)
+
+
+
+
     void build_h_nextn_sink() const;
 };
 

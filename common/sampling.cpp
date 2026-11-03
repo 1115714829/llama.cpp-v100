@@ -171,7 +171,7 @@ struct common_sampler {
 
     mutable int64_t t_total_us = 0;
 
-    // number of tokens the logit bias bans (-INFINITY, e.g. ignore_eos), -1 if a bias is finite
+
     int32_t n_logit_bans = 0;
 };
 
@@ -412,6 +412,14 @@ struct common_sampler * common_sampler_init(
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
         } else {
             // default: sample from distribution
+            // upstream 0.7.0 (#29797) picks the greedy sampler here when the chain ends with the
+            // temperature sampler at T = 0 (or with the top-k sampler at top_k = 1). We keep the
+            // 2.0.1.1 behavior: the chain always ends with "dist". Two reasons:
+            //   - the user visible default does not change without the user's decision (the
+            //     change is listed in the default value list of the merge)
+            //   - our own T = 0 greedy verification path (common_sampler_can_greedy_topk) and the
+            //     sparse rejection path both require the last sampler of the chain to be "dist";
+            //     a "greedy" tail would silently switch our verification path off
             samplers.push_back(llama_sampler_init_dist(params.seed));
         }
     } else if (params.mirostat == 1) {
@@ -605,6 +613,7 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
         LOG_INF("%s:       total time = %10.2f ms / %5d tokens\n", __func__, (t_end_ms - data.t_start_ms), (data.n_p_eval + data.n_eval));
         LOG_INF("%s: unaccounted time = %10.2f ms / %5.1f %%      (total - sampling - prompt eval - eval) / (total)\n", __func__, t_unacc_ms, t_unacc_pc);
         LOG_INF("%s:    graphs reused = %10d\n", __func__, data.n_reused);
+        LOG_INF("%s:   graph reallocs = %10d    / %5d        (same size) / (changed size)\n", __func__, data.n_reallocs_same, data.n_reallocs_diff);
 
         common_memory_breakdown_print(ctx);
     }
@@ -872,10 +881,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
 }
 
-// rejection sampling
+
 
 static bool common_sampler_name_is(const char * name, const char * base) {
-    // backend samplers carry a '+' or '-' support prefix
+
     if (name[0] == '+' || name[0] == '-') {
         name++;
     }
@@ -883,16 +892,16 @@ static bool common_sampler_name_is(const char * name, const char * base) {
     return strcmp(name, base) == 0;
 }
 
-// the device top-k output of the verification selects its candidates per vocab shard; larger rows
-// lose the benefit of the sparse rejection, so only the first buckets of llama_set_logits_topk
-// (64, 128, 256, ...) are admitted
+
+
+
 static const int32_t COMMON_SPARSE_K_MAX = 256;
 
-// number of candidates the penalties sampler of the chain adds: the whole penalty window is
-// reserved, since the sampler lowers the logits of at most penalty_last_n distinct tokens; the
-// count must not depend on the current window state because llama_set_logits_topk is set once per
-// request while the window keeps sliding. -1 if the sampler can raise a logit (a repeat penalty
-// with a factor != 1 or a negative presence/frequency penalty)
+
+
+
+
+
 static int32_t common_sampler_sparse_n_penalized(const struct common_sampler * gsmpl) {
     struct llama_sampler * chain = gsmpl->chain;
     const int32_t n = llama_sampler_chain_n(chain);
@@ -924,12 +933,12 @@ bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl) {
         return false;
     }
 
-    // the rejection path draws from the host dist RNG, which is not used with backend sampling
+
     if (params.backend_sampling) {
         return false;
     }
 
-    // the sparse rows come from the top_k sampler of the chain
+
     if (params.top_k <= 0 || params.top_k > 64) {
         return false;
     }
@@ -955,10 +964,10 @@ bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl) {
         return false;
     }
 
-    // before top-k only no-op samplers, a logit bias that only bans tokens (e.g. ignore_eos) and
-    // penalties that only lower the logits of the tokens they have seen are allowed; the sparse
-    // rows then hold top_k + n_bans + n_penalized candidates, so that the banned and penalized
-    // ones can drop out when the chain is replayed over them
+
+
+
+
     for (int32_t i = 0; i < i_top_k; ++i) {
         const char * name = llama_sampler_name(llama_sampler_chain_get(chain, i));
         if (name[0] == '?') {
@@ -973,8 +982,8 @@ bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl) {
         return false;
     }
 
-    // after top-k only truncation and temperature samplers are allowed; this rejects
-    // penalties, DRY, logit bias, top-n-sigma, typical, XTC, mirostat, infill, etc.
+
+
     for (int32_t i = i_top_k + 1; i < n - 1; ++i) {
         const char * name = llama_sampler_name(llama_sampler_chain_get(chain, i));
         if (name[0] == '?') {
@@ -1009,8 +1018,8 @@ bool common_sampler_can_greedy_topk(const struct common_sampler * gsmpl) {
 
     const auto & params = gsmpl->params;
 
-    // greedy only: at T > 0 the sparse rejection path applies. a dynamic temperature range makes the
-    // temp sampler sample even at T = 0, and n_probs needs the full rows
+
+
     if (params.temp > 0.0f || params.n_probs != 0 || params.dynatemp_range != 0.0f || params.mirostat != 0) {
         return false;
     }
@@ -1029,9 +1038,9 @@ bool common_sampler_can_greedy_topk(const struct common_sampler * gsmpl) {
         return false;
     }
 
-    // before dist: no-op samplers, a ban-only logit bias, penalties that only lower the logits of the
-    // tokens they have seen, truncations that keep the maximum and the (greedy) temperature. anything
-    // that can rewrite or drop the maximum (dry, typical, xtc, infill, ...) needs the full row
+
+
+
     for (int32_t i = 0; i < n - 1; ++i) {
         const char * name = llama_sampler_name(llama_sampler_chain_get(chain, i));
         if (name[0] == '?') {
@@ -1057,8 +1066,8 @@ bool common_sampler_can_greedy_topk(const struct common_sampler * gsmpl) {
         return false;
     }
 
-    // the graph selects at least 64 candidates per shard (llama_set_logits_topk); a ban or a penalty
-    // can push the maximum past that many raw candidates only if there are that many of them
+
+
     const int64_t k = 1 + gsmpl->n_logit_bans + n_penalized;
     if (k > 64) {
         return false;
@@ -1078,7 +1087,7 @@ int32_t common_sampler_greedy_topk_k(const struct common_sampler * gsmpl) {
     return 1 + gsmpl->n_logit_bans + n_penalized;
 }
 
-// dchain: the argmax of one row from its top-k candidates, see common_sampler_greedy_topk_and_accept_n
+
 static llama_token common_sampler_sample_greedy_topk(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
     const auto tm = gsmpl->tm();
 
@@ -1095,8 +1104,8 @@ static llama_token common_sampler_sample_greedy_topk(struct common_sampler * gsm
         cur[i] = llama_token_data{topk_ids[i], topk_logits[i], 0.0f};
     }
 
-    // the full row visits the ids in ascending order and the temp sampler keeps the first maximum, so
-    // among equal logits the smallest id wins: order the candidates so that the same one comes first
+
+
     std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
         return a.logit != b.logit ? a.logit > b.logit : a.id < b.id;
     });
@@ -1230,7 +1239,7 @@ std::vector<llama_token> common_sampler_reject_core(
             continue;
         }
 
-        // rejected: resample from the normalized relu(p - q); only the p support can have a positive residual
+
         std::vector<llama_token> r_ids;
         std::vector<float>       r_probs;
         r_ids.reserve(p.ids.size());
@@ -1247,22 +1256,22 @@ std::vector<llama_token> common_sampler_reject_core(
         if (z > 0.0f) {
             result.push_back(common_sampler_sparse_sample(r_ids, r_probs, uniform, uniform_data));
         } else {
-            // numerical fallback, should not happen for valid distributions
+
             result.push_back(common_sampler_sparse_sample(p.ids, p.probs, uniform, uniform_data));
         }
 
         return result;
     }
 
-    // all draft tokens accepted: bonus token from the last p row
+
     const auto & p_last = p_rows.back();
     result.push_back(common_sampler_sparse_sample(p_last.ids, p_last.probs, uniform, uniform_data));
 
     return result;
 }
 
-// top-k logits of the idx-th row of ctx, replayed through the sampler chain to get p
-// the chain may be a clone of the one of gsmpl, advanced with the draft tokens accepted before the row
+
+
 static common_sampler_sparse_probs common_sampler_sparse_p(
         struct llama_sampler * chain,
         struct llama_context * ctx,
@@ -1270,7 +1279,7 @@ static common_sampler_sparse_probs common_sampler_sparse_p(
         int32_t k) {
     std::vector<llama_token_data> cur;
 
-    // with the top-k logits output the row holds a superset of its top k candidates
+
     const llama_token * topk_ids    = nullptr;
     const float       * topk_logits = nullptr;
     const int32_t n_topk = llama_get_logits_topk_ith(ctx, idx, &topk_ids, &topk_logits);
@@ -1281,7 +1290,7 @@ static common_sampler_sparse_probs common_sampler_sparse_p(
             cur[i] = llama_token_data{topk_ids[i], topk_logits[i], 0.0f};
         }
 
-        // top-k with a deterministic tie break (logit desc, id asc)
+
         std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
             return a.logit != b.logit ? a.logit > b.logit : a.id < b.id;
         });
@@ -1295,15 +1304,15 @@ static common_sampler_sparse_probs common_sampler_sparse_p(
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
         GGML_ASSERT(k > 0 && k <= n_vocab);
 
-        // the same top-k in one pass over the row: the ids are visited in ascending order, so once k
-        // candidates are kept a later id only enters with a logit strictly greater than the k-th one
+
+
         cur.reserve(k + 1);
         for (llama_token id = 0; id < n_vocab; ++id) {
             const float logit = logits[id];
             if ((int32_t) cur.size() == k && !(logit > cur.back().logit)) {
                 continue;
             }
-            // after the kept candidates with a logit >= this one
+
             const auto it = std::upper_bound(cur.begin(), cur.end(), logit,
                     [](float l, const llama_token_data & t) { return l > t.logit; });
             cur.insert(it, llama_token_data{id, logit, 0.0f});
@@ -1315,14 +1324,14 @@ static common_sampler_sparse_probs common_sampler_sparse_p(
 
     llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
 
-    // replay the chain without the final dist sampler
+
     const int32_t n = llama_sampler_chain_n(chain);
     for (int32_t i = 0; i < n - 1; ++i) {
         llama_sampler_apply(llama_sampler_chain_get(chain, i), &cur_p);
     }
     GGML_ASSERT(cur_p.size > 0);
 
-    // softmax; the temperature is already applied by the chain
+
     common_sampler_sparse_probs res;
     res.ids.reserve(cur_p.size);
     res.probs.reserve(cur_p.size);
@@ -1364,9 +1373,9 @@ std::vector<llama_token> common_sampler_reject_and_accept_n(
 
     const int32_t k = common_sampler_sparse_k(gsmpl);
 
-    // penalties depend on the tokens accepted before a row, so with penalties in the chain replay
-    // the rows on a clone advanced with draft[0..i-1] like the sequential path does; without
-    // penalties no clone is needed and the chain is stateless within the round
+
+
+
     struct llama_sampler * chain_draft = nullptr;
     if (!draft.empty() && common_sampler_sparse_n_penalized(gsmpl) > 0) {
         chain_draft = llama_sampler_clone(gsmpl->chain);
@@ -1597,4 +1606,42 @@ std::vector<common_sampler_type> common_sampler_types_from_chars(const std::stri
     }
 
     return samplers;
+}
+
+void common_sampling_add_preserved_tokens(common_params_sampling & sampling, const llama_vocab * vocab, const std::vector<std::string> & tokens) {
+    GGML_ASSERT(vocab != nullptr);
+    for (const auto & t : tokens) {
+        auto ids = common_tokenize(vocab, t, false, true);
+        if (ids.size() == 1) {
+            sampling.preserved_tokens.insert(ids[0]);
+        }
+    }
+}
+
+void common_sampling_add_grammar_triggers(common_params_sampling & sampling, const llama_vocab * vocab, std::vector<common_grammar_trigger> triggers) {
+    GGML_ASSERT(vocab != nullptr);
+    for (auto & trigger : triggers) {
+        if (trigger.type == COMMON_GRAMMAR_TRIGGER_TYPE_WORD) {
+            const auto & word = trigger.value;
+            auto ids = common_tokenize(vocab, word, false, true);
+            if (ids.size() == 1) {
+                auto token = ids[0];
+                if (std::find(sampling.preserved_tokens.begin(), sampling.preserved_tokens.end(), (llama_token) token) == sampling.preserved_tokens.end()) {
+                    throw std::runtime_error("Grammar trigger word should be marked as preserved token: " + word);
+                }
+                common_grammar_trigger token_trigger;
+                token_trigger.type  = COMMON_GRAMMAR_TRIGGER_TYPE_TOKEN;
+                token_trigger.value = word;
+                token_trigger.token = token;
+                sampling.grammar_triggers.push_back(std::move(token_trigger));
+            } else {
+                sampling.grammar_triggers.push_back({COMMON_GRAMMAR_TRIGGER_TYPE_WORD, word});
+            }
+        } else {
+            sampling.grammar_triggers.push_back(std::move(trigger));
+        }
+    }
+    if (sampling.grammar_lazy && sampling.grammar_triggers.empty()) {
+        throw std::runtime_error("Error: no triggers set for lazy grammar!");
+    }
 }

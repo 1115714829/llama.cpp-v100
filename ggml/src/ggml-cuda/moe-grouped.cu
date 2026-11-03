@@ -40,10 +40,10 @@ MOE_GROUPED_TRAITS(GGML_TYPE_Q6_K, QK_K,  QI6_K, VDR_Q6_K_Q8_1_MMVQ, block_q6_K,
 MOE_GROUPED_TRAITS(GGML_TYPE_Q5_1, QK5_1, QI5_1, VDR_Q5_1_Q8_1_MMVQ, block_q5_1, vec_dot_q5_1_q8_1)
 MOE_GROUPED_TRAITS(GGML_TYPE_Q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ, block_q8_0, vec_dot_q8_0_q8_1)
 
-// One block handles ROWS output rows of one expert. The expert's entries are processed in
-// groups of at most CT, each group staged into shared memory. Warp w takes rows w, w+nwarps, ...
-// For a row the lane loads its weight blocks once into registers and dots them against every
-// staged entry, so the weight row is read from global memory once per group.
+
+
+
+
 template <ggml_type type, int ROWS, int CT, bool expert_store>
 __launch_bounds__(256, 1)
 static __global__ void moe_grouped_kernel(
@@ -67,8 +67,8 @@ static __global__ void moe_grouped_kernel(
         return;
     }
 
-    // Expert store: the expert base comes from the device pointer table, which may point at
-    // a VRAM slot or at the mapped host arena. Read it once per block, not per row group.
+
+
     const char * expert_base;
     if constexpr (expert_store) {
         expert_base = expert_ptrs[expert];
@@ -81,7 +81,7 @@ static __global__ void moe_grouped_kernel(
     const int nwarps = blockDim.x / 32;
     const int row0   = blockIdx.x * ROWS;
 
-    // Number of weight blocks one lane covers per iteration, and the lane's first block.
+
     constexpr int blocks_per_iter = vdr * 32 / qi;
     const int     kbx0            = lane / (qi / vdr);
     const int     kqs0            = vdr * (lane % (qi / vdr));
@@ -94,7 +94,7 @@ static __global__ void moe_grouped_kernel(
             const int e = i / nblocks_row_q8;
             const int b = i - e * nblocks_row_q8;
             const int row = ids_src1[col_start + cg + e];
-            // block_q8_1 holds a half2 union, so it is copied as raw bytes.
+
             memcpy(sh_q + e * nblocks_row_q8 + b, xq + (size_t) row * nblocks_row_q8 + b, sizeof(block_q8_1));
         }
         __syncthreads();
@@ -108,8 +108,8 @@ static __global__ void moe_grouped_kernel(
 
             float acc[CT] = {0.0f};
             for (int kbx = kbx0; kbx < nblocks_weight; kbx += blocks_per_iter) {
-                // The weight block is the same for every entry in the group, so its address is
-                // computed once and the reads hit L1 on the entries after the first.
+
+
                 const char * wb = wrow + (size_t) kbx * bs;
 #pragma unroll
                 for (int e = 0; e < CT; ++e) {
@@ -133,7 +133,7 @@ static __global__ void moe_grouped_kernel(
     }
 }
 
-// Admission predicate, also used to keep CUDA graphs enabled for this path.
+
 bool ggml_cuda_moe_grouped_mul_mat_id_supported(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -155,12 +155,12 @@ bool ggml_cuda_moe_grouped_mul_mat_id_supported(const ggml_tensor * dst, const i
         default:
             return false;
     }
-    // prefill only: the entries of one expert are staged into shared memory in groups and the
-    // weight row is read once per group; the group width follows the average columns per expert.
-    // There is no upper token bound: the kernel loops over the columns of one expert, a hot
-    // expert with more columns than the group width stays correct. Decode and verify windows
-    // (T <= MOE_GROUPED_MAX_TOKENS) stay on MMVQ: a few tokens rarely share an expert, so
-    // grouping saves no weight reads and only adds empty blocks (it measured slower than MMVQ)
+
+
+
+
+
+
     if (dst->ne[2] <= MOE_GROUPED_MAX_TOKENS) {
         return false;
     }
@@ -170,7 +170,7 @@ bool ggml_cuda_moe_grouped_mul_mat_id_supported(const ggml_tensor * dst, const i
     if (src1->nb[2] % src1->nb[1] != 0) {
         return false;
     }
-    // The activation is quantized to block_q8_1 rows; K must be a whole number of blocks.
+
     if (src1->ne[0] % QK8_1 != 0 || src1->ne[0] % ggml_blck_size(src0->type) != 0) {
         return false;
     }
@@ -180,14 +180,14 @@ bool ggml_cuda_moe_grouped_mul_mat_id_supported(const ggml_tensor * dst, const i
     if (!ggml_is_contiguous(dst) || dst->nb[1] % sizeof(float) != 0 || dst->nb[2] % sizeof(float) != 0) {
         return false;
     }
-    // The weights are read in their original GGUF layout, a repacked tensor would be misinterpreted.
+
     if (src0->extra != nullptr) {
         return false;
     }
     if (src0->ne[2] <= 0 || src0->ne[2] > 65535) {
         return false;
     }
-    // Shared memory for the decode group width must fit; the prefill width is checked at launch.
+
     const int64_t nblocks_row_q8 = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING) / QK8_1;
     if (MOE_GROUPED_CT_DECODE * nblocks_row_q8 * (int64_t) sizeof(block_q8_1) > (int64_t) ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) {
         return false;
@@ -206,7 +206,7 @@ static void moe_grouped_launch_ct(
     const dim3 grid((nrows_x + ROWS - 1) / ROWS, n_experts);
     const dim3 block(256);
 
-    // nbytes_shared depends on K, so the opt-in limit is raised on every launch rather than once.
+
 #if !defined(GGML_USE_HIP)
     CUDA_CHECK(cudaFuncSetAttribute((moe_grouped_kernel<type, ROWS, CT, expert_store>),
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int) nbytes_shared));
@@ -223,12 +223,12 @@ static void moe_grouped_launch(
         const block_q8_1 * xq, float * dst, const int64_t nrows_x, const int64_t nblocks_weight, const int64_t nblocks_row_q8,
         const int64_t nb01, const int64_t nb02, const int64_t dst_stride_col, const int n_experts, cudaStream_t stream,
         const char * const * expert_ptrs, const int64_t ncols_avg) {
-    // Decode and verify stage one group of MOE_GROUPED_CT_DECODE entries, which covers the whole
-    // routing of a small batch. Prefill stages a wider group and more output rows per block, so
-    // the weight row of an expert is read once for more of its columns and the staged activation
-    // is reused over more rows. The wider group needs more shared memory, so it is used only when
-    // it fits. A hot expert with more columns than the capacity keeps looping, so both widths
-    // stay correct. The width choice is a shared-memory capability limit, not a fallback.
+
+
+
+
+
+
     const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
     const bool prefill = ncols_avg > MOE_GROUPED_CT_DECODE &&
         (size_t) MOE_GROUPED_CT_PREFILL * nblocks_row_q8 * sizeof(block_q8_1) <= smpbo;
@@ -242,8 +242,8 @@ static void moe_grouped_launch(
     }
 }
 
-// Dispatch to the pointer-table kernel for expert store weights, to the src0 kernel otherwise.
-// The choice is made here so the kernel does not test expert_ptrs at run time.
+
+
 template <ggml_type type>
 static void moe_grouped_launch_dispatch(
         const char * vx, const int32_t * expert_bounds, const int32_t * ids_dst, const int32_t * ids_src1,
@@ -278,17 +278,17 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
 
     cudaStream_t stream = ctx.stream();
 
-    // Shared memory budget for the staged activation group (the decode width, the narrowest
-    // group). The prefill width is picked at launch time only when it fits.
+
+
     const int64_t nblocks_row_q8 = GGML_PAD(ne10, MATRIX_ROW_PADDING) / QK8_1;
     const int64_t nbytes_shared  = MOE_GROUPED_CT_DECODE * nblocks_row_q8 * (int64_t) sizeof(block_q8_1);
     if (nbytes_shared > (int64_t) ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) {
         return false;
     }
 
-    // Average columns one expert receives. The grouped kernel picks its staged-entry width from
-    // it: a small batch stays on the decode width, prefill uses the wider group. The global expert
-    // count is used under expert parallelism, where ne02 is only this device's slice.
+
+
+
     const int64_t n_experts = ggml_cuda_mul_mat_id_n_expert_density(dst);
     const int64_t ncols_avg = (ne12 * n_expert_used + n_experts - 1) / n_experts;
 
@@ -297,15 +297,15 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
     ggml_cuda_pool_alloc<int32_t> expert_fill(ctx.pool(), ne02);
 
-    // the expert map of the node: which routed id is which local expert of the weight (an expert
-    // store view addresses its weights from the view start through the pointer table the caller
-    // passes, so the ids stay view-local numbers)
+
+
+
     const ggml_cuda_expert_lut lut = ggml_cuda_mul_mat_id_lut(ctx, dst);
 
-    // M3: the weighted reduction of this node's output (moe_reduce_local_slots) reads the ids and
-    // skips the slots of the other devices itself, so nothing has to zero their rows.
+
+
     if (ggml_mul_mat_id_is_expert_parallel(dst) && ctx.moe_reduce_local_slots != dst) {
-        // the grouped kernel only writes the local entries, zero the others
+
         ggml_cuda_mmid_zero_nonlocal((float *) dst->data, (const int32_t *) ids->data, lut,
             ne12, (int) n_expert_used, dst->ne[0], ids->nb[1] / (int64_t) sizeof(int32_t),
             dst->nb[1] / sizeof(float), dst->nb[2] / sizeof(float), stream);
@@ -322,7 +322,7 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
         CUDA_CHECK(cudaGetLastError());
     }
 
-    // Quantize the flattened activation rows once, to the standard block_q8_1 used by MMVQ.
+
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne11*ne12 * ne10_padded * sizeof(block_q8_1) / QK8_1);
     {

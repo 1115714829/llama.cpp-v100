@@ -162,7 +162,7 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
-    // the buffer type of every layer that owns K/V tensors, used to place the rotation matrices
+
     std::vector<ggml_backend_buffer_type_t> layer_buft(n_layer, nullptr);
 
     for (uint32_t il = 0; il < n_layer; il++) {
@@ -286,10 +286,14 @@ llama_kv_cache::llama_kv_cache(
         n_rot_k = other->n_rot_k;
         n_rot_v = other->n_rot_v;
     } else {
-        const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
-        const bool attn_rot_disable = LLAMA_ATTN_ROT_DISABLE ? atoi(LLAMA_ATTN_ROT_DISABLE) : false;
+        // two knobs turn the same thing off: the environment variable, for the whole process, and
+        //   the model setting, for the contexts of one model - see llama_model_set_attn_rot
+        const char * env_rot_disable = getenv("LLAMA_ATTN_ROT_DISABLE");
+
+        const bool attn_rot_disable = !model.attn_rot || (env_rot_disable != nullptr && atoi(env_rot_disable) != 0);
         if (attn_rot_disable) {
-            LLAMA_LOG_WARN("%s: attention rotation force disabled (LLAMA_ATTN_ROT_DISABLE)\n", __func__);
+            LLAMA_LOG_WARN("%s: attention rotation force disabled (%s)\n", __func__,
+                    model.attn_rot ? "LLAMA_ATTN_ROT_DISABLE" : "llama_model_set_attn_rot");
         }
 
         bool attn_rot_k =
@@ -333,7 +337,7 @@ llama_kv_cache::llama_kv_cache(
     LLAMA_LOG_INFO("%s: n_rot_k = %u, n_embd_head_k_all = %d\n", __func__, n_rot_k, n_embd_head_k_all);
     LLAMA_LOG_INFO("%s: n_rot_v = %u, n_embd_head_k_all = %d\n", __func__, n_rot_v, n_embd_head_v_all);
 
-    // pre-compute the Hadamard matrices, they are kept in host memory for the upload into the K/V buffers
+
     if (n_rot_k || n_rot_v) {
         for (int64_t n = 64; n <= std::max(n_embd_head_k_all, n_embd_head_v_all); n *= 2) {
             attn_rot_hadamard[n] = std::vector<float>(n*n);
@@ -353,7 +357,7 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
-    // place the rotation matrices in the K/V buffers, so that they are not copied to the devices on every graph
+
     if (n_rot_k || n_rot_v) {
         std::map<ggml_backend_buffer_type_t, ggml_tensor *, ggml_backend_buft_comparator> k_rot_map;
         std::map<ggml_backend_buffer_type_t, ggml_tensor *, ggml_backend_buft_comparator> v_rot_map;
@@ -361,7 +365,7 @@ llama_kv_cache::llama_kv_cache(
         for (auto & layer : layers) {
             const ggml_backend_buffer_type_t buft = layer_buft[layer.il];
             if (buft == nullptr) {
-                continue; // K/V of this layer are shared with the other cache
+                continue;
             }
 
             if (n_rot_k) {
@@ -411,7 +415,7 @@ llama_kv_cache::llama_kv_cache(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
-    // the buffers above were zeroed, so the rotation matrices have to be written now
+
     upload_rot_tensors();
 
     {
@@ -439,7 +443,7 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
 
-        // the rotation matrices are stored in the same buffers
+
         upload_rot_tensors();
     }
 }
@@ -465,11 +469,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         auto & cells = v_cells[seq_to_stream[seq_id]];
         auto & head  = v_heads[seq_to_stream[seq_id]];
 
-        // a single-sequence SWA cache is written as a ring (see llama_kv_cells_ring_oldest). Removing the newest
-        // positions, but not all of them (the rejected tail of a speculative round), moves the head back to the
-        // cell of the first removed position, the first freed cell in write order: the freed cells stay one run
-        // at the head also when they straddle the end of the cell array, where the lowest freed index is not
-        // the first freed cell and would leave the others as a hole inside the window
+
+
+
+
+
         const bool ring_tail = swa_type != LLAMA_SWA_TYPE_NONE && n_seq_max == 1 && n_stream == 1 &&
                                cells.seq_n_cells(seq_id) > 0 &&
                                p0 > cells.seq_pos_min(seq_id) && p1 > cells.seq_pos_max(seq_id);
@@ -477,8 +481,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         uint32_t new_head  = cells.size();
         uint32_t ring_head = cells.size();
 
-        // collect first, as seq_rm() updates seq_pos and would invalidate the iteration (the cells come in
-        // position order)
+
+
         for (const uint32_t i : cells.seq_pos_range(seq_id, p0, p1)) {
             if (cells.seq_rm(i, seq_id)) {
                 new_head = std::min(new_head, i);
@@ -791,14 +795,12 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,
             bool embd_all) {
-    GGML_UNUSED(embd_all);
-
     do {
         balloc.split_reset();
 
         std::vector<llama_ubatch> ubatches;
         while (true) {
-            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
+            auto ubatch = n_stream == 1 ? balloc.split_simple(n_ubatch) : embd_all ? balloc.split_seq(n_ubatch) : balloc.split_equal(n_ubatch, true, 0);
 
             if (ubatch.n_tokens == 0) {
                 break;
@@ -951,8 +953,8 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
 
         // apply K-shift if needed
         if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
-            // inputs are copied to the backends asynchronously, so wait for any in-flight copies
-            // before overwriting the k_shift input
+
+
             llama_synchronize(lctx);
 
             ggml_backend_sched_reset(sched);
@@ -1370,7 +1372,7 @@ uint32_t llama_kv_cache::get_n_kv_used(const llama_kv_cells & cells) const {
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo, bool full) const {
     uint32_t result = 0;
 
-    // full: range-mask prompt ubatches always view the whole cache so that they share one n_kv and one graph
+
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
@@ -1722,14 +1724,14 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
 
                     seq_srct[seq_id] = i;
 
-                    // first mask for this sequence: compute it from scratch
-                    // read the cell arrays directly to keep this loop compact
+
+
                     const llama_pos * cell_pos = cells.pos_data();
                     const auto      * cell_seq = cells.seq_data();
 
                     const llama_pos pos_min = seq_pos_min[seq_id];
 
-                    // every used cell carries this sequence (e.g. a single sequence): a non-empty cell is enough
+
                     const bool all_seq = cells.seq_n_cells(seq_id) == cells.get_used();
 
                     for (uint32_t j = 0; j < n_kv; ++j) {
@@ -1779,7 +1781,7 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
                 }
             }
 
-            // for Alibi, or for the other tokens of the same sequence: update the cells of interest
+
             for (uint32_t jj = 0; jj < n_kv; ++jj) {
                 uint32_t j = jj;
 
@@ -1926,19 +1928,19 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 }
 
 bool llama_kv_cache::get_kq_range_reserve() const {
-    // a single sequence in causal order (see get_kq_range_ok) takes range masks for all its ubatches;
-    // a non-unified cache with one sequence per stream can do the same per stream - the unified cache,
-    // where one stream is shared by several sequences, keeps the dense mask
-    // note: ubatches that fail get_kq_range_ok (e.g. holes from a context shift) fall back to the dense
-    //       mask and grow the buffer as needed, same as for a single sequence
-    // a SWA cache (ring) takes a two-segment range mask under the conditions in get_kq_range_ok
+
+
+
+
+
+
     if (!kq_range_enabled) {
         return false;
     }
     if (swa_type != LLAMA_SWA_TYPE_NONE) {
-        // capability: only the standard trailing window on a single-sequence cache maps to a
-        // contiguous cell run (see get_kq_range_ok); other SWA types and the unified multi-sequence
-        // cache keep the dense mask. a window covering the whole ring is not a trailing window
+
+
+
         return swa_type == LLAMA_SWA_TYPE_STANDARD && n_seq_max == 1 && n_stream == 1 && n_swa < get_size();
     }
     return n_seq_max == 1 ? n_stream == 1 : n_stream == n_seq_max;
@@ -1952,19 +1954,19 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
     const bool swa = swa_type != LLAMA_SWA_TYPE_NONE;
 
     if (swa) {
-        // capability: only the standard trailing window maps to a contiguous cell run; the chunked
-        // and symmetric windows are not a single trailing interval and keep the dense mask
+
+
         if (swa_type != LLAMA_SWA_TYPE_STANDARD) {
             return false;
         }
-        // capability: the two-segment derivation is per single stream, one sequence (see
-        // get_kq_range_reserve)
+
+
         if (sinfo.n_stream() != 1 || n_seq_max != 1) {
             return false;
         }
     }
 
-    // single stream: keep the original single-stream logic, the multi-stream below scans per stream
+
     if (sinfo.n_stream() == 1) {
         if (ubatch.n_seqs_unq != 1 || ubatch.n_tokens == 0) {
             return false;
@@ -1987,19 +1989,19 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
         }
 
         if (swa) {
-            // the ring must be large enough for the whole ubatch: the window of token i reaches
-            // back n_swa cells, which must not wrap onto cells this same batch writes later (they
-            // lie at most n_tokens - 1 - i cells after the token's own cell), and the oldest cell
-            // the batch overwrites must not still be in a window. A ring of size n_swa + n_tokens
-            // satisfies both; n_swa >= cells.size() is the special case n_tokens == 1.
+
+
+
+
+
             if (n_swa + ubatch.n_tokens > cells.size()) {
                 return false;
             }
 
-            // the ring write order is the position order, with the empty cells (if any) right at the
-            // write head: a ring that has not wrapped yet, a full ring, and a full ring whose newest
-            // positions were removed (the rejected tail of a speculative round) all take the range mask,
-            // see llama_kv_cells_ring_oldest and set_input_kq_range
+
+
+
+
             return llama_kv_cells_ring_oldest(cells, v_heads[sinfo.strm[0]]) >= 0;
         }
 
@@ -2007,12 +2009,12 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
             return false;
         }
 
-        // the range [0, cell + 1) of a token equals its causal mask (see set_input_kq_mask) when the cells are in
-        // strict causal order: increasing positions, where the tokens of an image that share a position (M-RoPE)
-        // follow the order of the 2D causal mask
-        //
-        // this runs for every ubatch over all used cells: text has strictly increasing positions, which a
-        // branch-free scan checks (it vectorizes); only shared positions take the per-cell check
+
+
+
+
+
+
         const llama_pos * pos = cells.pos_data();
 
         int32_t not_increasing = 0;
@@ -2044,13 +2046,13 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
 
     const uint32_t n_stream = (uint32_t) sinfo.n_stream();
 
-    // one sequence per stream: the unified cache (a single stream shared by several sequences)
-    // keeps the dense mask
+
+
     if (n_stream == 0 || ubatch.n_seqs_unq != n_stream || ubatch.n_tokens == 0) {
         return false;
     }
 
-    // the tokens of each stream are contiguous in the ubatch (see split_equal)
+
     const uint32_t n_tps = ubatch.n_tokens/n_stream;
 
     if (n_tps == 0 || ubatch.n_tokens != n_tps*n_stream) {
@@ -2082,12 +2084,12 @@ bool llama_kv_cache::get_kq_range_ok(const slot_info & sinfo, const llama_ubatch
             return false;
         }
 
-        // the range [0, cell + 1) of a token equals its causal mask (see set_input_kq_mask) when the cells are in
-        // strict causal order: increasing positions, where the tokens of an image that share a position (M-RoPE)
-        // follow the order of the 2D causal mask
-        //
-        // this runs for every ubatch over all used cells: text has strictly increasing positions, which a
-        // branch-free scan checks (it vectorizes); only shared positions take the per-cell check
+
+
+
+
+
+
         const llama_pos * pos = cells.pos_data();
 
         int32_t not_increasing = 0;
@@ -2132,8 +2134,8 @@ void llama_kv_cache::set_input_kq_range(ggml_tensor * dst, const llama_ubatch * 
 
     const bool swa = swa_type != LLAMA_SWA_TYPE_NONE;
 
-    // non-SWA: the cells are in strict causal order (see get_kq_range_ok), so a token sees the cells
-    // up to and including its own. the second segment stays empty
+
+
     if (!swa) {
         for (uint32_t s = 0; s < n_stream; ++s) {
             for (uint32_t i = 0; i < n_tps; ++i) {
@@ -2148,21 +2150,21 @@ void llama_kv_cache::set_input_kq_range(ggml_tensor * dst, const llama_ubatch * 
         return;
     }
 
-    // SWA (ring): the visible set of a token is the window [p1 - n_swa + 1, p1]. with the write order
-    // equal to the position order (see get_kq_range_ok) that is the cells from the token's own cell
-    // back to the oldest cell still inside the window. on the ring this run wraps the cell array at
-    // most once, so it is at most two linear segments [lo0, hi0) and [lo1, hi1). the newer cells of
-    // the batch (positions > p1) lie past the token's cell and stay out of the window
+
+
+
+
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        // the cells are in the ring layout of llama_kv_cells_ring_oldest (checked by get_kq_range_ok on the
-        // same state): the cells available to a token run from the oldest cell to its own
+
+
         const int64_t oldest = llama_kv_cells_ring_oldest(cells, v_heads[sinfo.strm[s]]);
         GGML_ASSERT(oldest >= 0);
 
         for (uint32_t i = 0; i < n_tps; ++i) {
-            const uint32_t end = sinfo.idxs[s][i];       // the token's own cell, the newest in the window
+            const uint32_t end = sinfo.idxs[s][i];
 
             llama_kv_cells_ring_window(cells.size(), (uint32_t) oldest, end, n_swa, data + 4*(s*n_tps + i));
         }
@@ -2368,7 +2370,7 @@ public:
 void llm_graph_input_k_shift::set_input(const llama_ubatch * ubatch) {
     GGML_UNUSED(ubatch);
 
-    if (k_shift) {
+    if (k_shift && k_shift->buffer) {
         kv_self->set_input_k_shift(k_shift);
     }
 }
@@ -2429,7 +2431,9 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
-    GGML_UNUSED(flags);
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && swa_type == LLAMA_SWA_TYPE_NONE) {
+        return;
+    }
 
     io.write(&n_stream, sizeof(n_stream));
 
@@ -2508,7 +2512,9 @@ const slot_info_vec_t *   sinfos_in) {
         return;
     }
 
-    GGML_UNUSED(flags);
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) && swa_type == LLAMA_SWA_TYPE_NONE) {
+        return;
+    }
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
@@ -3179,8 +3185,8 @@ llama_kv_cache_context::llama_kv_cache_context(
         sinfos[0].idxs[s].resize(1, 0);
     }
 
-    // the worst-case graph takes the mask the ubatches will take: a dense mask over the whole cache
-    // would reserve n_kv*n_ubatch mask elements that a single sequence never uses
+
+
     kq_range = kv->get_kq_range_reserve();
 }
 
@@ -3224,12 +3230,12 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     kq_range = kv->get_kq_range_ok(sinfos[i_cur], ubatches[i_cur]);
-    // with a range mask an ubatch of 2+ tokens attends the whole cache: the range bounds the work (the
-    // sm70 prompt and verify kernels split by it), and the graph no longer depends on the context length,
-    // so prompt ubatches and verify batches are each built once (single-token ubatches keep the grain).
-    // bounded caches that view the whole cache saturate, but their n_kv still changes with the used-cell
-    // grain: 2+ token ubatches on them also view the whole cache so that the block graph is built once
-    // (dense mask, the extra cells are masked)
+
+
+
+
+
+
     const bool full = sinfos[i_cur].size() >= 2 && (kq_range || kv->get_view_full());
     n_kv = kv->get_n_kv(sinfos[i_cur], full);
 

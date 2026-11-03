@@ -86,12 +86,22 @@ static __global__ void quantize_q8_1(
     float sum = xi;
 
     amax = warp_reduce_max<QK8_1>(amax);
+#if !(defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 700))
     sum  = warp_reduce_sum<QK8_1>(sum);
+#endif
 
     const float  d = amax / 127.0f;
     const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
 
     y[ib].qs[iqs] = q;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 700)
+
+
+
+
+
+    sum  = warp_reduce_sum<QK8_1>((float) q);
+#endif
 
     if (iqs > 0) {
         return;
@@ -309,7 +319,7 @@ static __global__ void quantize_mmq_nvfp4(
             for (int slot = 0; slot < n_expert_used; ++slot) {
                 const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
                 if (i < 0) {
-                    continue; // expert parallelism: the entry belongs to another device
+                    continue;
                 }
                 block_fp4_mmq * yb = y + (k_block * ne1 + i);
                 uint32_t * yqs = reinterpret_cast<uint32_t *>(yb->qs);
@@ -431,7 +441,7 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
         for (int slot = 0; slot < n_expert_used; ++slot) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
             if (i < 0) {
-                continue; // expert parallelism: the entry belongs to another device
+                continue;
             }
             block_fp4_mmq * yb = y + (k_block * ne1 + i);
             char2 * yqs2 = (char2 *) yb->qs;
@@ -506,16 +516,6 @@ static __global__ void quantize_mmq_q8_1(
         amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
     }
 
-    float sum;
-    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
-        sum = xi.x + xi.y + xi.z + xi.w;
-
-        // Calculate sums across vals_per_sum/4 threads.
-#pragma unroll
-        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
-            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
-        }
-    }
 
     const float d_inv = 127.0f / amax;
     char4 q;
@@ -525,6 +525,25 @@ static __global__ void quantize_mmq_q8_1(
     q.w = roundf(xi.w*d_inv);
     const float d = 1.0f / d_inv;
 
+    float sum;
+    if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 700)
+
+
+
+
+        sum = (float) q.x + (float) q.y + (float) q.z + (float) q.w;
+#else
+        sum = xi.x + xi.y + xi.z + xi.w;
+#endif
+
+        // Calculate sums across vals_per_sum/4 threads.
+#pragma unroll
+        for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+        }
+    }
+
     // write the block once (normal) or to each of the token's compact rows (scatter)
     const int nwrite = scatter ? n_expert_used : 1;
 #pragma unroll
@@ -533,7 +552,7 @@ static __global__ void quantize_mmq_q8_1(
         if constexpr (scatter) {
             const int64_t i = ids[(int64_t) blockIdx.x * n_expert_used + slot];
             if (i < 0) {
-                continue; // expert parallelism: the entry belongs to another device
+                continue;
             }
             ib = k_block*ne1 + i;
         } else {
@@ -606,7 +625,6 @@ void quantize_mmq_q8_1_cuda(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 
@@ -636,7 +654,6 @@ void quantize_scatter_mmq_q8_1_cuda(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 

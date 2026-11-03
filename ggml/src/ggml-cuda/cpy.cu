@@ -252,7 +252,7 @@ struct cpy_batch_ptr_pair {
     char * dst;
 };
 
-// kernel arguments for cpy_scalar_batch, all copies share one indexing scheme
+
 struct cpy_batch_kernel_args {
     cpy_batch_ptr_pair pairs[CUDA_CPY_BATCH_MAX];
     int64_t ne;
@@ -681,7 +681,7 @@ bool ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, const ggml_tensor * co
         return false;
     }
 
-    // the batch kernel handles only a plain same-type F32 or F16 copy
+
     const ggml_type src_type = srcs[0]->type;
     const ggml_type dst_type = dsts[0]->type;
     const bool is_f32 = src_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F32;
@@ -690,7 +690,7 @@ bool ggml_cuda_cpy_batch(ggml_backend_cuda_context & ctx, const ggml_tensor * co
         return false;
     }
 
-    // all copies must share the layout of the first one, the kernel uses one index mapping for the whole batch
+
     const int64_t ne = ggml_nelements(srcs[0]);
     if (ne != ggml_nelements(dsts[0])) {
         return false;

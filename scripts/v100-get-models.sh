@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# 下载 V100 实测用的两个模型，并把草稿模型转成 F16：
-#   目标模型 unsloth/Qwen3.8-27B-GGUF 的 Q8_0（约 29 GB）
-#   草稿模型 z-lab/Qwen3.8-27B-DFlash2-GGUF 的 BF16（约 3.9 GB）
-# V100（sm_70）没有 BF16 硬件支持，所以草稿模型要转 F16。
-# 用法：scripts/v100-get-models.sh [-s modelscope|hf] [-d 目录] [-q llama-quantize路径] [-h]
+
+
+
+
+
 
 set -euo pipefail
 

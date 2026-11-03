@@ -5,6 +5,7 @@
 #include "common.h"
 #include "fit.h"
 #include "log.h"
+#include "speculative.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -31,6 +32,19 @@ int llama_fit_params(int argc, char ** argv) {
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+
+
+
+
+
+
+
+
+    if (cparams.n_outputs_max == 0) {
+        const auto output_limits = common_get_output_limits(params);
+        cparams.n_outputs_max         = output_limits.total;
+        cparams.n_outputs_max_per_seq = output_limits.per_seq;
+    }
 
     if (!params.fit_params_print) {
         std::vector<size_t> fit_margins = params.fit_params_target;

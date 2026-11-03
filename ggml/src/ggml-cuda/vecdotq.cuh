@@ -115,6 +115,24 @@ static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
 
+
+
+
+
+
+
+
+
+
+
+static __device__ __forceinline__ float ggml_cuda_q8_1_sum(const float2 & ds8f) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 700)
+    return ds8f.x * ds8f.y;
+#else
+    return ds8f.y;
+#endif
+}
+
 template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_impl(
     const int * v, const int * u, const float & d4, const half2 & ds8) {
 
@@ -133,7 +151,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_imp
     const float2 ds8f = __half22float2(ds8);
 
     // second part effectively subtracts 8 from each quant value
-    return d4 * (sumi * ds8f.x - (8*vdr/QI4_0) * ds8f.y);
+    return d4 * (sumi * ds8f.x - (8*vdr/QI4_0) * ggml_cuda_q8_1_sum(ds8f));
 }
 
 #define VDR_Q4_1_Q8_1_MMVQ 2
@@ -155,9 +173,19 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_imp
     }
 
 #ifdef FAST_FP16_AVAILABLE
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 700)
+
+
+
+    const float2 dm4f = __half22float2(dm4);
+    const float2 ds8f = __half22float2(ds8);
+    const float d4d8 = dm4f.x * ds8f.x;
+    const float m4s8 = dm4f.y * ggml_cuda_q8_1_sum(ds8f);
+#else
     const float2 tmp = __half22float2(__hmul2(dm4, ds8));
     const float d4d8 = tmp.x;
     const float m4s8 = tmp.y;
+#endif
 #else
     const float2 dm4f = __half22float2(dm4);
     const float2 ds8f = __half22float2(ds8);
@@ -197,7 +225,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_0_q8_1_imp
     const float2 ds8f = __half22float2(ds8);
 
     // second part effectively subtracts 16 from each quant value
-    return d5 * (sumi * ds8f.x - (16*vdr/QI5_0) * ds8f.y);
+    return d5 * (sumi * ds8f.x - (16*vdr/QI5_0) * ggml_cuda_q8_1_sum(ds8f));
 }
 
 #define VDR_Q5_1_Q8_1_MMVQ 2
@@ -226,9 +254,17 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
     }
 
 #ifdef FAST_FP16_AVAILABLE
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 700)
+
+    const float2 dm5f = __half22float2(dm5);
+    const float2 ds8f = __half22float2(ds8);
+    const float d5d8 = dm5f.x * ds8f.x;
+    const float m5s8 = dm5f.y * ggml_cuda_q8_1_sum(ds8f);
+#else
     const float2 tmp = __half22float2(__hmul2(dm5, ds8));
     const float d5d8 = tmp.x;
     const float m5s8 = tmp.y;
+#endif
 #else
     const float2 dm5f = __half22float2(dm5);
     const float2 ds8f = __half22float2(ds8);
@@ -269,9 +305,17 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_1_q8_1_imp
     }
 
 #ifdef FAST_FP16_AVAILABLE
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 700)
+
+    const float2 dm8f = __half22float2(dm8);
+    const float2 ds8f = __half22float2(ds8);
+    const float d8d8 = dm8f.x * ds8f.x;
+    const float m8s8 = dm8f.y * ggml_cuda_q8_1_sum(ds8f);
+#else
     const float2 tmp = __half22float2(__hmul2(dm8, ds8));
     const float d8d8 = tmp.x;
     const float m8s8 = tmp.y;
+#endif
 #else
     const float2 dm8f = __half22float2(dm8);
     const float2 ds8f = __half22float2(ds8);
@@ -421,8 +465,15 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
 
         if (i0/QI8_1 < ns8) {
             const float2 s8f = __half22float2(s8[i0/QI8_1]);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 700)
+
+
+            sumf_d8 -= dm2f0.y*s8f.x;
+            sumf_d8 -= dm2f1.y*s8f.y;
+#else
             sumf -= dm2f0.y*s8f.x;
             sumf -= dm2f1.y*s8f.y;
+#endif
         } else {
             int sumi_m0 = 0;
 #pragma unroll
@@ -549,7 +600,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
         const float2 ds8f = __half22float2(ds8[i]);
 
         sumf_d += ds8f.x * (sc[i] * sumi_d);
-        sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
+        sumf_m += ggml_cuda_q8_1_sum(ds8f) *   m[i]; // sum of q8_1 block * q4_K min val
     }
 
     const float2 dm4f = __half22float2(dm4);
@@ -612,7 +663,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
         const float2 ds8f = __half22float2(ds8[i]);
 
         sumf_d += ds8f.x * (sc[i] * sumi_d);
-        sumf_m += ds8f.y *   m[i]; // sum of q8_1 block * q4_K min val
+        sumf_m += ggml_cuda_q8_1_sum(ds8f) *   m[i]; // sum of q8_1 block * q4_K min val
     }
 
     const float2 dm4f = __half22float2(dm4);
@@ -1277,7 +1328,12 @@ static __device__ __forceinline__ float vec_dot_iq1_s_q8_1(
     const float  d1q   = __half2float(bq1->d) * (((qh >> 11) & 0x0E) + 1);
     const float  delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f*IQ1S_DELTA/0x8000);
     const float2 ds    = __half22float2(bq8_1[iqs].ds);
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 700)
+
+    return d1q * (ds.x*sumi + ggml_cuda_q8_1_sum(ds) * delta);
+#else
     return d1q * (ds.x*sumi + ds.y*delta);
+#endif
 }
 
 #define VDR_IQ1_M_Q8_1_MMVQ 1

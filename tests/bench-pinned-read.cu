@@ -65,7 +65,7 @@
     }                                                                                  \
 } while (0)
 
-// ---------------------------------------------------------------- sysfs / NUMA 辅助
+
 
 static std::vector<int> parse_list(const char * buf) {
     std::vector<int> ret;
@@ -92,7 +92,7 @@ static std::string read_file(const char * path) {
     return buf;
 }
 
-// 有 CPU 的在线节点（排除 POWER9 上显存对应的 250～255）
+
 static std::vector<int> host_nodes() {
     std::vector<int> ret;
     for (int node : parse_list(read_file("/sys/devices/system/node/online").c_str())) {
@@ -121,7 +121,7 @@ static int max_node() {
     return m >= 0 ? m : 1023;
 }
 
-// 节点 node 的单节点掩码；返回内核期望的 maxnode
+
 static unsigned long nodemask_one(int node, std::vector<unsigned long> & mask) {
     const int bits = 8 * (int) sizeof(unsigned long);
     mask.assign(max_node()/bits + 2, 0);
@@ -139,7 +139,7 @@ static int gpu_node(int dev) {
     return s.empty() ? -1 : atoi(s.c_str());
 }
 
-// 当前线程所在 CPU 的节点
+
 static int node_of_cpu(int cpu, const std::vector<int> & nodes) {
     for (int n : nodes) {
         cpu_set_t s;
@@ -148,7 +148,7 @@ static int node_of_cpu(int cpu, const std::vector<int> & nodes) {
     return -1;
 }
 
-// 当前线程的内存策略（get_mempolicy），返回 "default" / "bind 0,8" 等
+
 static std::string current_policy() {
     const int bits = 8 * (int) sizeof(unsigned long);
     std::vector<unsigned long> mask(max_node()/bits + 2, 0);
@@ -167,7 +167,7 @@ static std::string current_policy() {
     return std::string(name) + (nodes.empty() ? "" : " " + nodes);
 }
 
-// move_pages 抽样：返回 "0:48,8:16" 这样的节点分布；错误用 E<errno> 计（不足一页的块只查起点所在页）
+
 static std::string page_nodes(void * ptr, size_t size, int samples = 64) {
     const size_t page = (size_t) sysconf(_SC_PAGESIZE);
     const size_t n_pages = std::max<size_t>(size / page, 1);
@@ -190,7 +190,7 @@ static std::string page_nodes(void * ptr, size_t size, int samples = 64) {
     return out;
 }
 
-// 在绑到 node 的 CPU 上的新线程里跑 fn（node < 0：不绑）
+
 template <class F> static void run_on_node(int node, F && fn) {
     std::thread([&] {
         if (node >= 0) {
@@ -203,7 +203,7 @@ template <class F> static void run_on_node(int node, F && fn) {
     }).join();
 }
 
-// ---------------------------------------------------------------- 读内核与计时
+
 
 static __global__ void read_bw_kernel(const uint4 * __restrict__ src, size_t n_vec, unsigned int * __restrict__ sink) {
     const size_t tid    = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -251,7 +251,7 @@ static double median(std::vector<float> v) {
     return v[v.size() / 2];
 }
 
-// 直读：内核读 dev_ptr（主机内存的设备别名）
+
 static double bench_read_ms(gpu_ctx & g, const void * dev_ptr, size_t nbytes, int reps) {
     CK(cudaSetDevice(g.dev));
     const size_t n_vec = nbytes / sizeof(uint4);
@@ -271,7 +271,7 @@ static double bench_read_ms(gpu_ctx & g, const void * dev_ptr, size_t nbytes, in
     return median(ms);
 }
 
-// 拷贝：cudaMemcpyAsync 主机 → 显存
+
 static double bench_copy_ms(gpu_ctx & g, const void * host_ptr, size_t nbytes, int reps) {
     CK(cudaSetDevice(g.dev));
     for (int i = 0; i < 2; i++) CK(cudaMemcpyAsync(g.d_buf, host_ptr, nbytes, cudaMemcpyHostToDevice, g.stream));
@@ -287,7 +287,7 @@ static double bench_copy_ms(gpu_ctx & g, const void * host_ptr, size_t nbytes, i
     return median(ms);
 }
 
-// ---------------------------------------------------------------- 一块锁页内存的分配/填充/释放
+
 
 enum class alloc_mode { hostalloc, mallochost, register_, policy, nobind };
 
@@ -304,14 +304,14 @@ static const char * mode_name(alloc_mode m) {
 
 struct pinned_buf {
     alloc_mode mode = alloc_mode::hostalloc;
-    void * host = nullptr;   // 主机地址
-    void * dev  = nullptr;   // 设备别名
+    void * host = nullptr;
+    void * dev  = nullptr;
     size_t size = 0;
-    std::string note;        // 页面分布等说明
+    std::string note;
     bool ok = false;
 };
 
-// 分配：alloc_node = 分配/注册线程绑到的节点（<0 不绑）；dev = 当前 GPU（cudaSetDevice 在分配线程里做）
+
 static pinned_buf pinned_alloc(alloc_mode mode, int dev, size_t size, int alloc_node, int fill_node,
                                const std::vector<int> & nodes) {
     pinned_buf b;
@@ -319,7 +319,7 @@ static pinned_buf pinned_alloc(alloc_mode mode, int dev, size_t size, int alloc_
     b.size = size;
 
     auto fill = [&](void * p) {
-        // 填充线程绑到 fill_node，memset 使页面被该节点 CPU 最后写过（register 模式下也是首次触碰）
+
         run_on_node(fill_node, [&] { memset(p, 0x5a, size); });
     };
 
@@ -342,7 +342,7 @@ static pinned_buf pinned_alloc(alloc_mode mode, int dev, size_t size, int alloc_
         case alloc_mode::register_: {
             void * p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
             if (p == MAP_FAILED) { b.note = std::string("mmap failed: ") + strerror(errno); return b; }
-            fill(p);   // 首次触碰决定页面所在节点
+            fill(p);
             b.note = "touched " + page_nodes(p, size);
             run_on_node(alloc_node, [&] {
                 CK(cudaSetDevice(dev));
@@ -354,8 +354,8 @@ static pinned_buf pinned_alloc(alloc_mode mode, int dev, size_t size, int alloc_
             break;
         }
         case alloc_mode::policy: {
-            // 我们 ggml-cuda.cu 的路径：set_mempolicy(MPOL_BIND alloc_node) + cudaHostAlloc + mbind(MPOL_MF_MOVE)。
-            // 分配线程故意绑到另一个节点的 CPU，看驱动是按线程所在节点还是按 mempolicy 放页
+
+
             int other = -1;
             for (int n : nodes) if (n != alloc_node) { other = n; break; }
             std::string pol;
@@ -384,7 +384,7 @@ static pinned_buf pinned_alloc(alloc_mode mode, int dev, size_t size, int alloc_
             break;
         }
         case alloc_mode::nobind: {
-            // 原来的测法：主线程分配、主线程填充，节点由外部 numactl 决定
+
             CK(cudaSetDevice(dev));
             err = cudaHostAlloc(&b.host, size, cudaHostAllocMapped | cudaHostAllocPortable);
             if (err != cudaSuccess) { (void) cudaGetLastError(); b.note = std::string("alloc failed: ") + cudaGetErrorString(err); return b; }
@@ -412,7 +412,7 @@ static void pinned_free(pinned_buf & b) {
     b.host = nullptr;
 }
 
-// ---------------------------------------------------------------- 主程序
+
 
 static std::vector<int> parse_int_list(const char * s) { return parse_list(s); }
 
@@ -474,7 +474,7 @@ int main(int argc, char ** argv) {
         for (int d : gpus) {
             gpu_ctx & g = ctx[d];
             for (alloc_mode m : modes) {
-                // nobind：只有一行（节点由外部 numactl 决定）
+
                 std::vector<std::pair<int, int>> combos;
                 if (m == alloc_mode::nobind) {
                     combos.push_back({ -1, -1 });
@@ -506,8 +506,8 @@ int main(int argc, char ** argv) {
     }
 
     if (concurrent) {
-        // 所有 GPU 同时读：三种放置
-        struct placement { const char * name; int node; }; // node < 0：每卡本地
+
+        struct placement { const char * name; int node; };
         std::vector<placement> pls = { { "local(alloc+fill on GPU node)", -1 } };
         for (int n : nodes) {
             static char names[8][48];
@@ -562,9 +562,9 @@ int main(int argc, char ** argv) {
     }
 
     if (small) {
-        // 小块放置：分配线程绑到“另一”节点、set_mempolicy(MPOL_BIND 目标节点) 下连续分配不同大小的块，
-        // 看页面落在哪个节点（策略是否足够）、起点页内偏移（驱动是否从共享的 2 MiB 映射里切小块）、
-        // mbind(MPOL_MF_MOVE) 对这些块的返回值（非页对齐起点应 EINVAL）。只用第一块 GPU 的上下文。
+
+
+
         const int dev = gpus.front();
         const size_t page = (size_t) sysconf(_SC_PAGESIZE);
         const std::vector<size_t> sizes = { 20, 32, 64 << 10, 512 << 10, 900 << 10, 1 << 20, 2 << 20, 4 << 20, 32 << 20, 128 << 20 };

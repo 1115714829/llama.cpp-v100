@@ -380,8 +380,8 @@ extern "C" {
     GGML_API void        ggml_bf16_to_fp32_row(const ggml_bf16_t *, float *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row_ref(const float *, ggml_bf16_t *, int64_t);
     GGML_API void        ggml_fp32_to_bf16_row(const float *, ggml_bf16_t *, int64_t);
-    // BF16 -> F16: exact for values in the F16 range, finite values beyond it are clamped to +-65504
-    // returns the number of values that were clamped
+
+
     GGML_API int64_t     ggml_bf16_to_fp16_row(const ggml_bf16_t *, ggml_fp16_t *, int64_t);
 
     struct ggml_object;
@@ -673,11 +673,11 @@ extern "C" {
         GGML_TENSOR_FLAG_PARAM   =  4, // ...contains trainable parameters
         GGML_TENSOR_FLAG_LOSS    =  8, // ...defines loss for numerical optimization (multiple loss tensors add up)
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
-        // ...is the MoE output of expert parallelism: each backend holds a partial sum of it
+
         GGML_TENSOR_FLAG_EXPERT_PARALLEL_PARTIAL = 32,
-        // ...is an expert weight of a tiered expert store: the buffer type may keep it in
-        // device memory or in a device-readable host arena. Set by the caller that wants
-        // the tiered placement, so the store does not have to rely on the tensor name.
+
+
+
         GGML_TENSOR_FLAG_EXPERT = 64,
     };
 
@@ -1511,63 +1511,68 @@ extern "C" {
             enum ggml_op_hint    hint);
 
     // indirect matrix multiplication
+    //
+    // [TAG_MUL_MAT_ID_DUPLICATE_ID]
+    // note: this op has undefined behaviour if a given `a` is referenced more than once for a given `b`
+    //       (i.e. duplicate experts per token are not guaranteed to be supported in all backends)
+    // TODO: add backend support: https://github.com/ggml-org/llama.cpp/pull/29998#issuecomment-6153742533
     GGML_API struct ggml_tensor * ggml_mul_mat_id(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
-    // epilogue fused into MUL_MAT_ID, computed on the result before it is written out
+
     enum ggml_mul_mat_id_epilogue {
         GGML_MUL_MAT_ID_EPILOGUE_NONE   = 0,
         GGML_MUL_MAT_ID_EPILOGUE_SWIGLU = 1,
     };
 
-    // indirect matrix multiplication with a fused SwiGLU epilogue.
-    //
-    // as  -> [K, 2*n_ff, n_expert], rows interleaved: row 2r is gate row r, row 2r+1 is up row r
-    // b   -> [K, n_expert_used or 1, n_tokens], F32 or F16
-    // ids -> [n_expert_used, n_tokens] (i32)
-    // c   -> [n_ff, n_expert_used, n_tokens] (F16), c[r] = silu(gate[r]) * up[r]
-    //
-    // the rows of as must be interleaved when the weight is loaded, see llama.cpp; the plain
-    // ggml_mul_mat_id keeps the [K, n_ff, n_expert] layout of gate and up concatenated
+
+
+
+
+
+
+
+
+
     GGML_API struct ggml_tensor * ggml_mul_mat_id_swiglu(
             struct ggml_context * ctx,
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
-    // the epilogue fused into a MUL_MAT_ID node, GGML_MUL_MAT_ID_EPILOGUE_NONE when there is none
+
     GGML_API int32_t ggml_mul_mat_id_get_epilogue(const struct ggml_tensor * a);
 
-    // expert parallelism: global index of the first expert held by this device.
-    // MUL_MAT_ID entries whose id lies outside [expert_offset, expert_offset + as->ne[2]) are skipped
-    // (the output for them is zero), so the per-device weight slices need no renumbering of the ids.
-    // The enabled flag is needed in addition to the offset because the first device has offset 0.
+
+
+
+
     GGML_API void    ggml_mul_mat_id_set_expert_parallel(struct ggml_tensor * a, bool enabled);
     GGML_API bool    ggml_mul_mat_id_is_expert_parallel(const struct ggml_tensor * a);
     GGML_API void    ggml_mul_mat_id_set_expert_offset(struct ggml_tensor * a, int32_t expert_offset);
     GGML_API int32_t ggml_mul_mat_id_get_expert_offset(const struct ggml_tensor * a);
-    // expert parallelism: expert count of the whole (unsplit) weight tensor. as->ne[2] is only the
-    // expert count of this device, so heuristics that estimate the average columns per expert must
-    // use this global count instead. Returns 0 when the node is not MUL_MAT_ID or it is not set.
+
+
+
     GGML_API void    ggml_mul_mat_id_set_n_expert_total(struct ggml_tensor * a, int32_t n_expert_total);
     GGML_API int32_t ggml_mul_mat_id_get_n_expert_total(const struct ggml_tensor * a);
-    // expert parallelism: the layer of the expert weight (the N of its "blk.N." name) and the device
-    // that computes this node. The two select the expert map of the node (which global expert id is
-    // which local expert of the device, see ggml_expert_store_node_lut); the map replaces the
-    // [expert_offset, expert_offset + as->ne[2]) range test once the experts of a layer are no
-    // longer a contiguous range of the numbering. Both return 0 when the node is not MUL_MAT_ID.
+
+
+
+
+
     GGML_API void    ggml_mul_mat_id_set_layer(struct ggml_tensor * a, int32_t layer);
     GGML_API int32_t ggml_mul_mat_id_get_layer(const struct ggml_tensor * a);
     GGML_API void    ggml_mul_mat_id_set_device(struct ggml_tensor * a, int32_t device);
     GGML_API int32_t ggml_mul_mat_id_get_device(const struct ggml_tensor * a);
-    // expert parallelism: the expert assignment table the expert weight of the node was laid out by
-    // (ggml_expert_assignment_*): > 0 the table, whose row of (device, layer) is the expert map of the
-    // node; 0 the weight holds the contiguous segment named by the expert offset (nodes built by hand,
-    // the tests); < 0 the weight was laid out by no table. The meta backend sets it from the binding
-    // of the weight. Returns 0 when the node is not MUL_MAT_ID.
+
+
+
+
+
     GGML_API void    ggml_mul_mat_id_set_assignment(struct ggml_tensor * a, int32_t assignment);
     GGML_API int32_t ggml_mul_mat_id_get_assignment(const struct ggml_tensor * a);
 
@@ -2578,11 +2583,11 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
-    // Per-device query head boundary of the 3-card attention split.
-    // -1: the boundary is filled in by the split backend
-    //  0: uniform GQA (default, all backends behave as before)
-    // >0: query heads [0, g0) use KV head 0 and query heads [g0, n_head) use KV head 1
-    //     (valid only when K has 2 heads, honored by the sm70 grouped kernel)
+
+
+
+
+
     GGML_API void ggml_flash_attn_ext_set_q_head_boundary(
             struct ggml_tensor * a,
             int32_t              boundary);
@@ -2590,8 +2595,8 @@ extern "C" {
     GGML_API int32_t ggml_flash_attn_ext_get_q_head_boundary(
             const struct ggml_tensor * a);
 
-    // Mark a full attention node as shareable with the idle devices of a 6-device meta backend:
-    // the meta backend may split its KV range and hand the tail to an idle device (assist).
+
+
     GGML_API void ggml_flash_attn_ext_set_assist_capable(
             struct ggml_tensor * a,
             bool                 capable);
@@ -2740,6 +2745,7 @@ extern "C" {
     // the output packs the attention scores [S_v, H_v, n_tokens, n_seqs] followed by K state
     // snapshots, most-recent first (slot 0 = final state, slot s = state s tokens back). K == 1
     // keeps only the final state; when n_tokens < K only slots 0..n_tokens-1 are written.
+    // when n_tokens > K only slot 0 is guaranteed; backends may leave slots 1..K-1 unwritten.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,
@@ -2768,22 +2774,22 @@ extern "C" {
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
 
-    // QSA selection: score the pooled keys like the lightning indexer with every head weight set to
-    // head_scale, keep the n_top_pool best pools a token can see and expand them into cell ids.
-    //
-    // q          [n_embd_idx, n_head_idx, n_tokens]  F32, normed and rotated
-    // k          [n_embd_idx, 1,          n_rows  ]  key table (the pooled keys in the indexer cache rows)
-    // pool_cells [n_pool]                            I32 row of k holding the pooled key of each block
-    // pool_idxs  [kpool,      n_pool]                I32 member cells of each block
-    // tail_idxs  [kpool - 1,  n_tokens]              I32 incomplete tail cells of each token
-    // pool_rng   [2,          n_tokens]              I32 the pools [lo, hi) a token can see
-    // res        [kpool*n_top_pool + kpool - 1, n_tokens] I32
-    //
-    // Pool b is scored with the key in row pool_cells[b] of k, read in place (the rows may be strided
-    // and quantized, every pool_cells entry must address a row of k). The kept pools are the
-    // n_top_pool highest scores of [lo, hi), equal scores by ascending pool index. A row holds the
-    // cells of the kept pools in ascending pool index, then the tail cells that are not sentinel,
-    // then -1 up to the end: the valid ids are a prefix of the row.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     GGML_API struct ggml_tensor * ggml_qsa_select(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -2796,13 +2802,13 @@ extern "C" {
         int32_t               n_top_pool,
         int32_t               sentinel);
 
-    // The same selection stopped at the pool level (op_params[3] = 1): the kept pool indices in
-    // ascending order, then -1 up to n_top_pool. ggml_qsa_expand turns a row into the cell row
-    // that ggml_qsa_select writes. Every token only depends on its own q row and range, so a
-    // multi-device backend can score disjoint token slices and gather the small pool rows.
-    // The sources are q, k, pool_rng, pool_cells (no member or tail cells).
-    //
-    // res [n_top_pool, n_tokens] I32
+
+
+
+
+
+
+
     GGML_API struct ggml_tensor * ggml_qsa_select_pool(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -2813,13 +2819,13 @@ extern "C" {
         int32_t               n_top_pool,
         int32_t               sentinel);
 
-    // Expand the pool rows of ggml_qsa_select_pool into cell rows: the member cells of every
-    // pool >= 0 in row order, then the tail cells that are not sentinel, then -1 up to the end.
-    //
-    // ids_pool  [n_top_pool, n_tokens]              I32 kept pools ascending, -1 padded
-    // pool_idxs [kpool,      n_pool]                I32 member cells of each block
-    // tail_idxs [kpool - 1,  n_tokens]              I32 incomplete tail cells of each token
-    // res       [kpool*n_top_pool + kpool - 1, n_tokens] I32, identical to ggml_qsa_select
+
+
+
+
+
+
+
     GGML_API struct ggml_tensor * ggml_qsa_expand(
         struct ggml_context * ctx,
         struct ggml_tensor  * ids_pool,
@@ -2893,18 +2899,18 @@ extern "C" {
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
 
-    // Sequence-parallel token split and gather (see docs/design/r200-seqpar.md).
-    //
-    // seq_scatter: a [..., T] on `axis` -> [..., n] holding the token slice [t0, t0 + n). The
-    // graph builder passes t0 = 0, n = T, so the node keeps a's global shape; under the meta
-    // backend each device's simple tensor is the per-device node with its own (t0_j, T_j)
-    // from ggml_seq_token_share, so a MIRRORED source is sliced locally (no communication)
-    // and a PARTIAL source makes this node the reduce-scatter boundary of the collective.
-    //
-    // seq_gather: a [..., n_j] on `axis` (the concatenation of all per-device slices is the
-    // global T) -> [..., T], optionally casting to `type` (F16/F32/I32). The graph builder
-    // passes the global shape; on a single backend the node is a cast/dup, under the meta
-    // backend it is the all-gather boundary.
+
+
+
+
+
+
+
+
+
+
+
+
     GGML_API struct ggml_tensor * ggml_seq_scatter(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
@@ -2918,10 +2924,10 @@ extern "C" {
             int                   axis,
             enum ggml_type        type);
 
-    // Token share of device j of n devices over a global token count T on the token axis:
-    // Tp = ceil(T/n), t0_j = j*Tp, n_j = Tp for j < n-1 and n_{n-1} = T - Tp*(n-1).
-    // Single source of truth for every per-device token slice under sequence parallelism,
-    // including the device shares of the per-rank all-gather of the communication backends.
+
+
+
+
     GGML_API void ggml_seq_token_share(int64_t T, int64_t n, int64_t j, int64_t * t0, int64_t * nj);
 
     // custom operators
@@ -3119,66 +3125,78 @@ extern "C" {
     GGML_API void ggml_log_get(ggml_log_callback * log_callback, void ** user_data);
     GGML_API void ggml_log_set(ggml_log_callback   log_callback, void *  user_data);
 
-    //
-    // expert store (optional, implemented by backends with a tiered expert layout)
-    //
 
-    // routing profile used by stores created afterwards: a text file with lines
-    // "layer expert count"; experts with more hits are placed in device memory first.
-    // Set before the model loads. Without a profile the placement is uniform per layer.
+
+
+
+
+
+
     GGML_API void ggml_expert_store_set_profile(const char * path);
 
-    // when set, the accumulated per-(layer, expert) routing counts are written to this path
-    // when the model is unloaded, in the same format as the profile above
+
+
     GGML_API void ggml_expert_store_set_dump_path(const char * path);
 
-    // when set, every mul_mat_id records its per-token routing trace (RTRC format, described in
-    // ggml-cuda/ggml-cuda-routing-trace.cu) into a device ring buffer and the backend drains it
-    // to this path. size_mib is the device ring size per device in MiB. This records plain
-    // (non store) expert tensors too. The trace file is written for the whole process, not
-    // only when the model unloads.
+
+
+
+
+
+    GGML_API int ggml_expert_kind_of_name(const char * name);
+
+
+
+
+
+
     GGML_API void ggml_expert_store_set_trace_path(const char * path, int size_mib);
 
-    // Expert assignment tables: which device holds which expert of every layer when the routed
-    // experts are split over the devices along the expert dim, as the loaded data is laid out. A
-    // loader makes one table for the expert weights of its model it splits that way, lays the experts
-    // out by it, activates it - which binds those weights to it - and releases it with the model. The
-    // MUL_MAT_ID nodes of a weight read the table of that weight (ggml_mul_mat_id_get_assignment), so
-    // two models (a target and its MTP draft) each read their own. A table never changes; its id
-    // (> 0) is never reused in the process. 0 is returned when no table could be made.
-    //
-    // a snapshot of the proposal the expert buffers were planned with (the profile LPT split, the
-    // contiguous split without a profile; computed while the expert stores of the model were
-    // planned): the table of a model whose experts live in the expert stores. The proposal must have
-    // n_dev devices, n_expert experts and at least n_layer layers.
+
+
+
+
+
+
+
+
+
+
+
+
     GGML_API uint32_t ggml_expert_assignment_from_proposal(int n_dev, int n_layer, int n_expert);
-    // the contiguous split, device j holding the caps[j] experts after those of the devices before
-    // it: the table of a model whose experts are plain device weights (the meta backend slices them)
+
+
     GGML_API uint32_t ggml_expert_assignment_contiguous(int n_dev, int n_layer, int n_expert, const int64_t * caps);
-    // sizes of a table; false for an unknown table
+
     GGML_API bool     ggml_expert_assignment_dims(uint32_t table, int * n_dev, int * n_layer, int * n_expert);
-    // experts device dev holds per layer, -1 for an unknown table or device
+
     GGML_API int      ggml_expert_assignment_cap(uint32_t table, int dev);
-    // position of expert `expert` of layer `layer` in the host buffer of a tensor split over the
-    // devices: the buffer is the concatenation of the device segments in device order, segment j
-    // holds the cap(j) experts of device j in local order, so the position is
-    // sum(cap(0..owner)) + local. The loader writes expert `expert` there. -1 when unknown.
+
+
+
+
     GGML_API int64_t  ggml_expert_assignment_load_position(uint32_t table, int layer, int expert);
-    // the loader placed every weight of the list by the table: bind them to it (a MUL_MAT_ID node
-    // of such a weight reads its expert map from the table from now on) and make it known to the
-    // placement check of the backends. Once per table.
+
+
+
     GGML_API void     ggml_expert_assignment_activate(uint32_t table, const struct ggml_tensor * const * weights, size_t n_weights);
-    // drop a table and the bindings of its weights (the model is freed); 0 is a no-op
+
     GGML_API void     ggml_expert_assignment_release(uint32_t table);
 
-    // Placement check: the loader registers, per tensor name, the hash of the bytes of every
-    // global expert it placed (ggml_expert_store_hash_expert); the backend compares them after the
-    // load against the bytes every local expert received, mapped through the table the tensor was
-    // laid out by (ggml_expert_assignment_activate).
+
+
+
+
     GGML_API uint64_t ggml_expert_store_hash_expert(const void * data, size_t size);
     GGML_API void     ggml_expert_store_set_source_hash(const char * tensor_name, int64_t expert, uint64_t hash);
-    // drop the registered hashes once the backends checked the placement
+
     GGML_API void     ggml_expert_store_clear_source_hashes(void);
+
+
+
+
+    GGML_API void ggml_expert_store_set_adaptive_window(int64_t window);
 
     GGML_API struct ggml_tensor * ggml_set_zero(struct ggml_tensor * tensor);
 

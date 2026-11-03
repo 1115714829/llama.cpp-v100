@@ -6,12 +6,12 @@
 #include <vector>
 
 #define LLAMA_MAX_SEQ 256
-#define LLAMA_MAX_DEVICES 16 // same as llama_max_devices()
+#define LLAMA_MAX_DEVICES 16
 
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
-    uint32_t n_swa_mtp = 0;   // SWA window of the MTP draft context, in tokens (0 = attend the whole context)
+    uint32_t n_swa_mtp = 0;
     uint32_t n_batch;
     uint32_t n_ubatch;
     uint32_t n_seq_max;
@@ -57,20 +57,22 @@ struct llama_cparams {
     bool pipeline_parallel;
     bool training;           // set by llama_opt_init()
 
+    size_t moe_cache_size;
+
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
-    int32_t logits_topk        = 0; // output only the top k logits of every row, see llama_set_logits_topk
-    int32_t logits_topk_shards = 1; // vocab shards that select their candidates independently
-    // the logits are split like the rows of the output projection; each shard takes the top k of
-    // its own slice, which is padded to the longest slice (logits_topk_shard_max), and the host
-    // rebases the local ids with the prefix sums in logits_topk_shard_off (see get_logits_topk_ith)
+    int32_t logits_topk        = 0;
+    int32_t logits_topk_shards = 1;
+
+
+
     int32_t logits_topk_shard_max = 0;
     int32_t logits_topk_shard_off[LLAMA_MAX_DEVICES] = {0};
 
-    bool    logits_topk_active = false; // the current request reads the top-k output (the graph may keep a top-k output while it is off)
-    // the host never reads the raw logits of this context while the top-k output is on: a batch with a
-    // single output then only copies its top-k rows back as well (the MTP draft steps, see
-    // llama_set_logits_topk_only). Off by default: a single-output batch keeps its full logits
+    bool    logits_topk_active = false;
+
+
+
     bool    logits_topk_only   = false;
 
     enum llama_context_type ctx_type;
@@ -81,7 +83,7 @@ struct llama_cparams {
     void * cb_eval_user_data;
 
     llama_context * ctx_other;
-    // target lending token_embd/output to a draft head without them, set from ctx_other
-    // from unsloth PR #240
+
+
     const llama_model * model_tgt = nullptr;
 };

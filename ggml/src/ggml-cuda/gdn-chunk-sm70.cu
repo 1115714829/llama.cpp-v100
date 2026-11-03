@@ -7,8 +7,8 @@
 // (TileLang 0.1.13 generated, FlashQLA sm70 path of 1Cat-vLLM; the generated cumsum is
 // used for Hv=12 and a hand written scan for other head counts).
 
-// The HIP and MUSA backends glob ../ggml-cuda/*.cu into their own libraries and
-// cannot compile CuTe/CUTLASS. This file is only used by the CUDA backend.
+
+
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
 #include "common.cuh"
@@ -21,19 +21,19 @@
 
 using namespace gdn_chunk_sm70;
 
-// the kernels take the per-device head counts (H_v for v, H_k for q/k) as runtime
-// parameters, so any head split admitted by ggml_cuda_gdn_chunk_sm70_n_tokens works
+
+
 constexpr int GDN_CHUNK_SM70_D     = 128;
 constexpr int GDN_CHUNK_SM70_CHUNK = 64;
 constexpr int GDN_CHUNK_SM70_WARP  = 32;
 
-// dynamic shared memory sizes baked into the kernels (independent of the head counts)
+
 constexpr int GDN_CHUNK_SM70_SMEM_CUMSUM_HV12 = 6400;
 constexpr int GDN_CHUNK_SM70_SMEM_KKT = 16384;
 constexpr int GDN_CHUNK_SM70_SMEM_FWD = 91072;
 
-// Single-sequence chunk metadata: cu_seqlens {0, n}, chunk_offsets {0, num_chunks},
-// chunk_indices {0, i}.
+
+
 __global__ void gdn_chunk_meta_kernel(
         int * __restrict__ cu_seqlens, int * __restrict__ chunk_offsets, int * __restrict__ chunk_indices,
         const int n_tokens, const int num_chunks) {
@@ -49,9 +49,9 @@ __global__ void gdn_chunk_meta_kernel(
     }
 }
 
-// One warp per 128-element row: all q heads, then all k heads, then all v heads
-// of the chunked tokens. The q/k rows are l2-normalized in flight when l2norm
-// is set, with the same formula as the recurrent kernel's prologue.
+
+
+
 __global__ void gdn_chunk_prep_kernel(
         const float * __restrict__ q, const float * __restrict__ k, const float * __restrict__ v,
         half_t * __restrict__ q16, half_t * __restrict__ k16, half_t * __restrict__ v16,
@@ -121,7 +121,7 @@ __global__ void gdn_chunk_prep_kernel(
     }
 }
 
-// o16 [n][H][128] -> dst f32, both contiguous
+
 __global__ void gdn_chunk_store_kernel(const half2 * __restrict__ src, float2 * __restrict__ dst, const int64_t n2) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n2) {
@@ -129,7 +129,7 @@ __global__ void gdn_chunk_store_kernel(const half2 * __restrict__ src, float2 * 
     }
 }
 
-// kkt_solve + fused forward. HV/HK > 0 instantiate the kernels with compile-time head counts.
+
 template <int HV, int HK>
 static void gdn_chunk_launch_kkt_fwd(half_t * a, const ggml_cuda_gdn_chunk_args & args, int * chunk_indices, int * chunk_offsets,
         int * cu_seqlens, float * gcum, half_t * k16, half_t * o16, half_t * q16, half_t * v16,
@@ -152,7 +152,7 @@ int64_t ggml_cuda_gdn_chunk_sm70_n_tokens(int cc, int64_t S_v, int64_t H, int64_
     }
     GGML_ASSERT(K >= 1 && K <= GDN_CHUNK_SM70_CHUNK);
 
-    // the chunked kernels do not write snapshots, keep >= K tokens for the recurrent kernel
+
     int64_t tail = n_tokens % GDN_CHUNK_SM70_CHUNK;
     if (tail < K) {
         tail += GDN_CHUNK_SM70_CHUNK;
@@ -200,7 +200,7 @@ void ggml_cuda_gdn_chunk_sm70(ggml_backend_cuda_context & ctx, const ggml_cuda_g
     CUDA_CHECK(cudaGetLastError());
 
     if (H == 12 && Hk == 4) {
-        // the TileLang scan for Hv=12: keeps 4-GPU results bit-identical to earlier versions
+
         tilelang_chunk_local_cumsum_kernel_kernel<<<num_chunks, 128, GDN_CHUNK_SM70_SMEM_CUMSUM_HV12, stream>>>(
             chunk_indices, cu_seqlens, gcum.get(), args.g, num_chunks, (int) n, 1);
     } else {

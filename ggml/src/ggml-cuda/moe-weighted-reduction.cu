@@ -2,11 +2,11 @@
 
 #include "ggml-cuda-expert.cuh"
 
-// M3: with expert parallelism the down projection only writes the slots of the experts this device
-// holds. The slots of the other devices used to be read from the zeroed rows the MUL_MAT_ID launch
-// wrote; they are skipped here instead, from the ids and the expert map of the node, so neither the
-// zero rows nor their bytes are needed. The value substituted for such a slot is 0.0f, the value the
-// zero kernel stored, so the arithmetic (and with it the sum) is the same term by term.
+
+
+
+
+
 static __global__ void moe_weighted_reduction_f32(const float * __restrict__ experts,
                                                   const float * __restrict__ expert_scale,
                                                   const float * __restrict__ weights,
@@ -24,8 +24,8 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
 
     const uint64_t first_row   = (uint64_t) token * n_expert_used;
     const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
-    // the slot is computed on this device when the expert map knows its id; ids == nullptr (no
-    // expert parallelism) means every slot is
+
+
     const bool first_local = ids == nullptr || ggml_cuda_expert_local(lut, ids[token*ids_stride]) >= 0;
     const float first_val  = first_local ? experts[first_row * n_embd + col] : 0.0f;
     float          sum         = (first_val * first_scale) * weights[first_row];
@@ -77,8 +77,8 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
     const int64_t n_tokens      = experts->ne[2] * experts->ne[3];
     cudaStream_t  stream        = ctx.stream();
 
-    // the routing ids and the expert map of the node that wrote experts, when it is an expert
-    // parallel MUL_MAT_ID: they tell the kernel which slots no device wrote
+
+
     const int32_t * ids          = nullptr;
     int             ids_stride   = 0;
     ggml_cuda_expert_lut lut{};

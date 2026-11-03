@@ -109,7 +109,7 @@ static __device__ __forceinline__ float op_ceil(float x) {
 }
 
 static __device__ __forceinline__ float op_round(float x) {
-    return round(x);
+    return roundf(x);
 }
 
 static __device__ __forceinline__ float op_trunc(float x) {
@@ -136,24 +136,67 @@ static void unary_cuda(const T * x, T * dst, const int k, cudaStream_t stream) {
     ggml_cuda_kernel_launch(unary_op_kernel<op, T>, launch_params, x, dst, k);
 }
 
+template <float (*op)(float), typename T>
+static __global__ void unary_op_kernel_strided(const T * x, T * dst, const int k,const int64_t ne00,const int64_t ne01,const int64_t ne02,const size_t nb00,const size_t nb01,const size_t nb02,const size_t nb03) {
+    ggml_cuda_pdl_lc();
+    const int i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    int64_t rem = i;
+    const int64_t i0 = rem % ne00; rem /= ne00;
+    const int64_t i1 = rem % ne01; rem /= ne01;
+    const int64_t i2 = rem % ne02;
+    const int64_t i3 = rem / ne02;
+    const size_t src_byte_offset = i0 * nb00 + i1 * nb01 + i2 * nb02 + i3 * nb03;
+    const T * src_ptr = (const T *)((const char *)x + src_byte_offset);
+
+    ggml_cuda_pdl_sync();
+    dst[i] = ggml_cuda_cast<T>(op(ggml_cuda_cast<float>(*src_ptr)));
+}
+
+template <float (*op)(float), typename T>
+static void unary_cuda_strided(const T * x, T * dst, const int k,const int64_t ne00,const int64_t ne01,const int64_t ne02,const size_t nb00,const size_t nb01,const size_t nb02,const size_t nb03, cudaStream_t stream) {
+    const int num_blocks = (k + CUDA_NEG_BLOCK_SIZE - 1) / CUDA_NEG_BLOCK_SIZE;
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_NEG_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(unary_op_kernel_strided<op, T>, launch_params, x, dst, k, ne00,ne01,ne02,nb00,nb01,nb02,nb03);
+}
+
 template <float (*op)(float)>
 void ggml_cuda_op_unary(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const void * src0_d = src0->data;
     void * dst_d = dst->data;
-    cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(ggml_is_contiguous(src0));
+    cudaStream_t stream = ctx.stream();
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
     GGML_ASSERT(src0->type == dst->type);
 
-    if (src0->type == GGML_TYPE_F16) {
-        unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
-    } else if (src0->type == GGML_TYPE_BF16) {
-        unary_cuda<op>((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), stream);
+    if (ggml_is_contiguous(src0)) {
+        if (src0->type == GGML_TYPE_F16) {
+            unary_cuda<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), stream);
+        } else if (src0->type == GGML_TYPE_BF16) {
+            unary_cuda<op>((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), stream);
+        } else {
+            unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
+        }
     } else {
-        unary_cuda<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), stream);
+        if (src0->type == GGML_TYPE_F16) {
+            unary_cuda_strided<op>((const half *)src0_d, (half *)dst_d, ggml_nelements(src0),
+                src0->ne[0], src0->ne[1], src0->ne[2],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], stream);
+        } else if (src0->type == GGML_TYPE_BF16) {
+            unary_cuda_strided<op>((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0),
+                src0->ne[0], src0->ne[1], src0->ne[2],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], stream);
+        } else {
+            unary_cuda_strided<op>((const float *)src0_d, (float *)dst_d, ggml_nelements(src0),
+                src0->ne[0], src0->ne[1], src0->ne[2],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3], stream);
+        }
     }
 }
 
@@ -549,8 +592,8 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(ggml_is_contiguous(src0));
 
-    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16);
-    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16);
+    GGML_ASSERT( dst->type == GGML_TYPE_F32 ||  dst->type == GGML_TYPE_F16 ||  dst->type == GGML_TYPE_BF16);
     GGML_ASSERT(src0->type == dst->type);
 
     const float alpha_n = ggml_get_op_params_f32(dst, 1);
@@ -560,6 +603,8 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     if (src0->type == GGML_TYPE_F16) {
         xielu_cuda((const half *)src0_d, (half *)dst_d, ggml_nelements(src0), alpha_n, alpha_p, beta, eps, stream);
+    } else if (src0->type == GGML_TYPE_BF16) {
+        xielu_cuda((const nv_bfloat16 *)src0_d, (nv_bfloat16 *)dst_d, ggml_nelements(src0), alpha_n, alpha_p, beta, eps, stream);
     } else {
         xielu_cuda((const float *)src0_d, (float *)dst_d, ggml_nelements(src0), alpha_n, alpha_p, beta, eps, stream);
     }
@@ -702,11 +747,11 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     }
 }
 
-/* fused scale + unary(silu) */
 
-// y = silu(x*scale). qwen4exp builds the hyper-connection mixer's low-rank activation this way
-// (src/models/qwen4exp.cpp: lo = silu(scale(lo, 1/hc))); the Strata fused_gr.cu down projection
-// folds the same 1/hc and silu into its epilogue (Strata src/kernels/cuda/fused_gr.cu, end of gr_down_kernel).
+
+
+
+
 static __global__ void scale_silu_kernel(const float * x, float * dst, const float scale, const int64_t k) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
@@ -721,8 +766,8 @@ static __global__ void scale_silu_kernel(const float * x, float * dst, const flo
 }
 
 void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * silu_node) {
-    // scale_node: SCALE applied to scale_node->src[0]
-    // silu_node:  UNARY(SILU) applied to scale_node; the result goes to silu_node->data
+
+
 
     const ggml_tensor * x = scale_node->src[0];
 
@@ -757,11 +802,11 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
-/* fused sigmoid of a per-row gate, broadcast mul and add */
 
-// dst = a + x * sigmoid(g[row]), g one value per row of x: the qwen4exp shared expert tail
-// (ffn_out = moe_out + ffn_shexp * sigmoid(shared_gate)). Each step is rounded to F32 as the unfused
-// SIGMOID, MUL and ADD kernels round it (no contraction into an FMA), so the result is bitwise the same.
+
+
+
+
 static __global__ void sigmoid_mul_add_rows_kernel(const float * x, const float * g, const float * a, float * dst,
                                                    const int64_t ncols, const int64_t k) {
     ggml_cuda_pdl_lc();
@@ -794,10 +839,10 @@ void ggml_cuda_op_sigmoid_mul_add_rows(ggml_backend_cuda_context & ctx, ggml_ten
         (const float *) x->data, (const float *) g->data, (const float *) a->data, (float *) add->data, x->ne[0], k);
 }
 
-/* fused cont + unary + mul with a strided input view */
 
-// like unary_gated_op_kernel, but g is an F32 view with its own strides and the layout of dst
-// write_f16: also store dst rounded to F16 (as the F32 -> F16 conversion does) into dst_f16
+
+
+
 template <float (*op)(float), bool write_f16>
 static __global__ void unary_gated_view_kernel(
         const float * x, const float * g, float * dst, half * dst_f16,
@@ -837,7 +882,7 @@ static void unary_gated_view_cuda(
     ggml_cuda_kernel_launch(kernel, launch_params, x, g, dst, dst_f16, k, nc, ne0, ne2, nb1, nb2, nb3);
 }
 
-// CONT -> UNARY(SIGMOID) -> MUL: the attention gate is a strided view whose CONT is elided
+
 void ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * sigmoid, ggml_tensor * mul,
                                    half * dst_f16) {
     const ggml_tensor * gate = cont->src[0];
@@ -857,12 +902,12 @@ void ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor 
         gate->nb[1] / sizeof(float), gate->nb[2] / sizeof(float), gate->nb[3] / sizeof(float), stream);
 }
 
-/* fused gated delta net gating */
 
-// beta_out = sigmoid(beta) and gate = softplus(alpha + dt) * a, the gating of the GDN layers.
-// The two chains are independent. When their sizes match, thread i handles element i of both
-// chains and reads all inputs before writing, so either output may alias either input. Otherwise
-// the chains take two halves of the launch and an output may only alias its own input.
+
+
+
+
+
 static __global__ void gdn_gating_kernel(
         const float * beta, float * beta_out, const int64_t n_beta,
         const float * alpha, float * gate, const int64_t n_alpha,
@@ -905,7 +950,7 @@ static void gdn_gating_cuda(
         const float * beta, float * beta_out, const int64_t n_beta,
         const float * alpha, float * gate, const int64_t n_alpha,
         const float * dt, const float * a, const int64_t n_heads, cudaStream_t stream) {
-    // paired chains share one thread per element, see gdn_gating_kernel
+
     const int64_t n = n_beta == n_alpha ? n_beta : n_beta + n_alpha;
     const int64_t num_blocks = (n + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);

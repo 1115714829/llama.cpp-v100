@@ -1,7 +1,7 @@
-// Expert-to-device assignment: the proposal (ggml_expert_store_owner and friends) and the tables the
-// loaded data follows (ggml_expert_assignment_*), with the invariants every consumer relies on. No
-// GPU and no model: the proposal is computed by the same ggml_expert_store_plan() the backend calls,
-// with a small artificial profile; the MUL_MAT_ID nodes are built in a context without data.
+
+
+
+
 
 #include "ggml.h"
 #include "ggml-expert-store.h"
@@ -17,8 +17,8 @@
 
 static int g_fail = 0;
 
-// memory operations of a store that lives in host memory: the placement check only needs the
-// bytes to arrive where the store puts them
+
+
 static void * fake_alloc_device(void * user, size_t size) {
     (void) user;
     return malloc(size);
@@ -51,7 +51,7 @@ static void fake_table_upload(void * user, void * dst, const char * const * src,
     memcpy(dst, src, n * sizeof(char *));
 }
 
-// the bytes of global expert g: a pattern that differs between experts in every window
+
 static void fill_expert(std::vector<uint8_t> & buf, int g) {
     for (size_t i = 0; i < buf.size(); ++i) {
         buf[i] = (uint8_t) (g * 37 + i * 11 + (i >> 8));
@@ -87,7 +87,7 @@ static void write_profile(const std::string & path, const std::vector<std::vecto
     fclose(f);
 }
 
-// one device of a 32-expert model over 4 devices: 8 experts per device
+
 static ggml_expert_store_plan_tensor device_tensor(int layer) {
     ggml_expert_store_plan_tensor t;
     t.layer      = layer;
@@ -105,9 +105,9 @@ static void plan_of(int n_dev, const char * profile_path, int layer) {
     ggml_expert_store_plan(&t, 1, n_dev, -1, profile_path, &plan);
 }
 
-// every expert is on exactly one device, every device holds cap experts, the local numbers are
-// unique inside a device and count ascending with the global number, and the reverse lookup
-// answers the same expert
+
+
+
 static void check_invariants(int n_dev, int n_layer, int n_expert, const char * tag) {
     ggml_expert_store_assignment_info info;
     check(ggml_expert_store_assignment_info_get(&info), "assignment info");
@@ -165,7 +165,7 @@ static std::vector<std::vector<int16_t>> dump_table(int n_dev, int n_layer, int 
 }
 
 int main() {
-    // ---- profile driven assignment: 4 devices, 32 experts, 4 layers, 8 hot experts per layer
+
     const int n_dev    = 4;
     const int n_expert = 32;
     const int n_layer  = 4;
@@ -185,8 +185,8 @@ int main() {
     ggml_expert_store_assignment_info_get(&info);
     check(info.has_profile, "assignment used the profile");
 
-    // the hottest expert goes to the first device, the eight hot experts are spread over the
-    // devices and no device holds more than its quota
+
+
     check_eq(ggml_expert_store_owner(0, 0), 0, "hottest expert on device 0");
     check_eq(ggml_expert_store_owner(0, 1), 1, "second hottest on device 1");
     check_eq(ggml_expert_store_owner(0, 3), 3, "fourth hottest on device 3");
@@ -200,16 +200,16 @@ int main() {
         }
         check_eq(n_local, cap, "experts per device");
     }
-    // the hot experts must not all sit on one device
+
     int hot_on_dev0 = 0;
     for (int e = 0; e < 8; ++e) {
         hot_on_dev0 += ggml_expert_store_owner(0, e) == 0;
     }
     check(hot_on_dev0 < 8, "the hot experts are spread over the devices");
 
-    // ---- the table of a model whose experts live in the stores: a snapshot of the proposal. Load
-    // positions: the device segments follow each other in device order, segment j holds the experts
-    // of device j in local order, every position is used once
+
+
+
     const uint32_t tab_a = ggml_expert_assignment_from_proposal(n_dev, n_layer, n_expert);
     check(tab_a > 0, "a table from the proposal");
     check(ggml_expert_assignment_from_proposal(n_dev + 1, n_layer, n_expert) == 0, "no table from a proposal of other devices");
@@ -257,7 +257,7 @@ int main() {
         check(ggml_expert_assignment_fingerprint(tab_a) != 0, "the table has a fingerprint");
     }
 
-    // ---- the device of a slice of the expert dim
+
     check_eq(ggml_expert_store_slice_device(0, 8),   0, "slice of device 0");
     check_eq(ggml_expert_store_slice_device(8, 8),   1, "slice of device 1");
     check_eq(ggml_expert_store_slice_device(24, 8),  3, "slice of device 3");
@@ -266,10 +266,10 @@ int main() {
     check_eq(ggml_expert_store_slice_device(0, 9),  -2, "a longer slice is no segment");
     check_eq(ggml_expert_store_slice_device(32, 8), -2, "a slice past the end is no segment");
 
-    // ---- placement check: a store of device 1 receives the segment the loader lays out for it
-    // (the experts of device 1 in local order of table A); the loader registers the hash of every
-    // global expert, the activation of its table names the table of the tensor, and the check maps
-    // local -> global through that table
+
+
+
+
     {
         ggml_expert_store_backend be;
         be.user         = nullptr;
@@ -285,7 +285,7 @@ int main() {
         const int64_t blob = 1024;
         std::vector<int64_t> slots((size_t) n_expert);
         std::iota(slots.begin(), slots.end(), 0);
-        const int id = ggml_expert_store_add_tensor(store, /*layer =*/ 0, /*kind =*/ 7, /*expert_base =*/ 8, cap,
+        const int id = ggml_expert_store_add_tensor(store, 0, 7, 8, cap,
             (size_t) blob, 0, 32, slots.data(), cap, -1);
         check(id >= 0, "store tensor of device 1");
 
@@ -303,7 +303,7 @@ int main() {
             ggml_expert_store_set_source_hash(name, g, ggml_expert_store_hash_expert(buf.data(), (size_t) blob));
         }
 
-        // the loader's weight of that name, bound to table A by the activation
+
         ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
         ggml_context * ctx = ggml_init(ip);
         ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, n_expert);
@@ -329,13 +329,13 @@ int main() {
         check_eq(n_checked, 0, "nothing checked without source hashes");
         check_eq(n_skipped, cap, "every expert skipped without source hashes");
 
-        // the file's expert at one local number is another one than the table says
+
         const int g_wrong = ggml_expert_assignment_global_of(tab_a, 1, 0, 3);
         fill_expert(buf, g_wrong + 100);
         ggml_expert_store_set_source_hash(name, g_wrong, ggml_expert_store_hash_expert(buf.data(), (size_t) blob));
         check(!ggml_expert_store_verify_placement(store, id, name, &n_checked, &n_skipped), "a misplaced expert fails the placement check");
 
-        // a slice of the expert dim written in file order (no table) cannot be numbered
+
         ggml_expert_store_clear_source_hashes();
         for (int g = 0; g < n_expert; ++g) {
             fill_expert(buf, g);
@@ -347,10 +347,10 @@ int main() {
         check(ggml_expert_store_verify_placement(store, id, name, &n_checked, &n_skipped) && n_skipped == cap,
             "cleared hashes: every expert skipped");
 
-        // a tensor that holds the whole expert dim in file order: the identity, no table needed
+
         std::vector<int64_t> all_slots((size_t) n_expert);
         std::iota(all_slots.begin(), all_slots.end(), 0);
-        const int id_all = ggml_expert_store_add_tensor(store, /*layer =*/ 1, /*kind =*/ 7, /*expert_base =*/ 0, n_expert,
+        const int id_all = ggml_expert_store_add_tensor(store, 1, 7, 0, n_expert,
             (size_t) blob, 0, 32, all_slots.data(), n_expert, -1);
         std::vector<uint8_t> whole((size_t) n_expert * blob);
         const char * name_all = "blk.1.ffn_down_exps.weight";
@@ -371,7 +371,7 @@ int main() {
         ggml_free(ctx);
     }
 
-    // ---- the expert hash: head, middle and tail windows of a large expert, all bytes of a small one
+
     {
         std::vector<uint8_t> a((size_t) 100 * 1024);
         fill_expert(a, 3);
@@ -399,7 +399,7 @@ int main() {
         check(ggml_expert_store_hash_expert(zeros, 8) != ggml_expert_store_hash_expert(zeros, 16), "the length is part of the hash");
     }
 
-    // ---- same counts, different file name: the table is computed again and must be identical
+
     write_profile("test-expert-assign-profile-2.txt", counts);
     const std::vector<std::vector<int16_t>> first = dump_table(n_dev, n_layer, n_expert);
     plan_of(n_dev, "test-expert-assign-profile-2.txt", 0);
@@ -410,14 +410,14 @@ int main() {
         same = first[i] == second[i];
     }
     check(same, "the same counts give the same table");
-    // and the unchanged input keeps the table of the first computation
+
     plan_of(n_dev, "test-expert-assign-profile-2.txt", 0);
     check(dump_table(n_dev, n_layer, n_expert) == second, "the cached table is reused");
 
-    // ---- no profile: the contiguous split, the only placement that can be right without counts
+
     {
         ggml_expert_store_plan_tensor t = device_tensor(0);
-        t.n_expert = n_expert; // one unsplit tensor, so the global expert count is known
+        t.n_expert = n_expert;
         ggml_expert_store_placement plan;
         ggml_expert_store_plan(&t, 1, n_dev, -1, nullptr, &plan);
     }
@@ -437,7 +437,7 @@ int main() {
         base += cap;
     }
 
-    // ---- extremes: all counts on one expert, and a layer without any count
+
     std::vector<std::vector<int64_t>> extreme(2, std::vector<int64_t>((size_t) n_expert, 0));
     extreme[0][5] = 1000000;
     write_profile("test-expert-assign-profile-extreme.txt", extreme);
@@ -459,18 +459,18 @@ int main() {
         check_eq(n_local, cap, "the empty layer still fills every device");
     }
 
-    // ---- no assignment of a layer or device that does not exist
+
     check_eq(ggml_expert_store_owner(99, 0),      -1, "owner of an unknown layer");
     check_eq(ggml_expert_store_owner(0, 999),     -1, "owner of an unknown expert");
     check(ggml_expert_store_local_of(n_dev, 0) == nullptr, "local_of of an unknown device");
 
-    // ---- two models, two tables: the target's experts are laid out by its table (A, the profile
-    // permutation over layers 0..3), the draft's by its own (B, the contiguous split of its slices,
-    // which has a layer 4 that A does not have). Every MUL_MAT_ID node reads the table of its own
-    // weight, whatever the layer number says: the draft's node of layer 4 finds its row, and a node
-    // of layer 0 of either model reads its own row.
+
+
+
+
+
     {
-        const int64_t caps_b[4] = { 7, 9, 8, 8 }; // a split that is not the even one
+        const int64_t caps_b[4] = { 7, 9, 8, 8 };
         const uint32_t tab_b = ggml_expert_assignment_contiguous(n_dev, n_layer + 1, n_expert, caps_b);
         check(tab_b > tab_a, "table ids count up");
         check(ggml_expert_assignment_contiguous(n_dev, n_layer, n_expert + 1, caps_b) == 0, "the caps must cover the experts");
@@ -494,7 +494,7 @@ int main() {
 
         ggml_init_params ip = { 512 * ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
         ggml_context * ctx = ggml_init(ip);
-        // the per-device MUL_MAT_ID node of `dev` for a weight slice of n_local experts
+
         const auto make_node = [&](int n_local, bool ep, int offset, int layer, int dev, int32_t table) {
             ggml_tensor * as  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 16, n_local);
             ggml_tensor * b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 1, 2);
@@ -513,7 +513,7 @@ int main() {
 
         ggml_expert_assignment_activate(tab_b, nullptr, 0);
 
-        // the identity without expert parallelism, a segment for a hand-built node (table 0)
+
         const int16_t * idn = ggml_expert_store_node_lut(make_node(n_expert, false, 0, 0, 0, 0));
         for (int e = 0; e < n_expert && idn != nullptr; ++e) {
             check_eq(idn[e], e, "identity row entry");
@@ -534,14 +534,14 @@ int main() {
                 check(rb == ggml_expert_assignment_local_of(tab_b, j, l), "a node of the draft of the same layer reads its row of B");
                 rows_differ = rows_differ || memcmp(ra, rb, (size_t) n_expert * sizeof(int16_t)) != 0;
             }
-            // the layer only the draft has (the MTP layer after the last layer of the target)
+
             const int boff = (int) (j == 0 ? 0 : caps_b[0] + (j > 1 ? caps_b[1] : 0) + (j > 2 ? caps_b[2] : 0));
             const int16_t * rb = ggml_expert_store_node_lut(make_node((int) caps_b[j], true, boff, n_layer, j, (int32_t) tab_b));
             check(rb != nullptr && rb == ggml_expert_assignment_local_of(tab_b, j, n_layer), "the draft's own layer has a row in its table");
         }
         check(rows_differ, "the two tables give the nodes of one layer different rows");
 
-        // weights: the binding the meta backend reads, a view answers for its tensor
+
         ggml_tensor * w_a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 16, n_expert);
         ggml_tensor * w_b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 16, n_expert);
         ggml_tensor * w_off = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 16, n_expert);
@@ -553,7 +553,7 @@ int main() {
         ggml_expert_assignment_activate(tab_c, bind_c, 1);
         check_eq(ggml_expert_assignment_of_weight(w_b), tab_c, "the draft weight is bound to its table");
         check_eq(ggml_expert_assignment_of_weight(w_a), -1, "a weight bound to nothing yet");
-        // the proposal of the profile again (the plans above computed others), the target's table
+
         plan_of(n_dev, "test-expert-assign-profile.txt", 0);
         const uint32_t tab_d = ggml_expert_assignment_from_proposal(n_dev, n_layer, n_expert);
         check(tab_d > tab_c, "the target's table");
@@ -563,7 +563,7 @@ int main() {
         check_eq(ggml_expert_assignment_of_weight(v_a), tab_d, "a view answers for the tensor it views");
         check_eq(ggml_expert_assignment_of_weight(w_off), -1, "an unbound weight");
 
-        // releasing a model drops its table and its bindings, the other model keeps its own
+
         const size_t n_tables = ggml_expert_assignment_count();
         ggml_expert_assignment_release(tab_d);
         check_eq((long long) ggml_expert_assignment_count(), (long long) n_tables - 1, "one table less");
@@ -582,17 +582,17 @@ int main() {
         ggml_free(ctx);
     }
 
-    // ---- the launches field of a profile: the device slots go to the experts the most launches
-    //      route to, the routing counts still decide the assignment (same table with and without it)
+
+
     {
         const int nl = 2;
         std::vector<std::vector<int64_t>> cnt((size_t) nl, std::vector<int64_t>((size_t) n_expert, 0));
         std::vector<std::vector<int64_t>> lau((size_t) nl, std::vector<int64_t>((size_t) n_expert, 0));
         for (int l = 0; l < nl; ++l) {
             for (int e = 0; e < n_expert; ++e) {
-                // routing entries fall with the expert number; the launches rank the experts the other
-                // way round (a decode-hot expert sees few entries but many launches), with ties broken
-                // by the count
+
+
+
                 cnt[(size_t) l][(size_t) e] = 4000 - 97 * e + l;
                 lau[(size_t) l][(size_t) e] = (e / 2) * 3;
             }
@@ -612,7 +612,7 @@ int main() {
             }
         }
 
-        // three slots of device 0's slice of layer 1 (stride 1024 B)
+
         const auto slots_of = [&](const char * path, std::vector<std::vector<int16_t>> & table) {
             ggml_expert_store_plan_tensor t = device_tensor(1);
             ggml_expert_store_placement plan;
@@ -625,7 +625,7 @@ int main() {
         const std::vector<int64_t> s_lau = slots_of("test-expert-assign-profile-lau.txt", tab_lau);
         check(tab_cnt == tab_lau, "the launches field does not change the expert assignment");
 
-        // expected: device 0's local experts of layer 1 ranked by count / by (launches, count)
+
         std::vector<int> loc;
         const int16_t * row = ggml_expert_store_local_of(0, 1);
         check(row != nullptr, "local_of row of device 0");

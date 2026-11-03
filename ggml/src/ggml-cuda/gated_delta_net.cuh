@@ -7,11 +7,11 @@ struct ggml_cuda_gated_delta_net_fused_cache {
     int64_t slot_stride; // between rollback slots (0 when K==1)
 };
 
-// raw inputs of the q/k l2 normalization fused into the gated_delta_net kernel
-// (see ggml_cuda_match_gdn_prologue); all strides are in elements
+
+
 struct ggml_cuda_gdn_prologue {
-    const float * q_raw; // rms_norm q src
-    const float * k_raw; // rms_norm k src
+    const float * q_raw;
+    const float * k_raw;
     int64_t sq1, sq2, sq3;
     int64_t sk1, sk2, sk3;
     float   eps_q, scale_q;
@@ -24,7 +24,7 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                               ggml_cuda_gated_delta_net_fused_cache cache);
 
-// same op, but l2-normalizes the raw q/k in-kernel (see ggml_cuda_match_gdn_prologue)
+
 void ggml_cuda_op_gated_delta_net_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                         const ggml_cuda_gdn_prologue & prologue,
                                         const ggml_cuda_gated_delta_net_fused_cache * cache);

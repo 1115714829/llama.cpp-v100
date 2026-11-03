@@ -58,6 +58,15 @@ jobs:
       - name: Build
         run: cmake --build build -j $(nproc)
 
+      - name: Check the CUDA backend was built
+        # llama.cpp 0.7.0 把 GGML_CUDA 的默认值改成了 OFF（ggml/CMakeLists.txt）
+        # => 少一个旗标就只编出 CPU 库，包对 V100 用户没有用 => 这里断言一下。
+        run: |
+          if ! ls build/bin/libggml-cuda.so* >/dev/null 2>&1; then
+            echo "::error::libggml-cuda.so was not built (check -DGGML_CUDA=ON in the configure step)"
+            exit 1
+          fi
+
       - name: Package
         if: startsWith(github.ref, 'refs/tags/v100-')
         run: |
@@ -67,6 +76,14 @@ jobs:
           cp LICENSE README.md "$name/"
           cp -a licenses/* "$name/licenses/"
           tar -czf "$name.tar.gz" "$name"
+
+      - name: Check the package contains the CUDA backend
+        if: startsWith(github.ref, 'refs/tags/v100-')
+        run: |
+          if ! ls llama-*/libggml-cuda.so* >/dev/null 2>&1; then
+            echo "::error::the release package has no libggml-cuda.so"
+            exit 1
+          fi
 
       - name: Upload package
         if: startsWith(github.ref, 'refs/tags/v100-')

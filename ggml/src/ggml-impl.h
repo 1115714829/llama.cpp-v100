@@ -182,9 +182,9 @@ static void ggml_set_op_params_f32(struct ggml_tensor * tensor, uint32_t i, floa
     ((float *)(tensor->op_params))[i] = value;
 }
 
-// layer number of a model tensor from its name ("blk.N." -> N), -1 when the name has none. The
-// expert store keys its per-layer tables by this number, so every consumer of those tables (the
-// store plan, the meta backend writing ggml_mul_mat_id_set_layer, the kernels) derives it here.
+
+
+
 static inline int ggml_expert_layer_of_name(const char * name) {
     const char * p = name != NULL ? strstr(name, "blk.") : NULL;
     if (p == NULL) {
@@ -202,26 +202,26 @@ static inline int ggml_expert_layer_of_name(const char * name) {
     return layer;
 }
 
-// Expert map of one MUL_MAT_ID node (ggml-expert-store.cpp, ggml-base): the local expert number of
-// every expert id the node may see, -1 for the experts of the other devices; n_total entries, ids
-// outside [0, n_total) are not local either. The row is the one source the CUDA kernels (through
-// a device copy) and the CPU backend read, so both backends agree on which id is which expert.
-// It is read from the op params of the node:
-//   - not expert parallel: every id is a local expert and keeps its number (identity);
-//   - expert parallel, assignment > 0 (ggml_mul_mat_id_get_assignment): the weight was laid out by
-//     that expert assignment table, the map is its row of (device, layer); the slice of the node
-//     (expert_offset, the n_local experts of src[0]) must be the segment of the device in the table;
-//   - expert parallel, assignment == 0: a node built with its expert range in the op params (the
-//     tests): the weight holds the contiguous segment [expert_offset, expert_offset + n_local);
-//   - expert parallel, assignment < 0: the weight was laid out by no table, which aborts - a weight
-//     the meta backend splits along the expert dim is always laid out and bound by its loader.
-// The row stays valid until the table is released (with its model); a table never changes, its
-// ids are never reused, so (assignment, device, layer) names one row for the life of the process.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 GGML_API const int16_t * ggml_expert_store_node_lut(const struct ggml_tensor * node);
 
-// the expert assignment table a weight was laid out by (ggml_expert_assignment_activate bound it),
-// -1 when it was bound to none; a view answers for the tensor it views. The meta backend writes it
-// into the MUL_MAT_ID nodes it splits along the expert dim (ggml_mul_mat_id_set_assignment).
+
+
+
 GGML_API int32_t ggml_expert_assignment_of_weight(const struct ggml_tensor * weight);
 
 struct ggml_map_custom1_op_params {
@@ -399,9 +399,9 @@ struct ggml_cgraph {
     // a value of 0 means it is not set and should be ignored
     uint64_t uid;
 
-    // the uid of the graph this one replaces: a scheduler that splits a new graph drops its previous
-    // split of the same backend, which is then never computed again (see ggml_backend_sched_split_graph).
-    // 0 = no such graph
+
+
+
     uint64_t uid_prev;
 };
 

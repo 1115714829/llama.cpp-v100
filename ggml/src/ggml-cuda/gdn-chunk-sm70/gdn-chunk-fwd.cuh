@@ -17,8 +17,8 @@
 
 namespace gdn_chunk_sm70 {
 
-// HV_CT/HK_CT > 0 fix the head counts at compile time (the TP4 shape keeps its constant address
-// arithmetic); 0 takes them from Hv_rt/Hk_rt.
+
+
 template <int HV_CT, int HK_CT>
 __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_kernel(const half_t* __restrict__ a, const float* __restrict__ b, const int* __restrict__ chunk_offsets, const int* __restrict__ cu_seqlens, const float* __restrict__ g, const float* __restrict__ h0, float* __restrict__ ht, const half_t* __restrict__ k, half_t* __restrict__ o, const half_t* __restrict__ q, const half_t* __restrict__ v, int batch_size, int num_tokens, int raw_batch_size, int Hv_rt, int Hk_rt) {
   const int Hv = HV_CT > 0 ? HV_CT : Hv_rt;
@@ -55,8 +55,8 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
   float o_fragment[16];
   float g_last_local[1];
   batch_idx = 0;
-  const int hv4 = Hv * 4;                                // one CTA per (v head, DV block)
-  const int blk = ((int) blockIdx.x) % hv4;              // h * 4 + dv
+  const int hv4 = Hv * 4;
+  const int blk = ((int) blockIdx.x) % hv4;
   const int h   = blk >> 2;
   const int batch = ((int) blockIdx.x) / hv4;
   const int qk_head = h % Hk;
@@ -85,7 +85,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
       __syncthreads();
       #pragma unroll
       for (int i_1 = 0; i_1 < 16; ++i_1) {
-        half_t broadcast_var = half_t(0x0p+0f/*0.000000e+00*/);
+        half_t broadcast_var = half_t(0x0p+0f );
         uint2 condval;
         if ((((((((i_1 * 4) + (((int)threadIdx.x) >> 5)) + left) < num_tokens) && (0 <= (((i_1 * 4) + (((int)threadIdx.x) >> 5)) + left))) && (0 <= batch_idx)) && (batch_idx < 1))) {
           condval = *(uint2*)(q + ((int64_t)i_1 * qk_iter_stride + (int64_t)(threadIdx.x >> 5) * qk_tok_stride + (int64_t)left * qk_tok_stride + (int64_t)batch_idx * num_tokens * qk_tok_stride + (int64_t)qk_head * 128 + (int64_t)(threadIdx.x & 31) * 4));
@@ -97,7 +97,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
       __syncthreads();
       #pragma unroll
       for (int i_2 = 0; i_2 < 16; ++i_2) {
-        half_t broadcast_var_1 = half_t(0x0p+0f/*0.000000e+00*/);
+        half_t broadcast_var_1 = half_t(0x0p+0f );
         uint2 condval_1;
         if ((((((((i_2 * 4) + (((int)threadIdx.x) >> 5)) + left) < num_tokens) && (0 <= (((i_2 * 4) + (((int)threadIdx.x) >> 5)) + left))) && (0 <= batch_idx)) && (batch_idx < 1))) {
           condval_1 = *(uint2*)(k + ((int64_t)i_2 * qk_iter_stride + (int64_t)(threadIdx.x >> 5) * qk_tok_stride + (int64_t)left * qk_tok_stride + (int64_t)batch_idx * num_tokens * qk_tok_stride + (int64_t)qk_head * 128 + (int64_t)(threadIdx.x & 31) * 4));
@@ -108,7 +108,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
       }
       #pragma unroll
       for (int i_3 = 0; i_3 < 2; ++i_3) {
-        half_t broadcast_var_2 = half_t(0x0p+0f/*0.000000e+00*/);
+        half_t broadcast_var_2 = half_t(0x0p+0f );
         uint4 condval_2;
         if ((((((((i_3 * 32) + (((int)threadIdx.x) >> 2)) + left) < num_tokens) && (0 <= (((i_3 * 32) + (((int)threadIdx.x) >> 2)) + left))) && (0 <= batch_idx)) && (batch_idx < 1))) {
           condval_2 = *(uint4*)(v + ((int64_t)i_3 * v_iter_stride + (int64_t)(threadIdx.x >> 2) * v_tok_stride + (int64_t)left * v_tok_stride + (int64_t)batch_idx * num_tokens * v_tok_stride + (int64_t)blk * 32 + (int64_t)(threadIdx.x & 3) * 8));
@@ -120,7 +120,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
       __syncthreads();
       #pragma unroll
       for (int i_4 = 0; i_4 < 8; ++i_4) {
-        half_t broadcast_var_3 = half_t(0x0p+0f/*0.000000e+00*/);
+        half_t broadcast_var_3 = half_t(0x0p+0f );
         uint2 condval_3;
         if ((((((((i_4 * 8) + (((int)threadIdx.x) >> 4)) + left) < num_tokens) && (0 <= (((i_4 * 8) + (((int)threadIdx.x) >> 4)) + left))) && (0 <= batch_idx)) && (batch_idx < 1))) {
           condval_3 = *(uint2*)(a + ((int64_t)i_4 * a_iter_stride + (int64_t)(threadIdx.x >> 4) * a_tok_stride + (int64_t)left * a_tok_stride + (int64_t)batch_idx * num_tokens * a_tok_stride + (int64_t)h * 64 + (int64_t)(threadIdx.x & 15) * 4));
@@ -134,14 +134,14 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
         if (((((0 <= (left + ((int)threadIdx.x))) && ((left + ((int)threadIdx.x)) < num_tokens)) && (0 <= batch_idx)) && (batch_idx < 1))) {
           condval_4 = g[((int64_t)left + threadIdx.x) * g_tok_stride + (int64_t)batch_idx * num_tokens * g_tok_stride + h];
         } else {
-          condval_4 = 0x0p+0f/*0.000000e+00*/;
+          condval_4 = 0x0p+0f ;
         }
         g_shared[((int)threadIdx.x)] = condval_4;
         float condval_5;
         if (((((0 <= (left + ((int)threadIdx.x))) && ((left + ((int)threadIdx.x)) < num_tokens)) && (0 <= batch_idx)) && (batch_idx < 1))) {
           condval_5 = b[((int64_t)left + threadIdx.x) * g_tok_stride + (int64_t)batch_idx * num_tokens * g_tok_stride + h];
         } else {
-          condval_5 = 0x0p+0f/*0.000000e+00*/;
+          condval_5 = 0x0p+0f ;
         }
         b_shared[((int)threadIdx.x)] = condval_5;
       }
@@ -150,7 +150,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
       #pragma unroll
       for (int i_5 = 0; i_5 < 16; ++i_5) {
         if ((((i_5 * 4) + (((int)threadIdx.x) >> 5)) + left) < seq_end_idx) {
-          half_t broadcast_var_4 = half_t(0x0p+0f/*0.000000e+00*/);
+          half_t broadcast_var_4 = half_t(0x0p+0f );
           uint2 condval_6;
           if (((((0 <= (((i_5 * 4) + (((int)threadIdx.x) >> 5)) + left)) && ((((i_5 * 4) + (((int)threadIdx.x) >> 5)) + left) < num_tokens)) && (0 <= batch_idx)) && (batch_idx < 1))) {
             condval_6 = *(uint2*)(q + ((int64_t)i_5 * qk_iter_stride + (int64_t)(threadIdx.x >> 5) * qk_tok_stride + (int64_t)left * qk_tok_stride + (int64_t)batch_idx * num_tokens * qk_tok_stride + (int64_t)qk_head * 128 + (int64_t)(threadIdx.x & 31) * 4));
@@ -158,7 +158,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
             condval_6 = make_uint2(__pack_half2(broadcast_var_4, broadcast_var_4), __pack_half2(broadcast_var_4, broadcast_var_4));
           }
           *(uint2*)(((half_t*)q_shared) + ((((((((int)threadIdx.x) & 31) * 256) + ((i_5 >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 16)) + ((((((i_5 & 7) >> 2) + ((((int)threadIdx.x) & 7) >> 2)) + ((i_5 & 3) >> 1)) & 1) * 8)) + (((((((int)threadIdx.x) & 3) >> 1) + (i_5 & 1)) & 1) * 4))) = condval_6;
-          half_t broadcast_var_5 = half_t(0x0p+0f/*0.000000e+00*/);
+          half_t broadcast_var_5 = half_t(0x0p+0f );
           uint2 condval_7;
           if (((((0 <= (((i_5 * 4) + (((int)threadIdx.x) >> 5)) + left)) && ((((i_5 * 4) + (((int)threadIdx.x) >> 5)) + left) < num_tokens)) && (0 <= batch_idx)) && (batch_idx < 1))) {
             condval_7 = *(uint2*)(k + ((int64_t)i_5 * qk_iter_stride + (int64_t)(threadIdx.x >> 5) * qk_tok_stride + (int64_t)left * qk_tok_stride + (int64_t)batch_idx * num_tokens * qk_tok_stride + (int64_t)qk_head * 128 + (int64_t)(threadIdx.x & 31) * 4));
@@ -167,16 +167,16 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
           }
           *(uint2*)(((half_t*)k_shared) + ((((((((int)threadIdx.x) & 31) * 256) + ((i_5 >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 16)) + ((((((i_5 & 7) >> 2) + ((((int)threadIdx.x) & 7) >> 2)) + ((i_5 & 3) >> 1)) & 1) * 8)) + (((((((int)threadIdx.x) & 3) >> 1) + (i_5 & 1)) & 1) * 4))) = condval_7;
         } else {
-          half_t broadcast_var_6 = half_t(0x0p+0f/*0.000000e+00*/);
+          half_t broadcast_var_6 = half_t(0x0p+0f );
           *(uint2*)(((half_t*)q_shared) + ((((((((int)threadIdx.x) & 31) * 256) + ((i_5 >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 16)) + ((((((i_5 & 7) >> 2) + ((((int)threadIdx.x) & 7) >> 2)) + ((i_5 & 3) >> 1)) & 1) * 8)) + (((((((int)threadIdx.x) & 3) >> 1) + (i_5 & 1)) & 1) * 4))) = make_uint2(__pack_half2(broadcast_var_6, broadcast_var_6), __pack_half2(broadcast_var_6, broadcast_var_6));
-          half_t broadcast_var_7 = half_t(0x0p+0f/*0.000000e+00*/);
+          half_t broadcast_var_7 = half_t(0x0p+0f );
           *(uint2*)(((half_t*)k_shared) + ((((((((int)threadIdx.x) & 31) * 256) + ((i_5 >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 16)) + ((((((i_5 & 7) >> 2) + ((((int)threadIdx.x) & 7) >> 2)) + ((i_5 & 3) >> 1)) & 1) * 8)) + (((((((int)threadIdx.x) & 3) >> 1) + (i_5 & 1)) & 1) * 4))) = make_uint2(__pack_half2(broadcast_var_7, broadcast_var_7), __pack_half2(broadcast_var_7, broadcast_var_7));
         }
       }
       #pragma unroll
       for (int i_6 = 0; i_6 < 2; ++i_6) {
         if ((((i_6 * 32) + (((int)threadIdx.x) >> 2)) + left) < seq_end_idx) {
-          half_t broadcast_var_8 = half_t(0x0p+0f/*0.000000e+00*/);
+          half_t broadcast_var_8 = half_t(0x0p+0f );
           uint4 condval_8;
           if (((((0 <= (((i_6 * 32) + (((int)threadIdx.x) >> 2)) + left)) && ((((i_6 * 32) + (((int)threadIdx.x) >> 2)) + left) < num_tokens)) && (0 <= batch_idx)) && (batch_idx < 1))) {
             condval_8 = *(uint4*)(v + ((int64_t)i_6 * v_iter_stride + (int64_t)(threadIdx.x >> 2) * v_tok_stride + (int64_t)left * v_tok_stride + (int64_t)batch_idx * num_tokens * v_tok_stride + (int64_t)blk * 32 + (int64_t)(threadIdx.x & 3) * 8));
@@ -185,7 +185,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
           }
           *(uint4*)(((half_t*)v_shared) + (((i_6 * 1280) + ((((int)threadIdx.x) >> 2) * 40)) + ((((int)threadIdx.x) & 3) * 8))) = condval_8;
         } else {
-          half_t broadcast_var_9 = half_t(0x0p+0f/*0.000000e+00*/);
+          half_t broadcast_var_9 = half_t(0x0p+0f );
           *(uint4*)(((half_t*)v_shared) + (((i_6 * 1280) + ((((int)threadIdx.x) >> 2) * 40)) + ((((int)threadIdx.x) & 3) * 8))) = make_uint4(__pack_half2(broadcast_var_9, broadcast_var_9), __pack_half2(broadcast_var_9, broadcast_var_9), __pack_half2(broadcast_var_9, broadcast_var_9), __pack_half2(broadcast_var_9, broadcast_var_9));
         }
       }
@@ -193,7 +193,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
       #pragma unroll
       for (int i_7 = 0; i_7 < 8; ++i_7) {
         if ((((i_7 * 8) + (((int)threadIdx.x) >> 4)) + left) < seq_end_idx) {
-          half_t broadcast_var_10 = half_t(0x0p+0f/*0.000000e+00*/);
+          half_t broadcast_var_10 = half_t(0x0p+0f );
           uint2 condval_9;
           if (((((0 <= (((i_7 * 8) + (((int)threadIdx.x) >> 4)) + left)) && ((((i_7 * 8) + (((int)threadIdx.x) >> 4)) + left) < num_tokens)) && (0 <= batch_idx)) && (batch_idx < 1))) {
             condval_9 = *(uint2*)(a + ((int64_t)i_7 * a_iter_stride + (int64_t)(threadIdx.x >> 4) * a_tok_stride + (int64_t)left * a_tok_stride + (int64_t)batch_idx * num_tokens * a_tok_stride + (int64_t)h * 64 + (int64_t)(threadIdx.x & 15) * 4));
@@ -202,7 +202,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
           }
           *(uint2*)(((half_t*)a_shared) + ((((((((int)threadIdx.x) & 15) * 256) + ((i_7 >> 1) * 64)) + (((((int)threadIdx.x) & 63) >> 4) * 16)) + ((((((((int)threadIdx.x) & 7) >> 2) + ((i_7 & 3) >> 1)) + (i_7 & 1)) & 1) * 8)) + ((((((int)threadIdx.x) >> 6) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 4))) = condval_9;
         } else {
-          half_t broadcast_var_11 = half_t(0x0p+0f/*0.000000e+00*/);
+          half_t broadcast_var_11 = half_t(0x0p+0f );
           *(uint2*)(((half_t*)a_shared) + ((((((((int)threadIdx.x) & 15) * 256) + ((i_7 >> 1) * 64)) + (((((int)threadIdx.x) & 63) >> 4) * 16)) + ((((((((int)threadIdx.x) & 7) >> 2) + ((i_7 & 3) >> 1)) + (i_7 & 1)) & 1) * 8)) + ((((((int)threadIdx.x) >> 6) + ((((int)threadIdx.x) & 3) >> 1)) & 1) * 4))) = make_uint2(__pack_half2(broadcast_var_11, broadcast_var_11), __pack_half2(broadcast_var_11, broadcast_var_11));
         }
       }
@@ -212,14 +212,14 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
           if (((((0 <= (left + ((int)threadIdx.x))) && ((left + ((int)threadIdx.x)) < num_tokens)) && (0 <= batch_idx)) && (batch_idx < 1))) {
             condval_10 = g[((int64_t)left + threadIdx.x) * g_tok_stride + (int64_t)batch_idx * num_tokens * g_tok_stride + h];
           } else {
-            condval_10 = 0x0p+0f/*0.000000e+00*/;
+            condval_10 = 0x0p+0f ;
           }
           g_shared[((int)threadIdx.x)] = condval_10;
           float condval_11;
           if (((((0 <= (left + ((int)threadIdx.x))) && ((left + ((int)threadIdx.x)) < num_tokens)) && (0 <= batch_idx)) && (batch_idx < 1))) {
             condval_11 = b[((int64_t)left + threadIdx.x) * g_tok_stride + (int64_t)batch_idx * num_tokens * g_tok_stride + h];
           } else {
-            condval_11 = 0x0p+0f/*0.000000e+00*/;
+            condval_11 = 0x0p+0f ;
           }
           b_shared[((int)threadIdx.x)] = condval_11;
         } else {
@@ -227,10 +227,10 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
           if (((((1 <= seq_end_idx) && (seq_end_idx <= num_tokens)) && (0 <= batch_idx)) && (batch_idx < 1))) {
             condval_12 = g[((int64_t)seq_end_idx - 1) * g_tok_stride + (int64_t)batch_idx * num_tokens * g_tok_stride + h];
           } else {
-            condval_12 = 0x0p+0f/*0.000000e+00*/;
+            condval_12 = 0x0p+0f ;
           }
           g_shared[((int)threadIdx.x)] = condval_12;
-          b_shared[((int)threadIdx.x)] = 0x0p+0f/*0.000000e+00*/;
+          b_shared[((int)threadIdx.x)] = 0x0p+0f ;
         }
       }
     }
@@ -251,12 +251,12 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
     }
     __syncthreads();
     if (((int)threadIdx.x) < 64) {
-      g_exp_shared[((int)threadIdx.x)] = exp2f((g_shared[((int)threadIdx.x)] * 0x1.715475a31a4bep+0f/*1.442695e+00*/));
+      g_exp_shared[((int)threadIdx.x)] = exp2f((g_shared[((int)threadIdx.x)] * 0x1.715475a31a4bep+0f ));
       float condval_13;
       if (((left + ((int)threadIdx.x)) < seq_end_idx)) {
-        condval_13 = exp2f(((g_shared[63] - g_shared[((int)threadIdx.x)]) * 0x1.715475a31a4bep+0f/*1.442695e+00*/));
+        condval_13 = exp2f(((g_shared[63] - g_shared[((int)threadIdx.x)]) * 0x1.715475a31a4bep+0f ));
       } else {
-        condval_13 = 0x0p+0f/*0.000000e+00*/;
+        condval_13 = 0x0p+0f ;
       }
       g_rev_exp_shared[((int)threadIdx.x)] = condval_13;
     }
@@ -266,7 +266,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
       half_t B_local[8];
       #pragma unroll
       for (int i_10 = 0; i_10 < 8; ++i_10) {
-        float broadcast_var_12 = 0x0p+0f/*0.000000e+00*/;
+        float broadcast_var_12 = 0x0p+0f ;
         *(float4*)(p_fragment + (i_10 * 4)) = make_float4(broadcast_var_12, broadcast_var_12, broadcast_var_12, broadcast_var_12);
       }
       for (int ki = 0; ki < 32; ++ki) {
@@ -295,9 +295,9 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
     #pragma unroll
     for (int i_15 = 0; i_15 < 32; ++i_15) {
       if (((((((((int)threadIdx.x) >> 6) * 32) + (((i_15 & 15) >> 2) * 8)) + (((((int)threadIdx.x) & 15) >> 3) * 4)) + (((((int)threadIdx.x) & 3) >> 1) * 2)) + (i_15 & 1)) <= ((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_15 >> 4) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + (((i_15 & 3) >> 1) * 2)) + (((int)threadIdx.x) & 1))) {
-        g_fragment[i_15] = exp2f((g_fragment[i_15] * 0x1.715475a31a4bep+0f/*1.442695e+00*/));
+        g_fragment[i_15] = exp2f((g_fragment[i_15] * 0x1.715475a31a4bep+0f ));
       } else {
-        g_fragment[i_15] = 0x0p+0f/*0.000000e+00*/;
+        g_fragment[i_15] = 0x0p+0f ;
       }
     }
     #pragma unroll
@@ -338,7 +338,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
       half_t B_local_1[4];
       #pragma unroll
       for (int i_20 = 0; i_20 < 4; ++i_20) {
-        float broadcast_var_13 = 0x0p+0f/*0.000000e+00*/;
+        float broadcast_var_13 = 0x0p+0f ;
         *(float4*)(u_fragment + (i_20 * 4)) = make_float4(broadcast_var_13, broadcast_var_13, broadcast_var_13, broadcast_var_13);
       }
       for (int ki_1 = 0; ki_1 < 32; ++ki_1) {
@@ -355,7 +355,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
     for (int i_23 = 0; i_23 < 8; ++i_23) {
       float2 __6;
         float2 v__7 = *(float2*)(u_fragment + (i_23 * 2));
-        float2 v__8 = make_float2((g_exp_shared[((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_23 >> 2) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + ((i_23 & 1) * 2)) + (((int)threadIdx.x) & 1))] * -0x1p+0f/*-1.000000e+00*/), (g_exp_shared[((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_23 >> 2) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + ((i_23 & 1) * 2)) + (((int)threadIdx.x) & 1))] * -0x1p+0f/*-1.000000e+00*/));
+        float2 v__8 = make_float2((g_exp_shared[((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_23 >> 2) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + ((i_23 & 1) * 2)) + (((int)threadIdx.x) & 1))] * -0x1p+0f ), (g_exp_shared[((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_23 >> 2) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + ((i_23 & 1) * 2)) + (((int)threadIdx.x) & 1))] * -0x1p+0f ));
         __6.x = (v__7.x*v__8.x);
         __6.y = (v__7.y*v__8.y);
       *(float2*)(u_fragment + (i_23 * 2)) = __6;
@@ -389,7 +389,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
       half_t B_local_2[4];
       #pragma unroll
       for (int i_26 = 0; i_26 < 4; ++i_26) {
-        float broadcast_var_14 = 0x0p+0f/*0.000000e+00*/;
+        float broadcast_var_14 = 0x0p+0f ;
         *(float4*)(v_fragment + (i_26 * 4)) = make_float4(broadcast_var_14, broadcast_var_14, broadcast_var_14, broadcast_var_14);
       }
       for (int ki_2 = 0; ki_2 < 16; ++ki_2) {
@@ -435,7 +435,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
       half_t B_local_3[4];
       #pragma unroll
       for (int i_32 = 0; i_32 < 4; ++i_32) {
-        float broadcast_var_15 = 0x0p+0f/*0.000000e+00*/;
+        float broadcast_var_15 = 0x0p+0f ;
         *(float4*)(o_fragment + (i_32 * 4)) = make_float4(broadcast_var_15, broadcast_var_15, broadcast_var_15, broadcast_var_15);
       }
       for (int ki_3 = 0; ki_3 < 32; ++ki_3) {
@@ -450,7 +450,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
     }
     #pragma unroll
     for (int i_35 = 0; i_35 < 32; ++i_35) {
-      p_fragment[i_35] = (p_fragment[i_35] * (0x1.6a09e667f3bcdp-4f/*8.838835e-02*/ * g_fragment[i_35]));
+      p_fragment[i_35] = (p_fragment[i_35] * (0x1.6a09e667f3bcdp-4f * g_fragment[i_35]));
     }
     __syncthreads();
     #pragma unroll
@@ -466,7 +466,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
     for (int i_37 = 0; i_37 < 8; ++i_37) {
       float2 __14;
         float2 v__17 = *(float2*)(o_fragment + (i_37 * 2));
-        float2 v__18 = make_float2((0x1.6a09e667f3bcdp-4f/*8.838835e-02*/ * g_exp_shared[((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_37 >> 2) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + ((i_37 & 1) * 2)) + (((int)threadIdx.x) & 1))]), (0x1.6a09e667f3bcdp-4f/*8.838835e-02*/ * g_exp_shared[((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_37 >> 2) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + ((i_37 & 1) * 2)) + (((int)threadIdx.x) & 1))]));
+        float2 v__18 = make_float2((0x1.6a09e667f3bcdp-4f * g_exp_shared[((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_37 >> 2) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + ((i_37 & 1) * 2)) + (((int)threadIdx.x) & 1))]), (0x1.6a09e667f3bcdp-4f * g_exp_shared[((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_37 >> 2) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + ((i_37 & 1) * 2)) + (((int)threadIdx.x) & 1))]));
         __14.x = (v__17.x*v__18.x);
         __14.y = (v__17.y*v__18.y);
       *(float2*)(o_fragment + (i_37 * 2)) = __14;
@@ -555,5 +555,5 @@ __global__ void __launch_bounds__(128, 1) tilelang_fused_chunk_gdr_fwd_kernel_ke
   }
 }
 
-} // namespace gdn_chunk_sm70
+}
 

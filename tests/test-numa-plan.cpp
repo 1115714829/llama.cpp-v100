@@ -1,4 +1,4 @@
-// tests for the NUMA placement solver of the expert host arena (ggml-cuda-numa-plan.h)
+
 
 #include "ggml-cuda/ggml-cuda-numa-plan.h"
 
@@ -29,24 +29,24 @@ bool expect(const char * what, const std::vector<int> & got, const std::vector<i
     return true;
 }
 
-// read time matrix of a 6 card AC922 measurement, one GiB per device, 128 MiB probe
-// buffer, in ms. The measured step times were: 0,0,8,0,0,8 -> 90 ms (best), page interleaved
-// -> 119, all on node 0 -> 128, 8,8,8,0,0,0 -> 134, slot local 0,0,0,8,8,8 -> 146, all on node 8
-// -> 233. The times are per (device, node) under concurrent load, which is why the placement
-// that keeps four devices on node 0 beats the slot local one: it uses the total bandwidth of
-// the node instead of the local path of every device.
+
+
+
+
+
+
 const double T6[6*2] = {
-     88.0, 150.0,   // device 0
-     85.0, 155.0,   // device 1
-    145.0,  90.0,   // device 2
-     82.0, 200.0,   // device 3
-     80.0, 195.0,   // device 4
-    150.0,  87.0,   // device 5
+     88.0, 150.0,
+     85.0, 155.0,
+    145.0,  90.0,
+     82.0, 200.0,
+     80.0, 195.0,
+    150.0,  87.0,
 };
 
 const int TOPO6[6] = { 0, 0, 0, 1, 1, 1 };
 
-// every assignment of the six devices within the two node capacities, and the capacity holds
+
 bool test_exhaustive_best(void) {
     const size_t            n_dev   = 6;
     const size_t            n_nodes = 2;
@@ -59,7 +59,7 @@ bool test_exhaustive_best(void) {
         fprintf(stderr, "%s: the plan failed (%d)\n", __func__, ret);
         return false;
     }
-    // 64 assignments is below the enumeration limit, so the best one is the measured one
+
     if (!expect(__func__, r.node, { 0, 0, 1, 0, 0, 1 })) {
         return false;
     }
@@ -68,13 +68,13 @@ bool test_exhaustive_best(void) {
             (long long) r.node_bytes[0], (long long) r.node_bytes[1]);
         return false;
     }
-    // the estimated step time is the slowest device, and the slot local placement of the same
-    // table is worse, which is what the measurement showed
+
+
     if (r.cost >= r.cost_local || !r.have_local) {
         fprintf(stderr, "%s: cost %f is not better than the slot local %f\n", __func__, r.cost, r.cost_local);
         return false;
     }
-    // every device on its own fastest node is never worse than the chosen plan
+
     if (r.cost > r.cost_fast) {
         fprintf(stderr, "%s: cost %f is worse than every device on its fastest node %f\n",
             __func__, r.cost, r.cost_fast);
@@ -83,12 +83,12 @@ bool test_exhaustive_best(void) {
     return true;
 }
 
-// a node that cannot hold all the devices of the plan forces a different one, and the result
-// still respects the capacity
+
+
 bool test_capacity(void) {
     const size_t              n_dev   = 6;
     const std::vector<size_t> bytes   = { GiB, GiB, GiB, GiB, GiB, GiB };
-    // node 0 takes at most two devices
+
     const int64_t cap[2] = { (int64_t) (2*GiB + GiB/2), (int64_t) 28*GiB };
 
     result r;
@@ -110,8 +110,8 @@ bool test_capacity(void) {
     return true;
 }
 
-// times that differ by one percent make every assignment a tie: the result must spread the
-// devices over the nodes and be the same on every call
+
+
 bool test_tie_is_deterministic(void) {
     const std::vector<size_t> bytes = { GiB, GiB };
     const double  t[2*2] = { 1.00, 0.99, 1.00, 0.99 };
@@ -134,25 +134,25 @@ bool test_tie_is_deterministic(void) {
             return false;
         }
     }
-    // every assignment has the same cost, so the tie is broken by the spread: one device per node
+
     if (!expect(__func__, first.node, { 0, 1 })) {
         return false;
     }
     return true;
 }
 
-// the tie of the two cards of the same socket: the two nodes read the same within the
-// measurement error, so every assignment has the same cost. the old rule took the
-// lexicographically smallest one and piled both arenas on node 0; the arenas of the two cards
-// must go to different nodes instead, and the spread must not cost anything
+
+
+
+
 bool test_tie_spreads_the_devices(void) {
     const int64_t MiB = 1024ll*1024ll;
     const size_t  bytes[2] = { (size_t) (30249*MiB), (size_t) (30243*MiB) };
-    // the nodes read the same within the noise of the probe
+
     const double  t[2*2] = { 4.30, 4.32, 3.30, 3.31 };
-    // both cards are in the slots of node 0
+
     const int     topo[2] = { 0, 0 };
-    // the nodes hold both arenas, so every assignment fits
+
     const int64_t cap[2]  = { (int64_t) 96*1024*MiB, (int64_t) 96*1024*MiB };
 
     result r;
@@ -167,8 +167,8 @@ bool test_tie_spreads_the_devices(void) {
         fprintf(stderr, "%s: both arenas are on node %d\n", __func__, r.node[0]);
         return false;
     }
-    // the spread does not cost anything: the cost of the assignment that piles them on one node
-    // is the same, so the spread was free
+
+
     const int piled[2] = { 0, 0 };
     const double c_piled = ggml_cuda_numa_plan::cost_of(piled, 2, 2, bytes, t);
     if (c_piled < 0.0 || r.cost > c_piled*ggml_cuda_numa_plan::TIE) {
@@ -178,10 +178,10 @@ bool test_tie_spreads_the_devices(void) {
     return true;
 }
 
-// the placement of the six card machine of the ac922-1: the read times of the probe, the host
-// complement of every device and the node capacities are the ones of the run of job #162
-// (server/ac922-1/162-2card-tip-7ec77fba6-b2-measure/numa-c6-moe-16k-tip-p1.log). the placement
-// must not change: the six cards keep their arena on the node of their PCI slot
+
+
+
+
 bool test_six_cards_ac9221(void) {
     const int64_t MiB = 1024ll*1024ll;
     const size_t  n_dev = 6;
@@ -208,8 +208,8 @@ bool test_six_cards_ac9221(void) {
     return true;
 }
 
-// more bytes than the nodes hold together: the solver reports the failure instead of placing
-// the arena anyway
+
+
 bool test_does_not_fit(void) {
     const std::vector<size_t> bytes = { GiB, GiB };
     const double  t[2*2] = { 1.0, 1.0, 1.0, 1.0 };
@@ -229,11 +229,11 @@ bool test_does_not_fit(void) {
     return true;
 }
 
-// more assignments than the enumeration limit: the solver descends from the per device fastest
-// node instead. The result must be legal and the same on every call.
+
+
 bool test_descent(void) {
     const size_t              n_dev   = 3;
-    const size_t              n_nodes = 7; // 7^3 = 343 assignments, above the enumeration limit
+    const size_t              n_nodes = 7;
     const size_t              limit  = (size_t) ggml_cuda_numa_plan::EXHAUSTIVE;
     const std::vector<size_t> bytes   = { 4*GiB, 2*GiB, 1*GiB };
     std::vector<double>       t(n_dev*n_nodes);
@@ -265,7 +265,7 @@ bool test_descent(void) {
         }
         if (i == 0) {
             first = r;
-            // every device reads node 0 the fastest, and nothing forces it elsewhere
+
             if (r.node != std::vector<int>({ 0, 0, 0 })) {
                 fprintf(stderr, "%s: got %s, want 0,0,0\n", __func__, to_string(r.node).c_str());
                 return false;
@@ -279,12 +279,366 @@ bool test_descent(void) {
     return true;
 }
 
+
+
+
+
+static bool test_pinned_room(void) {
+    const int64_t MiB = 1024ll*1024ll;
+    const int64_t margin_proc = 4*1024*MiB;
+
+    const int64_t cap8 = 44847*MiB;
+    const int64_t cap0 = 44762*MiB;
+    const int64_t high  = 1024*MiB;
+
+
+
+    if (!(43835*MiB > ggml_cuda_numa_plan::pinned_room(cap8, high, margin_proc))) {
+        fprintf(stderr, "%s: the 3 card tier does not fill node 8\n", __func__);
+        return false;
+    }
+
+    if (34079*MiB > ggml_cuda_numa_plan::pinned_room(cap0, high, margin_proc)) {
+        fprintf(stderr, "%s: the 6 card tier fills node 0\n", __func__);
+        return false;
+    }
+    return true;
+}
+
+
+
+
+
+
+static bool test_balanced_one_card_ac9221(void) {
+    const int64_t MiB = 1024ll*1024ll;
+    const size_t  bytes[1] = { (size_t) (71907*MiB) };
+    const int     local[1] = { 0 };
+    const int64_t cap[2] = { (int64_t) (40744*MiB), (int64_t) (40990*MiB) };
+    const int64_t fixed_w = 644*MiB;
+    const int64_t fixed_p = 163*MiB;
+
+    const int     node_w  = 1;
+    const int     node_p  = 0;
+
+    std::vector<std::vector<ggml_cuda_numa_plan::segment_entry>> seg;
+    if (ggml_cuda_numa_plan::balanced(1, bytes, nullptr, nullptr, 0, local, 2, cap,
+            fixed_w, fixed_p, 0, node_w, node_p, &seg) != 1) {
+        fprintf(stderr, "%s: the balanced placement failed\n", __func__);
+        return false;
+    }
+
+    int64_t used[2] = { fixed_p, fixed_w };
+    for (const ggml_cuda_numa_plan::segment_entry & e : seg[0]) {
+        used[e.node] += e.bytes;
+    }
+
+
+    if (seg[0].size() < 2) {
+        fprintf(stderr, "%s: the complement of the card is not split over the nodes\n", __func__);
+        return false;
+    }
+
+
+    const int64_t diff = used[0] > used[1] ? used[0] - used[1] : used[1] - used[0];
+    if (diff > used[0]/100) {
+        fprintf(stderr, "%s: the nodes carry %lld and %lld MiB\n", __func__,
+            (long long) (used[0]/MiB), (long long) (used[1]/MiB));
+        return false;
+    }
+    for (size_t n = 0; n < 2; n++) {
+        if (used[n] > cap[n]) {
+            fprintf(stderr, "%s: node %zu holds %lld MiB of %lld\n", __func__, n,
+                (long long) (used[n]/MiB), (long long) (cap[n]/MiB));
+            return false;
+        }
+    }
+    return true;
+}
+
+
+
+
+static bool test_table_node_without_arena(void) {
+    const int64_t MiB = 1024ll*1024ll;
+
+    const size_t bytes[2] = { (size_t) (29945*MiB), (size_t) (29945*MiB) };
+    const int    local[2] = { 0, 0 };
+    const int64_t cap[2] = { (int64_t) (61132*MiB), (int64_t) (61132*MiB) };
+    const int64_t table  = 27466*MiB;
+
+
+    if (ggml_cuda_numa_plan::table_node(2, bytes, local, 2, cap, table) != 1) {
+        fprintf(stderr, "%s: the table did not take the node without an arena\n", __func__);
+        return false;
+    }
+
+
+
+    const int local_both[2] = { 0, 1 };
+    const int got = ggml_cuda_numa_plan::table_node(2, bytes, local_both, 2, cap, table);
+    if (got != 0 && got != 1) {
+        fprintf(stderr, "%s: the table took no node when every node carries an arena\n", __func__);
+        return false;
+    }
+    return true;
+}
+
+
+
+static bool test_table_node_shares_with_arena(void) {
+    const int64_t MiB = 1024ll*1024ll;
+    const size_t bytes[3] = { (size_t) (15503*MiB), (size_t) (15644*MiB), (size_t) (15644*MiB) };
+    const int    local[3] = { 0, 0, 1 };
+    const int64_t cap[2] = { (int64_t) (44762*MiB), (int64_t) (44847*MiB) };
+    const int64_t table  = 27466*MiB;
+
+
+
+
+    const int got = ggml_cuda_numa_plan::table_node(3, bytes, local, 2, cap, table);
+    if (got != 1) {
+        fprintf(stderr, "%s: the table went to node %d instead of node 1\n", __func__, got);
+        return false;
+    }
+    return true;
+}
+
+
+
+
+
+
+static bool test_table_node_of_uses_the_placement(void) {
+    const int64_t MiB = 1024ll*1024ll;
+    const int64_t cap[2] = { (int64_t) (61132*MiB), (int64_t) (61132*MiB) };
+
+
+    std::vector<int64_t> placed(2, 0);
+    placed[0] = 29945*MiB;
+    placed[1] = 29945*MiB;
+    const int w = ggml_cuda_numa_plan::table_node_of(placed, 2, cap, 27466*MiB);
+    if (w < 0 || w > 1) {
+        fprintf(stderr, "%s: the table took node %d of two\n", __func__, w);
+        return false;
+    }
+
+
+    std::vector<int64_t> slot(2, 0);
+    slot[0] = 59890*MiB;
+    if (ggml_cuda_numa_plan::table_node_of(slot, 2, cap, 27466*MiB) != 1) {
+        fprintf(stderr, "%s: the table did not take the node without an arena\n", __func__);
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
-// the committed plan is what the load reads: a device gets the node of the plan no matter how
-// many bytes it has when its arena is allocated
+
+
+
+
+
+
+
+
+
+
+static bool test_balanced_three_cards(void) {
+    const int64_t MiB = 1024ll*1024ll;
+    const size_t  n_dev = 3;
+    const size_t  bytes[3] = { (size_t) (15503*MiB), (size_t) (15644*MiB), (size_t) (15644*MiB) };
+
+    const int     local[3] = { 0, 0, 1 };
+
+    const int64_t cap[2] = { (int64_t) (46810*MiB), (int64_t) (46895*MiB) };
+
+    const int64_t fixed_w = 27464*MiB;
+    const int64_t fixed_p = 83*MiB;
+    const int     node_w  = 1;
+    const int     node_p  = 0;
+
+    std::vector<std::vector<ggml_cuda_numa_plan::segment_entry>> seg;
+    if (ggml_cuda_numa_plan::balanced(n_dev, bytes, nullptr, nullptr, 0, local, 2, cap,
+            fixed_w, fixed_p, 0, node_w, node_p, &seg) != 1) {
+        fprintf(stderr, "%s: the balanced placement failed\n", __func__);
+        return false;
+    }
+
+    int64_t used[2] = { 0, 0 };
+    used[node_w] += fixed_w;
+    used[node_p] += fixed_p;
+    for (size_t d = 0; d < n_dev; d++) {
+        for (const ggml_cuda_numa_plan::segment_entry & e : seg[d]) {
+            used[e.node] += e.bytes;
+        }
+    }
+
+
+    const int64_t diff = used[0] > used[1] ? used[0] - used[1] : used[1] - used[0];
+    if (diff > used[0]/100) {
+        fprintf(stderr, "%s: the nodes carry %lld and %lld MiB\n", __func__,
+            (long long) (used[0]/MiB), (long long) (used[1]/MiB));
+        return false;
+    }
+
+
+    if (seg[2].size() < 2) {
+        fprintf(stderr, "%s: the third card is not split over the nodes\n", __func__);
+        return false;
+    }
+
+
+    for (size_t n = 0; n < 2; n++) {
+        if (used[n] > cap[n]) {
+            fprintf(stderr, "%s: node %zu holds %lld MiB of %lld\n", __func__, n,
+                (long long) (used[n]/MiB), (long long) (cap[n]/MiB));
+            return false;
+        }
+    }
+    return true;
+}
+
+
+
+static bool test_balanced_one_card(void) {
+    const int64_t MiB = 1024ll*1024ll;
+    const size_t  bytes[1] = { (size_t) (60000*MiB) };
+    const int     local[1] = { 0 };
+    const int64_t cap[2] = { (int64_t) (46810*MiB), (int64_t) (46895*MiB) };
+    const int64_t fixed_w = 27464*MiB;
+    const int64_t fixed_p = 83*MiB;
+
+    const int     node_w  = 1;
+    const int     node_p  = 0;
+
+    std::vector<std::vector<ggml_cuda_numa_plan::segment_entry>> seg;
+    if (ggml_cuda_numa_plan::balanced(1, bytes, nullptr, nullptr, 0, local, 2, cap,
+            fixed_w, fixed_p, 0, node_w, node_p, &seg) != 1) {
+        fprintf(stderr, "%s: the balanced placement failed\n", __func__);
+        return false;
+    }
+
+    int64_t used[2] = { fixed_p, fixed_w };
+    for (const ggml_cuda_numa_plan::segment_entry & e : seg[0]) {
+        used[e.node] += e.bytes;
+    }
+
+
+    if (seg[0].size() < 2) {
+        fprintf(stderr, "%s: the complement of the card is not split over the nodes\n", __func__);
+        return false;
+    }
+
+
+    const int64_t diff = used[0] > used[1] ? used[0] - used[1] : used[1] - used[0];
+    if (diff > used[0]/100) {
+        fprintf(stderr, "%s: the nodes carry %lld and %lld MiB\n", __func__,
+            (long long) (used[0]/MiB), (long long) (used[1]/MiB));
+        return false;
+    }
+
+    for (size_t n = 0; n < 2; n++) {
+        if (used[n] > cap[n]) {
+            fprintf(stderr, "%s: node %zu holds %lld MiB of %lld\n", __func__, n,
+                (long long) (used[n]/MiB), (long long) (cap[n]/MiB));
+            return false;
+        }
+    }
+    return true;
+}
+
+
+
+static bool test_balanced_six_cards(void) {
+    const int64_t MiB = 1024ll*1024ll;
+    const size_t  bytes[6] = { (size_t) (1897*MiB), (size_t) (1832*MiB), (size_t) (1994*MiB),
+                                (size_t) (1890*MiB), (size_t) (1841*MiB), (size_t) (2007*MiB) };
+    const int     local[6] = { 0, 0, 0, 1, 1, 1 };
+    const int64_t cap[2] = { (int64_t) (46810*MiB), (int64_t) (46895*MiB) };
+    const int64_t fixed_w = 27464*MiB;
+    const int64_t fixed_p = 644*MiB;
+    const int     node_w  = 0;
+    const int     node_p  = 1;
+
+    std::vector<std::vector<ggml_cuda_numa_plan::segment_entry>> seg;
+    if (ggml_cuda_numa_plan::balanced(6, bytes, nullptr, nullptr, 0, local, 2, cap,
+            fixed_w, fixed_p, 0, node_w, node_p, &seg) != 1) {
+        fprintf(stderr, "%s: the balanced placement failed\n", __func__);
+        return false;
+    }
+
+    int64_t used[2] = { fixed_w, fixed_p };
+    for (size_t d = 0; d < 6; d++) {
+        for (const ggml_cuda_numa_plan::segment_entry & e : seg[d]) {
+            used[e.node] += e.bytes;
+        }
+    }
+    for (size_t n = 0; n < 2; n++) {
+        if (used[n] > cap[n]) {
+            fprintf(stderr, "%s: node %zu holds %lld MiB of %lld\n", __func__, n,
+                (long long) (used[n]/MiB), (long long) (cap[n]/MiB));
+            return false;
+        }
+    }
+    return true;
+}
+
+
+static bool test_balanced_does_not_fit(void) {
+    const int64_t MiB = 1024ll*1024ll;
+    const size_t  bytes[1] = { (size_t) (90000*MiB) };
+    const int     local[1] = { 0 };
+    const int64_t cap[2] = { (int64_t) (46810*MiB), (int64_t) (46895*MiB) };
+    const int64_t fixed_w = 27464*MiB;
+    const int64_t fixed_p = 83*MiB;
+
+    std::vector<std::vector<ggml_cuda_numa_plan::segment_entry>> seg;
+    if (ggml_cuda_numa_plan::balanced(1, bytes, nullptr, nullptr, 0, local, 2, cap,
+            fixed_w, fixed_p, 0, 1, 0, &seg) != 0) {
+        fprintf(stderr, "%s: the balanced placement did not report the failure\n", __func__);
+        return false;
+    }
+    return true;
+}
+
+
+
+
+static bool test_balanced_respects_the_room_of_the_node(void) {
+    const int64_t MiB = 1024ll*1024ll;
+    const size_t  bytes[1] = { (size_t) (1000*MiB) };
+    const int     local[1] = { 0 };
+    const int64_t cap[2] = { (int64_t) (100*MiB), (int64_t) (1900*MiB) };
+    const int64_t fixed_w = 0;
+    const int64_t fixed_p = 0;
+
+    std::vector<std::vector<ggml_cuda_numa_plan::segment_entry>> seg;
+    if (ggml_cuda_numa_plan::balanced(1, bytes, nullptr, nullptr, 0, local, 2, cap,
+            fixed_w, fixed_p, 0, 1, 0, &seg) != 1) {
+        fprintf(stderr, "%s: the placement failed although the bytes fit the nodes\n", __func__);
+        return false;
+    }
+
+    int64_t used[2] = { 0, 0 };
+    for (const ggml_cuda_numa_plan::segment_entry & e : seg[0]) {
+        used[e.node] += e.bytes;
+    }
+    for (size_t n = 0; n < 2; n++) {
+        if (used[n] > cap[n]) {
+            fprintf(stderr, "%s: node %zu holds %lld MiB of %lld\n", __func__, n,
+                (long long) (used[n]/MiB), (long long) (cap[n]/MiB));
+            return false;
+        }
+    }
+    return true;
+}
+
+
+
 static bool test_committed_plan(void) {
-    // the placement of the 6 card machine: 0,0,8,0,0,0 is what the machines measure
+
     ggml_cuda_numa_plan::committed c;
     const std::vector<int>     node  = { 1, 1, 1, 0, 0, 0 };
     const std::vector<size_t>  bytes = { 1514*1024*1024, 1500*1024*1024, 1494*1024*1024,
@@ -296,7 +650,7 @@ static bool test_committed_plan(void) {
 
     ggml_cuda_numa_plan::commit_plan(&c, node, bytes, true);
 
-    // every device gets the node of the plan, with the bytes it reads in the plan
+
     for (size_t d = 0; d < node.size(); d++) {
         bool     match = false;
         const int got = ggml_cuda_numa_plan::committed_node(c, d, bytes[d], &match);
@@ -310,8 +664,8 @@ static bool test_committed_plan(void) {
         }
     }
 
-    // other bytes than the plan was made for: the node stays, only the mismatch is reported.
-    // A load that only knows the bytes of one device must not place the machine again.
+
+
     for (size_t d = 0; d < node.size(); d++) {
         bool     match = true;
         const int got = ggml_cuda_numa_plan::committed_node(c, d, bytes[d] + 512*1024*1024, &match);
@@ -325,8 +679,8 @@ static bool test_committed_plan(void) {
         }
     }
 
-    // a difference inside the tolerance is not a mismatch: the expert store rounds every arena
-    // to its expert pitch and every arena is a whole number of pages
+
+
     {
         bool match = false;
         const size_t tol = ggml_cuda_numa_plan::BYTES_TOLERANCE;
@@ -340,7 +694,7 @@ static bool test_committed_plan(void) {
         }
     }
 
-    // a device the plan does not cover has no node
+
     if (ggml_cuda_numa_plan::committed_node(c, node.size(), 0, nullptr) != -1) {
         fprintf(stderr, "%s: a device outside the plan returned a node\n", __func__);
         return false;
@@ -357,7 +711,19 @@ int main(void) {
         !test_six_cards_ac9221() ||
         !test_does_not_fit()  ||
         !test_descent()       ||
-        !test_committed_plan()) {
+        !test_committed_plan()||
+        !test_balanced_three_cards() ||
+        !test_balanced_one_card()    ||
+        !test_balanced_one_card_ac9221() ||
+        !test_balanced_six_cards()   ||
+        !test_balanced_does_not_fit() ||
+        !test_balanced_respects_the_room_of_the_node() ||
+        !test_pinned_room()) {
+        return 1;
+    }
+
+    if (!test_table_node_without_arena() || !test_table_node_shares_with_arena() ||
+        !test_table_node_of_uses_the_placement()) {
         return 1;
     }
 

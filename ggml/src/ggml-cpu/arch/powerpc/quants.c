@@ -2076,7 +2076,7 @@ void ggml_vec_dot_iq1_s_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
             vsumi2 = vec_msum(qv2, vscales23, vsumi2);
             vsumi3 = vec_msum(qv3, vscales23, vsumi3);
 
-            // delta term, same as the generic implementation (per 32-element block scale and sign)
+
             sumi1 += (2*ls0 + 1) * (qh[0] & 0x8000 ? -1 : 1) * (qs[0] + qs[1]);
             sumi1 += (2*ls1 + 1) * (qh[1] & 0x8000 ? -1 : 1) * (qs[2] + qs[3]);
             qs += 4;

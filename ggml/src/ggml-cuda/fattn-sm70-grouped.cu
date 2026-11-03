@@ -35,24 +35,24 @@ bool ggml_cuda_flash_attn_ext_sm70_grouped_supported(const ggml_tensor * dst, in
             }
         }
     }
-    // Only matching K/V types are instantiated below, so mixed caches take the generic path.
+
     if (K->type != V->type) {
         return false;
     }
-    // Under tensor split a device can get 0 KV heads (fewer KV heads than devices); fall back to the generic path.
+
     if (K->ne[2] == 0 || Q->ne[2] == 0) {
         return false;
     }
     if (K->ne[2] != V->ne[2]) {
         return false;
     }
-    // op_params[5]: 0 = uniform GQA (the original behaviour), > 0 = the local Q head boundary
-    // of the 3-card attention split, < 0 = the global node of that split, whose per-device
-    // copies get their boundary from the split backend: its global shape is checked as uniform
-    // GQA so that the scheduler keeps it on this device (the computed copies are never < 0).
+
+
+
+
     const int32_t q_head_boundary = ggml_get_op_params_i32(dst, 5);
     if (q_head_boundary > 0) {
-        // Non-uniform GQA: two local KV heads, the first g0 local query heads use KV head 0.
+
         if (K->ne[2] != 2) {
             return false;
         }
@@ -61,13 +61,13 @@ bool ggml_cuda_flash_attn_ext_sm70_grouped_supported(const ggml_tensor * dst, in
             return false;
         }
     } else {
-        // Only GQA 2, 4 and 6 are instantiated below.
-        const int gqa = Q->ne[2] / K->ne[2]; // K->ne[2] > 0, checked above
+
+        const int gqa = Q->ne[2] / K->ne[2];
         if (Q->ne[2] % K->ne[2] != 0 || (gqa != 2 && gqa != 4 && gqa != 6)) {
             return false;
         }
     }
-    // single-token decode stays on the vec kernel, which is faster there
+
     if (Q->ne[1] < 2 || Q->ne[1] > 16) {
         return false;
     }
@@ -89,7 +89,7 @@ bool ggml_cuda_flash_attn_ext_sm70_grouped_supported(const ggml_tensor * dst, in
     if (mask && mask->type != GGML_TYPE_F16 && !(mask->type == GGML_TYPE_I32 && mask->ne[0] == 4 && mask->nb[0] == sizeof(int32_t))) {
         return false;
     }
-    if (ggml_get_op_params_i32(dst, 4) != 0) { // n_kv_max hint
+    if (ggml_get_op_params_i32(dst, 4) != 0) {
         return false;
     }
 
@@ -114,9 +114,11 @@ static void ggml_cuda_flash_attn_ext_sm70_grouped_launch(ggml_backend_cuda_conte
     constexpr int head_groups = GroupedVerifyTraits<MAX_QUERY_TOKENS, HEADS>::kHeadGroups;
     const int grid_x = n_kv_heads * head_groups;
     if (n_kv_heads == 0 || grid_x == 0) {
-        return; // defensive: the dispatch predicate already rejects 0 heads
+        return;
     }
-    const int splits = std::max(1, std::min(80 / grid_x, (n_kv + 63) / 64));
+
+    const int nsm    = ggml_cuda_info().devices[ctx.device].nsm;
+    const int splits = std::max(1, std::min(nsm / grid_x, (n_kv + 63) / 64));
 
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params, sizeof(float));
@@ -161,7 +163,7 @@ static void ggml_cuda_flash_attn_ext_sm70_grouped_launch(ggml_backend_cuda_conte
         dst_partial.ptr, dst_meta.ptr, (float *) dst->data, splits);
 }
 
-// The predicate rejects mixed K/V types, so only the matching combinations exist.
+
 template <int MAX_QUERY_TOKENS, int HEADS, bool NONUNIFORM>
 static void ggml_cuda_flash_attn_ext_sm70_grouped_select_kv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * K = dst->src[1];
@@ -176,11 +178,11 @@ static void ggml_cuda_flash_attn_ext_sm70_grouped_select_kv(ggml_backend_cuda_co
     }
 }
 
-// The predicate only lets GQA 2, 4 and 6 through; a Q head boundary always uses the two-KV-head form.
+
 template <int MAX_QUERY_TOKENS, bool NONUNIFORM>
 static void ggml_cuda_flash_attn_ext_sm70_grouped_select_heads(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if constexpr (NONUNIFORM) {
-        // A Q head boundary always has two local KV heads and fits the HEADS=6 slot layout.
+
         ggml_cuda_flash_attn_ext_sm70_grouped_select_kv<MAX_QUERY_TOKENS, 6, true>(ctx, dst);
     } else {
         const int gqa = (int) (dst->src[0]->ne[2] / dst->src[1]->ne[2]);
@@ -205,7 +207,7 @@ void ggml_cuda_flash_attn_ext_sm70_grouped(ggml_backend_cuda_context & ctx, ggml
 
     GGML_ASSERT(ggml_cuda_flash_attn_ext_sm70_grouped_supported(dst, ggml_cuda_info().devices[ggml_cuda_get_device()].cc));
 
-    // a node still marked for the split backend was never given its per-device boundary
+
     GGML_ASSERT(ggml_get_op_params_i32(dst, 5) >= 0 && "q head boundary not filled in by the split backend");
     const bool nonuniform = ggml_get_op_params_i32(dst, 5) > 0;
     if (Q->ne[1] <= 8) {

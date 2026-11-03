@@ -79,6 +79,130 @@ static void concat_cont_cuda(const T * x,
     concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#define CUDA_CONCAT_TILE 32
+
+template <typename T>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_dim0_transpose(
+        const char * src0,
+        const char * src1,
+              char * dst,
+           int64_t   ne00,
+          uint64_t   s0_nb0,
+          uint64_t   s0_nb1,
+          uint64_t   s0_nb2,
+          uint64_t   s0_nb3,
+          uint64_t   s1_nb0,
+          uint64_t   s1_nb1,
+          uint64_t   s1_nb2,
+          uint64_t   s1_nb3,
+           int64_t   ne0,
+           int64_t   ne1,
+           int64_t   ne2,
+          uint64_t   d_nb0,
+          uint64_t   d_nb1,
+          uint64_t   d_nb2,
+          uint64_t   d_nb3,
+           int64_t   plane0) {
+    __shared__ T tile[CUDA_CONCAT_TILE][CUDA_CONCAT_TILE + 1];
+
+    const int64_t p  = plane0 + blockIdx.z;
+    const int64_t i3 = p / ne2;
+    const int64_t i2 = p - i3*ne2;
+
+    const char * b0 = src0 + i3*s0_nb3 + i2*s0_nb2;
+    const char * b1 = src1 + i3*s1_nb3 + i2*s1_nb2;
+    char *       bd = dst  + i3*d_nb3  + i2*d_nb2;
+
+    const int64_t x0 = (int64_t) blockIdx.x * CUDA_CONCAT_TILE;
+    const int64_t y0 = (int64_t) blockIdx.y * CUDA_CONCAT_TILE;
+
+
+    for (int ix = threadIdx.y; ix < CUDA_CONCAT_TILE; ix += blockDim.y) {
+        const int64_t x = x0 + ix;
+        const char * s   = x < ne00 ? b0 : b1;
+        const uint64_t nb0 = x < ne00 ? s0_nb0 : s1_nb0;
+        const uint64_t nb1 = x < ne00 ? s0_nb1 : s1_nb1;
+        const int64_t  xx  = x < ne00 ? x : x - ne00;
+
+        for (int iy = threadIdx.x; iy < CUDA_CONCAT_TILE; iy += blockDim.x) {
+            const int64_t y = y0 + iy;
+            tile[iy][ix] = (x < ne0 && y < ne1) ? *((const T *)(s + y*nb1 + xx*nb0)) : (T) 0;
+        }
+    }
+
+    __syncthreads();
+
+
+    for (int iy = threadIdx.y; iy < CUDA_CONCAT_TILE; iy += blockDim.y) {
+        const int64_t y = y0 + iy;
+        if (y >= ne1) {
+            continue;
+        }
+        for (int ix = threadIdx.x; ix < CUDA_CONCAT_TILE; ix += blockDim.x) {
+            const int64_t x = x0 + ix;
+            if (x >= ne0) {
+                continue;
+            }
+            *((T *) (bd + y*d_nb1 + x*d_nb0)) = tile[iy][ix];
+        }
+    }
+}
+
+
+template <typename T>
+static void concat_dim0_transpose_cuda(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+                                       cudaStream_t stream) {
+    const dim3 block(CUDA_CONCAT_TILE, CUDA_CONCAT_BLOCK_SIZE / CUDA_CONCAT_TILE, 1);
+    const dim3 grid((dst->ne[0] + CUDA_CONCAT_TILE - 1) / CUDA_CONCAT_TILE,
+                    (dst->ne[1] + CUDA_CONCAT_TILE - 1) / CUDA_CONCAT_TILE, 1);
+
+    const int64_t n_planes = dst->ne[2] * dst->ne[3];
+    const int64_t max_z    = 65535;
+
+    for (int64_t p0 = 0; p0 < n_planes; p0 += max_z) {
+        const int64_t n_p = (n_planes - p0) < max_z ? (n_planes - p0) : max_z;
+        const dim3 grid_z(grid.x, grid.y, (unsigned) n_p);
+
+        concat_dim0_transpose<T><<<grid_z, block, 0, stream>>>(
+                (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                src0->ne[0],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                dst->ne[0], dst->ne[1], dst->ne[2],
+                dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3],
+                p0);
+    }
+}
+
 // non-contiguous kernel (slow)
 template <typename T, int dim>
 static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
@@ -163,6 +287,14 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
+
+
+
+        if (dim == 0 && dst->nb[0] == sizeof(T) && src1->nb[1] == sizeof(T) && src1->nb[0] != sizeof(T)) {
+            concat_dim0_transpose_cuda<T>(src0, src1, dst, stream);
+            return;
+        }
+
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {
             concat_non_cont<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
@@ -189,7 +321,6 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
                 break;
             default:
                 GGML_ABORT("Invalid dim: %d", dim);
-                break;
         }
     }
 }
@@ -236,7 +367,6 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 break;
             default:
                 GGML_ABORT("Unsupported type size: %zu", ggml_type_size(src0->type));
-                break;
         }
     }
 }

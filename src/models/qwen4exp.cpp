@@ -9,18 +9,18 @@
 #include <algorithm>
 #include <cinttypes>
 
-// QSA selection of a batch with at least this many tokens goes through pool rows plus an expansion into cells
-// (ggml_qsa_select_pool + ggml_qsa_expand), the form a multi-device backend splits by token; smaller batches
-// (decode: one token per sequence, speculative verify: a handful) select the cells directly. The ids are the
-// same either way, this only decides the graph shape.
+
+
+
+
 static constexpr int64_t QSA_SEL_POOL_MIN_TOKENS = 32;
 
-// ...and only above this many context tokens: the saving of the pool path (each device scores a token slice,
-// the rows are gathered) grows with the pool the selection reads, while the gather and the extra expansion
-// pass cost a fixed time per layer. The four-pool A/B (16K/32K/64K/200K, see mimo-runs/qsa-16k-fix-report.md
-// section 2.4b) puts the break-even at about 16K context: a 16K prompt stays on the mirrored cell path
-// (below, the same graph as without the pool path), larger prompts split across the devices. Graph-shape
-// branch, the ids are identical either way.
+
+
+
+
+
+
 static constexpr int64_t QSA_SEL_POOL_MIN_CTX = 16384;
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
@@ -41,9 +41,9 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
 }
 
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
-    // r-mtpdev: graph_mtp reads the nextn h from the device sink
+
     h_nextn_sink_ok = true;
-    // dchain: graph_mtp keeps the draft token chain in the device ring
+
     draft_ring_ok = true;
 
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
@@ -102,7 +102,7 @@ void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     // the reference groups the visible tokens in cache order and always keeps the tail
     hparams.indexer_kpool_by_order    = true;
     hparams.indexer_kpool_select_tail = true;
-    // one pooled key per 4 tokens, the raw keys only while their pool is incomplete (official / SGLang layout)
+
     hparams.indexer_kpool_compact     = true;
 
     // PLE n-gram hash embeddings; if the key group is absent every field stays zero
@@ -198,19 +198,18 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int64_t hc_dim = hc * n_embd;
     const int64_t hc_lr  = hparams.hc_low_rank;
 
-    // an MTP-only file carries the MTP block, the embeddings and the LM head, but no trunk
-    const bool mtp_only    = n_layer_nextn > 0 && ml.get_weight(tn(LLM_TENSOR_HC_ATTN_NORM, "weight", 0).str().c_str()) == nullptr;
-    const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
-    const int  mtp_flags   = ml.load_mtp ? 0 : TENSOR_SKIP;
+    const auto nf = nextn_flags(ml, LLM_TENSOR_HC_ATTN_NORM);
+    const int trunk_flags = nf.trunk;
+    const int mtp_flags   = nf.mtp;
 
-    // the graph reads the merged gate/up expert weight with the fused SwiGLU matmul, which needs the
-    // rows interleaved while loading. the merged path never applies the swiglu clamp (that branch
-    // needs a separate gate weight), so it matches ggml_swiglu_split() one to one
+
+
+
     gate_up_fused_swiglu = true;
 
-    // an MTP-only file that shares the target's embeddings leaves tok_embd out too; then the
-    // loader borrows it from the target (see llama_model_loader::borrow_shared_tensor)
-    // from unsloth PR #240
+
+
+
     tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
 
     // there is no output_norm: the final hyper-connection mixer carries it
@@ -278,9 +277,9 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
             layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
 
-            // the indexer only serves QSA blocks (compress ratio > 0). A dense block (the MTP block, ratio 0)
-            // never runs it (build_layer_attn: qsa is false) and keeps no indexer cache, so its indexer weights
-            // are left in the file instead of costing a full copy on every device
+
+
+
             const int idx_flags = hparams.dsv4_compress_ratios[il] > 0 ? flags :
                 (flags | TENSOR_SKIP | TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
             const int64_t idx_dim = hparams.indexer_head_size;
@@ -309,7 +308,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             layer.ple_conv1d     = create_tensor(tn(LLM_TENSOR_PLE_CONV1D,     "weight", il), { hparams.ple_conv_kernel, hc_dim }, flags);
         }
 
-        // the router is F32 in the GGUF, holding the BF16 values of the checkpoint: kept as BF16
+
         layer.ffn_gate_inp  = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,  "weight", il), { n_embd, n_expert }, flags | TENSOR_F32_AS_BF16);
         layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", il), { n_ff_exp, n_embd, n_expert }, flags);
         create_tensor_gate_up_exps(layer, il, n_embd, n_ff_exp, n_expert, flags,
@@ -444,16 +443,29 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
-    cb(inpL, "model.input_embed", -1);
-    ggml_build_forward_expand(gf, inpL);
 
-    // the QSA layers attend through the selection, so the mask only serves dense blocks and may be a range mask
     auto * inp = build_inp_mem_hybrid(model.kq_range_mask_supported());
 
     // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
     // the indexer cache inside it is absent when the GGUF has no indexer tensors
     const auto * mctx_hyb = static_cast<const llama_memory_hybrid_idx_context *>(inp->mctx);
+
+    const llama_kv_cache_context * mctx_idx = mctx_hyb->get_idx();
+    if (mctx_idx) {
+        GGML_ASSERT(mctx_idx->get_n_kv() == inp->mctx->get_attn()->get_n_kv() &&
+                "the indexer cache must track the attention cache cell for cell");
+    }
+
+    ggml_tensor * ple_emb = nullptr;
+    if (hparams.ple_n_heads > 0) {
+        ple_emb = build_inp_ple(mctx_hyb);
+        // make sure ple_emb and build_inp_embd are in the same graph split
+        ggml_build_forward_expand(gf, ple_emb);
+    }
+
+    ggml_tensor * inpL = build_inp_embd(model.tok_embd);
+    cb(inpL, "model.input_embed", -1);
+    ggml_build_forward_expand(gf, inpL);
 
     // the QSA layers share one set of k-pool inputs
     llm_graph_input_kpool * inp_kpool = nullptr;
@@ -464,13 +476,6 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    ggml_tensor * ple_emb = nullptr;
-    if (hparams.ple_n_heads > 0) {
-        ple_emb = build_inp_ple(mctx_hyb);
-        // make sure ple_emb and build_inp_embd are in the same graph split
-        ggml_build_forward_expand(gf, ple_emb);
-    }
-
     // the wide residual starts as hc identical copies of the embedding
     ggml_tensor * res_hc = ggml_repeat_4d(ctx0,
             ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens),
@@ -479,14 +484,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     // make sure hc_init is in the same graph split as the first layer (-sm tensor)
     ggml_build_forward_expand(gf, res_hc);
 
-    // Sequence parallelism (docs/design/r200-seqpar.md): from the layer after the PLE one up to the
-    // last layer, the per-token part of every layer half runs on one token slice per device. The
-    // whole token axis of every node stays global, the meta backend gives each device its slice.
-    // The draft graph does not come through here, it keeps seq_par false.
+
+
+
+
     const size_t n_dev = model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ? model.get_split_state_ud.n_devices : 1;
     seq_par = params.gtype != LLM_GRAPH_TYPE_DECODER_MTP && n_dev > 1 && n_tokens >= 16*(int64_t) n_dev;
-    // the PLE convolutions read the neighbouring tokens of the whole batch, so the residual only
-    // enters the token-split range after them
+
+
     int il_first_split = 0;
     if (seq_par) {
         for (int il = 0; il < n_layer; ++il) {
@@ -502,7 +507,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         if (hparams.is_ple(il)) {
             res_hc = build_ple(inp->get_recr(), ple_emb, res_hc, il);
             if (seq_par && il == il_first_split) {
-                // the split range starts here: every device takes its own slice of the residual
+
                 res_hc = ggml_seq_scatter(ctx0, res_hc, 2, 0, res_hc->ne[2]);
                 cb(res_hc, "hc_scatter", il);
             }
@@ -519,7 +524,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 &inject, il);
 
         if (split_layer) {
-            // the block below reads the whole batch, gather the slices back into one tensor
+
             cur = ggml_seq_gather(ctx0, cur, 1, GGML_TYPE_F16);
             cb(cur, "hc_mix_gathered", il);
         }
@@ -531,7 +536,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked) && !split_layer) {
+        if (il == n_layer - 1 && !split_layer && crop_before_nextn(inp_out_ids)) {
             // everything below is per token, so drop the rows that produce no output; with the token
             // split the mixer already runs on a sixth of the rows, gathering them back is dearer
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
@@ -543,7 +548,7 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         }
 
         if (split_layer) {
-            // the block output is a partial sum over the devices, the combine wants its token slice
+
             cur = ggml_seq_scatter(ctx0, cur, 1, 0, cur->ne[1]);
             cb(cur, "hc_mix_scattered", il);
         }
@@ -575,28 +580,33 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     }
 
     if (seq_par) {
-        // the MTP sink, the output rows and the final mixer all need the whole residual
-        res_hc = ggml_seq_gather(ctx0, res_hc, 2, GGML_TYPE_F32);
-        cb(res_hc, "hc_gathered", -1);
 
-        // the last-layer row filter runs before the combine on the split graph; keep only the
-        // output rows here instead, under the same condition as the non-split graph
-        if (inp_out_ids && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked)) {
+
+
+
+
+
+
+        if (crop_before_nextn(inp_out_ids)) {
             res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
             res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
             res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
             cb(res_hc, "hc_out_rows", -1);
+        } else {
+            res_hc = ggml_seq_gather(ctx0, res_hc, 2, GGML_TYPE_F32);
+            cb(res_hc, "hc_gathered", -1);
         }
     }
 
-    // the MTP head reads the hc-wide residual, before the final mixer
+    // the MTP head reads the hc-wide residual, before the final mixer (and only it ever does:
+    // every reader of t_h_nextn is gated on cparams.embeddings_nextn)
     if (cparams.embeddings_nextn) {
         res->t_h_nextn = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
         cb(res->t_h_nextn, "h_nextn", -1);
         ggml_build_forward_expand(gf, res->t_h_nextn);
     }
 
-    if (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked && inp_out_ids) {
+    if (crop_after_nextn(inp_out_ids)) {
         res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
         res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
         res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
@@ -613,14 +623,12 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
     cur = build_lora_mm(model.output, cur, model.output_s);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }
 
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
     graph(model, params, no_build{}) {
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "qwen4exp MTP has a single block");
-    GGML_ASSERT(ubatch.token && "qwen4exp MTP requires token input");
+    GGML_ASSERT(ubatch.token || ubatch.embd);
 
     const int64_t hc = hparams.dsv4_hc_mult;
     GGML_ASSERT(hparams.n_embd_out() == (uint32_t) (n_embd*hc) && "qwen4exp MTP hidden width mismatch");
@@ -634,44 +642,72 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_out());
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hparams.n_embd_inp(), hparams.n_embd_out());
 
-    // dchain: a draft step (an output row per token, at most one per sequence) takes its input tokens
-    // from the device ring, where the previous step wrote its argmax; the catch-up decode (kv-only,
-    // real target tokens) keeps the host token input, and so does the worst-case reserve graph of the
-    // catch-up size (every row an output): it only sizes the buffers and has more rows than the ring
+
+
+
+
     const bool draft_ring = t_draft_ring != nullptr && !mtp_kv_only && n_tokens <= t_draft_ring->ne[0];
 
     if (draft_ring) {
         GGML_ASSERT(t_draft_ring->type == GGML_TYPE_I32);
         inp->tokens        = ggml_view_1d(ctx0, t_draft_ring, n_tokens, 0);
         inp->tokens_device = true;
-    } else {
+    } else if (ubatch.token || ubatch.is_mixed()) {
+
         inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
         ggml_set_input(inp->tokens);
     }
 
-    // r-mtpdev device path: the h rows are gathered in place from the sink. The separate host
-    // input branch is gone with the MTP host h path, so the linked sink is required
+
+
     GGML_ASSERT(t_embd_h_src != nullptr);
     GGML_ASSERT(t_embd_h_src->type == GGML_TYPE_F32);
     GGML_ASSERT(t_embd_h_src->ne[0] == (int64_t) hparams.n_embd_out());
     GGML_ASSERT(h_src_cols != nullptr);
 
     inp->h_cols     = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
-    // a larger batch is split into ubatches: each graph copies the columns of its own slice
+
     inp->h_cols_src = h_src_cols + token_offset;
     ggml_set_input(inp->h_cols);
 
     ggml_tensor * h = ggml_get_rows(ctx0, t_embd_h_src, inp->h_cols);
     ggml_set_name(h, "mtp_h_input");
 
-    // a shared MTP head has neither embeddings nor lm head; take them from the target
-    // from unsloth PR #240
+
+
     const llama_model & emb  = model.tok_embd ? model : *cparams.model_tgt;
     const llama_model & head = model.output   ? model : *cparams.model_tgt;
 
-    ggml_tensor * tok_embd = ggml_get_rows(ctx0, emb.tok_embd, inp->tokens);
+
+
+    ggml_tensor * tok_embd = nullptr;
+    if (ubatch.is_mixed()) {
+        int64_t n_tok_rows = 0;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            n_tok_rows += !ubatch.type[i];
+        }
+        GGML_ASSERT(n_tok_rows > 0 && n_tok_rows < n_tokens);
+
+        inp->mixed_tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tok_rows);
+        ggml_set_input(inp->mixed_tokens);
+        inp->mixed_slots  = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, n_tok_rows);
+        ggml_set_input(inp->mixed_slots);
+        inp->mixed_embd   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+        ggml_set_input(inp->mixed_embd);
+
+
+        tok_embd = ggml_set_rows(ctx0, ggml_dup(ctx0, inp->mixed_embd),
+                ggml_get_rows(ctx0, emb.tok_embd, inp->mixed_tokens), inp->mixed_slots);
+    } else if (ubatch.token) {
+        tok_embd = ggml_get_rows(ctx0, emb.tok_embd, inp->tokens);
+    } else {
+        inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_inp(), n_tokens);
+        ggml_set_input(inp->embd);
+
+        tok_embd = inp->embd;
+    }
     cb(tok_embd, "mtp_tok_embd", il);
 
     res->add_input(std::move(inp));
@@ -683,13 +719,13 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
     llm_graph_input_kpool * inp_kpool = nullptr;
-    // ratio 0: dense MTP block, there is no QSA k-pool to build
-    if (mctx_hyb->has_idx() && hparams.indexer_kpool > 0 && hparams.dsv4_compress_ratios[il] > 0) { // from unsloth PR #240
+
+    if (mctx_hyb->has_idx() && hparams.indexer_kpool > 0 && hparams.dsv4_compress_ratios[il] > 0) {
         inp_kpool = build_inp_kpool(mctx_hyb);
     }
 
     ggml_tensor * inp_pos     = build_inp_pos();
-    // MTP catch-up has no output rows: the out_ids input would stay unallocated and set_input asserts
+
     ggml_tensor * inp_out_ids = mtp_kv_only ? nullptr : build_inp_out_ids();
 
     ggml_tensor * h_norm = build_norm(ggml_reshape_3d(ctx0, h, n_embd, hc, n_tokens), layer.nextn.hnorm, nullptr, LLM_NORM_RMS, il);
@@ -699,10 +735,10 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     e_norm = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e_norm, n_embd, 1, n_tokens), n_embd, hc, n_tokens, 1);
     cb(e_norm, "mtp_enorm", il);
 
-    // eh_proj is one linear map applied to every (stream, token) column: run it as a single 2D
-    // matmul over hc*n_tokens columns. With a 3D [2*n_embd, hc, n_tokens] input the backend sees a
-    // 4-column product broadcast over n_tokens channels and re-reads the whole (mirrored) weight once
-    // per token: a 512-token catch-up chunk read 512 x 26 MB per device
+
+
+
+
     ggml_tensor * eh_in = ggml_concat(ctx0, e_norm, h_norm, 0); // [2*n_embd, hc, n_tokens]
     eh_in = ggml_reshape_2d(ctx0, eh_in, 2*n_embd, hc*n_tokens);
     ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, eh_in);
@@ -710,14 +746,14 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(res_hc, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;
-    // MTP catch-up needs no inject: it only feeds build_hc_combine, which is not built below
+
     ggml_tensor * cur = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject, mtp_kv_only ? nullptr : &inject, il);
     cur    = build_layer_attn(inp_hyb->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
 
-    // MTP catch-up (n_outputs == 0): build_layer_attn has written the K/V cache and returned
-    // nullptr. Nothing downstream consumes this layer's output, so stop here. The KQ mask of the
-    // cut attention stays unallocated: llm_graph_input_mem_hybrid::set_input skips filling it when
-    // its buffer is null, same as the qwen4exp QSA layers
+
+
+
+
     if (mtp_kv_only) {
         res->t_h_nextn = nullptr;
         res->t_embd    = nullptr;
@@ -750,30 +786,30 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_build_forward_expand(gf, cur);
 
-    // dchain: the argmax of every output row goes back into the ring as the input token of the next
-    // draft step. ggml_top_k over the vocab-sharded logits is a meta collective: every device selects
-    // the candidates of its own shard, the shards are merged with the deterministic (value desc, id
-    // asc) order and every device ends up with the same global ids, so each one writes its own copy
-    // of the ring. The same tensor is a graph output (the host reads the chain once at its end)
+
+
+
+
+
     if (draft_ring) {
-        const int64_t n_rows = cur->ne[1]; // output rows of this step, one per drafting sequence
+        const int64_t n_rows = cur->ne[1];
         GGML_ASSERT(n_rows <= t_draft_ring->ne[0]);
 
         ggml_tensor * top1 = nullptr;
         if (draft_ring_ptop) {
-            // p_min gate: the probability of the argmax over the global top 10, the same candidate set
-            // the CPU chain (top_k(10) + dist) normalizes over
-            ggml_tensor * ids10 = ggml_top_k(ctx0, cur, 10);                                                  // I32 [10, n_rows]
-            ggml_tensor * vals  = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, cur, 1, cur->ne[0], n_rows), ids10); // F32 [1, 10, n_rows]
-            ggml_tensor * probs = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, vals, 10, n_rows));              // F32 [10, n_rows]
-            ggml_tensor * ptop  = ggml_cont(ctx0, ggml_view_2d(ctx0, probs, 1, n_rows, probs->nb[1], 0));     // F32 [1, n_rows]
+
+
+            ggml_tensor * ids10 = ggml_top_k(ctx0, cur, 10);
+            ggml_tensor * vals  = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, cur, 1, cur->ne[0], n_rows), ids10);
+            ggml_tensor * probs = ggml_soft_max(ctx0, ggml_reshape_2d(ctx0, vals, 10, n_rows));
+            ggml_tensor * ptop  = ggml_cont(ctx0, ggml_view_2d(ctx0, probs, 1, n_rows, probs->nb[1], 0));
             cb(ptop, "draft_ptop", -1);
             res->t_draft_ptop = ptop;
             ggml_build_forward_expand(gf, ptop);
 
-            top1 = ggml_cont(ctx0, ggml_view_2d(ctx0, ids10, 1, n_rows, ids10->nb[1], 0));                    // I32 [1, n_rows]
+            top1 = ggml_cont(ctx0, ggml_view_2d(ctx0, ids10, 1, n_rows, ids10->nb[1], 0));
         } else {
-            top1 = ggml_top_k(ctx0, cur, 1);                                                                 // I32 [1, n_rows]
+            top1 = ggml_top_k(ctx0, cur, 1);
         }
         cb(top1, "draft_top1", -1);
         res->t_draft_top1 = top1;
@@ -792,10 +828,10 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen4exp::graph::build_qkvz(
     const int64_t n_seqs       = ubatch.n_seqs;
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
-    // Expand the projections that share this input back to back, so that the CUDA backend can
-    // run them with one input conversion and one multi-weight kernel. ggml reuses compute
-    // buffers in node order, so a projection expanded apart from the others could have its
-    // output overwritten before its consumers read it.
+
+
+
+
     ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, input, model.layers[il].wqkv_s);
     ggml_build_forward_expand(gf, qkv_mixed);
     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
@@ -845,20 +881,20 @@ public:
         res &= pool_cells->ne[0]  == mctx->get_n_kpool();
         res &= pool_rng->ne[1]    == params.ubatch.n_tokens;
         res &= tail_idxs->ne[1]   == params.ubatch.n_tokens;
-        // the cells the pools address follow the attention cache's n_kv
+
         res &= n_kv               == mctx->get_attn()->get_n_kv();
         res &= n_new              == mctx->get_n_kpool_new();
 
         return res;
     }
 
-    ggml_tensor * k_ring_idxs   = nullptr; // I64 [n_tokens]       raw-key ring row of each token
-    ggml_tensor * pool_cells    = nullptr; // I32 [n_pool]         pooled slot of each block
+    ggml_tensor * k_ring_idxs   = nullptr;
+    ggml_tensor * pool_cells    = nullptr;
     ggml_tensor * pool_idxs     = nullptr; // I32 [kpool, n_pool]  member cells per block, -1 for the padded blocks
-    ggml_tensor * pool_rng      = nullptr; // I32 [2, n_tokens]    the blocks [lo, hi) each token sees
-    ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens] incomplete tail cells, -1 when missing
+    ggml_tensor * pool_rng      = nullptr;
+    ggml_tensor * tail_idxs     = nullptr;
     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   raw-key ring rows of the members of the blocks pooled this ubatch
-    ggml_tensor * new_pool_rep  = nullptr; // I64 [n_new]          pooled slot each new pooled key goes to
+    ggml_tensor * new_pool_rep  = nullptr;
     ggml_tensor * new_pool_pos  = nullptr; // I32 [4*n_new]        M-RoPE position of each new block's first member
 
     const llama_memory_hybrid_idx_context * mctx;
@@ -901,8 +937,7 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
     inp->new_pool_idxs = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, inp->n_new);
     ggml_set_input(inp->new_pool_idxs);
-    // the scatter target is part of the graph shape: llama_context reserves the full-context graph,
-    // so this must not depend on cache_safe, which only the decode-time graph can know
+    // one scatter row per new pool, each a distinct rep row (see kpool_build_state)
     inp->new_pool_rep = ggml_new_tensor_1d(ctx0, GGML_TYPE_I64, inp->n_new);
     ggml_set_input(inp->new_pool_rep);
     inp->new_pool_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*inp->n_new);
@@ -932,13 +967,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
     cb(k_raw, "indexer_k_raw", il);
 
-    // the compact indexer cache: one pooled key per complete block, the raw keys only in a ring while their block may
-    // still be pooled (llama_memory_hybrid_idx::kpool_store). The ubatch's raw keys go to their ring rows first, the
-    // blocks it completes are pooled from the ring below
+
+
+
     auto kpool_cache = mctx_hyb->get_kpool_access(ctx0, il, idx_dim);
     ggml_build_forward_expand(gf, kpool_cache.store_raw(k_raw, inp_kpool->k_ring_idxs));
 
-    // pool only the blocks this ubatch completes, each from its members' ring rows
+
     ggml_tensor * rows = kpool_cache.gather_key_gate(ggml_reshape_1d(ctx0, inp_kpool->new_pool_idxs, kpool*n_new));
     rows = ggml_reshape_3d(ctx0, rows, idx_dim, kpool, n_new);
 
@@ -977,15 +1012,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
     ggml_tensor * ids = nullptr;
     if (n_tokens >= QSA_SEL_POOL_MIN_TOKENS && inp_kpool->n_kv >= QSA_SEL_POOL_MIN_CTX) {
-        // a prompt batch: the pool rows first, so that a multi-device backend scores disjoint token slices and
-        // gathers the small rows (ggml_backend_meta_node_qsa_select_collective), then every device expands the
-        // rows into cells itself. Identical ids to the direct selection below.
+
+
+
         ggml_tensor * pools = ggml_qsa_select_pool(ctx0, q, pooled, inp_kpool->pool_cells, inp_kpool->pool_rng,
                 1.0f/sqrtf((float) idx_dim), (int32_t) n_top_pool, -1);
         cb(pools, "indexer_sel_pool", il);
         ids = ggml_qsa_expand(ctx0, pools, inp_kpool->pool_idxs, inp_kpool->tail_idxs, -1);
     } else {
-        // decode and verify batches: the cells directly, one kernel per pass
+
         ids = ggml_qsa_select(ctx0, q, pooled, inp_kpool->pool_cells, inp_kpool->pool_idxs, inp_kpool->tail_idxs,
                 inp_kpool->pool_rng, 1.0f/sqrtf((float) idx_dim), (int32_t) n_top_pool, -1);
     }
@@ -1036,7 +1071,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
-    // the selection is already causal and per sequence
+
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
@@ -1132,8 +1167,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
                     Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     }
 
-    // MTP catch-up: build_attn has expanded the K/V cache writes and returns nullptr. The gate
-    // and wo have no consumer, so stop before touching the null attention output
+
+
     if (mtp_kv_only) {
         return nullptr;
     }
@@ -1261,12 +1296,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    // The gating projections and their elementwise tails go here, after the q/k l2 norm and right
-    // before the gated delta net, in this order: the CUDA backend runs sigmoid(beta) and
-    // softplus(alpha + dt) * a as one kernel only when the four elementwise nodes are adjacent, and
-    // the depth-first order from the gated delta net inputs puts the beta projection between them.
-    // Between the l2 norm and the gated delta net, as in the depth-first order, they also keep the
-    // l2 norm in its own kernels (the gated delta net kernel can fold it in, with other rounding).
+
+
+
+
+
+
     ggml_build_forward_expand(gf, q_conv);
     ggml_build_forward_expand(gf, k_conv);
     ggml_build_forward_expand(gf, beta_proj);
@@ -1353,7 +1388,7 @@ public:
     llm_graph_input_qwen4exp_ple(const llama_model & model,
                         const llama_kv_cache_context * mctx) : model(model), mctx(mctx) {}
     virtual ~llm_graph_input_qwen4exp_ple() {
-        // the host buffer of the rows of the table goes away with the graph that reads them
+
         if (ctx_src) {
             ggml_free(ctx_src);
             ctx_src = nullptr;
@@ -1373,7 +1408,7 @@ public:
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
-    ggml_tensor * src  = nullptr;   // the rows of the table in the host memory, host read mode only
+    ggml_tensor * src  = nullptr;
 
     const llama_model & model;
 
@@ -1383,27 +1418,27 @@ public:
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
 
-    // the rows of the n-gram table that the tokens of the ubatch gather
+
     void compute_rows(const llama_ubatch * ubatch, std::vector<int32_t> & idx);
 
-    // host read mode: the table stays in the GGUF file, the rows of the ubatch are read from the
-    //   disk into stage and copied into the host buffer of the gather
+
+
     bool host_read = false;
     bool prepared  = false;
-    std::vector<int32_t> idx;    // the rows of the table, in the order of the gather
-    std::vector<uint8_t>  stage; // the raw bytes of those rows
-    std::vector<int32_t>  iota;  // the identity gather of the host read mode
+    std::vector<int32_t> idx;
+    std::vector<uint8_t>  stage;
+    std::vector<int32_t>  iota;
     int n_prepared = 0;
 
-    // host read mode: the host buffer that holds the rows of the table the batch gathers. The
-    //   gather of the graph reads it on the CPU, like the pinned path reads the mapped table, so
-    //   the two modes run the same graph and give the same numbers. The buffer is a host buffer of
-    //   its own, so the compute buffers of the two modes hold the same tensors at the same places.
+
+
+
+
     ggml_context * ctx_src = nullptr;
     ggml_backend_buffer_t          buf_src = nullptr;
 };
 
-// the rows of the n-gram table that the tokens of the ubatch gather
+
 void llm_graph_input_qwen4exp_ple::compute_rows(const llama_ubatch * ubatch, std::vector<int32_t> & idx) {
     const auto & hparams = model.hparams;
 
@@ -1466,15 +1501,15 @@ void llm_graph_input_qwen4exp_ple::compute_rows(const llama_ubatch * ubatch, std
     }
 }
 
-// read the rows of the table that the ubatch needs, before the graph runs: the read overlaps with
-//   the computation of the previous ubatch
+
+
 void llm_graph_input_qwen4exp_ple::prepare(const llama_ubatch * ubatch) {
     if (!host_read) {
-        return; // the pinned path gathers the rows from the host memory in set_input()
+        return;
     }
 
     if (!ubatch || ubatch->n_tokens == 0) {
-        return; // an empty batch has no rows to read
+        return;
     }
 
     llama_ple_reader * reader = model.ple_reader.get();
@@ -1493,8 +1528,8 @@ void llm_graph_input_qwen4exp_ple::prepare(const llama_ubatch * ubatch) {
 
     {
         const llama_ple_reader::stats st = reader->get_stats();
-        // the line of every batch is for the debug log, the line of the accumulated counters is
-        //   rare: a decode step would otherwise fill the log with one line per token
+
+
         if (n_prepared % 1024 == 0) {
             LLAMA_LOG_INFO("%s: n-gram table rows: %llu rows, %llu distinct, %llu reads, %llu bytes, %.1f ms wall, %.3f ms max latency\n",
                     __func__, (unsigned long long) st.rows, (unsigned long long) st.distinct,
@@ -1512,7 +1547,7 @@ void llm_graph_input_qwen4exp_ple::prepare(const llama_ubatch * ubatch) {
 void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     if (host_read) {
         if (!ubatch || ubatch->n_tokens == 0) {
-            return; // an empty batch has no rows to read, the buffer keeps the rows of the last one
+            return;
         }
 
         if (!prepared) {
@@ -1520,7 +1555,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         }
         prepared = false;
 
-        // the gather is the identity here: the host buffer already holds the rows of the table
+
         if ((int64_t) iota.size() != rows->ne[0]) {
             iota.resize(rows->ne[0]);
             for (int64_t i = 0; i < rows->ne[0]; ++i) {
@@ -1533,7 +1568,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
                     __func__, stage.size(), ggml_nbytes(src));
         }
 
-        // the rows stay in the host memory: the gather of the graph reads them there
+
         ggml_backend_tensor_set(src, stage.data(), 0, stage.size());
         ggml_backend_tensor_set(rows, iota.data(), 0, iota.size()*ggml_element_size(rows));
 
@@ -1617,8 +1652,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
 
-    // host read mode: the table stays in the GGUF file, the rows of the ubatch are read from the
-    //   disk into a host buffer, so the gather below becomes the identity
+
+
     const bool host_read = model.ple_reader != nullptr;
 
     ggml_tensor * ple_src = model.per_layer_tok_embd;
@@ -1628,8 +1663,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
             GGML_ABORT("%s: the n-gram table is missing, its rows cannot be read from the disk\n", __func__);
         }
 
-        // the rows the reader returns must have the size of a row of the table, otherwise the
-        // gather below would read the wrong bytes
+
+
         const size_t row_bytes = ggml_row_size(ple_src->type, hparams.ple_head_dim);
         if (model.ple_reader->row_bytes != row_bytes) {
             GGML_ABORT("%s: the n-gram table row size is %zu bytes, but the tensor row is %zu bytes\n",
@@ -1638,10 +1673,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
         ple_inp->host_read = true;
 
-        // The rows of the table stay in the host memory and the gather of the graph reads them
-        // there, like the pinned path reads the mapped table: the two modes run the same graph,
-        // so they give the same numbers. The buffer is a host buffer of its own, so the compute
-        // buffers of the two modes hold the same tensors at the same places.
+
+
+
+
         const int64_t n_rows = n_heads*n_tokens;
         ggml_init_params src_params = {
             /* .mem_size   = */ 2*ggml_tensor_overhead(),
@@ -1672,7 +1707,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
     ggml_tensor * emb = ggml_get_rows(ctx0, ple_src, rows);
     if (host_read) {
-        // the gather runs on the CPU, like the pinned path: the rows are in the host memory
+
         ggml_backend_sched_set_tensor_backend(sched, emb, backend_cpu);
     }
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
@@ -1689,10 +1724,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
     const int64_t hc      = hparams.dsv4_hc_mult;
     const int64_t hc_dim  = hc * n_embd;
 
-    // Expand the projections that share this input back to back, so that the CUDA backend can
-    // run them with one input conversion and one multi-weight kernel. ggml reuses compute
-    // buffers in node order, so a projection expanded apart from the others could have its
-    // output overwritten before its consumers read it.
+
+
+
+
     ggml_tensor * key   = build_lora_mm(model.layers[il].ple_key,   emb);
     ggml_build_forward_expand(gf, key);
     ggml_tensor * value = build_lora_mm(model.layers[il].ple_value, emb);

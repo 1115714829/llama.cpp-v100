@@ -192,19 +192,19 @@ public:
     // graph_build API
     //
 
-    // full: ignore the used cells and return the cache size, so that all prompt
-    // ubatches with range masks share the same n_kv
+
+
     uint32_t get_n_kv(const slot_info & sinfo, bool full = false) const;
 
-    // the n_kv of a ubatch over these cells (one stream of this cache) that does not view the whole cache: the used
-    // cells padded to a grain that grows with them, see get_n_kv
+
+
     uint32_t get_n_kv_used(const llama_kv_cells & cells) const;
 
-    // allow I32 [lo, hi) range masks for eligible ubatches (see get_kq_range_ok)
+
     void set_kq_range_allowed(bool allowed) override;
 
-    // 2+ token ubatches view the whole cache (bounded caches only, e.g. the SWA cache of an iSWA
-    // memory without swa_full): the graph then does not depend on the used cells
+
+
     void set_view_full(bool enable) { view_full = enable; }
     bool get_view_full() const { return view_full; }
 
@@ -241,7 +241,7 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
-    // the Hadamard rotation matrices are stored in the KV cache buffers - no graph inputs
+
     ggml_tensor * build_input_k_rot(int32_t il) const;
     ggml_tensor * build_input_v_rot(int32_t il) const;
 
@@ -253,19 +253,19 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
-    // the KQ mask of this ubatch is exactly two [lo, hi) ranges of visible cells per token:
-    // a non-SWA cache, one sequence per stream, and cells [0, n_used) all holding that sequence
-    // in strict causal order (O(n_used) check per stream)
-    // a standard SWA ring whose write order is the position order with no holes and no shared
-    // positions: the window maps to one or two linear cell ranges (see set_input_kq_range)
+
+
+
+
+
     bool get_kq_range_ok(const slot_info & sinfo, const llama_ubatch & ubatch) const;
 
-    // true if every ubatch of a single sequence can take a range mask, so the worst-case graphs take one too
+
     bool get_kq_range_reserve() const;
 
-    // fills an I32 [4, n_tokens/n_stream, 1, n_stream] range mask: two [lo, hi) pairs of visible
-    // cells per token. the non-SWA case writes [0, cell + 1) and an empty second pair; the SWA case
-    // writes the window [p1 - n_swa + 1, p1] split at the ring boundary (see get_kq_range_ok)
+
+
+
     void set_input_kq_range(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
@@ -291,7 +291,7 @@ private:
         ggml_tensor * k;
         ggml_tensor * v;
 
-        // Hadamard rotation matrices, allocated in the same buffer as K/V
+
         ggml_tensor * k_rot = nullptr;
         ggml_tensor * v_rot = nullptr;
 
@@ -319,10 +319,10 @@ private:
     int32_t n_embd_head_k_all = 0;
     int32_t n_embd_head_v_all = 0;
 
-    // pre-computed hadamard matrices, kept in host memory for the initial upload and for re-upload after a buffer clear
+
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
 
-    // the tensors in the K/V buffers that hold the rotation matrices, one K and one V per buffer type
+
     std::vector<ggml_tensor *> attn_rot_tensors;
 
     // env: LLAMA_KV_CACHE_DEBUG
@@ -331,10 +331,10 @@ private:
     // this is the SWA type of the cache - not to be confused with the model SWA type
     const llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
 
-    // see get_view_full()
+
     bool view_full = false;
 
-    // range masks are enabled before each decode from the current context parameters
+
     bool kq_range_enabled = false;
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
@@ -367,7 +367,7 @@ private:
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
 
-    // copy the pre-computed Hadamard matrices into the K/V buffers
+
     void upload_rot_tensors() const;
 
     ggml_tensor * build_rope_shift(
@@ -445,7 +445,7 @@ public:
 
     uint32_t get_n_kv() const;
 
-    // true if the KQ mask of the current ubatch is a single [lo, hi) range per token
+
     bool get_kq_range() const {
         return kq_range;
     }
@@ -518,6 +518,6 @@ private:
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
 
-    // true if the current ubatch can use a range mask (see llama_kv_cache::get_kq_range_ok)
+
     bool kq_range = false;
 };

@@ -157,13 +157,13 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
     }
 }
 
-// d_conv is fixed to 4: the pattern matched by ggml_cuda_try_ssm_conv_rollback_fusion comes from
-// the gated delta net layers, which always use a kernel of size 4
+
+
 static constexpr size_t d_conv_fused = 4;
 
-// One thread per channel: rebuilds the [d_conv - 1 + n_tok, C] convolution window from the state
-// row and the qkv projection, writes the rollback snapshots into the state cache and produces the
-// conv output. The accumulate order matches ssm_conv_f32.
+
+
+
 static __global__ void ssm_conv_rollback_fused_f32(const ggml_cuda_ssm_conv_rollback_params p) {
     ggml_cuda_pdl_lc();
 
@@ -182,8 +182,8 @@ static __global__ void ssm_conv_rollback_fused_f32(const ggml_cuda_ssm_conv_roll
         x[j] = state_c[j];
     }
 
-    // the snapshots are written from the values already in registers, so a snapshot may overwrite
-    // the state row that was just read
+
+
     for (int k = 0; k < p.n_snap; ++k) {
         float * snap_c = p.snap_dst[k] + c * (d_conv_fused - 1);
 #pragma unroll

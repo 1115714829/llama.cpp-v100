@@ -17,8 +17,8 @@
 
 namespace gdn_chunk_sm70 {
 
-// HV_CT/HK_CT > 0 fix the head counts at compile time (the TP4 shape keeps its constant address
-// arithmetic); 0 takes them from Hv_rt/Hk_rt.
+
+
 template <int HV_CT, int HK_CT>
 __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_t* __restrict__ a, const float* __restrict__ b, const int* __restrict__ chunk_indices, const int* __restrict__ cu_seqlens, const half_t* __restrict__ k, int num_chunks, int num_tokens, int real_batch_size, int Hv_rt, int Hk_rt) {
   const int Hv = HV_CT > 0 ? HV_CT : Hv_rt;
@@ -75,7 +75,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
   if ((((chunk_idx_1 * 64) + seq_start_idx_1) + 64) <= seq_end_idx_1) {
     #pragma unroll
     for (int i = 0; i < 16; ++i) {
-      half_t broadcast_var = half_t(0x0p+0f/*0.000000e+00*/);
+      half_t broadcast_var = half_t(0x0p+0f );
       uint2 condval_2;
       if (((((((chunk_idx_1 * 64) + (i * 4)) + (((int)threadIdx.x) >> 5)) + seq_start_idx_1) < num_tokens) && (0 <= ((((chunk_idx_1 * 64) + (i * 4)) + (((int)threadIdx.x) >> 5)) + seq_start_idx_1)))) {
         condval_2 = *(uint2*)(k + ((int64_t)chunk_idx_1 * k_chunk_stride + (int64_t)i * k_iter_stride + (int64_t)(threadIdx.x >> 5) * k_tok_stride + (int64_t)seq_start_idx_1 * k_tok_stride + (int64_t)hk * 128 + (int64_t)(threadIdx.x & 31) * 4));
@@ -89,7 +89,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
       if (((0 <= (((chunk_idx_1 * 64) + seq_start_idx_1) + ((int)threadIdx.x))) && ((((chunk_idx_1 * 64) + seq_start_idx_1) + ((int)threadIdx.x)) < num_tokens))) {
         condval_3 = b[(int64_t)chunk_idx_1 * b_chunk_stride + ((int64_t)seq_start_idx_1 + threadIdx.x) * b_tok_stride + h];
       } else {
-        condval_3 = 0x0p+0f/*0.000000e+00*/;
+        condval_3 = 0x0p+0f ;
       }
       b_shared[((int)threadIdx.x)] = condval_3;
     }
@@ -98,7 +98,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
     #pragma unroll
     for (int i_1 = 0; i_1 < 16; ++i_1) {
       if (((((chunk_idx_1 * 64) + (i_1 * 4)) + (((int)threadIdx.x) >> 5)) + seq_start_idx_1) < seq_end_idx_1) {
-        half_t broadcast_var_1 = half_t(0x0p+0f/*0.000000e+00*/);
+        half_t broadcast_var_1 = half_t(0x0p+0f );
         uint2 condval_4;
         if (((0 <= ((((chunk_idx_1 * 64) + (i_1 * 4)) + (((int)threadIdx.x) >> 5)) + seq_start_idx_1)) && (((((chunk_idx_1 * 64) + (i_1 * 4)) + (((int)threadIdx.x) >> 5)) + seq_start_idx_1) < num_tokens))) {
           condval_4 = *(uint2*)(k + ((int64_t)chunk_idx_1 * k_chunk_stride + (int64_t)i_1 * k_iter_stride + (int64_t)(threadIdx.x >> 5) * k_tok_stride + (int64_t)seq_start_idx_1 * k_tok_stride + (int64_t)hk * 128 + (int64_t)(threadIdx.x & 31) * 4));
@@ -107,7 +107,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
         }
         *(uint2*)(((half_t*)k_shared) + ((((((((int)threadIdx.x) & 31) * 256) + ((i_1 >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 16)) + ((((((i_1 & 7) >> 2) + ((((int)threadIdx.x) & 7) >> 2)) + ((i_1 & 3) >> 1)) & 1) * 8)) + (((((((int)threadIdx.x) & 3) >> 1) + (i_1 & 1)) & 1) * 4))) = condval_4;
       } else {
-        half_t broadcast_var_2 = half_t(0x0p+0f/*0.000000e+00*/);
+        half_t broadcast_var_2 = half_t(0x0p+0f );
         *(uint2*)(((half_t*)k_shared) + ((((((((int)threadIdx.x) & 31) * 256) + ((i_1 >> 2) * 64)) + ((((int)threadIdx.x) >> 5) * 16)) + ((((((i_1 & 7) >> 2) + ((((int)threadIdx.x) & 7) >> 2)) + ((i_1 & 3) >> 1)) & 1) * 8)) + (((((((int)threadIdx.x) & 3) >> 1) + (i_1 & 1)) & 1) * 4))) = make_uint2(__pack_half2(broadcast_var_2, broadcast_var_2), __pack_half2(broadcast_var_2, broadcast_var_2));
       }
     }
@@ -117,11 +117,11 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
         if (((0 <= (((chunk_idx_1 * 64) + seq_start_idx_1) + ((int)threadIdx.x))) && ((((chunk_idx_1 * 64) + seq_start_idx_1) + ((int)threadIdx.x)) < num_tokens))) {
           condval_5 = b[(int64_t)chunk_idx_1 * b_chunk_stride + ((int64_t)seq_start_idx_1 + threadIdx.x) * b_tok_stride + h];
         } else {
-          condval_5 = 0x0p+0f/*0.000000e+00*/;
+          condval_5 = 0x0p+0f ;
         }
         b_shared[((int)threadIdx.x)] = condval_5;
       } else {
-        b_shared[((int)threadIdx.x)] = 0x0p+0f/*0.000000e+00*/;
+        b_shared[((int)threadIdx.x)] = 0x0p+0f ;
       }
     }
   }
@@ -131,7 +131,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
     half_t B_local[8];
     #pragma unroll
     for (int i_2 = 0; i_2 < 8; ++i_2) {
-      float broadcast_var_3 = 0x0p+0f/*0.000000e+00*/;
+      float broadcast_var_3 = 0x0p+0f ;
       *(float4*)(a64_fragment + (i_2 * 4)) = make_float4(broadcast_var_3, broadcast_var_3, broadcast_var_3, broadcast_var_3);
     }
     for (int ki = 0; ki < 32; ++ki) {
@@ -160,10 +160,10 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
   #pragma unroll
   for (int i_7 = 0; i_7 < 32; ++i_7) {
     if (((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_7 >> 4) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + (((i_7 & 3) >> 1) * 2)) + (((int)threadIdx.x) & 1)) < ((((((((int)threadIdx.x) >> 6) * 32) + (((i_7 & 15) >> 2) * 8)) + (((((int)threadIdx.x) & 15) >> 3) * 4)) + (((((int)threadIdx.x) & 3) >> 1) * 2)) + (i_7 & 1))) {
-      a64_fragment[i_7] = 0x0p+0f/*0.000000e+00*/;
+      a64_fragment[i_7] = 0x0p+0f ;
     } else {
       if (((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_7 >> 4) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + (((i_7 & 3) >> 1) * 2)) + (((int)threadIdx.x) & 1)) == ((((((((int)threadIdx.x) >> 6) * 32) + (((i_7 & 15) >> 2) * 8)) + (((((int)threadIdx.x) & 15) >> 3) * 4)) + (((((int)threadIdx.x) & 3) >> 1) * 2)) + (i_7 & 1))) {
-        a64_fragment[i_7] = 0x1p+0f/*1.000000e+00*/;
+        a64_fragment[i_7] = 0x1p+0f ;
       }
     }
   }
@@ -171,10 +171,10 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
   #pragma unroll
   for (int i_8 = 0; i_8 < 32; ++i_8) {
     if ((32 <= (((int)threadIdx.x) & 63)) && (((int)threadIdx.x) < 64)) {
-      ((float*)a32o_shared)[((((((((((((((int)threadIdx.x) >> 5) * 1024) + ((i_8 >> 4) * 512)) + (((((int)threadIdx.x) & 7) >> 2) * 256)) + (((((int)threadIdx.x) & 31) >> 4) * 128)) + (((i_8 & 3) >> 1) * 64)) + ((((int)threadIdx.x) & 1) * 32)) + (((i_8 & 15) >> 2) * 8)) + (((((int)threadIdx.x) & 15) >> 3) * 4)) + (((((int)threadIdx.x) & 3) >> 1) * 2)) + (i_8 & 1)) - 1024)] = (a64_fragment[i_8] * -0x1p+0f/*-1.000000e+00*/);
+      ((float*)a32o_shared)[((((((((((((((int)threadIdx.x) >> 5) * 1024) + ((i_8 >> 4) * 512)) + (((((int)threadIdx.x) & 7) >> 2) * 256)) + (((((int)threadIdx.x) & 31) >> 4) * 128)) + (((i_8 & 3) >> 1) * 64)) + ((((int)threadIdx.x) & 1) * 32)) + (((i_8 & 15) >> 2) * 8)) + (((((int)threadIdx.x) & 15) >> 3) * 4)) + (((((int)threadIdx.x) & 3) >> 1) * 2)) + (i_8 & 1)) - 1024)] = (a64_fragment[i_8] * -0x1p+0f );
     } else {
       if (((((((int)threadIdx.x) & 63) >> 5) * 2) + (i_8 >> 4)) == ((((((int)threadIdx.x) >> 6) * 2) + (((((((i_8 & 15) >> 2) * 8) + (((((int)threadIdx.x) & 15) >> 3) * 4)) + (((((int)threadIdx.x) & 3) >> 1) * 2)) + (i_8 & 1)) >> 4)) + 1)) {
-        ((float*)a16o_shared)[((((((((((int)threadIdx.x) & 63) >> 5) * 272) + (((((int)threadIdx.x) & 7) >> 2) * 128)) + (((((int)threadIdx.x) & 31) >> 4) * 64)) + (((i_8 & 3) >> 1) * 32)) + ((((int)threadIdx.x) & 1) * 16)) + (((((((i_8 & 15) >> 2) * 8) + (((((int)threadIdx.x) & 15) >> 3) * 4)) + (((((int)threadIdx.x) & 3) >> 1) * 2)) + (i_8 & 1)) & 15))] = (a64_fragment[i_8] * -0x1p+0f/*-1.000000e+00*/);
+        ((float*)a16o_shared)[((((((((((int)threadIdx.x) & 63) >> 5) * 272) + (((((int)threadIdx.x) & 7) >> 2) * 128)) + (((((int)threadIdx.x) & 31) >> 4) * 64)) + (((i_8 & 3) >> 1) * 32)) + ((((int)threadIdx.x) & 1) * 16)) + (((((((i_8 & 15) >> 2) * 8) + (((((int)threadIdx.x) & 15) >> 3) * 4)) + (((((int)threadIdx.x) & 3) >> 1) * 2)) + (i_8 & 1)) & 15))] = (a64_fragment[i_8] * -0x1p+0f );
       } else {
         if (((((((int)threadIdx.x) & 63) >> 5) * 2) + (i_8 >> 4)) == (((((int)threadIdx.x) >> 6) * 2) + (((((((i_8 & 15) >> 2) * 8) + (((((int)threadIdx.x) & 15) >> 3) * 4)) + (((((int)threadIdx.x) & 3) >> 1) * 2)) + (i_8 & 1)) >> 4))) {
           ((float*)a16i_shared)[(((((((((((int)threadIdx.x) & 63) >> 5) * 544) + ((i_8 >> 4) * 272)) + (((((int)threadIdx.x) & 7) >> 2) * 128)) + (((((int)threadIdx.x) & 31) >> 4) * 64)) + (((i_8 & 3) >> 1) * 32)) + ((((int)threadIdx.x) & 1) * 16)) + (((((((i_8 & 15) >> 2) * 8) + (((((int)threadIdx.x) & 15) >> 3) * 4)) + (((((int)threadIdx.x) & 3) >> 1) * 2)) + (i_8 & 1)) & 15))] = a64_fragment[i_8];
@@ -184,7 +184,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
   }
   #pragma unroll
   for (int i_9 = 0; i_9 < 4; ++i_9) {
-    float broadcast_var_4 = 0x0p+0f/*0.000000e+00*/;
+    float broadcast_var_4 = 0x0p+0f ;
     *(float4*)(a16i_row + (i_9 * 4)) = make_float4(broadcast_var_4, broadcast_var_4, broadcast_var_4, broadcast_var_4);
   }
   __syncthreads();
@@ -196,7 +196,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
         a16i_row[i_10] = ((float*)a16i_shared)[(((((((int)threadIdx.x) & 63) >> 4) * 272) + (k_s * 16)) + i_10)];
       }
     }
-    a16i_sum[0] = 0x0p+0f/*0.000000e+00*/;
+    a16i_sum[0] = 0x0p+0f ;
     #pragma unroll
     for (int k_r = 0; k_r < k_s; ++k_r) {
       a16i_sum[0] = (a16i_sum[0] - (((float*)a16i_shared)[(((((((int)threadIdx.x) & 63) >> 4) * 272) + (k_r * 16)) + (((int)threadIdx.x) & 15))] * a16i_row[k_r]));
@@ -208,7 +208,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
       }
     }
   }
-  float broadcast_var_5 = 0x0p+0f/*0.000000e+00*/;
+  float broadcast_var_5 = 0x0p+0f ;
   *(float4*)(a16o_fragment + 0) = make_float4(broadcast_var_5, broadcast_var_5, broadcast_var_5, broadcast_var_5);
   __syncthreads();
   #pragma unroll
@@ -233,7 +233,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
   for (int i_11 = 0; i_11 < 4; ++i_11) {
     ((float*)a16o_shared)[(((((((int)threadIdx.x) >> 6) * 272) + ((((int)threadIdx.x) & 3) * 64)) + (i_11 * 16)) + ((((int)threadIdx.x) & 63) >> 2))] = a16o_fragment[i_11];
   }
-  float broadcast_var_6 = 0x0p+0f/*0.000000e+00*/;
+  float broadcast_var_6 = 0x0p+0f ;
   *(float4*)(a16o_fragment + 0) = make_float4(broadcast_var_6, broadcast_var_6, broadcast_var_6, broadcast_var_6);
   __syncthreads();
   #pragma unroll
@@ -258,7 +258,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
   #pragma unroll
   for (int i_12 = 0; i_12 < 16; ++i_12) {
     if (((i_12 & 7) < 4) && (4 <= (((int)threadIdx.x) & 7))) {
-      a32i_fragment[i_12] = 0x0p+0f/*0.000000e+00*/;
+      a32i_fragment[i_12] = 0x0p+0f ;
     }
   }
   __syncthreads();
@@ -285,7 +285,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
   }
   #pragma unroll
   for (int i_16 = 0; i_16 < 2; ++i_16) {
-    float broadcast_var_7 = 0x0p+0f/*0.000000e+00*/;
+    float broadcast_var_7 = 0x0p+0f ;
     *(float4*)(a32o_fragment + (i_16 * 4)) = make_float4(broadcast_var_7, broadcast_var_7, broadcast_var_7, broadcast_var_7);
   }
   __syncthreads();
@@ -315,7 +315,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
   }
   #pragma unroll
   for (int i_19 = 0; i_19 < 2; ++i_19) {
-    float broadcast_var_8 = 0x0p+0f/*0.000000e+00*/;
+    float broadcast_var_8 = 0x0p+0f ;
     *(float4*)(a32o_fragment + (i_19 * 4)) = make_float4(broadcast_var_8, broadcast_var_8, broadcast_var_8, broadcast_var_8);
   }
   __syncthreads();
@@ -359,7 +359,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
     *(uint2*)(a64_shared_local_cast_1 + 0) = __11;
     *(uint2*)(((half_t*)a64_shared) + ((((i_22 * 1024) + ((((int)threadIdx.x) >> 3) * 64)) + ((((int)threadIdx.x) & 7) * 4)) + 2048)) = *(uint2*)(a64_shared_local_cast_1 + 0);
   }
-  half_t broadcast_var_9 = half_t(0x0p+0f/*0.000000e+00*/);
+  half_t broadcast_var_9 = half_t(0x0p+0f );
   *(uint4*)(((half_t*)a64_shared) + ((((((int)threadIdx.x) >> 2) * 64) + ((((int)threadIdx.x) & 3) * 8)) + 32)) = make_uint4(__pack_half2(broadcast_var_9, broadcast_var_9), __pack_half2(broadcast_var_9, broadcast_var_9), __pack_half2(broadcast_var_9, broadcast_var_9), __pack_half2(broadcast_var_9, broadcast_var_9));
   __syncthreads();
   if ((((chunk_idx_1 * 64) + seq_start_idx_1) + 64) <= seq_end_idx_1) {
@@ -383,5 +383,5 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
   }
 }
 
-} // namespace gdn_chunk_sm70
+}
 

@@ -1,31 +1,31 @@
-// Checks the k-pool layout that llama_memory_hybrid_idx keeps across decodes against one rebuilt from scratch.
-//
-// kpool_layout_update keeps each sequence's cells before the position an edit staled, with the pools made of them,
-// and appends the rest; a rebuild is the same code keeping nothing. These are the edits that reach it:
-//  - speculative decoding: decode a draft of k tokens, then seq_rm its rejected tail, every round - also when none is
-//    rejected, which removes nothing but still stales from there, as the server does
-//  - seq_rm of a range in the middle, which leaves a gap (the compact layout of qwen4exp refuses it: the pools after the
-//    gap would regroup from raw keys it no longer keeps)
-//  - seq_add of the tail down (overlapping positions) and up (a gap), on models that can shift
-//  - clearing a sequence and filling it again
-//  - two sequences in their own streams, rolled back in turn and in one batch
-//  - two sequences sharing cells after seq_cp, the copy rolled back and then dropped
-//  - many sequences whose first tokens share one ubatch, which pads more new-pool entries than the layout has cells
-//    that are no rep; then they grow a token each, and half of them decode two and roll back the second, per ubatch
-//  - one sequence decoded across an n_kv grain boundary, by single tokens and by verify rounds
-//  - a checkpoint (partial state) taken mid-pool, the sequence decoded on, the checkpoint restored and the sequence cut
-//    back to it, then a different continuation; a full state saved, the sequence dropped and restored, decoded on
-//  - a sequence copied to another stream (seq_cp of a non unified cache), both decoded on
-// The layout is compared after every decode. After the speculative rounds, the restores and the copy the next token's
-// logits must also match a context that decoded the same tokens straight.
-// The compact layout (pooled keys plus a raw-key ring, qwen4exp) also has its slots and ring checked after every decode.
-// After every decode the cells for padded new-pool entries are also picked over the layout, for counts up to every cell
-// that is no pool's rep: each must be in range, no rep and taken once. The graph's pool count must leave a padded pool
-// after the real ones and fit the reserved graph; across the grain boundary it must be the pools of the cells padded
-// like the n_kv of a ubatch that does not view the whole cache, so it moves exactly where that n_kv moves.
-//
-// Models without a k-pool indexer are skipped. The dummy models of test-llama-archs (-o DIR) cover both pool kinds:
-// qwen4exp groups cells in sequence order, glm5-next groups consecutive positions.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #include "arg.h"
 #include "common.h"
@@ -71,7 +71,7 @@ static test_status merge_status(test_status a, test_status b) {
     return test_status::SKIP;
 }
 
-// one run of tokens [p0, p1) of sequence s: its own tokens before p_bad, rejected draft tokens from there
+
 struct span {
     llama_seq_id s;
     llama_pos    p0;
@@ -93,7 +93,7 @@ struct kpool_case {
     llama_memory_t mem_i() const { return llama_get_memory(ctx.get()); }
 
     llama_token tok(llama_seq_id s, llama_pos pos, bool bad = false) const {
-        // a rejected draft token is the next id, so it always differs from the sequence's own
+
         return (llama_token) ((7*(uint32_t) pos + 31*(uint32_t) s + 1 + (bad ? 1 : 0)) % (uint32_t) n_vocab);
     }
 
@@ -111,7 +111,7 @@ struct kpool_case {
         return true;
     }
 
-    // the layout as the decode left it against a rebuild over the cache, and the padding cells picked over it
+
     bool check(const char * what, int step) {
         ++n_checks;
         const std::string diff = mem->kpool_layout_diff();
@@ -141,13 +141,13 @@ struct kpool_case {
         return decode(spans) && check(what, step);
     }
 
-    // after a sequence edit: the compact layout follows every edit at once; the per-cell one catches up at the next
-    // ubatch, so it is checked after the next decode instead
+
+
     bool check_edit(const char * what, int step) {
         return mem->get_kstore() == nullptr || check(what, step);
     }
 
-    // tokens toks at positions p0.. of sequence s, the logits of the last one
+
     bool decode_toks(llama_seq_id s, llama_pos p0, const std::vector<llama_token> & toks, const char * what) {
         common_batch batch(ctx.get());
         for (size_t i = 0; i < toks.size(); ++i) {
@@ -160,7 +160,7 @@ struct kpool_case {
         return check(what, 0);
     }
 
-    // sequence s's tokens [p0, p1), or the rejected-draft ones
+
     std::vector<llama_token> toks(llama_seq_id s, llama_pos p0, llama_pos p1, bool bad = false) const {
         std::vector<llama_token> res;
         for (llama_pos pos = p0; pos < p1; ++pos) {
@@ -173,7 +173,7 @@ struct kpool_case {
         return llama_memory_seq_pos_max(mem_i(), s) + 1;
     }
 
-    // verify rounds on seq s: a draft of 1..4 tokens, the first 1..k of them right, then the server's seq_rm of the rest
+
     bool spec_rounds(llama_seq_id s, int n_rounds, const char * what) {
         for (int r = 0; r < n_rounds; ++r) {
             const llama_pos pos   = pos_next(s);
@@ -191,7 +191,7 @@ struct kpool_case {
     }
 };
 
-// false with res set when the case cannot run: FAIL if the context fails, SKIP without a k-pool indexer
+
 static bool make_case(kpool_case & tc, const common_params & params, llama_model * model, const char * name,
         uint32_t n_seq_max, bool unified, test_status & res, uint32_t n_ctx_seq = 1024) {
     auto cparams = common_context_params_to_llama(params);
@@ -241,7 +241,7 @@ static double nmse(const float * a, const float * b, int n) {
     return mse_a0 == 0.0 ? (mse_ab == 0.0 ? 0.0 : std::numeric_limits<double>::infinity()) : mse_ab/mse_a0;
 }
 
-// One sequence through every edit kind.
+
 static test_status test_single(const common_params & params, llama_model * model) {
     kpool_case tc;
     test_status res = test_status::SKIP;
@@ -249,13 +249,13 @@ static test_status test_single(const common_params & params, llama_model * model
         return res;
     }
 
-    // a prefill over three ubatches, ending inside a pool
+
     if (!tc.decode_check({ { 0, 0, 71 } }, "prefill", 0) ||
         !tc.spec_rounds(0, 48, "spec")) {
         return test_status::FAIL;
     }
 
-    // the next token against a context that decoded the accepted tokens straight
+
     {
         kpool_case ref;
         test_status res_ref = test_status::SKIP;
@@ -288,9 +288,9 @@ static test_status test_single(const common_params & params, llama_model * model
         tc.n_checks += ref.n_checks;
     }
 
-    // a range in the middle, off the pool grid, leaves a gap that later pools must step over. The compact layout keeps
-    // no raw key for the pools that would regroup, so it refuses the cut and the front cut alike, and leaves every
-    // cache as it was
+
+
+
     {
         const llama_pos pos = tc.pos_next(0);
         const llama_pos a   = pos/3 + 1;
@@ -314,9 +314,9 @@ static test_status test_single(const common_params & params, llama_model * model
         }
     }
 
-    // the tail shifted down onto earlier positions, then up past a gap; only where the cache can shift
+
     if (llama_memory_can_shift(tc.mem_i())) {
-        // the hybrid's pos_min is the recurrent tail's, the cells start where the indexer cache says
+
         const llama_pos c = (tc.mem->get_idx_cells()->seq_pos_min(0) + tc.pos_next(0))/2;
         llama_memory_seq_add(tc.mem_i(), 0, c, -1, -3);
         llama_pos pos = tc.pos_next(0);
@@ -331,8 +331,8 @@ static test_status test_single(const common_params & params, llama_model * model
             return test_status::FAIL;
         }
 
-        // a gap inside a pool's span that a rollback then removes: the pool across it forms only once the gap is
-        // gone, so the scan must go back before the first pool it dropped
+
+
         const llama_pos kpool = (llama_pos) tc.mem->get_kpool();
         const llama_pos pmin  = tc.mem->get_idx_cells()->seq_pos_min(0);
         pos = tc.pos_next(0);
@@ -355,7 +355,7 @@ static test_status test_single(const common_params & params, llama_model * model
         LOG_INF("%s: the cache cannot shift, no seq_add\n", __func__);
     }
 
-    // cleared and filled again
+
     if (!llama_memory_seq_rm(tc.mem_i(), 0, -1, -1)) {
         LOG_ERR("%s: clearing the sequence was refused\n", __func__);
         return test_status::FAIL;
@@ -368,7 +368,7 @@ static test_status test_single(const common_params & params, llama_model * model
     return test_status::PASS;
 }
 
-// Two sequences in their own streams: rolled back in turn, and together in one batch.
+
 static test_status test_streams(const common_params & params, llama_model * model) {
     kpool_case tc;
     test_status res = test_status::SKIP;
@@ -405,7 +405,7 @@ static test_status test_streams(const common_params & params, llama_model * mode
     return test_status::PASS;
 }
 
-// Two sequences sharing cells after seq_cp: the copy grows and is rolled back, then dropped.
+
 static test_status test_shared(const common_params & params, llama_model * model) {
     kpool_case tc;
     test_status res = test_status::SKIP;
@@ -445,11 +445,11 @@ static test_status test_shared(const common_params & params, llama_model * model
     return test_status::PASS;
 }
 
-// Many sequences: the first tokens of all but one in one ubatch pad more new-pool entries than the layout has cells that
-// are no rep, so the pick runs on into the cells no sequence holds. Then every sequence grows a token per ubatch, and
-// half of them decode two in one ubatch and roll back the second, which spreads the pads over many sequences.
+
+
+
 static test_status test_many(const common_params & params, llama_model * model) {
-    constexpr uint32_t n_seq = 32; // a token each fills the ubatch of 32
+    constexpr uint32_t n_seq = 32;
 
     kpool_case tc;
     test_status res = test_status::SKIP;
@@ -457,7 +457,7 @@ static test_status test_many(const common_params & params, llama_model * model) 
         return res;
     }
 
-    // one pool in sequence 0, so the pick has a rep to step over
+
     const llama_pos kpool = (llama_pos) tc.mem->get_kpool();
     if (!tc.decode_check({ { 0, 0, kpool } }, "first pool", 0)) {
         return test_status::FAIL;
@@ -501,10 +501,10 @@ static test_status test_many(const common_params & params, llama_model * model) 
     return test_status::PASS;
 }
 
-// One sequence decoded across the first n_kv grain boundary (2048 cells), by single tokens and then by verify rounds
-// with their rollbacks. A new pool count rebuilds the graph, so the count must be the pools of the used cells padded
-// like the n_kv of a ubatch that does not view the whole cache, plus the unused last pool: it then moves exactly where
-// that n_kv moves, once here, and stays put within a bucket.
+
+
+
+
 static test_status test_grain(const common_params & params, llama_model * model) {
     kpool_case tc;
     test_status res = test_status::SKIP;
@@ -532,7 +532,7 @@ static test_status test_grain(const common_params & params, llama_model * model)
         return true;
     };
 
-    // a prefill that ends short of the boundary, then single tokens across it
+
     const llama_pos p_bound = 2048;
     for (llama_pos p0 = 0; p0 < p_bound - 16; p0 += 256) {
         const llama_pos p1 = std::min<llama_pos>(p0 + 256, p_bound - 16);
@@ -550,7 +550,7 @@ static test_status test_grain(const common_params & params, llama_model * model)
         return test_status::FAIL;
     }
 
-    // verify rounds inside the next bucket, each drafting 1..4 tokens and rolling back the rejected ones
+
     for (int r = 0; r < 24; ++r) {
         const llama_pos pos   = tc.pos_next(0);
         const int       k     = std::uniform_int_distribution<int>(1, 4)(tc.rng);
@@ -573,7 +573,7 @@ static test_status test_grain(const common_params & params, llama_model * model)
     return test_status::PASS;
 }
 
-// the logits of the last decode of the case against those of a context that decoded the same tokens straight
+
 static bool logits_match(kpool_case & tc, kpool_case & ref, const char * what) {
     const float * a = llama_get_logits_ith(tc.ctx.get(),  -1);
     const float * b = llama_get_logits_ith(ref.ctx.get(), -1);
@@ -590,12 +590,12 @@ static bool logits_match(kpool_case & tc, kpool_case & ref, const char * what) {
     return true;
 }
 
-// A checkpoint (partial state) taken inside a pool: the sequence goes on over several ubatches, which retires the raw
-// keys of the checkpoint's incomplete pool from the compact cache's ring, then the checkpoint is restored and the
-// sequence cut back to it, as the server does for a prompt that shares a prefix, and it continues differently. The same
-// checkpoint is then loaded into a second sequence that took the prefix with seq_cp, as the server's cross-slot reuse
-// does. Last a full state of that sequence is saved, the sequence dropped and the state restored. After each the next
-// token must match a context that decoded the same tokens straight.
+
+
+
+
+
+
 static test_status test_states(const common_params & params, llama_model * model) {
     kpool_case tc;
     test_status res = test_status::SKIP;
@@ -610,7 +610,7 @@ static test_status test_states(const common_params & params, llama_model * model
     }
 
     const llama_pos kpool  = (llama_pos) tc.mem->get_kpool();
-    const llama_pos p_ckpt = 17*kpool + 2; // inside a pool
+    const llama_pos p_ckpt = 17*kpool + 2;
 
     const auto prefix = tc.toks(0, 0, p_ckpt);
     if (!tc.decode_toks(0, 0, prefix, "prefix") || !ref.decode_toks(0, 0, prefix, "prefix")) {
@@ -623,7 +623,7 @@ static test_status test_states(const common_params & params, llama_model * model
         return test_status::FAIL;
     }
 
-    // on past the checkpoint in several ubatches, and a rollback
+
     const llama_pos p_on = p_ckpt + 6*kpool + 1;
     for (llama_pos p = p_ckpt; p < p_on; p += kpool + 1) {
         const llama_pos p1 = std::min(p + kpool + 1, p_on);
@@ -636,7 +636,7 @@ static test_status test_states(const common_params & params, llama_model * model
         return test_status::FAIL;
     }
 
-    // back to the checkpoint, then another continuation
+
     if (llama_state_seq_set_data_ext(tc.ctx.get(), ckpt.data(), ckpt.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != ckpt.size()) {
         LOG_ERR("%s: restoring the checkpoint failed\n", __func__);
         return test_status::FAIL;
@@ -653,7 +653,7 @@ static test_status test_states(const common_params & params, llama_model * model
         return test_status::FAIL;
     }
 
-    // the prefix copied into another sequence, the checkpoint loaded into it, the same continuation
+
     if (!llama_memory_seq_rm(tc.mem_i(), 1, -1, -1)) {
         LOG_ERR("%s: clearing sequence 1 failed\n", __func__);
         return test_status::FAIL;
@@ -671,7 +671,7 @@ static test_status test_states(const common_params & params, llama_model * model
         return test_status::FAIL;
     }
 
-    // a full state of the copy, which ends inside a pool, dropped and restored, then decoded on
+
     std::vector<uint8_t> full(llama_state_seq_get_size(tc.ctx.get(), 1));
     if (full.empty() || llama_state_seq_get_data(tc.ctx.get(), full.data(), full.size(), 1) != full.size()) {
         LOG_ERR("%s: saving the full state failed\n", __func__);
@@ -697,8 +697,8 @@ static test_status test_states(const common_params & params, llama_model * model
     return test_status::PASS;
 }
 
-// A sequence copied to another stream (seq_cp of a non unified cache copies the whole stream), both continued, the copy
-// against a context that decoded its tokens straight.
+
+
 static test_status test_copy_streams(const common_params & params, llama_model * model) {
     kpool_case tc;
     test_status res = test_status::SKIP;
@@ -713,7 +713,7 @@ static test_status test_copy_streams(const common_params & params, llama_model *
     }
 
     const llama_pos kpool = (llama_pos) tc.mem->get_kpool();
-    const llama_pos p0    = 11*kpool + 3; // inside a pool
+    const llama_pos p0    = 11*kpool + 3;
 
     const auto prefix = tc.toks(0, 0, p0);
     if (!tc.decode_toks(0, 0, prefix, "prefix") || !ref.decode_toks(0, 0, prefix, "prefix")) {
@@ -729,7 +729,7 @@ static test_status test_copy_streams(const common_params & params, llama_model *
         return test_status::FAIL;
     }
 
-    // the source goes its own way first, then the copy continues the prefix
+
     if (!tc.decode_toks(0, p0, tc.toks(0, p0, p0 + kpool + 3, true), "source on")) {
         return test_status::FAIL;
     }
@@ -796,7 +796,7 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    // our own --models DIR option, the rest goes to the common arg parser
+
     std::string models_dir;
     std::vector<char *> filtered_argv;
     filtered_argv.push_back(argv[0]);
@@ -814,7 +814,7 @@ int main(int argc, char ** argv) {
     filtered_argv.push_back(nullptr);
     const int fargc = (int) filtered_argv.size() - 1;
 
-    // a placeholder so the common parser's "--model is required" check passes, each model is set in the loop
+
     if (!models_dir.empty()) {
         params.model.path = models_dir;
     }

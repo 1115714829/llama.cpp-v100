@@ -53,6 +53,7 @@
 #define GGML_CUDA_CC_VOLTA           700
 #define GGML_CUDA_CC_TURING          750
 #define GGML_CUDA_CC_AMPERE          800
+#define GGML_CUDA_CC_AMPERE_GA10X    860
 #define GGML_CUDA_CC_ORIN            870
 #define GGML_CUDA_CC_ADA_LOVELACE    890
 #define GGML_CUDA_CC_HOPPER          900
@@ -188,8 +189,8 @@ static int ggml_cuda_highest_compiled_arch(const int arch) {
 
 #define GGML_CUDA_MAX_STREAMS 8
 
-// tile counters per stream of the split-K kernels (q8-skinny.cu, mmvf.cu): a weight takes a
-// split path only up to this many tiles or rows
+
+
 #define GGML_CUDA_MAX_SPLIT_TILES 64
 
 [[noreturn]]
@@ -886,6 +887,7 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3(float x) {
     const __nv_fp8_e4m3 xf(x);
     return xf.__x;
 #else
+     GGML_UNUSED(x);
      NO_DEVICE_CODE; // Used only for NVFP4 Scales for Activations, only for Blackwell
 #endif // defined(BLACKWELL_MMA_AVAILABLE)
 }
@@ -1200,18 +1202,18 @@ const ggml_cuda_device_info & ggml_cuda_info();
 void ggml_cuda_set_device(int device);
 int ggml_cuda_get_device();
 
-// host copies that split at the end of every cudaHostRegister range the host side enters
-// (defined in ggml-cuda.cu): a copy that starts inside a registered range and ends outside
-// it fails with "invalid argument", so it is split at the range boundary
+
+
+
 void ggml_cuda_memcpy_h2d_async(void * dst, const void * src, size_t size, cudaStream_t stream);
 
-// shared by the regular CUDA buffer type and the expert buffer type
+
 struct ggml_backend_cuda_buffer_type_context {
     int device;
     std::string name;
-    // set for the mapped weights buffer type: a device-readable host buffer without row
-    // padding that any device of the backend may read (the mapped buffer type itself places
-    // its memory per device)
+
+
+
     bool mapped_weights = false;
 };
 
@@ -1300,10 +1302,10 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
-    // The owner side of a meta assist runs inside the captured FA launch and bakes the buffers of
-    // the mounted descriptor (split point, epochs, partial slot) into the capture. The meta backend
-    // rebuilds those buffers whenever it rebuilds a plan, while the subgraph tensors stay the same,
-    // so the descriptor the capture was made with is part of what has to match for a replay.
+
+
+
+
     bool has_assist = false;
     ggml_backend_meta_assist_rank assist = {};
     struct node_properties {
@@ -1477,52 +1479,56 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
-    cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
-    cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
-    void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
-    size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {0};
+    cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+    cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+    void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {};
+    size_t cublas_workspace_sizes[GGML_CUDA_MAX_DEVICES] = {};
 
     int curr_stream_no = 0;
 
-    // number of consecutive q8 skinny prepass scans that found no candidate tensors
-    // see ggml_cuda_q8_skinny_prepass()
+
+
     int q8_skinny_idle_scans = 0;
 
-    // GGML_CUDA_MAX_STREAMS x GGML_CUDA_MAX_SPLIT_TILES tile counters of the split-K kernels
-    // (q8 skinny, narrow mmvf), zero between launches (the last CTA of a tile or row resets its
-    // counter); allocated with the context on Volta, the only architecture that runs those kernels
+
+
+
     unsigned int * tile_counters = nullptr;
 
-    // an outer capture records everything enqueued on the main stream, graphs are evaluated directly
-    // see ggml_backend_cuda_capture_begin()
+
+
     bool capture_external = false;
-    // the graphs belong to a prefill-sized ubatch split into subgraphs by the meta backend: evaluated
-    // directly, without a CUDA graph cache entry, see ggml_backend_set_graph_uncached_t
+
+
     bool graph_uncached   = false;
 
-    // meta backend assist description mounted for the next graph execution, see ggml-backend.h;
-    // nullptr leaves every existing path unchanged
+
+
+    bool expert_maintain_external = false;
+
+
+
     const struct ggml_backend_meta_assist_rank * assist = nullptr;
 
-    // device copies of the expert maps of the MUL_MAT_ID launches (ggml_cuda_mul_mat_id_lut), one
-    // per distinct map, keyed by one 64-bit word: (assignment table, device, layer) for a node whose
-    // weight was laid out by a table, (expert_offset, n_local, n_total) for a contiguous segment or
-    // the identity. A table never changes and its id is never reused, so an entry is made once and
-    // stays right for the life of the context: a captured graph keeps the device pointer of its
-    // launches, which is never moved or freed before the context goes. The lookup is one hash
-    // probe per launch; the slice of the node is compared with the one the entry was made for.
+
+
+
+
+
+
+
     struct expert_lut_entry {
         int16_t *       dev     = nullptr;
         const int16_t * host    = nullptr;
         int             n       = 0;
-        int             offset  = 0; // the slice of the node the row was made for
+        int             offset  = 0;
         int             n_local = 0;
     };
     std::unordered_map<uint64_t, expert_lut_entry> expert_luts;
 
-    // The MUL_MAT_ID node whose output the weighted reduction reads without the zero rows of the
-    // other devices: ggml_cuda_try_fuse sets it for the node it is about to launch when that
-    // reduction is matched and fused, and ggml_cuda_mul_mat_id leaves those rows alone for it.
+
+
+
     const struct ggml_tensor * moe_reduce_local_slots = nullptr;
 
 #ifdef USE_CUDA_GRAPH
@@ -1634,22 +1640,22 @@ struct ggml_backend_cuda_context {
     }
 };
 
-// Expert map of one MUL_MAT_ID launch: which id of the routing is which local expert of the weight
-// this device holds. map has n entries, map[id] is the local expert number (the index into the
-// weight slice and into the expert store tables) or -1 for an expert held by another device; ids
-// outside [0, n) are not local either. The row is a device copy of ggml_expert_store_node_lut()
-// (ggml-impl.h) made by ggml_cuda_mul_mat_id_lut(): the identity for a node without expert
-// parallelism, otherwise the row of (device, layer) of the expert assignment table the weight of
-// the node was laid out by. The kernels never test an id against a range: this map is the one
-// place that knows which expert is local.
+
+
+
+
+
+
+
+
 struct ggml_cuda_expert_lut {
-    const int16_t * map  = nullptr; // device memory
-    const int16_t * host = nullptr; // the same row in host memory, for the host side sorted path
+    const int16_t * map  = nullptr;
+    const int16_t * host = nullptr;
     int             n    = 0;
 };
 
-// local expert number of an id, -1 when it is not an expert of this launch. The row of a layer is
-// 1 KiB for 512 experts, so it stays in L1 across the lanes of a block.
+
+
 static __device__ __forceinline__ int ggml_cuda_expert_local(const ggml_cuda_expert_lut & lut, const int id) {
     return (unsigned int) id < (unsigned int) lut.n ? (int) __ldg(lut.map + id) : -1;
 }
@@ -1665,9 +1671,9 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
-    // expert parallelism: the fused output node (GLU or ADD) has no expert state of its own, so
-    // the MUL_MAT_ID node that carries it (expert parallel flag, offset, global count, layer and
-    // device: the inputs of ggml_cuda_mul_mat_id_lut) is passed along. nullptr when dst is that node.
+
+
+
     const ggml_tensor * mm_id = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
@@ -1682,10 +1688,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
-    // expert store: device pointer table of the src0 expert tensor, one entry per local
-    // expert; the kernel reads the weights through it instead of src0->data + expert*nb02.
-    // The gate table is the same lookup for the gate weight of a fused gate/up pair (the
-    // two weights are separate store tensors unless the model merges them).
+
+
+
+
     const char * const * expert_ptrs = nullptr;
     const char * const * expert_ptrs_gate = nullptr;
 };
@@ -1815,10 +1821,10 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Expert count used to estimate the average columns per expert in MUL_MAT_ID heuristics.
-// Under expert parallelism dst->src[0]->ne[2] is only the expert count of this device, so the
-// density is overestimated by the split factor; use the global expert count recorded on the node.
-// A non-expert-parallel node keeps src0->ne[2], so the dense behavior is unchanged.
+
+
+
+
 static inline int64_t ggml_cuda_mul_mat_id_n_expert_density(const ggml_tensor * dst) {
     if (ggml_mul_mat_id_is_expert_parallel(dst)) {
         const int32_t n_expert_total = ggml_mul_mat_id_get_n_expert_total(dst);

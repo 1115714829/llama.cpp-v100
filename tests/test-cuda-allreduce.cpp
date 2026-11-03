@@ -1,25 +1,25 @@
-// Correctness and timing test for the CUDA AllReduce comm interface used by
-// the meta backend for tensor parallelism.
-//
-// Only the public ggml-backend API is used, including the per-backend
-// ggml_backend_comm_* proc addresses, so the same binary can run against
-// different libggml-cuda builds (for example to time the NCCL fallback).
-//
-// Small aligned F32 tensors with a multiple of 8 elements are expected to take
-// the P2P push path: the default proc transports f16 and accumulates in f32,
-// so it must produce bitwise identical results on all ranks, but only to f16
-// accuracy. The exact proc transports f32 instead. Larger tensors fall back to
-// NCCL, which reduces large tensors in BF16 for the default proc, hence the
-// looser relative tolerance there. The exact proc is optional: with an older
-// library the exact part of the test is skipped.
-//
-// The chain timing records many per-rank push AllReduce calls into one CUDA
-// graph per rank and replays the graph, which removes the host launch overhead
-// and the rank-to-rank skew from the per-call time.
-//
-// With 5 or 6 devices whose topology splits into two cliques the default comm
-// picks the hierarchical 3+2 or 3+3 kernel; to time the flat one against it,
-// run this test built against the older library.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -43,7 +43,7 @@ struct ar_test {
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce_exact = nullptr; // optional
 
-    // CUDA graph capture of the per-rank push AllReduce; all optional.
+
     ggml_backend_comm_allreduce_rank_t            comm_allreduce_rank = nullptr;
     ggml_backend_comm_allreduce_rank_capturable_t comm_allreduce_rank_capturable = nullptr;
     ggml_backend_capture_begin_t  capture_begin  = nullptr;
@@ -51,14 +51,14 @@ struct ar_test {
     ggml_backend_capture_launch_t capture_launch = nullptr;
     ggml_backend_capture_free_t   capture_free   = nullptr;
 
-    // Sequence-parallel reduce-scatter / all-gather (see docs/design/r200-seqpar.md); optional.
+
     ggml_backend_comm_reduce_scatter_rank_can_t comm_reduce_scatter_rank_can = nullptr;
     ggml_backend_comm_reduce_scatter_rank_t     comm_reduce_scatter_rank     = nullptr;
     ggml_backend_comm_allgather_rank_can_t      comm_allgather_rank_can      = nullptr;
     ggml_backend_comm_allgather_rank_t          comm_allgather_rank          = nullptr;
 };
 
-// Per-case ggml contexts and their backend buffers, freed together.
+
 struct ar_case {
     std::vector<ggml_context *>        ctxs;
     std::vector<ggml_backend_buffer_t> bufs;
@@ -116,7 +116,7 @@ static bool run_case(const ar_test & t, ggml_backend_comm_allreduce_tensor_t all
         ggml_backend_tensor_set(tensor, host[i].data(), 0, ne * sizeof(float));
     }
 
-    // Double-precision reference sum of the compute ranks.
+
     std::vector<double> expected(ne, 0.0);
     for (size_t i = 0; i < n; ++i) {
         if (!compute[i]) {
@@ -146,11 +146,11 @@ static bool run_case(const ar_test & t, ggml_backend_comm_allreduce_tensor_t all
 
         for (int64_t j = 0; j < ne; ++j) {
             const double diff = std::fabs((double) result[j] - expected[j]);
-            // The exact proc must match the f64 reference up to f32 rounding.
-            // The f16 push path converts its input (here in [-1, 1]) to f16,
-            // which loses at most 4.9e-4 per element. The NCCL fallback uses
-            // BF16 for large tensors, so it gets a relative tolerance that grows
-            // with the number of ranks (one BF16 rounding per ring step).
+
+
+
+
+
             const double tol_bf16 = 2e-2 * std::max(1.0, (double) n / 4.0);
             const bool good = exact ? diff < 1e-5 :
                 (f16_push ? diff < 4e-3 :
@@ -174,10 +174,10 @@ static bool run_case(const ar_test & t, ggml_backend_comm_allreduce_tensor_t all
     return true;
 }
 
-// The meta backend uses the exact collective to gather f32 token ids: the
-// TOP_K candidates and the GET_ROWS rows. As f16, any id above 65504 turns
-// into inf. Only rank 0 is nonzero here, so the result must be bitwise equal
-// to its input. Sizes cover both the push path (512 KiB) and the fallback.
+
+
+
+
 static bool run_case_exact_ids(const ar_test & t) {
     const size_t n = t.n;
     const int64_t sizes[] = { 131072, 250000 };
@@ -210,8 +210,8 @@ static bool run_case_exact_ids(const ar_test & t) {
 
             std::fill(host.begin(), host.end(), 0.0f);
             if (i == 0) {
-                // Start above 65504 so every value would break as f16, and
-                // stay inside the 0..250000 range the real ids live in.
+
+
                 const int64_t base = ne == 131072 ? 100000 : 0;
                 for (int64_t j = 0; j < ne; ++j) {
                     host[j] = (float) (base + j);
@@ -303,7 +303,7 @@ static void run_timing(const ar_test & t, ggml_backend_comm_allreduce_tensor_t a
     }
 }
 
-// Median per-call time of the default-proc allreduce over n_iter calls. All// ranks are synchronized after every call, so a sample is one full round trip.
+
 static double ar_median_us(const ar_test & t, void * comm,
                            ggml_backend_comm_allreduce_tensor_t allreduce, int64_t ne) {
     const size_t n = t.n;
@@ -356,10 +356,10 @@ static double ar_median_us(const ar_test & t, void * comm,
     return samples[samples.size() / 2];
 }
 
-// On 5 or 6 devices whose topology splits into two cliques the default comm
-// picks the hierarchical 3+2 or 3+3 kernel; the flat one is timed by running
-// this test built against the older library. Shapes are the decode sizes of
-// the tensor-parallel graph: [5120,8] and [5120,1] f32.
+
+
+
+
 static bool run_hier_rank_default(ar_test & t, const char * phase) {
     const int64_t sizes[] = { 5120 * 8, 5120 };
     const char * labels[] = { "5120x8", "5120x1" };
@@ -386,10 +386,10 @@ static bool run_hier_rank_default(ar_test & t, const char * phase) {
     return ok;
 }
 
-// Records n_per_graph per-rank push AllReduce calls of one size into one CUDA
-// graph per rank, replays the graphs together and reports the per-call time.
-// The push kernel keeps its state in device memory, so the replay needs no
-// host-side bookkeeping. A skip is not a failure, a failed check is.
+
+
+
+
 static bool run_chain_timing(const ar_test & t, bool exact) {
     if (t.comm_allreduce_rank == nullptr || t.comm_allreduce_rank_capturable == nullptr ||
         t.capture_begin == nullptr || t.capture_end == nullptr ||
@@ -404,7 +404,7 @@ static bool run_chain_timing(const ar_test & t, bool exact) {
     const int n_warmup    = 5;
     const int n_replay    = 50;
     const int n_single    = 200;
-    const int n_fill      = 20; // warmup allreduce calls before the capture
+    const int n_fill      = 20;
 
     printf("chain timing exact=%d (%d calls each)\n", (int) exact, n_replay * n_per_graph);
 
@@ -508,8 +508,8 @@ static bool run_chain_timing(const ar_test & t, bool exact) {
             t.capture_free(exec);
         }
 
-        // One-call graphs replayed with an idle gap each time: this number
-        // includes the launch overhead, so it is only a reference point.
+
+
         std::vector<void *> singles(n, nullptr);
         bool single_captured = true;
         for (size_t i = 0; i < n; ++i) {
@@ -547,8 +547,8 @@ static bool run_chain_timing(const ar_test & t, bool exact) {
         }
         printf("single ne=%lld exact=%d us/call=%.2f\n", (long long) ne, (int) exact, single_us / n_single);
 
-        // The replayed tensors hold repeated sums, so reload the inputs and
-        // replay one fresh one-call graph before comparing rank 0.
+
+
         for (size_t i = 0; i < n; ++i) {
             ggml_backend_tensor_set(c.tensors[i], host[i].data(), 0, nbytes);
         }
@@ -564,7 +564,7 @@ static bool run_chain_timing(const ar_test & t, bool exact) {
 
         bool check = true;
         if (exact) {
-            // The f32 kernel sums the ranks in rank order, so the reference does too.
+
             std::vector<float> ref(ne);
             for (int64_t j = 0; j < ne; ++j) {
                 float sum = host[0][j];
@@ -610,12 +610,12 @@ static bool run_chain_timing(const ar_test & t, bool exact) {
     return ok;
 }
 
-// Sequence-parallel reduce-scatter / all-gather correctness (see docs/design/r200-seqpar.md).
-//
-// RS: every rank holds a full PARTIAL token axis [D0, D1, T] F32 and receives its own
-// share [D0, D1, T_rank] of the elementwise sum (bf16 wire, so compared to a f64 reference
-// with a bf16 tolerance). AG: every rank holds its share and receives the concatenation on
-// the token axis; the wire type is dst_full's type (F16 -> f16 tolerance, F32/I32 bitwise).
+
+
+
+
+
+
 static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, ggml_type ag_type, uint32_t seed,
                           const char * phase, int64_t zero_rank = -1) {
     const size_t n = t.n;
@@ -626,7 +626,7 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
         ggml_seq_token_share(T, (int64_t) n, (int64_t) i, &t0[i], &Tj[i]);
     }
 
-    // ---- reduce-scatter ----
+
     {
         ar_case c;
         std::vector<std::vector<float>> host_full(n);
@@ -638,7 +638,7 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
             c.ctxs.push_back(ctx);
 
             ggml_tensor * full = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d0, d1, T);
-            if ((int64_t) i != zero_rank) { // a rank without COMPUTE contributes a zero partial
+            if ((int64_t) i != zero_rank) {
                 full->flags |= GGML_TENSOR_FLAG_COMPUTE;
             }
             ggml_tensor * slice = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d0, d1, Tj[i]);
@@ -677,7 +677,7 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
         for (size_t i = 0; i < n; ++i) {
             std::vector<float> got((size_t) d0*d1*Tj[i]);
             ggml_backend_tensor_get(dsts[i], got.data(), 0, got.size()*sizeof(float));
-            const int64_t row = d0*d1; // column-major: element (e, t) is at e + row*t
+            const int64_t row = d0*d1;
             for (int64_t tt = 0; tt < Tj[i]; ++tt) {
                 const int64_t col = t0[i] + tt;
                 for (int64_t e = 0; e < row; ++e) {
@@ -689,7 +689,7 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
                         expected += (double) host_full[r][(size_t) e + (size_t) row*col];
                     }
                     const double diff = std::fabs((double) got[(size_t) e + (size_t) row*tt] - expected);
-                    // one bf16 rounding of the partial sum plus the reduction order
+
                     const double tol = 2e-2 * std::max(1.0, (double) n / 4.0);
                     if (diff > 1e-5 && diff / std::max(std::fabs(expected), 1.0) > tol) {
                         fprintf(stderr, "%s rs: d0=%lld d1=%lld T=%lld rank=%zu elem=%lld col=%lld got=%g want=%g\n",
@@ -702,7 +702,7 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
         }
     }
 
-    // ---- all-gather ----
+
     {
         ar_case c;
         std::vector<std::vector<float>> host_slice(n);
@@ -715,11 +715,11 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
 
             ggml_tensor * slice = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d0, d1, Tj[i]);
             ggml_tensor * full  = ggml_new_tensor_3d(ctx, ag_type, d0, d1, T);
-            // tag the destination as the gather output it stands for in the graph: the all-gather
-            // writes NCCL's Tp*n columns into it and the CUDA buffer type sizes a SEQ_GATHER output
-            // for the pad columns (ggml_backend_cuda_buffer_type_get_alloc_size)
+
+
+
             full->op = GGML_OP_SEQ_GATHER;
-            full->op_params[0] = axis; // ggml_set_op_params_i32, ggml-impl.h is not public
+            full->op_params[0] = axis;
             ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, t.backends[i]);
             if (buf == nullptr) {
                 fprintf(stderr, "%s ag: alloc failed (rank=%zu)\n", phase, i);
@@ -752,8 +752,8 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
         }
 
         for (size_t i = 0; i < n; ++i) {
-            // the wire type is dst_full's type: read it back in its own element size, then
-            // widen to float for the compare
+
+
             std::vector<float> got((size_t) d0*d1*T);
             if (ag_type == GGML_TYPE_F32) {
                 ggml_backend_tensor_get(dsts[i], got.data(), 0, got.size()*sizeof(float));
@@ -764,9 +764,9 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
                     got[k] = ggml_fp16_to_fp32(got_h[k]);
                 }
             }
-            const int64_t row = d0*d1; // column-major: element (e, t) is at e + row*t
+            const int64_t row = d0*d1;
             for (int64_t tt = 0; tt < T; ++tt) {
-                // find the rank and local column that own global column tt
+
                 size_t r = 0;
                 while (r + 1 < n && t0[r] + Tj[r] <= tt) {
                     ++r;
@@ -775,7 +775,7 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
                     const double want = (double) host_slice[r][(size_t) e + (size_t) (d0*d1)*(tt - t0[r])];
                     const double got_v = (double) got[(size_t) e + (size_t) row*tt];
                     const bool good = ag_type == GGML_TYPE_F32 ? got_v == want :
-                        std::fabs(got_v - want) < 4e-3; // F16 rounding of a value in [-1, 1]
+                        std::fabs(got_v - want) < 4e-3;
                     if (!good) {
                         fprintf(stderr, "%s ag: d0=%lld d1=%lld T=%lld rank=%zu elem=%lld col=%lld got=%g want=%g\n",
                                 phase, (long long) d0, (long long) d1, (long long) T, i,
@@ -790,7 +790,7 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
     return true;
 }
 
-// I32 all-gather: ids must survive the wire bitwise (F16 would turn large ids into inf).
+
 static bool run_case_rsag_i32(const ar_test & t, int64_t d0, int64_t d1, int64_t T, uint32_t seed, const char * phase) {
     const size_t n = t.n;
     const int axis = 2;
@@ -811,7 +811,7 @@ static bool run_case_rsag_i32(const ar_test & t, int64_t d0, int64_t d1, int64_t
 
         ggml_tensor * slice = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, d0, d1, Tj[i]);
         ggml_tensor * full  = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, d0, d1, T);
-        full->op = GGML_OP_SEQ_GATHER; // see run_case_rsag: the pad columns must fit the allocation
+        full->op = GGML_OP_SEQ_GATHER;
         full->op_params[0] = axis;
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, t.backends[i]);
         if (buf == nullptr) {
@@ -845,7 +845,7 @@ static bool run_case_rsag_i32(const ar_test & t, int64_t d0, int64_t d1, int64_t
     for (size_t i = 0; i < n; ++i) {
         std::vector<int32_t> got((size_t) d0*d1*T);
         ggml_backend_tensor_get(dsts[i], got.data(), 0, got.size()*sizeof(int32_t));
-        const int64_t row = d0*d1; // column-major: element (e, t) is at e + row*t
+        const int64_t row = d0*d1;
         for (int64_t tt = 0; tt < T; ++tt) {
             size_t r = 0;
             while (r + 1 < n && t0[r] + Tj[r] <= tt) {
@@ -866,10 +866,10 @@ static bool run_case_rsag_i32(const ar_test & t, int64_t d0, int64_t d1, int64_t
     return true;
 }
 
-// All-gather on a middle token axis: the per-layer sequence-parallel gather of the model graph
-// splits axis 1 (the block-end F32 one splits axis 2), so the token columns are not contiguous
-// here and the staging/alignment path differs from run_case_rsag. T is odd on purpose, so the last
-// rank is short and its pad columns must be cleared on the send side.
+
+
+
+
 static bool run_case_ag_axis1(const ar_test & t, int64_t d0, int64_t d1, int64_t T, ggml_type ag_type,
                               uint32_t seed, const char * phase) {
     const size_t n = t.n;
@@ -891,7 +891,7 @@ static bool run_case_ag_axis1(const ar_test & t, int64_t d0, int64_t d1, int64_t
 
         ggml_tensor * slice = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d0, Tj[i], d1);
         ggml_tensor * full  = ggml_new_tensor_3d(ctx, ag_type, d0, T, d1);
-        full->op = GGML_OP_SEQ_GATHER; // see run_case_rsag
+        full->op = GGML_OP_SEQ_GATHER;
         full->op_params[0] = axis;
         ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, t.backends[i]);
         if (buf == nullptr) {
@@ -946,7 +946,7 @@ static bool run_case_ag_axis1(const ar_test & t, int64_t d0, int64_t d1, int64_t
                 const double want = (double) host_slice[r][(size_t) cc + (size_t) (d0*d1)*tt_local];
                 const double got_v = (double) got[(size_t) cc + (size_t) (d0*d1)*tt];
                 const bool good = ag_type == GGML_TYPE_F32 ? got_v == want :
-                    std::fabs(got_v - want) < 4e-3; // F16 rounding of a value in [-1, 1]
+                    std::fabs(got_v - want) < 4e-3;
                 if (!good) {
                     fprintf(stderr, "%s ag1: d0=%lld d1=%lld T=%lld rank=%zu col=%lld ch=%lld got=%g want=%g\n",
                             phase, (long long) d0, (long long) d1, (long long) T, i,
@@ -980,11 +980,11 @@ int main() {
         return 0;
     }
 
-    // Optional: older libraries have no exact variant, the exact part is then skipped.
+
     ggml_backend_comm_allreduce_tensor_t comm_allreduce_exact =
         (ggml_backend_comm_allreduce_tensor_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor_exact");
 
-    // Optional: CUDA graph capture of the per-rank push AllReduce, for the chain timing.
+
     ggml_backend_comm_allreduce_rank_t comm_allreduce_rank =
         (ggml_backend_comm_allreduce_rank_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_rank");
     ggml_backend_comm_allreduce_rank_capturable_t comm_allreduce_rank_capturable =
@@ -998,7 +998,7 @@ int main() {
     ggml_backend_capture_free_t capture_free =
         (ggml_backend_capture_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_free");
 
-    // Optional: sequence-parallel reduce-scatter / all-gather (newer libraries).
+
     ggml_backend_comm_reduce_scatter_rank_can_t comm_reduce_scatter_rank_can =
         (ggml_backend_comm_reduce_scatter_rank_can_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_reduce_scatter_rank_can");
     ggml_backend_comm_reduce_scatter_rank_t comm_reduce_scatter_rank =
@@ -1078,9 +1078,9 @@ int main() {
     }
 
     if (backends_ok && n_failed == 0) {
-        // Alternate random sizes, COMPUTE flags and procs: the per-block
-        // epochs and the shared slot buffers must stay correct across
-        // back-to-back calls of both kernels.
+
+
+
         const int64_t stress_sizes[] = { 4, 1280, 5120, 40960, 81920, 131072 };
         std::mt19937 rng(1234567u);
         std::uniform_int_distribution<size_t> pick(0, sizeof(stress_sizes) / sizeof(stress_sizes[0]) - 1);
@@ -1114,15 +1114,15 @@ int main() {
         printf("exact ids: %s\n", ok ? "OK" : "FAILED");
     }
 
-    // Sequence-parallel reduce-scatter / all-gather.
+
     if (backends_ok && n_failed == 0 &&
         t.comm_reduce_scatter_rank != nullptr && t.comm_allgather_rank != nullptr &&
         t.comm_reduce_scatter_rank_can != nullptr && t.comm_allgather_rank_can != nullptr) {
         printf("testing reduce-scatter/all-gather on %zu CUDA devices\n", n);
 
-        // D = 2560 (the activation width), the token axis split as in the design: T = 2048
-        // over n ranks (Tp = ceil(T/n), last rank takes the remainder), plus an even split
-        // and the 2000-token tail block.
+
+
+
         const int64_t d0 = 2560;
         const struct { int64_t d1, T; } rsag_cases[] = {
             { 1, 2048 },
@@ -1141,7 +1141,7 @@ int main() {
                 ok = false;
             }
         }
-        // a rank without COMPUTE has no partial sum and must enter the collective as zero
+
         if (!run_case_rsag(t, d0, 1, 2048, GGML_TYPE_F32, 0x53u, "rsag-nc", 3)) {
             ok = false;
         }
@@ -1151,8 +1151,8 @@ int main() {
         if (!run_case_rsag_i32(t, 512, 1, 2048, 0x62u, "rsag-i32")) {
             ok = false;
         }
-        // middle token axis (the per-layer gather) with an odd T: the last rank is short, so the
-        // send-side pad columns are cleared and still have to fit the gather output's allocation
+
+
         if (!run_case_ag_axis1(t, 2560, 1, 2047, GGML_TYPE_F16, 0x71u, "ag1-f16")) {
             ok = false;
         }

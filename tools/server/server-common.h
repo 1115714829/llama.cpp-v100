@@ -226,8 +226,8 @@ public:
 
     llama_tokens get_text_tokens() const;
 
-    // the token list itself when it holds only text tokens (no media chunks), nullptr otherwise;
-    // lets callers avoid the copy made by get_text_tokens()
+
+
     const llama_tokens * text_tokens_or_null() const;
 
     std::vector<char> serialize() const;
@@ -359,9 +359,11 @@ json oaicompat_completion_params_parse(const json & body);
 
 // used by /chat/completions endpoint
 json oaicompat_chat_params_parse(
+    const llama_vocab * vocab,
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
-    std::vector<raw_buffer> & out_files);
+    std::vector<raw_buffer> & out_files,
+    common_chat_session & out_session);
 
 // used by /embeddings endpoint, content has the same format as a chat message content array
 server_tokens tokenize_oai_content_array(

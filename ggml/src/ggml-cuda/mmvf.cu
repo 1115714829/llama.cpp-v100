@@ -48,8 +48,8 @@ static __global__ void mul_mat_vec_f(
 
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
 
-    // expert parallelism: the expert map gives the local expert of the routed id, -1 for an expert
-    // held by another device - that slot is written as zeros
+
+
     const int expert_local = ids != nullptr ? ggml_cuda_expert_local(lut, channel_x) : channel_x;
     if (expert_local < 0) {
         if (tid < ncols_dst) {
@@ -62,11 +62,11 @@ static __global__ void mul_mat_vec_f(
         return;
     }
 
-    // src0 only holds the local experts, the weight of the routed expert is its local number
+
     const int channel_x_local = expert_local;
 
-    // expert store: the weight base comes from the device pointer table, the channel stride
-    // within src0 is then not used
+
+
     if (ids != nullptr && fusion.expert_ptrs != nullptr) {
         x = (const T *) (fusion.expert_ptrs[channel_x_local]) + int64_t(sample_x) *stride_sample_x + row*stride_row;
     } else {
@@ -110,7 +110,7 @@ static __global__ void mul_mat_vec_f(
     }
 
     if (use_gate) {
-        // expert store: the gate weight of a fused gate/up pair is read through its own table
+
         if (ids != nullptr && fusion.expert_ptrs_gate != nullptr) {
             gate_x = (const T *) (fusion.expert_ptrs_gate[channel_x_local]) + int64_t(sample_x) *stride_sample_x + row*stride_row;
         } else {
@@ -536,9 +536,8 @@ void launch_mul_mat_vec_f_cuda(
                  channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, block_dims, block_nums, nbytes_shared, ids_stride, lut, stream);
         } break;
-        default: {
+        default:
             GGML_ABORT("fatal error");
-        } break;
     }
 }
 
@@ -635,7 +634,6 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
             break;
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 
@@ -664,24 +662,24 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, lut, stream);
 }
 
-// ---- narrow F32/BF16 GEMV: few rows with a long K, or many rows at M > 1 ----
-//
-// mul_mat_vec_f runs one block per output row. For a few long rows (the Qwen3.8-Flash-Next
-// decode graph has the hyper-connection inject [10240, 4], the GDN beta/alpha slices [2560, 8]
-// and the shared expert gate [2560, 1]) that is 1 to 8 SMs, each pulling its row and the whole
-// input through one SM at the per-SM load limit. For many rows at M > 1 (the router [2560, 512]
-// at M = 4) every block reads the whole input again, 20 MiB of L2 reads for 5 MiB of weights.
-// The two kernels below keep the arithmetic of mul_mat_vec_f with its 256-thread block (thread
-// t adds columns t, t + 256, ... with the same multiply-adds, then the same warp and block
-// reductions), so the results are bitwise the same:
-//  - mul_mat_vec_f_split runs each of the 8 warps of a row as its own CTA; a warp stores its
-//    warp-reduced sums, the last CTA of the row (one atomic counter per row) reduces the 8 sums
-//    with the same 32-lane butterfly (lanes 8..31 add zero, as the zeroed shared buffer does)
-//    and resets the counter, so the counters are zero between launches;
-//  - mul_mat_vec_f_rows runs Rows rows per 256-thread block and loads each input value once.
-// Only taken when mul_mat_vec_f would use a 256-thread block (K a multiple of 512).
 
-// mmvf_narrow_block_size, mul_mat_vec_f_narrow_accumulate() and the split warp: mmvf-narrow.cuh
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 template <typename T, int ncols_dst>
 static __global__ void __launch_bounds__(WARP_SIZE) mul_mat_vec_f_split(
@@ -696,10 +694,10 @@ static __global__ void __launch_bounds__(WARP_SIZE) mul_mat_vec_f_split(
                                            counters + row, warp, threadIdx.x);
 }
 
-// Several narrow weights that read one input (the GDN ssm_beta and ssm_alpha slices of a qwen4exp
-// layer, expanded next to each other): the rows of all of them in one launch, every row on the warps
-// of mul_mat_vec_f_split. first_row is the running sum of the row counts of the previous weights;
-// row r of the launch uses scratch row r and counter r.
+
+
+
+
 struct mmvf_narrow_multi_seg {
     const void * x;
     float *      dst;
@@ -800,7 +798,7 @@ static __global__ void __launch_bounds__(mmvf_narrow_block_size) mul_mat_vec_f_r
         }
     }
 
-    // the reductions of mul_mat_vec_f, per row
+
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
@@ -852,7 +850,7 @@ static void mul_mat_vec_f_narrow_launch(ggml_backend_cuda_context & ctx, const T
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Returns false if the shape is not one of the two narrow cases; the caller runs mul_mat_vec_f.
+
 static bool ggml_cuda_mul_mat_vec_f_narrow(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                                            const ggml_tensor * src1, ggml_tensor * dst) {
     const int64_t ncols     = src0->ne[0];
@@ -897,9 +895,9 @@ static bool ggml_cuda_mul_mat_vec_f_narrow(ggml_backend_cuda_context & ctx, cons
     return true;
 }
 
-// True when ggml_cuda_mul_mat computes the node with mul_mat_vec_f_split: the route to
-// ggml_cuda_mul_mat_vec_f (no Hadamard hint, mul_mat_vec_f chosen for this batch size) and the
-// few-rows case of ggml_cuda_mul_mat_vec_f_narrow.
+
+
+
 bool ggml_cuda_mul_mat_vec_f_split_covers(const ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                                           const ggml_tensor * src1, const ggml_tensor * dst) {
     if ((src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_BF16) || src1->type != GGML_TYPE_F32 ||
@@ -1039,8 +1037,8 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         fusion_local.glu_limit = fusion->glu_limit;
     }
 
-    // expert store: read the weights through the device pointer table of the tensor instead
-    // of src0->data + expert*nb02. A fused gate/up pair looks up the gate weight as well.
+
+
     ggml_cuda_expert_table ex_table;
     bool is_expert_store = false;
     if (ids != nullptr && ggml_cuda_expert_table_get(src0, &ex_table)) {
@@ -1079,11 +1077,11 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    // expert map of the launch: which routed id is which local expert of the weight (identity
-    // without expert parallelism). The fused kernels write the GLU/ADD node, which has no expert
-    // state, so the MUL_MAT_ID node that carries it is the one asked. An expert store view reads
-    // its weights from the view start (the pointer table is shifted there), so the ids stay
-    // view-local numbers.
+
+
+
+
+
     ggml_cuda_expert_lut lut;
     if (ids != nullptr) {
         lut = ggml_cuda_mul_mat_id_lut(ctx, fusion != nullptr && fusion->mm_id != nullptr ? fusion->mm_id : dst);
@@ -1198,8 +1196,8 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                 if (ampere_mma_available(cc)) {
                     return ne11 <= 3;
                 }
-                // Volta: a 4-token batch (speculative verify) on cuBLAS is a SIMT SGEMM plus a split-K
-                // reduction; MMVF beats it on small matrices and is within 10% on large ones up to 4 columns
+
+
                 if (cc >= GGML_CUDA_CC_VOLTA) {
                     return ne11 <= 4;
                 }

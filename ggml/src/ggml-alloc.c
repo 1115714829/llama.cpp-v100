@@ -1021,10 +1021,10 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         return true;
     }
 
-    // ggml_gallocr_alloc_graph places every leaf at its previous offset, so a leaf that grew needs a new layout too.
-    // The node loop below only sees the leafs that some node reads: a leaf no node reads (an input kept allocated for
-    // set_input, the spare copies of a double-buffered input) would otherwise be written past its old size into the
-    // next tensor
+
+
+
+
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
 
@@ -1118,13 +1118,13 @@ bool ggml_gallocr_get_node_slot(ggml_gallocr_t galloc, int node_index, int * buf
     }
     const struct tensor_alloc * ta = &galloc->node_allocs[node_index].dst;
     if (ta->buffer_id < 0 || ta->size_max == 0) {
-        // a view, a pre-allocated tensor or an unused node: ggml-alloc did not place it
+
         return false;
     }
     *buffer_id = ta->buffer_id;
     *chunk     = ta->addr.chunk;
     *offset    = ta->addr.offset;
-    // ggml_dyn_tallocr_alloc hands out the allocation size rounded up to the alignment of the buffer
+
     *size      = aligned_offset(NULL, ta->size_max, galloc->buf_tallocs[ta->buffer_id]->alignment);
     return true;
 }

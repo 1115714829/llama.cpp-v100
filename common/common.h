@@ -337,9 +337,9 @@ struct common_params_speculative_draft {
 
     bool probabilistic = false; // sample the draft and verify by rejection, instead of argmax and match
 
-    int32_t window = 32768; // the MTP draft layer attends to the last N positions (0 = attend every position)
+    int32_t window = 32768;
 
-    int32_t n_ubatch = 0;   // physical batch size of the draft context (catch-up replays the target window in batches of this size); 0 = inherit the target -ub
+    int32_t n_ubatch = 0;
 
     common_params_model mparams;
 
@@ -485,7 +485,7 @@ struct common_params {
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
-    bool    fit_mmproj         = true;  // whether --fit adds the estimated memory of the multimodal projector (mmproj) to the per-device fit margin
+    bool    fit_mmproj         = true;
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
     // margin per device in bytes for fitting parameters to free memory. Without -fitt the value
@@ -493,7 +493,7 @@ struct common_params {
     // multimodal projector); each fit mode then applies its own default instead of the 1024 MiB
     // (the expert parallel fit budgets the runtime growth itself, see common_fit_params)
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), COMMON_FIT_TARGET_DEFAULT);
-    bool fit_params_target_set = false; // -fitt given: every fit mode leaves exactly these margins
+    bool fit_params_target_set = false;
 
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_AUTO; // how to load the model
@@ -541,10 +541,10 @@ struct common_params {
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
-    std::string expert_profile      = ""; // expert routing profile: decides which experts stay in device memory // NOLINT
-    std::string dump_expert_routing = ""; // write the observed expert routing to this file when the model unloads // NOLINT
-    std::string dump_routing_trace  = ""; // per-token routing trace (RTRC) written by the CUDA backend // NOLINT
-    int dump_routing_trace_size     = 4;  // device ring size per device for the trace, MiB
+    std::string expert_profile      = "";
+    std::string dump_expert_routing = "";
+    std::string dump_routing_trace  = "";
+    int dump_routing_trace_size     = 4;
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
@@ -608,13 +608,15 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    size_t moe_cache_size = 0; // GPU cache size in bytes for the MoE experts kept in the CPU, split among the GPUs like the layers
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;                 // use GPU for multimodal model
     ggml_backend_dev_t mmproj_device = nullptr; // GPU device to use for multimodal model
-    bool mmproj_device_explicit = false;        // -mmdev given: keep the projector on that one device
+    bool mmproj_device_explicit = false;
     bool no_mmproj = false;                     // explicitly disable multimodal model
     std::vector<std::string> image;             // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
@@ -649,10 +651,11 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t n_ctx_checkpoints    = 32;    // max number of context checkpoints per slot
-    int32_t prefill_pace         = 30;    // llama-server: while a slot is generating, prompt processing may use at most this percentage of the wall clock (0 = off, 100 = unlimited)
+    int32_t prefill_pace         = 30;
     int32_t kv_unified_per_slot  = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step  = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib        = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    bool    cache_ram_explicit   = false; // set by --cache-ram, decision models disable the cache otherwise
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
@@ -977,14 +980,23 @@ enum common_decision_type {
     COMMON_DECISION_TYPE_NIMBLE,  // same as openjev, the prompt lists all the questions of the request
     COMMON_DECISION_TYPE_LAYA,    // score of one marker token per option, read from the embeddings output
     COMMON_DECISION_TYPE_CLEF,    // all questions in one prompt, score of option i read from the embeddings output at row i
+    COMMON_DECISION_TYPE_PPLX_DECIDER, // same as openjev, label codes of 1 or 2 letters
+    COMMON_DECISION_TYPE_VLLM_DECISION2, // score of each option read from the embeddings output, the options of a question are marked in the batch
+    COMMON_DECISION_TYPE_VLLM_D3, // same as pplx-decider, non-causal attention
+    COMMON_DECISION_TYPE_LFM2_D1, // same as openjev, the labels depend on the question type
+    COMMON_DECISION_TYPE_LFM2_D1_OMNI, // same as laya, other prompt layout
     COMMON_DECISION_TYPE_UNKNOWN, // a decision model of a type that is not supported
 };
 
 common_decision_type common_get_decision_type(const struct llama_model * model);
 
-// same as above, but reads a GGUF file; it does not load the model
-// returns COMMON_DECISION_TYPE_UNKNOWN if the file is missing, unreadable, or invalid
-common_decision_type common_get_decision_type(const std::string & fname);
+// metadata of a GGUF file, read without loading the model
+struct common_gguf_info {
+    common_decision_type decision_type = COMMON_DECISION_TYPE_UNKNOWN; // UNKNOWN if the file is missing, unreadable, or invalid
+    uint32_t             n_ctx_train   = 0;                            // 0 if unknown
+};
+
+common_gguf_info common_get_gguf_info(const std::string & fname);
 
 // note: defines the model, context, samplers, ets. lifetimes
 struct common_init_result {
@@ -1082,6 +1094,7 @@ struct common_batch {
         llama_seq_id seq_id; // the first sequence id, see add_seq()
         bool         output;
         llama_embd   embd; // non-owning view of the data passed to add_embd()/set_embd(), data == NULL if none
+        llama_embd   state; // non-owning view of the data passed to set_embd_state(), data == NULL if none
         std::vector<llama_seq_id> seq_ids_extra; // see add_seq()
         int32_t      decision_order = 0; // see llama_batch_ext_set_decision_order()
     };
@@ -1118,6 +1131,9 @@ struct common_batch {
 
     // attach a token embedding to the entry at idx, can only be set once per entry
     bool set_embd(int32_t idx, llama_embd embd);
+
+    // attach a state embedding (e.g. the target hidden state for MTP) to the entry at idx, can only be set once per entry
+    bool set_embd_state(int32_t idx, llama_embd state);
 
     // add an embedding-only entry (no token id)
     // pos points to n_pos positions
@@ -1308,12 +1324,13 @@ struct common_prompt_checkpoint {
             llama_seq_id seq_id,
             llama_state_seq_flags flags);
 
-    void load_tgt(
+    // return false if the state could not be restored
+    bool load_tgt(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;
 
-    void load_dft(
+    bool load_dft(
             llama_context * ctx,
             llama_seq_id seq_id,
             llama_state_seq_flags flags) const;

@@ -87,37 +87,47 @@ struct llama_device_memory_data {
 using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data>;
 
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
+
+
+LLAMA_API int32_t llama_model_n_expert_used(const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
-// per-device slice of a model tensor, as the meta backend splits it (MIRRORED/PARTIAL for
-// tensors every device holds whole)
+
+
 LLAMA_API struct ggml_backend_meta_split_state llama_model_tensor_split_state(
         const struct llama_model * model, const struct ggml_tensor * tensor);
 
-// the devices llama uses when no explicit device list is given: RPC servers first, then
-// discrete GPUs, integrated GPUs only when no discrete GPU exists. Same selection as the
-// model load applies, so callers can match where a model will run without its own rules.
+
+
+
 LLAMA_API std::vector<ggml_backend_dev_t> llama_default_devices();
 
-// all tensors of the loaded model, by name; the fit code reads the expert tensor metadata
-// (name and shape) from it to plan the expert store without another trial load. Matches the
-// declaration in llama-model.h, the function itself is internal to libllama.
+
+
+
 const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_tensor_map(const llama_model * model);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 
-// all cache tensors of a context (KV k/v, rotation matrices, recurrent states, indexer caches),
-// by name; the fit code reads their shapes to budget the context per device, since the meta
-// backend reports one number per buffer type and the tensors are split differently
+
+
+
 LLAMA_API const std::vector<std::pair<std::string, ggml_tensor *>> & llama_internal_get_memory_tensors(const llama_context * ctx);
 
-// Under a tensor split, run one of each collective the context's prefill graph uses (the large
-// all-reduce, the reduce-scatter of sequence parallelism) on its communication context, so that
-// the connection buffers a collective library sets up lazily are allocated now and count as device
-// memory of that context. The expert parallel fit calls it on its measurement context to budget
-// them; the real context still connects them at its first large collective.
+// the backend buffers that a state write of this memory would touch - empty caches report none
+LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
+
+// Turn the KV cache attention rotation on or off for the contexts created from this model.
+// Useful for testing purposes.
+LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
+
+
+
+
+
+
 LLAMA_API void llama_internal_comm_connect(llama_context * ctx);
 
 // Set whether the context outputs nextn embeddings or not
@@ -130,7 +140,7 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
-// Marks the entries that a joint decision head (clef) reads, the default is 0
+// Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0
 // An option belongs to the last question before it
@@ -161,110 +171,110 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
-// DFlash2: keep the target layer inputs in a device sink instead of host buffers. The order of
-// lids is the row order within the sink and must match the draft's target_layer_ids. Returns
-// false if unsupported or the allocation failed - the caller then uses the host path.
+
+
+
 LLAMA_API bool llama_enable_layer_inp_sink(struct llama_context * ctx, const uint32_t * lids, uint32_t n_layers);
 
-// DFlash2: link a target and a draft context for the direct device transfer of the layer inputs.
-// Creates the events and allocates the draft staging sink. Returns false if the devices are not
-// compatible or the allocation failed - the caller then uses the host path.
+
+
+
 LLAMA_API bool llama_context_link_embd(struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
 
-// DFlash2: select the source of the next embd batch of a linked draft: true reads the staging
-// sink (token_offset selects the first target-sink column to copy, and is ignored for the graph),
-// false uses the host input. No-op when the context is not linked.
+
+
+
 LLAMA_API void llama_set_embd_source(struct llama_context * ctx, bool enable, int32_t token_offset);
 
-// DFlash2 host fallback: copy the sink rows [token_offset, token_offset + n_tokens) into dst,
-// in the same per-token layer order as the injection embd rows. Requires a sink.
+
+
 LLAMA_API bool llama_layer_inp_sink_get(struct llama_context * ctx, size_t token_offset, size_t n_tokens, float * dst);
 
-// DFlash2: the target sink column of token (seq_id, pos) of the last decoded batch, -1 if not in the sink
+
 LLAMA_API int32_t llama_layer_inp_sink_col(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
 
-// r-mtpdev: keep the nextn hidden state in a device sink. The target writes its t_h_nextn rows
-// there; the draft reads and writes the same sink through the link. is_target selects the role
-// of the context; n_h_rows is the number of extra sink columns the MTP draft needs on top of
-// n_batch (the second batch-column group followed by the pending rows and the draft-step rows).
-// Returns false if unsupported or the allocation failed - the caller reports the failure instead
-// of silently going back to the host path.
+
+
+
+
+
+
 LLAMA_API bool llama_enable_h_nextn_sink(struct llama_context * ctx, bool is_target, uint32_t n_h_rows);
 
-// r-mtpdev: link a target and a draft context for the direct device access to the target h sink.
-// Creates the per-group events that order the target writes, the captures and the draft
-// reads/writes. Returns false if the devices are not compatible or the events are not available.
+
+
+
 LLAMA_API bool llama_context_link_h_nextn(struct llama_context * ctx_tgt, struct llama_context * ctx_dft);
 
-// r-mtpdev: select the h source of the next draft batch: true gathers the h rows in the graph
-// from the sink columns [cols, cols + n_cols), false disables the device gather. No-op when the
-// context is not linked.
+
+
+
 LLAMA_API void llama_set_h_source(struct llama_context * ctx, bool enable, const int32_t * cols, size_t n_cols);
 
-// r-mtpdev draft: the sink group (0 or 1) that the next draft graph reads, -1 when it reads no
-// group columns. The catch-up decode reads the group of the last target write; the draft steps
-// only touch the pending and step columns and must pass -1.
+
+
+
 LLAMA_API void llama_set_h_src_group(struct llama_context * ctx, int32_t group);
 
-// r-mtpdev: the sink group written by the most recent target graph (0 or 1). The driver maps its
-// columns through this group instead of counting target submissions on its own.
+
+
 LLAMA_API int32_t llama_h_nextn_sink_group(struct llama_context * ctx);
 
-// r-mtpdev draft: column offset of the next sink write. The chained-head draft uses it to keep
-// one row per draft step; the non-chained draft keeps the first draft-step column. No-op for a
-// target context.
+
+
+
 LLAMA_API void llama_set_h_sink_offset(struct llama_context * ctx, int32_t offset);
 
-// r-mtpdev draft: enable/disable the sink write of the next draft graph. The catch-up decode
-// does not consume its own h rows, so it must not write the sink; the draft steps write their
-// output rows for the next step to read
+
+
+
 LLAMA_API void llama_set_h_sink_write(struct llama_context * ctx, bool write);
 
-// r-mtpskip: target-side prefill skip. The target skips its sink write and the cross-context
-// ordering for a ubatch whose positions all lie below the first position of their sequence. The
-// MTP draft can never read those rows (the draft KV ring keeps only the last window + n_ubatch
-// positions), so the write is wasted work. A first position of 0 disables the skip for that
-// sequence (all positions are written). Set per sequence and cleared when the prompt is done.
+
+
+
+
+
 LLAMA_API void llama_set_h_sink_first_pos(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos_first);
 
-// r-mtpdev draft: copy the sink rows src_cols into the reserved pending columns
-// [2*n_batch, 2*n_batch + n_cols), so that the next batch may overwrite the source columns. The
-// copies run on the draft's output-device stream, ordered after the target write and after the
-// draft graph, and before the next draft read. Returns false if the context is not a linked draft
-// or n_cols exceeds the reserved space.
+
+
+
+
+
 LLAMA_API bool llama_h_nextn_sink_capture(struct llama_context * ctx, const int32_t * src_cols, size_t n_cols);
 
-// r-mtpdev: copy the target sink rows [group*n_batch + token_offset, ... + n_tokens) into dst.
-// Requires a target sink.
+
+
 LLAMA_API bool llama_h_nextn_sink_get(struct llama_context * ctx, int32_t group, size_t token_offset, size_t n_tokens, float * dst);
 
-// r-mtpdev: the h-sink column of token (seq_id, pos) of the last decoded batch, -1 if not in the sink
+
 LLAMA_API int32_t llama_h_nextn_sink_col(struct llama_context * ctx, llama_seq_id seq_id, llama_pos pos);
 
-// r-mtpdev: wait for one prefill pipeline ubatch without draining the pipeline. A negative id
-// waits for the most recent one. Returns false if the context has no scheduler or the ubatch is
-// not tracked by the pipeline (decode-sized batches).
+
+
+
 LLAMA_API bool llama_synchronize_ubatch(struct llama_context * ctx, int64_t ubatch_id);
 
-// dchain: wait only for the host output buffers of the last decode (its device-to-host copies), not
-// for everything queued on the device streams. Valid after a decode that did not use the prefill
-// pipeline (decode-sized batches). llama_get_logits_topk_ith then reads without another wait.
+
+
+
 LLAMA_API void llama_synchronize_outputs(struct llama_context * ctx);
 
-// dchain: with the top-k output on (llama_set_logits_topk), a batch with a single output normally
-// still copies its full logits to the host. A context whose host only ever reads the top-k rows
-// (the MTP draft steps) turns that copy off here; llama_get_logits_ith is then invalid for it.
+
+
+
 LLAMA_API void llama_set_logits_topk_only(struct llama_context * ctx, bool only);
 
-// dchain: MTP draft token ring. The MTP graph of the draft context reads the input token of every
-// draft step from a device ring and writes the argmax of its logits back into it, so the steps of a
-// chain are submitted without a host round trip in between. The host writes the first token with
-// llama_draft_ring_begin, submits n_max single-token decodes, waits once (llama_synchronize_outputs)
-// and reads the drafted tokens of every step (and with with_p the probability of the argmax over the
-// top 10, for the p_min gate). Returns false if the architecture keeps the chain on the host.
+
+
+
+
+
+
 LLAMA_API bool llama_draft_ring_enable(struct llama_context * ctx, int32_t n_max, bool with_p);
 LLAMA_API void llama_draft_ring_begin(struct llama_context * ctx, const llama_token * ids, size_t n);
-// row of step (0-based): one token / probability per sequence slot, in the batch order of the chain
+
 LLAMA_API const llama_token * llama_draft_ring_tokens(const struct llama_context * ctx, int32_t step);
 LLAMA_API const float       * llama_draft_ring_p     (const struct llama_context * ctx, int32_t step);
 

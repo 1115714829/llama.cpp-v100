@@ -91,31 +91,31 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
-// sparse distribution over a subset of the vocabulary, probs must sum to 1
+
 struct common_sampler_sparse_probs {
     std::vector<llama_token> ids;
     std::vector<float>       probs;
 };
 
-// proposal candidates of one speculative draft step, q must sum to 1
+
 struct common_sampler_draft_q {
     std::vector<llama_token> ids;
     std::vector<float>       q;
 };
 
-// uniform [0, 1) random number callback
+
 typedef float (* common_sampler_uniform_fn)(void * data);
 
-// pure rejection sampling core, independent of llama_context:
-//
-// - p_rows:  draft.size() + 1 normalized sparse target distributions, p_rows[i] corresponds to draft[i]
-// - draft:   the sampled draft tokens
-// - draft_q: the proposal distribution of the walk, one per draft token
-//
-// returns the accepted draft tokens followed by one resampled or bonus token
-// (only the resampled token if the first draft token is rejected)
-//
-// exposed for unit tests
+
+
+
+
+
+
+
+
+
+
 std::vector<llama_token> common_sampler_reject_core(
         const std::vector<common_sampler_sparse_probs> & p_rows,
         const llama_tokens & draft,
@@ -123,48 +123,48 @@ std::vector<llama_token> common_sampler_reject_core(
         common_sampler_uniform_fn uniform,
         void * uniform_data);
 
-// true if the chain of gsmpl can be replayed exactly on a sparse top-k row:
-// T > 0, no sampler that rewrites the full logits (a ban-only logit bias and penalties that only
-// lower the logits of the tokens they have seen are admitted), a top_k with 0 < k <= 64, and dist
-// as the last sampler
+
+
+
+
 bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl);
 
-// number of candidates the sparse rows of gsmpl hold: top_k, plus one per banned token (a ban-only
-// logit bias) and per penalty window token (penalties); 0 if unavailable
+
+
 int32_t common_sampler_sparse_k(const struct common_sampler * gsmpl);
 
-// dchain: greedy verification on the sparse top-k rows. true if the chain of gsmpl replayed on the
-// candidates of a row gives the argmax of the full row: T <= 0 (the temp sampler takes the first
-// maximum), no sampler that rewrites the full logits (a ban-only logit bias and penalties that only
-// lower the logits of the tokens they have seen are admitted), no truncation that can drop the
-// maximum (typical, xtc, dry), and dist as the last sampler
+
+
+
+
+
 bool common_sampler_can_greedy_topk(const struct common_sampler * gsmpl);
 
-// number of candidates the top-k rows need for the greedy replay: 1, plus one per banned token and
-// per penalty window token; 0 if unavailable
+
+
 int32_t common_sampler_greedy_topk_k(const struct common_sampler * gsmpl);
 
-// greedy variant of common_sampler_sample_and_accept_n that reads the top-k rows of every row in
-// idxs instead of the full logits (the full rows of a verification batch then never leave the
-// device). The candidates are visited like the full row (logit desc, id asc: the first maximum is
-// the smallest id among equal logits), then the chain is replayed on them.
-// requires: common_sampler_can_greedy_topk(gsmpl) and idxs.size() == draft.size() + 1
+
+
+
+
+
 std::vector<llama_token> common_sampler_greedy_topk_and_accept_n(
         struct common_sampler * gsmpl,
         struct llama_context * ctx,
         const std::vector<int> & idxs,
         const llama_tokens & draft);
 
-// rejection sampling variant of common_sampler_sample_and_accept_n:
-//
-// - reads the top_k logits of every row in idxs, replays the sampler chain on them to get p
-// - accepts draft tokens with probability min(1, p/q), resamples rejects from relu(p - q)
-//   and draws a bonus token from the last row if all draft tokens are accepted
-// - draws all random numbers from the dist sampler of the chain
-// - if the chain has penalties, the rows are replayed on a clone advanced with the draft tokens
-//   accepted before them, so that the targets match the sequential path
-//
-// requires: common_sampler_can_sparse_reject(gsmpl) and idxs.size() == draft.size() + 1
+
+
+
+
+
+
+
+
+
+
 std::vector<llama_token> common_sampler_reject_and_accept_n(
         struct common_sampler * gsmpl,
         struct llama_context * ctx,
@@ -198,6 +198,12 @@ std::string common_sampler_type_to_str(enum common_sampler_type cnstr);
 
 std::vector<enum common_sampler_type> common_sampler_types_from_names(const std::vector<std::string> & names);
 std::vector<enum common_sampler_type> common_sampler_types_from_chars(const std::string & chars);
+
+// add the strings that are a single token in the vocab to the preserved tokens
+void common_sampling_add_preserved_tokens(common_params_sampling & sampling, const llama_vocab * vocab, const std::vector<std::string> & tokens);
+
+// add grammar triggers, a trigger word that is a single token becomes a token trigger and must be a preserved token
+void common_sampling_add_grammar_triggers(common_params_sampling & sampling, const llama_vocab * vocab, std::vector<common_grammar_trigger> triggers);
 
 llama_sampler * llama_sampler_init_llg(const llama_vocab * vocab,
                 const char * grammar_kind, const char * grammar_data);

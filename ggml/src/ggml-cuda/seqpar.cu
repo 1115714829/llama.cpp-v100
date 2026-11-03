@@ -1,9 +1,9 @@
-// Sequence-parallel token split/gather, single-device forms.
-//
-// Under the meta backend the split/gather across devices is carried by the per-rank
-// reduce-scatter/all-gather comm procs in ggml-cuda.cu; these ops then only run on a
-// single device, where seq_scatter copies the [t0, t0+n) slice of the token axis and
-// seq_gather is the cast/dup of the whole tensor.
+
+
+
+
+
+
 #include "common.cuh"
 #include "cpy.cuh"
 #include "seqpar.cuh"

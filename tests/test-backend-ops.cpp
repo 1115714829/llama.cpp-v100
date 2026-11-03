@@ -19,7 +19,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
-#include "ggml-expert-store.h" // the expert assignment the permuted expert store test plays the loader for
+#include "ggml-expert-store.h"
 
 #include <algorithm>
 #include <atomic>
@@ -45,6 +45,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <map>
 #include <unordered_map>
 
 #ifdef __EMSCRIPTEN__
@@ -116,7 +117,7 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
             };
 
             const size_t min_blocks_per_thread = 1;
-            const size_t n_quant_threads = std::min<size_t>(std::max<size_t>(N_THREADS/2, 1),
+            const size_t n_quant_threads = std::min<size_t>(std::max<size_t>(N_THREADS, 1),
                                                             std::max<size_t>(1, n_blocks / min_blocks_per_thread));
 
             if (n_quant_threads == 1) {
@@ -195,7 +196,7 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
-// generate a causal mask: row i is 0 up to column ne0 - ne1 + i and -INF beyond
+
 static void init_tensor_kq_mask_causal(ggml_tensor * tensor) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
 
@@ -218,13 +219,13 @@ static void init_tensor_kq_mask_causal(ggml_tensor * tensor) {
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
-// generate an I32 range mask: the row for query i1 holds two [lo, hi) pairs, the visible KV
-// columns. mode: 1 = causal, 2 = random, 3 = causal over the first half of the KV positions (a
-// range that ends well before the KV view the kernel is given), 4 = deterministic split coverage:
-// every third row sees only the first eighth of the KV view, the next one only the last
-// eighth, and the last one is fully masked (all -inf), 5 = whole q blocks whose range lies
-// inside the first two KV blocks, so a KV split segment comes back empty, 6 = ring wrap: the
-// first pair covers [a, n_kv), the second [0, b), so the visible set wraps the array end
+
+
+
+
+
+
+
 static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, int mode) {
     GGML_ASSERT(tensor->type == GGML_TYPE_I32);
     GGML_ASSERT(tensor->ne[0] == 4);
@@ -269,11 +270,11 @@ static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, int mode) {
                             break;
                     }
                 } else if (mode == 5) {
-                    // whole 64-row q blocks with a one-KV-block range: the
-                    // first sees block 0 only (the second KV split is empty),
-                    // the second sees block 1 only (the first KV split has no
-                    // visible column for those rows), the third is fully
-                    // masked (both KV splits are empty)
+
+
+
+
+
                     switch ((i1 / 64) % 3) {
                         case 0:
                             lo0 = 0;
@@ -284,15 +285,15 @@ static void init_tensor_kq_range(ggml_tensor * tensor, int64_t n_kv, int mode) {
                             hi0 = std::min<int64_t>(64, n_kv);
                             break;
                         default:
-                            // both windows are empty but their hi is not 0, so the bounds
-                            // kernel must still mark the whole q block as not visible
+
+
                             lo0 = hi0 = std::min<int64_t>(48, n_kv);
                             lo1 = hi1 = std::min<int64_t>(16, n_kv);
                             break;
                     }
                 } else if (mode == 6) {
-                    // a ring window that wraps the array end: [a, n_kv) plus [0, b), disjoint and
-                    // both non-empty. a and b advance per row so every wrap offset is covered
+
+
                     const int64_t step = std::max<int64_t>(1, n_kv/4);
                     lo0 = n_kv/2 + (i1 % step);
                     hi0 = n_kv;
@@ -799,7 +800,11 @@ struct test_result {
 };
 
 // Printer classes for different output formats
-enum class test_status_t { NOT_SUPPORTED, OK, FAIL, SKIPPED };
+// FATAL: the case could not run because the backend refused to build what the case needs (the
+// expert buffer type refuses a budget that cannot hold the tensor). The machine state the case
+// needs was then never established, so the run stops here: the cases that follow would run
+// against a state that does not exist.
+enum class test_status_t { NOT_SUPPORTED, OK, FAIL, SKIPPED, FATAL };
 
 struct test_operation_info {
     std::string   op_name;
@@ -974,6 +979,10 @@ struct printer {
 
     virtual void print_backend_status(const backend_status_info & info) { (void) info; }
 
+
+
+    virtual void print_backend_error(const std::string & message) { (void) message; }
+
     virtual void print_overall_summary(const overall_summary_info & info) { (void) info; }
 
     virtual void print_failed_tests(const std::vector<std::string> & failed_tests) { (void) failed_tests; }
@@ -1064,6 +1073,11 @@ struct console_printer : public printer {
         } else {
             printf("\033[1;31mFAIL\033[0m\n");
         }
+    }
+
+    void print_backend_error(const std::string & message) override {
+        printf("%s\n", message.c_str());
+        fflush(stdout);
     }
 
     void print_testing_start(const testing_start_info & info) override {
@@ -1219,6 +1233,11 @@ struct sql_printer : public printer {
         }
         fprintf(fout, ");\n");
     }
+
+    void print_backend_error(const std::string & message) override {
+
+        fprintf(stderr, "%s\n", message.c_str());
+    }
 };
 
 struct csv_printer : public printer {
@@ -1259,6 +1278,11 @@ struct csv_printer : public printer {
         printf("\n");
     }
 
+    void print_backend_error(const std::string & message) override {
+
+        fprintf(stderr, "%s\n", message.c_str());
+    }
+
     static std::vector<std::string> get_fields_csv() {
         return {
             "op_name",
@@ -1285,7 +1309,7 @@ static std::unique_ptr<printer> create_printer(output_formats format) {
     GGML_ABORT("invalid output format");
 }
 
-// set with --show-err: print the error value also for passing comparisons
+
 static bool g_show_err = false;
 
 static std::mutex g_test_output_mutex;
@@ -1439,36 +1463,45 @@ struct test_case {
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
 
-    // optional buffer type for the weight context; when null the backend default is used
+
     virtual ggml_backend_buffer_type_t weight_buffer_type(ggml_backend_t backend) {
         GGML_UNUSED(backend);
         return nullptr;
     }
 
-    // when true, the test is skipped if weight_buffer_type() returns null for the backend
+
     virtual bool requires_weight_buffer_type() { return false; }
 
-    // called after the weight buffer was allocated: tests that use a special weight buffer
-    // type can inspect the resulting allocation (e.g. the tier split of the expert store)
+
+
     virtual void check_weight_alloc(ggml_backend_t backend) { GGML_UNUSED(backend); }
 
-    // called when eval() / eval_perf() leave, on every exit after build_graph(): a test that
-    // changes process-wide state for its run (the active expert assignment) restores it here
+
+
     virtual void after_eval(ggml_backend_t backend) { GGML_UNUSED(backend); }
 
-    // relaunches after the reference compare: the graph is computed again on backend1 n_relaunch()
-    // times and the output compared with the reference result of the compare, relaunch_prepare()
-    // runs before each of them. For state that a backend creates at the first launch of a graph
-    // and keeps afterwards: the hook puts the backend back into the first-launch state, so every
-    // relaunch exercises it again.
+
+
+
+
+
     virtual int n_relaunch() { return 0; }
     virtual void relaunch_prepare(ggml_backend_t backend) { GGML_UNUSED(backend); }
-    // checked after the compare and after every relaunch, for state of the backend that the output
-    // compare alone does not cover; false fails the test
+
+
     virtual bool relaunch_check(ggml_backend_t backend) { GGML_UNUSED(backend); return true; }
 
-    ggml_tensor * out_node = nullptr;   // the output of build_graph, for the relaunch compare
-    std::vector<float> out_ref;         // its reference result, captured by the compare callback
+    ggml_tensor * out_node = nullptr;
+    std::vector<float> out_ref;
+
+
+
+
+    virtual bool before_compare(ggml_backend_t backend1, ggml_backend_t backend2) {
+        GGML_UNUSED(backend1);
+        GGML_UNUSED(backend2);
+        return true;
+    }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1584,7 +1617,7 @@ struct test_case {
         current_op_name   = op_desc(out);
         check_for_f16_tensor(ctx.get());
 
-        // after_eval() runs on every exit from here on
+
         struct after_eval_guard {
             test_case *    tc;
             ggml_backend_t backend;
@@ -1641,8 +1674,9 @@ struct test_case {
                 ? ggml_backend_alloc_ctx_tensors_from_buft(ctx_weights.get(), weight_buft)
                 : ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
             if (buf_weights == NULL) {
-                printf("failed to allocate weight tensors [%s] ", ggml_backend_name(backend1));
-                return test_status_t::FAIL;
+                printf("failed to allocate the weight tensors [%s]: the buffer type refused the allocation, the machine state it needs was never established, so the run stops here\n",
+                       ggml_backend_name(backend1));
+                return test_status_t::FATAL;
             }
             ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             check_weight_alloc(backend1);
@@ -1752,6 +1786,7 @@ struct test_case {
         };
 
         std::vector<ggml_tensor *> fused_nodes_to_verify = fusion_test_nodes();
+        const bool pre_ok = before_compare(backend1, backend2);
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
         }
@@ -1761,10 +1796,10 @@ struct test_case {
                                                                fused_nodes_to_verify.size());
 
         // Create test result
-        bool        test_passed = ud.ok && cmp_ok;
-        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
+        bool        test_passed = pre_ok && ud.ok && cmp_ok;
+        std::string error_msg   = test_passed ? "" : (!pre_ok ? "before compare failed" : (!cmp_ok ? "compare failed" : "test failed"));
 
-        // relaunches against the reference result of the compare (see n_relaunch)
+
         const int n_re = n_relaunch();
         if (test_passed && n_re > 0) {
             GGML_ASSERT(!out_ref.empty());
@@ -2544,6 +2579,12 @@ struct test_swiglu_oai : public test_case {
             init_tensor_uniform(t, -150.f, 150.f);
         }
     }
+
+    double max_nmse_err() override {
+        // F16 epsilon ~ 9.7e-4: relax tolerance vs the F32 default to absorb the
+        // natural roundoff drift from the exp()/clamp() chain computed in F16.
+        return type == GGML_TYPE_F16 ? 5e-6 : 1e-7;
+    }
 };
 
 struct test_swiglu_clamp : public test_case {
@@ -2600,6 +2641,12 @@ struct test_swiglu_clamp : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             init_tensor_uniform(t, -150.f, 150.f);
         }
+    }
+
+    double max_nmse_err() override {
+        // F16 epsilon ~ 9.7e-4: relax tolerance vs the F32 default to absorb the
+        // natural roundoff drift from the sigmoid()/clamp() chain computed in F16.
+        return type == GGML_TYPE_F16 ? 5e-6 : 1e-7;
     }
 };
 
@@ -3062,7 +3109,14 @@ struct test_rms_norm_mul_rope : public test_case {
     }
 
     double max_nmse_err() override {
-        return ne[0] == 8192 ? 5e-6 : test_case::max_nmse_err();
+        if (ne[0] == 8192) {
+            return 5e-6;
+        }
+        // large positions amplify the difference between the GPU and CPU trig functions
+        if (ne[2] > 8192) {
+            return 1e-5;
+        }
+        return test_case::max_nmse_err();
     }
 };
 
@@ -3512,7 +3566,7 @@ struct test_cpy_batch : public test_case {
             if (mode == MODE_TEST) {
                 ggml_build_forward_expand(gf, cpy);
             }
-            // fold right to left, so the graph puts all cpys before the concats
+
             out = out == nullptr ? cpy : ggml_concat(ctx, cpy, out, 1);
         }
         ggml_set_name(out, "out");
@@ -3520,11 +3574,11 @@ struct test_cpy_batch : public test_case {
     }
 };
 
-// GET_ROWS + CONCAT + CPY x K + SSM_CONV + SILU, the conv-state rollback window that
-// build_conv_state() emits for gated delta net layers. The CUDA backend fuses the whole sequence
-// into one kernel, so this test checks that the fused output matches the unfused node order.
-// With self_write, the first snapshot overwrites the state row read by GET_ROWS: the fused kernel
-// must load the row before writing the snapshots, just like the node order does on the CPU.
+
+
+
+
+
 struct test_ssm_conv_rollback : public test_case {
     const int64_t C;
     const int64_t n_tok;
@@ -3573,17 +3627,17 @@ struct test_ssm_conv_rollback : public test_case {
         ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, C);
         ggml_set_name(w, "w");
 
-        // build_rs: gather the state row
+
         ggml_tensor * state_rows = ggml_get_rows(ctx, ggml_reshape_2d(ctx, states_all, 3 * C, n_rows), row_idx);
         ggml_set_name(state_rows, "state_rows");
         ggml_tensor * conv_states = ggml_reshape_3d(ctx, state_rows, 3, C, 1);
         ggml_set_name(conv_states, "conv_states");
 
-        // build_conv_state: concat the state window with the transposed qkv projection
+
         ggml_tensor * conv_input = ggml_concat(ctx, conv_states, ggml_transpose(ctx, qkv), 0);
         ggml_set_name(conv_input, "conv_input");
 
-        // chain the copies through their dst views so that they stay in the graph in order
+
         ggml_tensor * cpy_chain = nullptr;
         for (int64_t k = 0; k < K; ++k) {
             const int64_t slot  = first_slot + k;
@@ -3609,7 +3663,7 @@ struct test_ssm_conv_rollback : public test_case {
         ggml_tensor * silu = ggml_silu(ctx, conv_out);
         ggml_set_name(silu, "silu");
 
-        // cover the conv output and all snapshot rows
+
         ggml_tensor * snaps = ggml_reshape_2d(ctx,
                 ggml_view_2d(ctx, states_all, 3 * C, K, states_all->nb[1], first_slot * states_all->nb[1]),
                 3 * C * K, 1);
@@ -3665,7 +3719,7 @@ struct test_cont : public test_case {
     }
 };
 
-// GGML_OP_CONT + GGML_OP_UNARY(SIGMOID) + GGML_OP_MUL with the gate taken from a strided view
+
 struct test_cont_sigmoid_mul : public test_case {
     const int64_t head_dim;
     const int64_t n_head;
@@ -3686,7 +3740,7 @@ struct test_cont_sigmoid_mul : public test_case {
         : head_dim(head_dim), n_head(n_head), n_tokens(n_tokens) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        // joint Q and gate projection, the gate is the second half of every row
+
         ggml_tensor * qg = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2*head_dim, n_head, n_tokens);
         ggml_set_name(qg, "qg");
 
@@ -3721,6 +3775,7 @@ struct test_bin_bcast : public test_case {
     bool perm1; // permute src1?
     bool src_overlap; // src0 and src1 are overlapping views of the same buffer
     const ggml_type type_b; // type of src1, GGML_TYPE_COUNT -> same as src0
+    bool weights;
 
     bool run_whole_graph() override { return nf > 1; }
 
@@ -3728,6 +3783,9 @@ struct test_bin_bcast : public test_case {
         std::string s = VARS_TO_STR6(type, ne, nr, nf, perm1, src_overlap);
         if (type_b != GGML_TYPE_COUNT) {
             s += "," + VAR_TO_STR(type_b);
+        }
+        if (weights) {
+            s += ",weights=1";
         }
         return s;
     }
@@ -3741,28 +3799,38 @@ struct test_bin_bcast : public test_case {
             std::array<int, 4> nr = {1, 2, 1, 1},
             int nf = 1,
             bool perm1 = false, bool src_overlap = false,
-            ggml_type type_b = GGML_TYPE_COUNT)
-        : op(op), type(type), ne(ne), nr(nr), nf(nf), perm1(perm1), src_overlap(src_overlap), type_b(type_b) {}
+            ggml_type type_b = GGML_TYPE_COUNT, bool weights = false)
+        : op(op), type(type), ne(ne), nr(nr), nf(nf), perm1(perm1), src_overlap(src_overlap), type_b(type_b), weights(weights) {}
+
+    bool use_weight_context() override {
+        return weights;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         GGML_ASSERT(nf <= 16);
 
         ggml_tensor * a = ggml_new_tensor_4d(ctx, type, ne[0]*nr[0], ne[1]*nr[1], ne[2]*nr[2], ne[3]*nr[3]);
         ggml_set_name(a, "a");
 
         const ggml_type tb = type_b == GGML_TYPE_COUNT ? type : type_b;
+        ggml_context * ctx_b = weights ? ctx_weights : ctx;
+        GGML_ASSERT(ctx_b);
 
         ggml_tensor * b[16];
         for (int i = 0; i < nf; ++i) {
             if (perm1) {
                 const int p[4] = { 1, 2, 0, 3 }; // hardcoded for now
 
-                b[i] = ggml_new_tensor_4d(ctx, tb, ne[p[0]], ne[p[1]], ne[p[2]], ne[p[3]]);
-                b[i] = ggml_permute(ctx, b[i], p[0], p[1], p[2], p[3]);
+                b[i] = ggml_new_tensor_4d(ctx_b, tb, ne[p[0]], ne[p[1]], ne[p[2]], ne[p[3]]);
+                b[i] = ggml_permute(ctx_b, b[i], p[0], p[1], p[2], p[3]);
             } else if (src_overlap) {
                 b[i] = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], 2 * (ne[3] / 3), a->nb[1], a->nb[2], a->nb[3], (ne[3] / 3) * a->nb[3]);
             } else {
-                b[i] = ggml_new_tensor(ctx, tb, 4, ne.data());
+                b[i] = ggml_new_tensor(ctx_b, tb, 4, ne.data());
             }
             ggml_set_name(b[i], (std::string("b") + std::to_string(i)).c_str());
         }
@@ -4339,12 +4407,12 @@ struct test_rms_norm_mul_silu_mul : public test_case {
     }
 };
 
-// UNARY(SIGMOID) next to ADD + UNARY(SOFTPLUS) + MUL (fused GDN gating)
+
 struct test_gdn_gating : public test_case {
     const int64_t n_heads;
     const int64_t n_seq_tokens;
     const int64_t n_seqs;
-    const bool swap; // the alpha chain comes first in the graph
+    const bool swap;
 
     ggml_tensor * beta_out = nullptr;
     ggml_tensor * gate_out = nullptr;
@@ -4356,7 +4424,7 @@ struct test_gdn_gating : public test_case {
 
     bool run_whole_graph() override { return true; }
 
-    // both outputs of the fusion are used outside of it, so compare both
+
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { beta_out, gate_out }; }
 
     std::string vars() override {
@@ -4519,7 +4587,7 @@ struct test_add_rms_norm : public test_case {
     }
 };
 
-// GGML_OP_ADD + GGML_OP_RMS_NORM + GGML_OP_MUL (fused residual add -> rms norm -> weight mul)
+
 struct test_add_rms_norm_mul : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -4534,7 +4602,7 @@ struct test_add_rms_norm_mul : public test_case {
 
     bool run_whole_graph() override { return true; }
 
-    // both outputs of the fusion are used outside of it, so compare both
+
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { add_result, mul_result }; }
 
     std::string vars() override {
@@ -4564,7 +4632,7 @@ struct test_add_rms_norm_mul : public test_case {
         ggml_tensor * m = ggml_mul(ctx, ggml_rms_norm(ctx, s, eps), w);
         ggml_set_name(m, "mul_result");
 
-        // use the add result outside the fusion, as the residual in a transformer block
+
         ggml_tensor * out = ggml_add(ctx, m, s);
         ggml_set_name(out, "out");
 
@@ -4589,7 +4657,7 @@ struct test_add_rms_norm_mul : public test_case {
     }
 };
 
-// GGML_OP_RMS_NORM + GGML_OP_MUL (fused operation, the mul result is the graph output)
+
 struct test_rms_norm_mul : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -4817,9 +4885,9 @@ struct test_unary_mul : public test_case {
     }
 };
 
-// GGML_OP_SCALE + GGML_OP_UNARY(SILU): silu(x*s), the hyper-connection mixer activation
-// (qwen4exp builds silu(scale(lo, 1/hc))). The backend may fold the scale of the first
-// node into the silu kernel; both nodes must then match the unfused chain.
+
+
+
 struct test_scale_silu : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;
@@ -4849,6 +4917,93 @@ struct test_scale_silu : public test_case {
         ggml_set_name(scaled, "scaled");
 
         ggml_tensor * out = ggml_silu(ctx, scaled);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// GGML_OP_ADD + GGML_OP_UNARY(SILU|SIGMOID|SOFTPLUS) + GGML_OP_MUL with the ADD's bias and
+// the MUL's scale broadcast over dim 0: the delta-net alpha gate, softplus(alpha + dt) * a_coeff.
+struct test_add_unary_mul : public test_case {
+    const ggml_unary_op op;
+    const ggml_type type;
+    const std::array<int64_t, 4> ne;
+    const bool swap;          // unary result is the second MUL operand
+    const std::string layout; // bias/scale layout, see build_graph()
+    const std::string tail;   // extra consumer past the MUL, see build_graph()
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_" + std::string(ggml_unary_op_name(op)) + "_MUL";
+    }
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        switch (type) {
+            // f16 never fuses (the kernel is f32-only), so this bound is the unfused
+            // chain's own f16 rounding drift, as in test_unary_mul
+            case GGML_TYPE_F16: return 5e-5;
+            // gelu never fuses either, and the backends' exp form drifts from the CPU's tanhf
+            default:            return op == GGML_UNARY_OP_GELU ? 5e-7 : 1e-7;
+        }
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, ne, swap, layout, tail);
+    }
+
+    test_add_unary_mul(ggml_unary_op op,
+            ggml_type type = GGML_TYPE_F32,
+            std::array<int64_t, 4> ne = {32, 7, 1, 1},
+            bool swap = false,
+            std::string layout = "bcast",
+            std::string tail = "")
+        : op(op), type(type), ne(ne), swap(swap), layout(std::move(layout)), tail(std::move(tail)) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
+        ggml_set_name(a, "a");
+
+        std::array<int64_t, 4> ne_v = { ne[0], 1, 1, 1 };
+        if (layout == "bcast") {
+            // one ne0 row each, broadcast over the outer dims, which is the alpha-gate form
+        } else if (layout == "same_shape") {
+            // no broadcast at all; fuses only while the activation is a single row
+            ne_v = ne;
+        } else if (layout == "rep_ne0") {
+            // repeat on dim 0, which bias[col] cannot address, so this must not fuse
+            ne_v[0] = ne[0] / 4;
+        } else {
+            GGML_ABORT("unknown layout %s", layout.c_str());
+        }
+
+        ggml_tensor * bias = ggml_new_tensor(ctx, type, 4, ne_v.data());
+        ggml_set_name(bias, "bias");
+
+        ggml_tensor * scale = ggml_new_tensor(ctx, type, 4, ne_v.data());
+        ggml_set_name(scale, "scale");
+
+        ggml_tensor * s = ggml_add(ctx, a, bias);
+        ggml_set_name(s, "add");
+
+        ggml_tensor * u = ggml_unary(ctx, s, op);
+        ggml_set_name(u, "unary");
+
+        // a broadcasting operand can only be the second one, so swap needs same-shape operands
+        ggml_tensor * out = swap ? ggml_mul(ctx, scale, u) : ggml_mul(ctx, u, scale);
+
+        if (tail == "reuse") {
+            // a second read of the add result must block the fusion
+            ggml_set_name(out, "mul");
+            out = ggml_add(ctx, out, s);
+        } else if (tail == "consumer") {
+            // fusion still applies; catches a dispatcher that skips one node too many
+            ggml_set_name(out, "mul");
+            out = ggml_add(ctx, out, scale);
+        } else if (!tail.empty()) {
+            GGML_ABORT("unknown tail %s", tail.c_str());
+        }
         ggml_set_name(out, "out");
 
         return out;
@@ -5107,9 +5262,9 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 };
 
 
-// DSV4_HC_POST with the qwen4exp gate followed by the RMS_NORM -> MUL of the next mixer, which
-// backends can fuse; the output adds the normalized mixer input to the new residual so that both
-// fused outputs are checked
+
+
+
 struct test_dsv4_hc_post_norm : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -5151,18 +5306,18 @@ struct test_dsv4_hc_post_norm : public test_dsv4_hc {
     }
 };
 
-// The opening of a qwen4exp hyper-connection mixer on Q8_0 projections (sm_70 repacks them):
-// [gated DSV4_HC_POST ->] RMS_NORM -> MUL -> MUL_MAT(down) -> SCALE -> SILU -> MUL_MAT(up), which
-// backends can run as one norm kernel and two projections that exchange F16 activations. The output
-// adds the gate, the normed input and the new residual so that every output of the group is checked.
+
+
+
+
 struct test_hc_mix_q8 : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_lr;
     const int64_t n_tokens;
     const bool    with_post;
     const bool    with_inject;
-    const int     with_pre; // 0: none, 1: the gated DSV4_HC_PRE after the up projection, 2: plus two Q8_0 projections of it
-    const bool    inject_prev; // the post input of the combine is the previous mixer's inject projection (F32 MUL_MAT)
+    const int     with_pre;
+    const bool    inject_prev;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -5194,7 +5349,7 @@ struct test_hc_mix_q8 : public test_dsv4_hc {
             ggml_set_name(x, "x");
             ggml_tensor * post = nullptr;
             if (inject_prev) {
-                // qwen4exp build_hc_combine reads the previous mixer's inject projection here
+
                 ggml_tensor * w_inj_prev = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, hc);
                 ggml_tensor * xn_prev    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, n_tokens);
                 ggml_set_name(w_inj_prev, "w_inj_prev");
@@ -5222,9 +5377,9 @@ struct test_hc_mix_q8 : public test_dsv4_hc {
         ggml_tensor * gate = ggml_mul_mat(ctx, w_up, lo);
 
         out = ggml_add(ctx, ggml_add(ctx, gate, xn), ggml_reshape_2d(ctx, res, n_embd*hc, n_tokens));
-        // the nodes that come first in the depth-first order: the inject projection of build_hc_mix (F32
-        // [n_embd*hc, hc], same input), right before the down projection as qwen4exp expands it; then the
-        // gated hc_pre mixer of the up output (and the Q8_0 projections that open the block, GDN qkv and z)
+
+
+
         ggml_tensor * front = nullptr;
         if (with_inject) {
             ggml_tensor * w_inject = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, hc);
@@ -5254,9 +5409,9 @@ struct test_hc_mix_q8 : public test_dsv4_hc {
     }
 };
 
-// The hyper-connection mixer output feeding the Q8_0 projections that open a block, expanded right
-// after it (qwen4exp build_qkvz: wqkv and wqkv_gate). sm_70 hands the mixer result to the multi-weight
-// kernel as F16; the F32 mixer result is kept and checked too.
+
+
+
 struct test_hc_pre_mm_q8 : public test_dsv4_hc {
     const int64_t n_embd;
     const std::array<int64_t, 3> n_out;
@@ -5302,9 +5457,9 @@ struct test_hc_pre_mm_q8 : public test_dsv4_hc {
     }
 };
 
-// RMS_NORM -> MUL -> UNARY(SIGMOID or SILU) -> MUL, the gated norm of the GDN output, read by the Q8_0
-// output projection (qwen4exp ssm_out). sm_70 fuses the norm chain and hands it to the projection as F16;
-// the F32 gated norm is kept and checked too.
+
+
+
 struct test_gated_norm_q8 : public test_case {
     const int64_t head_dim;
     const int64_t n_head;
@@ -5350,9 +5505,9 @@ struct test_gated_norm_q8 : public test_case {
     }
 };
 
-// CONT -> UNARY(SIGMOID) -> MUL, the attention output gate (a strided view of the Q projection), read
-// by the Q8_0 output projection (qwen4exp wo). sm_70 hands the gated output to the projection as F16;
-// the F32 gated output is kept and checked too.
+
+
+
 struct test_attn_gate_q8 : public test_case {
     const int64_t head_dim;
     const int64_t n_head;
@@ -5397,8 +5552,8 @@ struct test_attn_gate_q8 : public test_case {
     }
 };
 
-// The qwen4exp shared expert tail: ffn_out = moe_out + ffn_shexp * sigmoid(shared_gate), the gate one
-// value per token (sm_70 fuses the sigmoid, the broadcast mul and the add)
+
+
 struct test_shexp_tail : public test_case {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -5430,8 +5585,8 @@ struct test_shexp_tail : public test_case {
     }
 };
 
-// A gated Q8_0 FFN, down(swiglu(gate(x), up(x))), as the qwen4exp shared expert (sm_70 repacks the
-// weights; a narrow pair hands silu(gate) * up to the down projection as F16)
+
+
 struct test_ffn_q8 : public test_case {
     const int64_t n_embd;
     const int64_t n_ff;
@@ -5465,8 +5620,8 @@ struct test_ffn_q8 : public test_case {
         ggml_tensor * act = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, w_gate, x), ggml_mul_mat(ctx, w_up, x));
         ggml_tensor * out = ggml_mul_mat(ctx, w_down, act);
         if (with_gate) {
-            // the qwen4exp shared expert gate (ffn_gate_inp_shexp, F32 [n_embd, 1]) of the same input, after
-            // the down projection in the depth-first order, as in build_layer_ffn
+
+
             ggml_tensor * w_sg = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
             ggml_set_name(w_sg, "w_sg");
             ggml_tensor * sg = ggml_mul_mat(ctx, w_sg, x);
@@ -5740,6 +5895,104 @@ struct test_ssm_scan_rollback : public test_case {
     }
 };
 
+// GGML_OP_SSM_SCAN + GGML_OP_CPY (recurrent cache fusion)
+struct test_ssm_scan_cache_fusion : public test_case {
+    const ggml_type type;
+
+    const int64_t d_state;
+    const int64_t head_dim;
+    const int64_t n_head;
+    const int64_t n_group;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int64_t K; // snapshot slot count (1 = final state only)
+
+    ggml_tensor * cpy_node = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR8(type, d_state, head_dim, n_head, n_group, n_seq_tokens, n_seqs, K);
+    }
+
+    test_ssm_scan_cache_fusion(ggml_type type = GGML_TYPE_F32,
+            int64_t d_state = 128, int64_t head_dim = 64, int64_t n_head = 16, int64_t n_group = 2,
+            int64_t n_seq_tokens = 4, int64_t n_seqs = 1, int64_t K = 4)
+        : type(type), d_state(d_state), head_dim(head_dim), n_head(n_head), n_group(n_group),
+          n_seq_tokens(n_seq_tokens), n_seqs(n_seqs), K(K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D         = d_state * head_dim * n_head;
+        const int64_t n_written = std::min<int64_t>(n_seq_tokens, K);
+
+        // more cache rows per slot than seqs and a non-zero first row, so a wrong slot stride or offset shows up
+        const int64_t mem_size = n_seqs + 2;
+        const int64_t kv_head  = 1;
+
+        ggml_tensor * s   = ggml_new_tensor_4d(ctx, type, d_state,  head_dim,     n_head,       n_seqs);
+        ggml_tensor * x   = ggml_new_tensor_4d(ctx, type, head_dim, n_head,       n_seq_tokens, n_seqs);
+        ggml_tensor * dt  = ggml_new_tensor_3d(ctx, type, n_head,   n_seq_tokens, n_seqs);
+        ggml_tensor * A   = ggml_new_tensor_2d(ctx, type, 1,        n_head);
+        ggml_tensor * B   = ggml_new_tensor_4d(ctx, type, d_state,  n_group,      n_seq_tokens, n_seqs);
+        ggml_tensor * C   = ggml_new_tensor_4d(ctx, type, d_state,  n_group,      n_seq_tokens, n_seqs);
+        ggml_tensor * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,  n_seqs);
+        ggml_set_name(A,   "A");
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * out = ggml_ssm_scan(ctx, s, x, dt, A, B, C, ids, K);
+        ggml_set_name(out, "ssm_out");
+
+        // snapshot tail view [D, n_seqs, n_written]
+        ggml_tensor * src = ggml_view_3d(ctx, out,
+                D, n_seqs, n_written,
+                ggml_row_size(out->type, D),
+                ggml_row_size(out->type, D * n_seqs),
+                ggml_row_size(out->type, ggml_nelements(x)));
+
+        // recurrent cache view [D, n_seqs, n_written]
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, type, D, mem_size * n_written);
+        ggml_set_name(cache, "cache");
+        ggml_tensor * dst = ggml_view_3d(ctx, cache,
+                D, n_seqs, n_written,
+                cache->nb[1],
+                mem_size * cache->nb[1],
+                kv_head * cache->nb[1]);
+
+        ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+        ggml_set_name(cpy, "ssm_cache_cpy");
+        cpy_node = cpy;
+
+        // read the cpy output so that neither the scan nor the cpy is the graph output (cont, since the cache view is strided)
+        ggml_tensor * res = ggml_sum(ctx, ggml_cont(ctx, cpy));
+        return res;
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_SCAN_CACHE_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node }; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = i;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, t->ne[0] * sizeof(int32_t));
+            } else if (strcmp(t->name, "A") == 0) {
+                init_tensor_uniform(t, -1.0f, -0.5f);
+            } else if (strcmp(t->name, "cache") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_RWKV_WKV6
 struct test_rwkv_wkv6 : public test_case {
     const ggml_type type;
@@ -5782,7 +6035,7 @@ struct test_gated_delta_net : public test_case {
     const bool    permuted;
     const bool    kda;
     const int64_t K; // snapshot slot count: 1 = final-only, >1 = last K states
-    const double  nmse_threshold; // 0 = test_case default
+    const double  nmse_threshold;
 
     std::string vars() override {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
@@ -5961,7 +6214,7 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
-// GATED_DELTA_NET + q/k l2 normalization (see ggml_cuda_match_gdn_prologue)
+
 struct test_gdn_prologue : public test_case {
     const int64_t head_count_k;
     const int64_t head_count_v;
@@ -5985,7 +6238,7 @@ struct test_gdn_prologue : public test_case {
         const int64_t S_k = head_size;
         const int64_t S_v = head_size;
 
-        // conv output holding [q | k | v], sliced into q/k/v like qwen35
+
         const int64_t qkv_dim = S_k * H_k * 2 + S_v * H_v;
         ggml_tensor * conv = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, qkv_dim, n_seq_tokens, n_seqs);
         ggml_set_name(conv, "conv");
@@ -6003,12 +6256,12 @@ struct test_gdn_prologue : public test_case {
         ggml_set_name(k, "k");
         ggml_set_name(v, "v");
 
-        // q/k l2 norm as in build_gdn_l2_norm
+
         const float eps = 1e-5f;
         q = ggml_scale(ctx, ggml_rms_norm(ctx, q, eps/S_k), 1.0f/sqrtf((float) S_k));
         k = ggml_scale(ctx, ggml_rms_norm(ctx, k, eps/S_k), 1.0f/sqrtf((float) S_k));
 
-        // the gating is computed ahead of the normalization in the model graph, here it is an input
+
         ggml_tensor * g    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_seq_tokens, n_seqs);
         ggml_tensor * beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_seq_tokens, n_seqs);
         ggml_set_name(g,    "g");
@@ -6042,7 +6295,7 @@ struct test_gdn_prologue : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ggml_is_view_op(t->op)) { continue; }
             if (strcmp(t->name, "g") == 0) {
-                init_tensor_uniform(t, -2.0f, -0.05f); // log of the decay, negative
+                init_tensor_uniform(t, -2.0f, -0.05f);
             } else if (strcmp(t->name, "beta") == 0) {
                 init_tensor_uniform(t, 0.05f, 0.95f);
             } else {
@@ -6278,10 +6531,10 @@ struct test_mul_mat : public test_case {
     }
 };
 
-// Check the BF16 -> F16 conversion that llama_model_loader applies to BF16 weights on devices
-// without native BF16 support, and the MUL_MAT of the resulting F16 weight: exact inside the
-// F16 range, finite values beyond it clamp to +-65504 instead of becoming Inf (as in Strata's
-// bf16_to_f16_kernel).
+
+
+
+
 static void test_bf16_to_f16_exact() {
     static bool done = false;
     if (done) {
@@ -6291,7 +6544,7 @@ static void test_bf16_to_f16_exact() {
 
     const ggml_bf16_t src[] = {
         ggml_fp32_to_bf16( 1.0f + 1.0f/128.0f),
-        ggml_fp32_to_bf16( 65504.0f), // rounds up to 65536 in BF16 (7-bit mantissa), so it is clamped as well
+        ggml_fp32_to_bf16( 65504.0f),
         ggml_fp32_to_bf16( 1e6f),
         ggml_fp32_to_bf16( 65536.0f),
         ggml_fp32_to_bf16(-1e30f),
@@ -6303,12 +6556,12 @@ static void test_bf16_to_f16_exact() {
     const int64_t n_clamped = ggml_bf16_to_fp16_row(src, dst, n);
 
     GGML_ASSERT(n_clamped == 4);
-    GGML_ASSERT(dst[0] == ggml_fp32_to_fp16(1.0f + 1.0f/128.0f)); // exact inside the F16 range
+    GGML_ASSERT(dst[0] == ggml_fp32_to_fp16(1.0f + 1.0f/128.0f));
     GGML_ASSERT(dst[1] == ggml_fp32_to_fp16(65504.0f));
-    GGML_ASSERT(dst[2] == ggml_fp32_to_fp16(65504.0f));           // clamped, not Inf
-    GGML_ASSERT(dst[3] == ggml_fp32_to_fp16(65504.0f));           // clamped, not Inf
-    GGML_ASSERT(dst[4] == ggml_fp32_to_fp16(-65504.0f));          // clamped, not Inf
-    GGML_ASSERT(dst[5] == ggml_fp32_to_fp16(INFINITY));           // Inf stays Inf
+    GGML_ASSERT(dst[2] == ggml_fp32_to_fp16(65504.0f));
+    GGML_ASSERT(dst[3] == ggml_fp32_to_fp16(65504.0f));
+    GGML_ASSERT(dst[4] == ggml_fp32_to_fp16(-65504.0f));
+    GGML_ASSERT(dst[5] == ggml_fp32_to_fp16(INFINITY));
 }
 
 struct test_mul_mat_bf16_to_f16 : public test_case {
@@ -6327,7 +6580,7 @@ struct test_mul_mat_bf16_to_f16 : public test_case {
     test_mul_mat_bf16_to_f16(int64_t m = 160, int64_t n = 1, int64_t k = 256) : m(m), n(n), k(k) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, m); // the converted weight
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, m);
         ggml_set_name(a, "a");
 
         ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
@@ -6345,7 +6598,7 @@ struct test_mul_mat_bf16_to_f16 : public test_case {
                 continue;
             }
 
-            // as if the weight were BF16 in the file, with values beyond the F16 range in every row
+
             const int64_t ne = ggml_nelements(t);
             std::vector<ggml_bf16_t> data_bf16(ne);
             for (int64_t i = 0; i < ne; i++) {
@@ -6377,10 +6630,10 @@ struct test_mul_mat_bf16_to_f16 : public test_case {
     }
 };
 
-// Multiple matmuls that share one input, run by one multi-weight kernel (small M) or by
-// sharing one input conversion across cuBLAS calls (large M)
+
+
 struct test_mul_mat_multi : public test_case {
-    const std::vector<int64_t> ns; // output columns of each matmul, 2 to 4 entries
+    const std::vector<int64_t> ns;
     const int64_t m;
     const int64_t k;
     const ggml_type type_w;
@@ -6420,9 +6673,9 @@ struct test_mul_mat_multi : public test_case {
             outs.push_back(ggml_mul_mat(ctx, w, x));
         }
 
-        // concat so that every result is compared, not only the last one. Fold from the right
-        // so that the DFS of the output visits the matmuls first and the fusion sees them
-        // adjacent.
+
+
+
         ggml_tensor * out = outs.back();
         for (int i = (int) outs.size() - 2; i >= 0; --i) {
             out = ggml_concat(ctx, outs[i], out, 0);
@@ -6431,7 +6684,7 @@ struct test_mul_mat_multi : public test_case {
         return out;
     }
 
-    // the fusion only happens when the whole graph is evaluated at once
+
     bool run_whole_graph() override { return true; }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6560,12 +6813,12 @@ static void init_mul_mat_id_tensors(ggml_context * ctx, int n_mats, float amax =
     init_mul_mat_id_ids(ctx, n_mats);
 }
 
-// Skewed routing: a few hot experts take most of the slots, so one expert receives far more
-// columns than the average (512 experts, top-10, n=2048 gives 40 on average but the hot ones
-// take hundreds). The grouped kernel must stay correct when an expert's column count exceeds
-// its staged-entry capacity. A token picks distinct experts like real top-k routing: every
-// expert draws a score, hot experts draw in a smaller range and so are picked first. The
-// routing tensor is the full (n_mats, n_rows) ids, the caller views its first n_used columns.
+
+
+
+
+
+
 static void init_mul_mat_id_ids_skew(ggml_context * ctx, int n_mats, int n_used, int n_hot) {
     std::random_device rd;
     std::default_random_engine rng(rd());
@@ -6577,7 +6830,7 @@ static void init_mul_mat_id_ids_skew(ggml_context * ctx, int n_mats, int n_used,
         for (int64_t r = 0; r < ggml_nrows(t); r++) {
             std::vector<std::pair<float, int32_t>> ranked(n_mats);
             for (int32_t e = 0; e < n_mats; e++) {
-                // hot experts draw in [0, 1), the others in [0, 8): a hot one wins most slots
+
                 ranked[e] = { score(rng) * (e < n_hot ? 1.0f : 8.0f), e };
             }
             std::partial_sort(ranked.begin(), ranked.begin() + n_used, ranked.end());
@@ -6606,9 +6859,10 @@ struct test_mul_mat_id : public test_case {
     const int64_t k;
     const float amax; // magnitude of src1
     const int64_t m_v; // rows of as in memory, the experts of as are strided for m_v > m, no view for m_v == 0
+    const bool ids_offset;
 
     std::string vars() override {
-        return VARS_TO_STR10(type_a, type_b, n_mats, n_used, b, m, n, k, amax, m_v);
+        return VARS_TO_STR11(type_a, type_b, n_mats, n_used, b, m, n, k, amax, m_v, ids_offset);
     }
 
     double max_nmse_err() override {
@@ -6633,9 +6887,9 @@ struct test_mul_mat_id : public test_case {
     test_mul_mat_id(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 8, int n_used = 2, bool b = false,
             int64_t m = 32, int64_t n = 32, int64_t k = 32,
-            float amax = 1.0f, int64_t m_v = 0)
+            float amax = 1.0f, int64_t m_v = 0, bool ids_offset = false)
         : type_a(type_a), type_b(type_b), n_mats(n_mats), n_used(n_used), b(b),
-            m(m), n(n), k(k), amax(amax), m_v(m_v) {
+            m(m), n(n), k(k), amax(amax), m_v(m_v), ids_offset(ids_offset) {
             GGML_ASSERT(n_used <= n_mats);
             GGML_ASSERT(m_v == 0 || m_v > m);
         }
@@ -6648,10 +6902,10 @@ struct test_mul_mat_id : public test_case {
         }
         ggml_set_name(as, "as");
 
-        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats + int(ids_offset), n);
         ggml_set_name(ids, "ids");
-        if (n_used != n_mats) {
-            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+        if (n_used != n_mats || ids_offset) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], ids_offset ? sizeof(int32_t) : 0);
             ggml_set_name(ids, "view_of_ids");
         }
 
@@ -6678,15 +6932,15 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
-// The fused SwiGLU expert matmul: the rows of src0 come in gate/up pairs (row 2r = gate row r,
-// row 2r+1 = up row r, the order the model loader writes them) and the epilogue applies
-// silu(gate)*up in FP32 and writes it as F16, which is what the down projection reads. Same
-// routing, shapes and tolerance as test_mul_mat_id, with src0 twice as tall.
+
+
+
+
 struct test_mul_mat_id_swiglu : public test_mul_mat_id {
     test_mul_mat_id_swiglu(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 512, int n_used = 10, bool b = false,
-            int64_t m = 1280, int64_t n = 32, int64_t k = 2560)
-        : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k) {}
+            int64_t m = 1280, int64_t n = 32, int64_t k = 2560, float amax = 1.0f)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k, amax) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -6694,7 +6948,7 @@ struct test_mul_mat_id_swiglu : public test_mul_mat_id {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        // the result is F16, so the src1 precision hint of the plain case does not apply
+
         ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
         ggml_set_name(as, "as");
 
@@ -6715,9 +6969,9 @@ struct test_mul_mat_id_swiglu : public test_mul_mat_id {
     }
 };
 
-// Skewed routing: a few hot experts take most of the slots. At n=2048 the average expert
-// receives 40 columns, but a hot expert receives hundreds, far more than the grouped kernel's
-// staged-entry capacity, so this exercises the per-expert column loop.
+
+
+
 struct test_mul_mat_id_skew : public test_mul_mat_id {
     const int n_hot;
 
@@ -6736,6 +6990,32 @@ struct test_mul_mat_id_skew : public test_mul_mat_id {
 
     void reinit_perf_iter(ggml_context * ctx) override {
         init_mul_mat_id_ids_skew(ctx, n_mats, n_used, n_hot);
+    }
+};
+
+// MUL_MAT_ID with expert ids repeated within a token's row
+struct test_mul_mat_id_dup : public test_mul_mat_id {
+    using test_mul_mat_id::test_mul_mat_id;
+    std::string vars() override { return test_mul_mat_id::vars() + ",dup=1"; }
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) { continue; }
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    std::vector<int32_t> data(t->ne[0]);
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        data[i] = (rng() % 4 == 0) ? (int32_t) (rng() % n_mats) : 0;   // repeated ids, mostly expert 0
+                    }
+                    if (r == ggml_nrows(t) - 1) {
+                        data[ids_offset ? 1 : 0] = n_mats - 1;
+                    }
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
     }
 };
 
@@ -6772,9 +7052,9 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
     }
 };
 
-// MUL_MAT_ID with the expert weights in a device-readable host buffer type (e.g. the CUDA mapped
-// host buffer). The kernel reads the weights through the device pointer, so the result must match
-// the same weights in the device buffer, which the plain test_mul_mat_id covers against the CPU.
+
+
+
 struct test_mul_mat_id_mapped : public test_mul_mat_id {
     test_mul_mat_id_mapped(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 32, int n_used = 4, int64_t m = 640, int64_t n = 8, int64_t k = 2560)
@@ -6830,8 +7110,8 @@ struct test_mul_mat_id_mapped : public test_mul_mat_id {
     }
 };
 
-// mark a tensor as an expert weight through the backend proc address, like the llama loader
-// does: the store then does not have to rely on the tensor name to recognize it
+
+
 static void mark_expert_tensor(ggml_backend_reg_t reg, ggml_backend_buffer_type_t buft, ggml_tensor * t) {
     auto mark = (void (*)(ggml_backend_buffer_type_t, ggml_tensor *))
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_expert_store_mark_tensor");
@@ -6840,10 +7120,10 @@ static void mark_expert_tensor(ggml_backend_reg_t reg, ggml_backend_buffer_type_
     }
 }
 
-// per-expert span the expert store uses: the data bytes, the trailing row padding the MMQ
-// loaders read past the last row (the same rule as the CUDA buffer get_alloc_size) and the
-// alignment of the next expert, which is lcm(256, type block size) so the pitch is a whole
-// number of blocks. The budgets below use it as the expert pitch.
+
+
+
+
 static size_t expert_store_stride(ggml_type type, int64_t k, int64_t m) {
     const size_t blob = (size_t) ggml_row_size(type, k) * (size_t) m;
     const size_t pad  = ggml_is_quantized(type) && k % 512 != 0
@@ -6857,14 +7137,14 @@ static size_t expert_store_stride(ggml_type type, int64_t k, int64_t m) {
         b = t;
     }
     align = 256 / align * ts;
-    // no power of two in general: round with a division
+
     return (blob + pad + align - 1) / align * align;
 }
 
-// ask the backend for the placement plan of the given expert tensors under the budget that
-// was set, and hand it back as the plan the real allocation must reproduce. The allocation
-// aborts when the two differ, so a test that records a plan covers the fit/allocation
-// invariant without loading a real model. specs are (layer, n_expert, blob_bytes, type, ne0).
+
+
+
+
 struct expert_plan_spec {
     int     layer;
     int64_t n_expert;
@@ -6873,11 +7153,29 @@ struct expert_plan_spec {
     int64_t ne0;
 };
 
+
+
+
+static size_t expert_stage_budget(const std::vector<std::pair<const char *, size_t>> & complements) {
+    std::map<int, size_t> peak;
+    for (const auto & c : complements) {
+        size_t & p = peak[ggml_expert_kind_of_name(c.first)];
+        p = std::max(p, c.second);
+    }
+    size_t sum = 0;
+    for (const auto & kv : peak) {
+        sum += kv.second;
+    }
+    return sum;
+}
+
 static void record_expert_plan(ggml_backend_reg_t reg, ggml_backend_buffer_type_t buft,
         const std::vector<expert_plan_spec> & specs, size_t slot_budget) {
+
+
     auto plan = (void (*)(ggml_backend_buffer_type_t, const int *, const int64_t *, const int64_t *,
-            const size_t *, const int *, const int64_t *, size_t, size_t,
-            size_t *, size_t *, size_t *, size_t *))
+            const size_t *, const int *, const int64_t *, const int *, int, size_t, size_t,
+            size_t *, size_t *, size_t *, size_t *, double *))
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_plan");
     auto record = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_record_plan");
@@ -6901,15 +7199,18 @@ static void record_expert_plan(ggml_backend_reg_t reg, ggml_backend_buffer_type_
     size_t slot = 0;
     size_t host = 0;
     size_t peak = 0;
-    // expert_base is null: without expert parallelism every local expert 0 is global expert 0
-    plan(buft, layers.data(), nullptr, n_experts.data(), blobs.data(), types.data(), ne0s.data(), specs.size(),
-        slot_budget, &slot, &host, &peak, nullptr);
+
+
+
+
+    plan(buft, layers.data(), nullptr, n_experts.data(), blobs.data(), types.data(), ne0s.data(), nullptr,
+        /*n_expert_used=*/0, specs.size(), slot_budget, &slot, &host, &peak, nullptr, nullptr);
     record(buft, slot, host);
 }
 
-// the expert store must place part of the experts in VRAM slots and the rest in the host
-// arena, and it must have room to stage the routed host experts during prefill. With
-// all_slot every expert is in a VRAM slot: no host arena, no staging area.
+
+
+
 static void check_expert_tiers(ggml_backend_reg_t reg, ggml_backend_buffer_type_t buft, bool all_slot) {
     GGML_ASSERT(buft != nullptr);
     auto get_alloc = (bool (*)(ggml_backend_buffer_type_t, size_t *, size_t *, size_t *))
@@ -6926,35 +7227,39 @@ static void check_expert_tiers(ggml_backend_reg_t reg, ggml_backend_buffer_type_
     }
 }
 
-// expert store: the experts of one tensor are split between VRAM slots and the
-// device-readable host arena, and the kernels read them through a device pointer table.
-// On Volta n covers every dispatch path: MMVQ mmid (1..16), the grouped kernel (17..64),
-// MMQ prefill (65..504, where the host experts are staged into VRAM first) and the large
-// batches (512) that take the expert-wise fallback. The weight tensor is marked explicitly,
-// its name does not match the llama pattern. The staging area covers the whole host
-// complement of the tensor, which is what fit sizes it for; all_slot is the other extreme:
-// every expert is in a VRAM slot, so the tensor has no host complement and no staging.
+
+
+
+
+
+
+
+
 struct test_mul_mat_id_expert : public test_mul_mat_id {
     test_mul_mat_id_expert(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 32, int n_used = 4, int64_t m = 640, int64_t n = 8, int64_t k = 2560,
             bool all_slot = false, int n_host = -1, size_t stage_bytes_min = 0)
         : test_mul_mat_id(type_a, type_b, n_mats, n_used, false, m, n, k), all_slot(all_slot),
           n_host(n_host < 0 ? n_mats - 2 : n_host), stage_bytes_min(stage_bytes_min) {
-        // the parameter shadows the member: check the member, the parameter is -1 by default
+
         GGML_ASSERT(all_slot || this->n_host > 0);
     }
 
-    const bool all_slot;   // every expert in a VRAM slot: no host complement, no staging
-    // how many experts go to the host arena. The staging area is sized for exactly that many, so
-    // a small value puts only a few experts in the staging area and every launch has to fill it
-    // again; the rest of the complement would not fit and the store refuses the budget.
+    const bool all_slot;
+
+
+
     const int n_host;
-    // lower bound of the staging budget in bytes (0 = exactly the host complement). A staging
-    // area far larger than the complement makes its clearing at the first launch take long, which
-    // is what test_mul_mat_id_expert_first_launch needs.
+
+
+
     const size_t stage_bytes_min;
 
-    ggml_tensor * expert_weight = nullptr; // the weight tensor, marked in weight_buffer_type()
+
+
+    bool spare_slots = false;
+
+    ggml_tensor * expert_weight = nullptr;
     ggml_backend_buffer_type_t expert_buft = nullptr;
 
     std::string vars() override {
@@ -6985,31 +7290,51 @@ struct test_mul_mat_id_expert : public test_mul_mat_id {
         for (ggml_backend_buffer_type_t * extra = get_extra(dev); extra && *extra; ++extra) {
             const std::string name = ggml_backend_buft_name(*extra);
             if (name.size() >= 8 && name.compare(name.size() - 8, 8, "_Experts") == 0) {
-                // keep two experts in the VRAM slots so both tiers are exercised. The staging
-                // area covers the whole host complement of the tensor, like fit sizes it; a
-                // smaller one is refused by the store. The budgets use the expert pitch of
-                // the store (data + row padding, 256-aligned). The all-slot mode gives the
-                // slot budget room for every expert and no staging.
+
+
+
+
+
+
+
                 const size_t blob_bytes   = expert_store_stride(type_a, k, m);
                 const size_t expert_bytes = blob_bytes * (size_t) n_mats;
-                const size_t slot_bytes   = all_slot ? expert_bytes : (size_t) (n_mats - n_host) * blob_bytes;
-                // a staging area above the complement (stage_bytes_min) takes what the device can
-                // spare: at most half of its free memory, so the case runs on smaller devices too
+                size_t       slot_bytes   = all_slot ? expert_bytes : (size_t) (n_mats - n_host) * blob_bytes;
+
+
+
+                ggml_expert_store_set_adaptive_min_host_per_pool(spare_slots && !all_slot ? 1 : 0);
+                if (spare_slots && !all_slot) {
+
+                    auto spare = (int64_t (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_spare_slots");
+                    const int64_t n_spare = spare != nullptr ? spare() : 0;
+
+
+
+
+                    if (n_spare > 0 && (int64_t) n_host < 2 * n_spare) {
+                        GGML_ABORT("test setup: %d host experts are fewer than twice the %" PRId64 " spare slots of the pool, "
+                            "the plan would carve no spare slots; raise n_mats", n_host, n_spare);
+                    }
+                    slot_bytes += (size_t) n_spare * blob_bytes;
+                }
+
+
                 size_t stage_min = stage_bytes_min;
                 if (stage_min > 0) {
                     size_t free_mem = 0, total_mem = 0;
                     ggml_backend_dev_memory(dev, &free_mem, &total_mem);
                     stage_min = std::min(stage_min, free_mem / 2);
                 }
-                const size_t stage_bytes  = all_slot ? 0 : std::max((size_t) n_host * blob_bytes, stage_min);
+                const size_t stage_bytes  = all_slot ? 0 : std::max((size_t) (n_host + 1) * blob_bytes, stage_min);
                 auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
                 if (set_budget != nullptr) {
                     set_budget(*extra, slot_bytes, stage_bytes);
                 }
-                // record the plan of this budget, so the allocation must reproduce it exactly
+
                 record_expert_plan(reg, *extra, {{ 0, n_mats, (size_t) ggml_row_size(type_a, k) * (size_t) m, (int) type_a, k }}, slot_bytes);
-                // explicit mark; the name of the tensor does not match the llama pattern
+
                 mark_expert_tensor(reg, *extra, expert_weight);
                 expert_buft = *extra;
                 return *extra;
@@ -7044,16 +7369,16 @@ struct test_mul_mat_id_expert : public test_mul_mat_id {
     }
 };
 
-// Two mul_mat_id on the same expert tensor in one graph, with different routing: the staging
-// pointer table and the staging slots of the second launch are written while the first launch
-// already consumed them, so the first result is wrong if a launch reads the table or the slots
-// of another one. The two ids are drawn independently, so the two launches route to different
-// host experts and reuse the same slots. Both results are compared against the reference, the
-// sum only makes the second one part of the graph the framework computes.
+
+
+
+
+
+
 struct test_mul_mat_id_expert_two_ids : public test_mul_mat_id_expert {
     test_mul_mat_id_expert_two_ids(ggml_type type_a, ggml_type type_b, int n_mats, int n_used,
             int64_t m, int64_t n, int64_t k, int n_host)
-        : test_mul_mat_id_expert(type_a, type_b, n_mats, n_used, m, n, k, /*all_slot=*/false, n_host) {}
+        : test_mul_mat_id_expert(type_a, type_b, n_mats, n_used, m, n, k, false, n_host) {}
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -7091,24 +7416,160 @@ struct test_mul_mat_id_expert_two_ids : public test_mul_mat_id_expert {
     }
 };
 
-// The first launch of a (buffer, stream) creates the staging state of the stream
-// (ggml_backend_cuda_expert_buffer_context::get_stream): the staging area, the plan buffers and the
-// pointer tables are allocated and cleared, and the first routing/plan/copy kernels follow right
-// after. The clearing has to be ordered before those kernels on the stream: a clear that runs
-// unordered (on the legacy default stream) lands while the staging area is being cleared and the
-// plan kernel has already counted the routed host experts, zeroes the count, and the copy kernel
-// copies nothing - the consumer then reads zeroed staging slots and the rows of every routed host
-// expert come out as zero. The staging budget is set far above the host complement (stage_bytes_min)
-// so that its clearing takes milliseconds, longer than the host needs to issue the kernels; with an
-// unordered clear this fails on every launch instead of once in a few hundred. After the reference
-// compare the case releases the stream state through the backend proc and computes again, n_relaunch
-// times, so every compute goes through the first-launch path again.
+
+
+
+
+
+
+
+
+
+
+
+static bool check_stage_hits(ggml_backend_t backend, ggml_backend_buffer_type_t expert_buft,
+        int n_mats, int n_host, ggml_tensor * out_node) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    auto hits = (bool (*)(ggml_backend_buffer_type_t, size_t *))
+        ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_last_stage_hits");
+    GGML_ASSERT(hits != nullptr);
+    size_t n_hit = 0;
+    if (!hits(expert_buft, &n_hit)) {
+        printf("no staging launch recorded ");
+        return false;
+    }
+
+    const ggml_tensor * ids = out_node->src[2];
+    const int64_t stride = ids->nb[1] / sizeof(int32_t);
+    std::vector<int32_t> data((size_t) ((ids->ne[1] - 1) * stride + ids->ne[0]));
+    ggml_backend_tensor_get(ids, data.data(), 0, data.size() * sizeof(int32_t));
+    std::vector<bool> routed((size_t) n_mats, false);
+    for (int64_t t = 0; t < ids->ne[1]; ++t) {
+        for (int64_t s = 0; s < ids->ne[0]; ++s) {
+            routed[(size_t) data[(size_t) (t * stride + s)]] = true;
+        }
+    }
+    size_t expected = 0;
+    for (int e = n_mats - n_host; e < n_mats; ++e) {
+        expected += routed[(size_t) e];
+    }
+    if (n_hit != expected && n_hit != (size_t) n_host) {
+        printf("staged %zu host experts, the launch routed to %zu, the tensor has %d ", n_hit, expected, n_host);
+        return false;
+    }
+    return true;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+struct test_mul_mat_id_expert_split : public test_mul_mat_id_expert {
+    const int n_re;
+
+    test_mul_mat_id_expert_split(ggml_type type_a, ggml_type type_b, int n_mats, int n_used,
+            int64_t m, int64_t n, int64_t k, int n_host, int n_re)
+        : test_mul_mat_id_expert(type_a, type_b, n_mats, n_used, m, n, k, false, n_host),
+          n_re(n_re) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_SPLIT";
+    }
+
+    std::string vars() override {
+        return test_mul_mat_id_expert::vars() + " split relaunch=" + std::to_string(n_re);
+    }
+
+    int n_relaunch() override { return n_re; }
+
+    bool relaunch_check(ggml_backend_t backend) override {
+        return check_stage_hits(backend, expert_buft, n_mats, n_host, out_node);
+    }
+};
+
+
+
+
+
+
+
+
+struct test_mul_mat_id_expert_mixed : public test_mul_mat_id_expert {
+    static constexpr int64_t n_decode = 4;
+
+    test_mul_mat_id_expert_mixed(ggml_type type_a, ggml_type type_b, int n_mats, int n_used,
+            int64_t m, int64_t n, int64_t k, int n_host)
+        : test_mul_mat_id_expert(type_a, type_b, n_mats, n_used, m, n, k, false, n_host) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_MIXED";
+    }
+
+    std::string vars() override {
+        return test_mul_mat_id_expert::vars() + " mixed";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(as, "blk.0.ffn_gate_expert.weight");
+        expert_weight = as;
+
+        ggml_tensor * out = nullptr;
+        for (int i = 0; i < 3; ++i) {
+
+
+            const int64_t ni = i == 1 ? n_decode : n;
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, ni);
+            ggml_set_name(ids, i == 0 ? "ids0" : (i == 1 ? "ids1" : "ids2"));
+            if (n_used != n_mats) {
+                ids = ggml_view_2d(ctx, ids, n_used, ni, ids->nb[1], 0);
+                ggml_set_name(ids, i == 0 ? "view_of_ids0" : (i == 1 ? "view_of_ids1" : "view_of_ids2"));
+            }
+            ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, ni);
+            ggml_set_name(b, i == 0 ? "b0" : (i == 1 ? "b1" : "b2"));
+            ggml_tensor * o = ggml_mul_mat_id(ctx, as, b, ids);
+            ggml_set_name(o, i == 0 ? "out0" : (i == 1 ? "out1" : "out2"));
+            out = out == nullptr ? o : ggml_concat(ctx, out, o, 2);
+        }
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
 struct test_mul_mat_id_expert_first_launch : public test_mul_mat_id_expert {
     const int n_re;
 
     test_mul_mat_id_expert_first_launch(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k,
             int n_re, size_t stage_bytes_min)
-        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, n_mats, n_used, m, n, k, /*all_slot=*/false, /*n_host=*/-1, stage_bytes_min),
+        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, n_mats, n_used, m, n, k, false, -1, stage_bytes_min),
           n_re(n_re) {}
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7130,53 +7591,26 @@ struct test_mul_mat_id_expert_first_launch : public test_mul_mat_id_expert {
         reset(expert_buft);
     }
 
-    // The plan of the launch must have staged every routed host expert. A clear of the plan
-    // counters or of the routing bitmap that lands after the routing kernel leaves the count short:
-    // the launch then either reads the host arena in place (correct output, no staging) or reads
-    // slots that were never filled (wrong output). The output compare catches only the second, this
-    // catches both. Without a routing profile the store puts experts 0 .. n_slot-1 into the slots
-    // (ggml_expert_store_plan sorts the slot experts), so the host experts are the ids >= n_mats - n_host.
-    bool relaunch_check(ggml_backend_t backend) override {
-        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
-        auto hits = (bool (*)(ggml_backend_buffer_type_t, size_t *))
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_last_stage_hits");
-        GGML_ASSERT(hits != nullptr);
-        size_t n_hit = 0;
-        if (!hits(expert_buft, &n_hit)) {
-            printf("no staging launch recorded ");
-            return false;
-        }
 
-        const ggml_tensor * ids = out_node->src[2];
-        const int64_t stride = ids->nb[1] / sizeof(int32_t);
-        std::vector<int32_t> data((size_t) ((ids->ne[1] - 1) * stride + ids->ne[0]));
-        ggml_backend_tensor_get(ids, data.data(), 0, data.size() * sizeof(int32_t));
-        std::vector<bool> routed((size_t) n_mats, false);
-        for (int64_t t = 0; t < ids->ne[1]; ++t) {
-            for (int64_t s = 0; s < ids->ne[0]; ++s) {
-                routed[(size_t) data[(size_t) (t * stride + s)]] = true;
-            }
-        }
-        size_t expected = 0;
-        for (int e = n_mats - n_host; e < n_mats; ++e) {
-            expected += routed[(size_t) e];
-        }
-        if (n_hit != expected) {
-            printf("staged %zu host experts, the launch routed to %zu ", n_hit, expected);
-            return false;
-        }
-        return true;
+
+
+
+
+
+
+    bool relaunch_check(ggml_backend_t backend) override {
+        return check_stage_hits(backend, expert_buft, n_mats, n_host, out_node);
     }
 };
 
-// Expert store with K not a multiple of MATRIX_ROW_PADDING: every expert needs trailing row
-// padding. The all-slot store puts the LAST expert right at the end of the slot allocation,
-// so a read past data + padding leaves the allocation (compute-sanitizer reports it). The
-// allocation check here is deterministic: the reported slot bytes must cover data + padding
-// for every expert, the span the MMQ loaders may read.
+
+
+
+
+
 struct test_mul_mat_id_expert_pad : public test_mul_mat_id_expert {
     test_mul_mat_id_expert_pad(ggml_type type_a, int n_mats, int64_t m, int64_t n, int64_t k)
-        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, n_mats, 4, m, n, k, /*all_slot=*/true) {
+        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, n_mats, 4, m, n, k, true) {
         GGML_ASSERT(ggml_is_quantized(type_a));
         GGML_ASSERT(k % 512 != 0);
     }
@@ -7198,15 +7632,15 @@ struct test_mul_mat_id_expert_pad : public test_mul_mat_id_expert {
     }
 };
 
-// A view of a fully resident expert store tensor: the view starts at expert n_skip, so the
-// kernels must reach the experts through the store base of the view (slot array base +
-// n_skip * expert pitch). The store pitch is larger than the tensor's own expert stride when
-// the weights need trailing row padding (k not a multiple of MATRIX_ROW_PADDING), so a kernel
-// that used the view's data pointer instead of the store pitch would read the wrong experts.
-// The ids stay inside the view so the CPU reference reads the same experts.
+
+
+
+
+
+
 struct test_mul_mat_id_expert_view : public test_mul_mat_id_expert {
     test_mul_mat_id_expert_view(ggml_type type_a, int n_mats, int n_used, int64_t m, int64_t n, int64_t k, int n_skip)
-        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, n_mats, n_used, m, n, k, /*all_slot=*/true), n_skip(n_skip) {
+        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, n_mats, n_used, m, n, k, true), n_skip(n_skip) {
         GGML_ASSERT(n_skip > 0 && n_skip < n_mats);
     }
 
@@ -7237,8 +7671,8 @@ struct test_mul_mat_id_expert_view : public test_mul_mat_id_expert {
         return out;
     }
 
-    // ids of the view range only, deterministic so that both graphs read the same rows
-    // ids are view-local expert numbers covering every expert of the view, as ggml requires
+
+
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type != GGML_TYPE_I32) {
@@ -7257,11 +7691,391 @@ struct test_mul_mat_id_expert_view : public test_mul_mat_id_expert {
     }
 };
 
-// MUL_MAT_ID with the expert weights in the plain device buffer, as model loading allocates
-// them. The skinny prepass scans such buffers and repacks eligible Q8_0/Q4_K weights in place,
-// so this verifies that the 3D expert tensors pass the repack admission untouched (the
-// MUL_MAT_ID kernels read the original layout) and still match the CPU. Regression guard for
-// reading a repacked tensor with the original layout, which yields garbage or NaN.
+
+
+
+struct expert_adaptive_window_scope {
+    explicit expert_adaptive_window_scope(int64_t window) {
+        ggml_expert_store_set_adaptive_window(window);
+    }
+    ~expert_adaptive_window_scope() {
+        ggml_expert_store_set_adaptive_window(0);
+    }
+};
+
+static const int64_t expert_adaptive_no_round = (int64_t) 1 << 40;
+
+
+
+
+static const int expert_adaptive_n_mats = 96;
+
+
+
+static int64_t expert_spare_slots(ggml_backend_t backend) {
+    auto spare = (int64_t (*)(void)) ggml_backend_reg_get_proc_address(
+        ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), "ggml_backend_cuda_expert_spare_slots");
+    return spare != nullptr ? spare() : 0;
+}
+
+
+
+
+
+
+
+
+
+
+struct test_mul_mat_id_expert_swap : public test_mul_mat_id_expert {
+    test_mul_mat_id_expert_swap(ggml_type type_a = GGML_TYPE_Q4_K, int n_mats = expert_adaptive_n_mats, int n_used = 4,
+            int64_t m = 640, int64_t n = 8, int64_t k = 2560, int n_pairs = 8)
+        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, n_mats, n_used, m, n, k, false,
+              n_mats - n_pairs),
+          n_pairs(n_pairs) {
+
+        spare_slots = true;
+    }
+
+    const int n_pairs;
+
+    ggml_tensor * out_node = nullptr;
+
+    std::string vars() override {
+        return test_mul_mat_id_expert::vars() + " n_pairs=" + std::to_string(n_pairs);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        out_node = test_mul_mat_id_expert::build_graph(ctx, ctx_weights);
+        return out_node;
+    }
+
+    bool before_compare(ggml_backend_t backend1, ggml_backend_t backend2) override {
+        GGML_UNUSED(backend2);
+
+        if (expert_spare_slots(backend1) == 0) {
+            printf("the adaptive expert placement is off in this build, nothing to exchange\n");
+            return true;
+        }
+
+        using swap_test_t = int (*)(ggml_tensor *, const int32_t *, int, int32_t *);
+        auto swap_test = (swap_test_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(backend1)), "ggml_backend_cuda_expert_swap_test");
+        if (swap_test == nullptr) {
+            printf("the backend has no expert exchange entry\n");
+            return false;
+        }
+
+
+        const expert_adaptive_window_scope window(expert_adaptive_no_round);
+
+        const std::vector<float> ref = run_and_read(backend1);
+        if (ref.empty()) {
+            return false;
+        }
+
+        std::vector<int32_t> pairs((size_t) 2 * n_pairs);
+        const int n = swap_test(expert_weight, nullptr, n_pairs, pairs.data());
+        if (n <= 0) {
+            printf("the expert exchange of %d pairs failed\n", n_pairs);
+            return false;
+        }
+
+        const std::vector<float> after = run_and_read(backend1);
+        if (after != ref) {
+            printf("the result changed over %d exchanged pairs: ", n);
+            report_first_diff(ref, after);
+            return false;
+        }
+
+
+
+        std::vector<int32_t> back((size_t) 2 * n);
+        for (int i = 0; i < n; i++) {
+            back[(size_t) (2*i)]     = pairs[(size_t) (2*i + 1)];
+            back[(size_t) (2*i + 1)] = pairs[(size_t) (2*i)];
+        }
+        if (swap_test(expert_weight, back.data(), n, nullptr) <= 0) {
+            printf("the exchange of the same %d pairs back failed\n", n);
+            return false;
+        }
+
+        const std::vector<float> back_result = run_and_read(backend1);
+        if (back_result != ref) {
+            printf("the result did not return to its original value: ");
+            report_first_diff(ref, back_result);
+            return false;
+        }
+        return true;
+    }
+
+    std::vector<float> run_and_read(ggml_backend_t backend) {
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS || out_node == nullptr) {
+            printf("graph compute failed\n");
+            return {};
+        }
+        return tensor_to_float(out_node);
+    }
+
+    void report_first_diff(const std::vector<float> & a, const std::vector<float> & b) {
+        size_t bad = 0;
+        for (size_t i = 0; i < a.size() && i < b.size(); i++) {
+            if (a[i] != b[i]) {
+                bad++;
+            }
+        }
+        printf("%zu of %zu values differ\n", bad, a.size());
+    }
+};
+
+
+
+
+
+
+
+struct test_mul_mat_id_expert_counts : public test_mul_mat_id_expert {
+    test_mul_mat_id_expert_counts(ggml_type type_a = GGML_TYPE_Q4_K, int64_t n = 8)
+        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, expert_adaptive_n_mats, 4, 640, n, 2560, false) {
+
+        spare_slots = true;
+    }
+
+    ggml_tensor * ids_node = nullptr;
+
+    std::string vars() override {
+        return test_mul_mat_id_expert::vars() + " counts";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ids_node = nullptr;
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(as, "blk.0.ffn_gate_expert.weight");
+        expert_weight = as;
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+        ids_node = ids;
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    bool before_compare(ggml_backend_t backend1, ggml_backend_t backend2) override {
+        GGML_UNUSED(backend2);
+
+        if (expert_spare_slots(backend1) == 0) {
+            printf("the adaptive expert placement is off in this build, nothing counts the decode routes\n");
+            return true;
+        }
+
+        using counts_read_t = int (*)(ggml_backend_t, const ggml_tensor *, uint32_t *, bool);
+        auto counts_read = (counts_read_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(backend1)), "ggml_backend_cuda_expert_counts_read");
+        if (counts_read == nullptr) {
+            printf("the backend has no expert routing count entry\n");
+            return false;
+        }
+
+
+        const expert_adaptive_window_scope window(expert_adaptive_no_round);
+
+
+        std::vector<uint32_t> counts((size_t) n_mats, 0);
+        if (counts_read(backend1, expert_weight, counts.data(), true) != n_mats) {
+            printf("could not reset the routing counts of the expert weight\n");
+            return false;
+        }
+
+        const int n_launches = 2;
+        for (int i = 0; i < n_launches; i++) {
+            if (ggml_backend_graph_compute(backend1, gf) != GGML_STATUS_SUCCESS) {
+                printf("graph compute failed\n");
+                return false;
+            }
+        }
+
+        if (counts_read(backend1, expert_weight, counts.data(), false) != n_mats) {
+            printf("could not read the routing counts of the expert weight\n");
+            return false;
+        }
+
+
+
+
+
+        const bool decode = n <= 8;
+        std::vector<int32_t>  row((size_t) ids_node->ne[0]);
+        std::vector<uint32_t> expect((size_t) n_mats, 0);
+        for (int64_t t = 0; decode && t < ids_node->ne[1]; t++) {
+            ggml_backend_tensor_get(ids_node, row.data(),
+                (size_t) t * (size_t) ids_node->nb[1], row.size() * sizeof(int32_t));
+            for (int32_t e : row) {
+                GGML_ASSERT(e >= 0 && e < n_mats);
+                expect[(size_t) e] += n_launches;
+            }
+        }
+
+        for (int e = 0; e < n_mats; e++) {
+            if (counts[(size_t) e] != expect[(size_t) e]) {
+                printf("expert %d was routed %u times, the ids ask for %u\n", e, counts[(size_t) e], expect[(size_t) e]);
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+
+
+
+
+
+
+struct test_mul_mat_id_expert_adaptive : public test_mul_mat_id_expert {
+    test_mul_mat_id_expert_adaptive(ggml_type type_a = GGML_TYPE_Q4_K, int n_mats = expert_adaptive_n_mats, int n_used = 4,
+            int64_t m = 640, int64_t n = 8, int64_t k = 2560)
+        : test_mul_mat_id_expert(type_a, GGML_TYPE_F32, n_mats, n_used, m, n, k, false) {
+
+        spare_slots = true;
+    }
+
+    const int32_t hot_expert = 20;
+
+    ggml_tensor * ids_node = nullptr;
+
+    std::string vars() override {
+        return test_mul_mat_id_expert::vars() + " adaptive";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
+        ggml_set_name(as, "blk.0.ffn_gate_expert.weight");
+        expert_weight = as;
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_set_name(ids, "ids");
+        if (n_used != n_mats) {
+            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ggml_set_name(ids, "view_of_ids");
+        }
+        ids_node = ids;
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, n_used, n);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * out = ggml_mul_mat_id(ctx, as, b, ids);
+        ggml_set_name(out, "out");
+
+        out_node = out;
+
+        return out;
+    }
+
+    bool before_compare(ggml_backend_t backend1, ggml_backend_t backend2) override {
+        GGML_UNUSED(backend2);
+
+        if (expert_spare_slots(backend1) == 0) {
+            printf("the adaptive expert placement is off in this build, nothing to move\n");
+            return true;
+        }
+
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend1));
+        using residency_t = int (*)(ggml_tensor *, int32_t *);
+        auto residency = (residency_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_residency");
+        if (residency == nullptr) {
+            printf("the backend has no expert placement entry\n");
+            return false;
+        }
+
+
+
+
+        const int64_t n_tokens = ids_node->ne[1];
+        std::vector<int32_t> row((size_t) ids_node->ne[0]);
+        for (int64_t t = 0; t < n_tokens; t++) {
+
+            for (size_t i = 0; i < row.size(); i++) {
+                row[i] = hot_expert;
+            }
+            ggml_backend_tensor_set(ids_node, row.data(),
+                (size_t) t * (size_t) ids_node->nb[1], row.size() * sizeof(int32_t));
+        }
+
+        std::vector<int32_t> res((size_t) n_mats, -2);
+        if (residency(expert_weight, res.data()) != n_mats || res[(size_t) hot_expert] >= 0) {
+            printf("expert %d is not in the host arena before the rounds\n", hot_expert);
+            return false;
+        }
+
+
+        const expert_adaptive_window_scope window(1);
+        const std::vector<float> before = run_and_read(backend1);
+        if (before.empty()) {
+            return false;
+        }
+
+
+
+
+        int left = -1;
+        for (int i = 0; i < 200 && left != 0; i++) {
+            const std::vector<float> after = run_and_read(backend1);
+            if (after != before) {
+                size_t bad = 0;
+                for (size_t j = 0; j < before.size() && j < after.size(); j++) {
+                    bad += before[j] != after[j];
+                }
+                printf("graph %d: %zu of %zu values differ over the exchange\n", i, bad, before.size());
+                return false;
+            }
+            if (residency(expert_weight, res.data()) != n_mats) {
+                printf("could not read the placement of the expert weight\n");
+                return false;
+            }
+            if (left < 0 && res[(size_t) hot_expert] >= 0) {
+                left = 3;
+            }
+            if (left > 0) {
+                left--;
+            }
+            if (left < 0) {
+
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+        if (left != 0) {
+            printf("the routed expert %d is still in the host arena after the rounds\n", hot_expert);
+            return false;
+        }
+        return true;
+    }
+
+    ggml_tensor * out_node = nullptr;
+
+    std::vector<float> run_and_read(ggml_backend_t backend) {
+        if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS || out_node == nullptr) {
+            printf("graph compute failed\n");
+            return {};
+        }
+        return tensor_to_float(out_node);
+    }
+};
+
+
+
+
+
+
 struct test_mul_mat_id_wctx : public test_mul_mat_id {
     test_mul_mat_id_wctx(ggml_type type_a = GGML_TYPE_Q8_0, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 512, int n_used = 1, int64_t m = 640, int64_t n = 1, int64_t k = 2560)
@@ -7275,11 +8089,11 @@ struct test_mul_mat_id_wctx : public test_mul_mat_id {
     }
 };
 
-// GLM-style shared expert next to a routed MUL_MAT_ID MoE: the routed gate/up pair plus GLU is
-// fused with the shared expert gate/up pair plus GLU into one mul_mat_vec_q launch. The shared
-// weights are 2D and meet the Q8_0 repack admission, so the prepass repacks them before the
-// fusion decision; the fused kernel reads the original layout, so a repacked shared weight must
-// disqualify the fusion instead of being read as garbage.
+
+
+
+
+
 struct test_mul_mat_id_shared_expert : public test_case {
     const ggml_type type_w;
     const int n_mats;
@@ -7319,9 +8133,9 @@ struct test_mul_mat_id_shared_expert : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
-        // node order matters: [MUL_MAT_ID, MUL_MAT_ID, GLU, MUL_MAT, MUL_MAT, GLU] is the
-        // pattern match_shared_expert() looks for, the shared MUL_MAT pair must sit at
-        // routed_idx + 3
+
+
+
         ggml_tensor * gate_exps  = ggml_new_tensor_3d(ctx_weights, type_w, k, m, n_mats);
         ggml_set_name(gate_exps, "gate_exps");
         ggml_tensor * up_exps    = ggml_new_tensor_3d(ctx_weights, type_w, k, m, n_mats);
@@ -7358,7 +8172,7 @@ struct test_mul_mat_id_shared_expert : public test_case {
         ggml_tensor * glu_s = ggml_swiglu_split(ctx, gate_s, up_s);
         ggml_set_name(glu_s, "ffn_shexp_swiglu");
 
-        // keep both GLU nodes alive in one output: the fused kernel writes them directly
+
         ggml_tensor * out = ggml_concat(ctx, ggml_reshape_2d(ctx, glu_r, m, n_used * n), glu_s, 1);
         ggml_set_name(out, "out");
         return out;
@@ -7369,9 +8183,9 @@ struct test_mul_mat_id_shared_expert : public test_case {
     }
 };
 
-// expert parallelism: the same weights are split along the expert dim and each part is
-// computed with its own expert_offset. The per-shard outputs cover disjoint slots (the other
-// devices' slots are zero) and their sum must equal the full computation.
+
+
+
 struct test_mul_mat_id_ep : public test_case {
     const ggml_type type_a;
     const ggml_type type_b;
@@ -7381,15 +8195,15 @@ struct test_mul_mat_id_ep : public test_case {
     const int64_t m;
     const int64_t n;
     const int64_t k;
-    const bool broadcast_b; // gate/up activations are broadcast across the experts
-    const bool check_full;  // output the difference against the full mul_mat_id
-    ggml_tensor * out_diff = nullptr; // the SUB node of the shard sum and the full result
+    const bool broadcast_b;
+    const bool check_full;
+    ggml_tensor * out_diff = nullptr;
 
     std::string vars() override {
         return VARS_TO_STR10(type_a, type_b, n_mats, n_used, n_shards, m, n, k, broadcast_b, check_full);
     }
 
-    // the full comparison is an absolute check: both sides are zero when correct
+
     double err(const float * a, const float * b, size_t n) override {
         if (!check_full) {
             return test_case::err(a, b, n);
@@ -7401,10 +8215,10 @@ struct test_mul_mat_id_ep : public test_case {
         return result;
     }
 
-    // With check_full only the SUB node is compared: it must be exactly zero on every backend,
-    // which is what "the shards sum to the full result" means. Comparing every intermediate node
-    // with the absolute tolerance of err() would instead flag the normal difference between the
-    // CPU Q8_K and the CUDA Q8_1 activation quantization, which reaches a few 0.1 at K = 2560.
+
+
+
+
     bool run_whole_graph() override { return check_full; }
     std::vector<ggml_tensor *> fusion_test_nodes() override {
         return check_full ? std::vector<ggml_tensor *>{ out_diff } : std::vector<ggml_tensor *>{};
@@ -7419,9 +8233,9 @@ struct test_mul_mat_id_ep : public test_case {
     }
 
     double max_nmse_err() override {
-        // the per-node comparison of the shard outputs against the CPU reference needs the
-        // same tolerance as the plain MUL_MAT_ID cases: Q4_K/Q8_0 weights against the CPU
-        // reference reach a few 1e-5 nMSE with the Q8_1 activation quantization
+
+
+
         return 5e-4;
     }
 
@@ -7430,7 +8244,7 @@ struct test_mul_mat_id_ep : public test_case {
         return 2 * m * k * n * n_used;
     }
 
-    // the output node is the SUB of the shard sum and the full result, filter with -o MUL_MAT_ID_EP
+
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_EP";
@@ -7453,11 +8267,11 @@ struct test_mul_mat_id_ep : public test_case {
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
         ggml_set_name(ids, "ids");
 
-        // gate/up broadcasts one activation row per token, down has one row per (token, slot)
+
         ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, broadcast_b ? 1 : n_used, n);
         ggml_set_name(b, "b");
 
-        // uneven contiguous slices along the expert dim, as the real per-device split gives
+
         ggml_tensor * out = nullptr;
         for (int s = 0; s < n_shards; ++s) {
             const int64_t start = (int64_t) n_mats * s / n_shards;
@@ -7476,7 +8290,7 @@ struct test_mul_mat_id_ep : public test_case {
         ggml_set_name(out, "out");
 
         if (check_full) {
-            // the full computation in the same graph; the difference must be zero on both backends
+
             ggml_tensor * full = ggml_mul_mat_id(ctx, as, b, ids);
             ggml_set_name(full, "full");
             out = ggml_sub(ctx, out, full);
@@ -7487,9 +8301,9 @@ struct test_mul_mat_id_ep : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
-        // weights and activations uniformly, then ids spread over the whole expert range so
-        // that every shard (offset > 0 as well) actually gets matches. The n_used experts of
-        // a token are drawn without replacement, as in the top-k routing that MUL_MAT_ID models.
+
+
+
         init_mul_mat_id_tensors(ctx, n_mats, 1.0f);
 
         std::random_device rd;
@@ -7514,16 +8328,16 @@ struct test_mul_mat_id_ep : public test_case {
     }
 };
 
-// expert store with expert parallelism: every shard is its own expert tensor holding a
-// contiguous expert range, dispatched with its own expert_offset. The pointer table of a
-// shard is indexed by the local expert number (id - expert_offset).
+
+
+
 struct test_mul_mat_id_expert_ep : public test_mul_mat_id_ep {
     test_mul_mat_id_expert_ep(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_b = GGML_TYPE_F32,
             int n_mats = 48, int n_used = 4, int n_shards = 3,
             int64_t m = 640, int64_t n = 8, int64_t k = 2560, bool broadcast_b = true)
-        : test_mul_mat_id_ep(type_a, type_b, n_mats, n_used, n_shards, m, n, k, broadcast_b, /*check_full =*/ false) {}
+        : test_mul_mat_id_ep(type_a, type_b, n_mats, n_used, n_shards, m, n, k, broadcast_b, false) {}
 
-    std::vector<ggml_tensor *> expert_weights; // the shard tensors, marked in weight_buffer_type()
+    std::vector<ggml_tensor *> expert_weights;
     ggml_backend_buffer_type_t expert_buft = nullptr;
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7548,18 +8362,19 @@ struct test_mul_mat_id_expert_ep : public test_mul_mat_id_ep {
         for (ggml_backend_buffer_type_t * extra = get_extra(dev); extra && *extra; ++extra) {
             const std::string name = ggml_backend_buft_name(*extra);
             if (name.size() >= 8 && name.compare(name.size() - 8, 8, "_Experts") == 0) {
-                // one slot per shard tensor, the rest of each shard goes to the host arena;
-                // the staging area covers the host complement of the largest shard, the
-                // budgets use the 256-byte expert pitch of the store
+
+
+
                 const int64_t shard_max  = (n_mats + n_shards - 1) / n_shards;
                 const size_t  blob_bytes = expert_store_stride(type_a, k, m);
+                ggml_expert_store_set_adaptive_min_host_per_pool(0);
                 auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
                 if (set_budget != nullptr) {
-                    set_budget(*extra, n_shards*blob_bytes, (size_t) (shard_max - 1)*blob_bytes);
+                    set_budget(*extra, n_shards*blob_bytes, (size_t) shard_max*blob_bytes);
                 }
-                // explicit mark of every shard tensor; the names mimic the llama tensors but
-                // play no part in the recognition
+
+
                 for (ggml_tensor * t : expert_weights) {
                     mark_expert_tensor(reg, *extra, t);
                 }
@@ -7571,7 +8386,7 @@ struct test_mul_mat_id_expert_ep : public test_mul_mat_id_ep {
     }
 
     void check_weight_alloc(ggml_backend_t backend) override {
-        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, /*all_slot=*/false);
+        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, false);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
@@ -7581,7 +8396,7 @@ struct test_mul_mat_id_expert_ep : public test_mul_mat_id_ep {
         ggml_tensor * b = ggml_new_tensor_3d(ctx, type_b, k, broadcast_b ? 1 : n_used, n);
         ggml_set_name(b, "b");
 
-        // uneven contiguous slices along the expert dim, one expert tensor per shard
+
         ggml_tensor * out = nullptr;
         for (int s = 0; s < n_shards; ++s) {
             const int64_t start = (int64_t) n_mats * s / n_shards;
@@ -7607,16 +8422,16 @@ struct test_mul_mat_id_expert_ep : public test_mul_mat_id_ep {
     }
 };
 
-// MoE FFN built from the expert store: gate and up are separate store tensors that share the
-// routing of one batch, the GLU joins them and down runs on the gated activation. This is the
-// layout of a real MoE block, so the three MUL_MAT_ID launches of a layer run one after another
-// on the same stream and reuse the one per-stream staging area: a slot, table or lifetime
-// mistake between the tensors has to show up as a mismatch against the CPU reference. The
-// n = 2048 batch reaches the batched MMQ path and stages the host experts of every tensor;
-// n = 16 reaches the fused MMVQ gate/up kernel instead, which reads the two main tables.
+
+
+
+
+
+
+
 struct test_mul_mat_id_expert_ffn : public test_case {
-    const ggml_type type_a;    // gate/up type
-    const ggml_type type_down; // down type: k = m = 640 is not a multiple of QK_K for the K-quants
+    const ggml_type type_a;
+    const ggml_type type_down;
     const int n_mats;
     const int n_used;
     const int64_t m;
@@ -7632,14 +8447,18 @@ struct test_mul_mat_id_expert_ffn : public test_case {
         return VARS_TO_STR7(type_a, type_down, n_mats, n_used, m, n, k);
     }
 
+
+
+    virtual int64_t n_batch() const { return n; }
+
     double max_nmse_err() override {
-        // two quantized projections in series (gate/up, then down)
+
         return 1e-3;
     }
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        // gate + up + down
+
         return 6 * m * k * n * n_used;
     }
 
@@ -7673,20 +8492,25 @@ struct test_mul_mat_id_expert_ffn : public test_case {
         for (ggml_backend_buffer_type_t * extra = get_extra(dev); extra && *extra; ++extra) {
             const std::string name = ggml_backend_buft_name(*extra);
             if (name.size() >= 8 && name.compare(name.size() - 8, 8, "_Experts") == 0) {
-                // three experts of every tensor in the VRAM slots, the complements in the host
-                // arena; the staging area covers the host complement of the largest tensor.
-                // The budgets use the expert pitch of the store (data + row padding, aligned).
+
+
+
+
                 const size_t blob_gate = expert_store_stride(type_a, k, m);
                 const size_t blob_down = expert_store_stride(type_down, m, k);
                 const size_t slot_bytes  = 3 * (2 * blob_gate + blob_down);
-                const size_t stage_bytes = std::max(blob_gate, blob_down) * (size_t) n_mats;
+                const size_t stage_bytes = expert_stage_budget({
+                    { "blk.0.ffn_gate_exps.weight", blob_gate * (size_t) n_mats },
+                    { "blk.0.ffn_up_exps.weight",   blob_gate * (size_t) n_mats },
+                    { "blk.0.ffn_down_exps.weight", blob_down * (size_t) n_mats } });
+                ggml_expert_store_set_adaptive_min_host_per_pool(0);
                 auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
                 if (set_budget != nullptr) {
                     set_budget(*extra, slot_bytes, stage_bytes);
                 }
-                // explicit mark of every weight tensor; the names mimic the llama tensors but
-                // play no part in the recognition
+
+
                 mark_expert_tensor(reg, *extra, gate_w);
                 mark_expert_tensor(reg, *extra, up_w);
                 mark_expert_tensor(reg, *extra, down_w);
@@ -7698,7 +8522,7 @@ struct test_mul_mat_id_expert_ffn : public test_case {
     }
 
     void check_weight_alloc(ggml_backend_t backend) override {
-        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, /*all_slot=*/false);
+        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, false);
     }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -7706,7 +8530,7 @@ struct test_mul_mat_id_expert_ffn : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
-        // gate/up: (k, m) x (k, 1, n) -> (m, n_used, n); down: (m, k) x (m, n_used, n) -> (k, n_used, n)
+
         gate_w = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
         ggml_set_name(gate_w, "blk.0.ffn_gate_exps.weight");
         up_w = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_mats);
@@ -7714,15 +8538,15 @@ struct test_mul_mat_id_expert_ffn : public test_case {
         down_w = ggml_new_tensor_3d(ctx_weights, type_down, m, k, n_mats);
         ggml_set_name(down_w, "blk.0.ffn_down_exps.weight");
 
-        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n_batch());
         ggml_set_name(ids, "ids");
         if (n_used != n_mats) {
-            ids = ggml_view_2d(ctx, ids, n_used, n, ids->nb[1], 0);
+            ids = ggml_view_2d(ctx, ids, n_used, n_batch(), ids->nb[1], 0);
             ggml_set_name(ids, "view_of_ids");
         }
 
-        // gate/up broadcast one activation row per token, like the real pre-FFN activation
-        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
+
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n_batch());
         ggml_set_name(b, "b");
 
         ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_w, b, ids);
@@ -7733,7 +8557,7 @@ struct test_mul_mat_id_expert_ffn : public test_case {
         ggml_tensor * gated = ggml_swiglu_split(ctx, gate, up);
         ggml_set_name(gated, "gated");
 
-        // the same ids drive the down projection of the gated activation
+
         ggml_tensor * out = ggml_mul_mat_id(ctx, down_w, gated, ids);
         ggml_set_name(out, "out");
 
@@ -7751,8 +8575,134 @@ struct test_mul_mat_id_expert_ffn : public test_case {
     bool run_whole_graph() override { return true; }
 };
 
-// index of the device of a backend in its registry: the CUDA registry lists its devices in CUDA
-// device order, which is the device number the expert store and the expert maps are keyed by
+
+
+
+
+
+
+
+
+
+
+
+struct test_mul_mat_id_expert_decode_odd : public test_mul_mat_id_expert_ffn {
+    test_mul_mat_id_expert_decode_odd(ggml_type type_a = GGML_TYPE_Q4_K, ggml_type type_down = GGML_TYPE_Q8_0,
+            int n_mats = 512, int n_used = 10, int64_t m = 640, int64_t n = 512, int64_t k = 2560)
+        : test_mul_mat_id_expert_ffn(type_a, type_down, n_mats, n_used, m, n, k) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_DECODE_ODD";
+    }
+
+    int64_t n_batch() const override { return 1; }
+};
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+struct test_mul_mat_id_expert_ffn_prefetch : public test_mul_mat_id_expert_ffn {
+    const int n_re;
+    size_t hits_before = 0;
+    size_t cold_before = 0;
+
+    test_mul_mat_id_expert_ffn_prefetch(ggml_type type_a, ggml_type type_down, int n_mats, int n_used,
+            int64_t m, int64_t n, int64_t k, int n_re)
+        : test_mul_mat_id_expert_ffn(type_a, type_down, n_mats, n_used, m, n, k), n_re(n_re) {}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_ID_EXPERT_FFN_PREFETCH";
+    }
+
+    std::string vars() override {
+        return test_mul_mat_id_expert_ffn::vars() + " relaunch=" + std::to_string(n_re) +
+            " prefetch_threshold=" + std::to_string(GGML_EXPERT_S3PRIME_MIN_TOKENS);
+    }
+
+    int n_relaunch() override { return n_re; }
+
+
+    bool prefetch_expected() const { return (int64_t) n >= (int64_t) GGML_EXPERT_S3PRIME_MIN_TOKENS; }
+
+    bool counters(ggml_backend_t backend, size_t * cold, size_t * hits) {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+        auto get = (bool (*)(ggml_backend_buffer_type_t, size_t *, size_t *))
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_stage_counters");
+        GGML_ASSERT(get != nullptr);
+        return get(expert_buft, cold, hits);
+    }
+
+    void relaunch_prepare(ggml_backend_t backend) override {
+        counters(backend, &cold_before, &hits_before);
+    }
+
+
+
+
+
+    bool hits_ok(ggml_backend_t backend) {
+        size_t cold = 0;
+        size_t hits = 0;
+        if (!counters(backend, &cold, &hits)) {
+            printf("no staging counters ");
+            return false;
+        }
+        if (hits_before == 0 && hits == 0 && cold > 0) {
+            return true;
+        }
+        if (hits < hits_before + 2) {
+            printf("prefetch hits %zu -> %zu (cold %zu), expected at least two more ", hits_before, hits, cold);
+            return false;
+        }
+        if (hits + cold <= hits_before + cold_before) {
+            printf("staging counters did not move (hits %zu cold %zu -> hits %zu cold %zu) ",
+                   hits_before, cold_before, hits, cold);
+            return false;
+        }
+        return true;
+    }
+
+
+
+
+
+    bool no_abort_ok(ggml_backend_t backend) {
+        size_t cold = 0;
+        size_t hits = 0;
+        if (!counters(backend, &cold, &hits)) {
+            printf("no staging counters ");
+            return false;
+        }
+        return true;
+    }
+
+    bool relaunch_check(ggml_backend_t backend) override {
+        if (prefetch_expected()) {
+            return hits_ok(backend);
+        }
+        return no_abort_ok(backend);
+    }
+
+};
+
+
+
 static int backend_device_index(ggml_backend_t backend) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     ggml_backend_reg_t reg = dev != nullptr ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -7767,45 +8717,45 @@ static int backend_device_index(ggml_backend_t backend) {
     return -1;
 }
 
-// Expert store under a permuted expert assignment. The loader of a model places the experts of a
-// device by its table, a snapshot of the LPT proposal computed from the routing profile (local
-// expert k of device d holds global expert global_of(d, layer, k), see
-// ggml_expert_store_compute_assignment), and activates the table; from then on every consumer of
-// the routing ids of a node of that model goes through the row of (device, layer) of the table
-// (ggml_expert_store_node_lut) instead of a contiguous range test. This test plays the loader: it
-// computes a proposal from an artificial profile, takes its table, activates it, writes the experts
-// of its device into the store tensors in that order and marks the MUL_MAT_ID nodes with the layer,
-// the device and the table like the meta backend does. The ids are global ids over all n_mats
-// experts, one store tensor per layer.
-//   check_naive == false: the permuted node against the CPU reference, which reads the same row;
-//   check_naive == true:  the difference between the permuted node and the naive computation on the
-//                         full unpermuted weight (the slots of the other devices zeroed by a mask),
-//                         which has to be zero on both backends - a table error that both backends
-//                         share shows up here, the plain comparison would not see it.
-// The device of the test is the device of the backend; devices without a row in the n_dev
-// assignment skip the test. after_eval() releases the table.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 struct test_mul_mat_id_expert_permute : public test_case {
     const ggml_type type_a;
-    const int n_mats;    // global experts
+    const int n_mats;
     const int n_used;
-    const int n_dev;     // devices of the assignment, n_mats is a multiple so every device holds n_local
-    const int n_layer;   // rows of the assignment used, one store tensor each
+    const int n_dev;
+    const int n_layer;
     const int64_t m;
     const int64_t n;
     const int64_t k;
     const bool all_slot;
     const bool check_naive;
 
-    const int n_local;   // experts of the device of the test
+    const int n_local;
 
-    int      dev   = -1; // device of the backend, set in weight_buffer_type()
-    uint32_t table = 0;  // the activated table of the permutation, 0 in perf mode
+    int      dev   = -1;
+    uint32_t table = 0;
 
-    std::vector<ggml_tensor *> as_perm; // per layer: the store tensor of the device, n_local experts in local order
-    std::vector<ggml_tensor *> as_full; // per layer: the full unpermuted weight the store tensor is cut from
-    std::vector<ggml_tensor *> ids_l;   // per layer: global ids
-    std::vector<ggml_tensor *> mask_l;  // per layer: 1 for a slot of a local expert, 0 otherwise (check_naive)
-    std::vector<ggml_tensor *> mm_perm; // per layer: the MUL_MAT_ID node of the store tensor
+    std::vector<ggml_tensor *> as_perm;
+    std::vector<ggml_tensor *> as_full;
+    std::vector<ggml_tensor *> ids_l;
+    std::vector<ggml_tensor *> mask_l;
+    std::vector<ggml_tensor *> mm_perm;
     ggml_tensor * out_diff = nullptr;
     ggml_backend_buffer_type_t expert_buft = nullptr;
 
@@ -7823,8 +8773,8 @@ struct test_mul_mat_id_expert_permute : public test_case {
         return 2 * m * k * n * n_used * n_layer;
     }
 
-    // the naive comparison is an absolute check: the difference has to be zero on both backends,
-    // so the error is the largest value either backend produced
+
+
     double err(const float * a, const float * b, size_t n) override {
         if (!check_naive) {
             return test_case::err(a, b, n);
@@ -7845,12 +8795,12 @@ struct test_mul_mat_id_expert_permute : public test_case {
     }
 
     double max_nmse_err() override {
-        // Q4_K/Q8_0 weights against the CPU reference with the Q8_1 activation quantization
+
         return 5e-4;
     }
 
-    // with check_naive only the difference node is compared, the intermediate nodes carry the normal
-    // CPU/CUDA activation quantization difference
+
+
     bool run_whole_graph() override { return check_naive; }
     std::vector<ggml_tensor *> fusion_test_nodes() override {
         return check_naive ? std::vector<ggml_tensor *>{ out_diff } : std::vector<ggml_tensor *>{};
@@ -7873,8 +8823,8 @@ struct test_mul_mat_id_expert_permute : public test_case {
         return build_graph(ctx, ctx);
     }
 
-    // the routing counts the assignment is computed from: pseudo-random per (layer, expert), so the
-    // LPT split scatters the experts of a device over the whole numbering
+
+
     static int64_t profile_count(int layer, int expert) {
         return (int64_t) ((expert * 7919 + layer * 104729 + 17) % 101) + 1;
     }
@@ -7892,7 +8842,7 @@ struct test_mul_mat_id_expert_permute : public test_case {
         }
         dev = backend_device_index(backend);
         if (dev < 0 || dev >= n_dev) {
-            // no row of the n_dev assignment belongs to this device
+
             return nullptr;
         }
         for (ggml_backend_buffer_type_t * extra = get_extra(bdev); extra && *extra; ++extra) {
@@ -7901,9 +8851,9 @@ struct test_mul_mat_id_expert_permute : public test_case {
                 continue;
             }
 
-            // the loader's part: the proposal from the profile, its table, activated. The plan of
-            // the store allocation recomputes the proposal without a profile afterwards, which leaves
-            // the table alone (a table never changes).
+
+
+
             ggml_expert_store_profile profile;
             profile.n_layer  = n_layer;
             profile.n_expert = n_mats;
@@ -7918,8 +8868,8 @@ struct test_mul_mat_id_expert_permute : public test_case {
             GGML_ASSERT(table != 0);
             ggml_expert_assignment_activate(table, nullptr, 0);
 
-            // the permutation must be a real one for the test to mean anything: the row of the
-            // device differs from its contiguous segment
+
+
             bool permuted = false;
             for (int l = 0; l < n_layer && !permuted; ++l) {
                 const int16_t * row = ggml_expert_assignment_local_of(table, dev, l);
@@ -7934,20 +8884,21 @@ struct test_mul_mat_id_expert_permute : public test_case {
             }
             GGML_ASSERT(permuted);
 
-            // the meta backend marks every per-device MUL_MAT_ID node with its device, the start of
-            // the segment of the device and the table of its weight; the layer was set at build
+
+
             for (ggml_tensor * mm : mm_perm) {
                 ggml_mul_mat_id_set_device(mm, dev);
                 ggml_mul_mat_id_set_expert_offset(mm, dev * n_local);
                 ggml_mul_mat_id_set_assignment(mm, (int32_t) table);
             }
 
-            // budgets: every expert in a slot, or two experts per tensor in the slots and the
-            // complement in the host arena with a staging area for the whole complement
+
+
             const size_t blob_bytes   = expert_store_stride(type_a, k, m);
             const size_t expert_bytes = blob_bytes * (size_t) n_local * (size_t) n_layer;
             const size_t slot_bytes   = all_slot ? expert_bytes : 2 * blob_bytes * (size_t) n_layer;
             const size_t stage_bytes  = all_slot ? 0 : blob_bytes * (size_t) n_local;
+            ggml_expert_store_set_adaptive_min_host_per_pool(0);
             auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
             if (set_budget != nullptr) {
@@ -7973,7 +8924,7 @@ struct test_mul_mat_id_expert_permute : public test_case {
     }
 
     ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
-        // gate/up broadcast one activation row per token
+
         ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
         ggml_set_name(b, "b");
 
@@ -7982,13 +8933,13 @@ struct test_mul_mat_id_expert_permute : public test_case {
         for (int l = 0; l < n_layer; ++l) {
             char name[64];
 
-            // the store tensor of the device: n_local experts, filled in local order by initialize_tensors
+
             snprintf(name, sizeof(name), "blk.%d.ffn_gate_exps.weight", l);
             ggml_tensor * as = ggml_new_tensor_3d(ctx_weights, type_a, k, m, n_local);
             ggml_set_name(as, name);
             as_perm.push_back(as);
 
-            // the full weight it is cut from, for the naive computation
+
             snprintf(name, sizeof(name), "as_full_%d", l);
             ggml_tensor * full = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
             ggml_set_name(full, name);
@@ -8003,7 +8954,7 @@ struct test_mul_mat_id_expert_permute : public test_case {
             ggml_mul_mat_id_set_expert_parallel(mm, true);
             ggml_mul_mat_id_set_n_expert_total(mm, n_mats);
             ggml_mul_mat_id_set_layer(mm, l);
-            // the device and the segment start follow in weight_buffer_type(), when the device is known
+
             snprintf(name, sizeof(name), "out_perm_%d", l);
             ggml_set_name(mm, name);
             mm_perm.push_back(mm);
@@ -8040,8 +8991,8 @@ struct test_mul_mat_id_expert_permute : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             const std::string name = t->name;
             if (name.compare(0, 4, "ids_") == 0) {
-                // the n_used experts of a token are drawn without replacement over all experts, like
-                // the top-k routing: every device, hence this one, gets matches and misses
+
+
                 std::vector<int32_t> data(n_mats);
                 for (int i = 0; i < n_mats; i++) {
                     data[i] = i;
@@ -8051,13 +9002,13 @@ struct test_mul_mat_id_expert_permute : public test_case {
                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
                 }
             } else if (name.compare(0, 5, "mask_") == 0 || name.compare(0, 4, "blk.") == 0) {
-                // filled below from the ids / the full weight
+
             } else {
                 init_tensor_uniform(t);
             }
         }
 
-        // the mask of a layer: 1 for the slots routed to an expert of this device
+
         for (size_t l = 0; l < mask_l.size(); ++l) {
             if (!in_context(ctx, mask_l[l])) {
                 continue;
@@ -8067,16 +9018,16 @@ struct test_mul_mat_id_expert_permute : public test_case {
             ggml_backend_tensor_get(ids_l[l], ids.data(), 0, ids.size() * sizeof(int32_t));
             std::vector<float> mask(ids.size());
             for (size_t i = 0; i < ids.size(); ++i) {
-                // without an activated assignment (perf mode) the node is the contiguous segment [0, n_local)
+
                 const bool local = row != nullptr ? row[ids[i]] >= 0 : ids[i] < n_local;
                 mask[i] = local ? 1.0f : 0.0f;
             }
             ggml_backend_tensor_set(mask_l[l], mask.data(), 0, mask.size() * sizeof(float));
         }
 
-        // the store tensor of a layer: local expert k is global expert global_of(dev, l, k) of the
-        // full weight, exactly what the loader writes under a permuted assignment. The compute
-        // context (the full weights) is initialized before the weight context, see test_case::eval.
+
+
+
         for (size_t l = 0; l < as_perm.size(); ++l) {
             if (!in_context(ctx, as_perm[l])) {
                 continue;
@@ -8086,7 +9037,7 @@ struct test_mul_mat_id_expert_permute : public test_case {
             std::vector<uint8_t> full(ggml_nbytes(as_full[l]));
             ggml_backend_tensor_get(as_full[l], full.data(), 0, full.size());
             for (int kk = 0; kk < n_local; ++kk) {
-                // perf mode has no activated assignment: the tensor is the contiguous segment then
+
                 const int g = table != 0 ? ggml_expert_assignment_global_of(table, dev, (int) l, kk) : kk;
                 GGML_ASSERT(g >= 0 && g < n_mats);
                 ggml_backend_tensor_set(as_perm[l], full.data() + (size_t) g * expert_bytes, (size_t) kk * expert_bytes, expert_bytes);
@@ -8108,25 +9059,25 @@ struct test_mul_mat_id_expert_permute : public test_case {
     }
 };
 
-// Two models on one device, each with its own expert assignment table, in one graph: the target's
-// experts are laid out by the permutation of its routing profile (table A, layer 0 only), the
-// draft's by its own table (table B, layers 0 and 1: a different permutation, or the contiguous split
-// of its slices). The draft has the layer number the target has (0) and one the target does not have
-// (1, like the MTP layer after the last layer of the target). Every MUL_MAT_ID node reads the table of
-// its own weight (op param assignment, which the meta backend writes from the binding of the weight):
-// the draft's node of layer 0 reads B and not A, the draft's node of layer 1 finds its row in B. A
-// node that read the other model's table would compute other experts than its weight holds, which
-// the naive variant catches; with one table for the process the draft's layer 1 had no row at all.
-// The target's weight is a store tensor; the draft's weights are store tensors too (b_in_store) or
-// plain device tensors of the same buffer, as the MTP draft keeps its experts (no_expert_store).
-//   check_naive == false: against the CPU reference, which reads the same rows;
-//   check_naive == true:  the difference to the naive computation on the full unpermuted weights
-//                         masked to the experts of this device, zero on both backends.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 struct test_mul_mat_id_expert_two_tables : public test_case {
     const ggml_type type_a;
-    const int n_mats;    // global experts of every weight
+    const int n_mats;
     const int n_used;
-    const int n_dev;     // devices of both tables, n_mats is a multiple
+    const int n_dev;
     const int64_t m;
     const int64_t n;
     const int64_t k;
@@ -8134,13 +9085,13 @@ struct test_mul_mat_id_expert_two_tables : public test_case {
     const bool b_in_store;
     const bool check_naive;
 
-    const int n_local;   // experts of the device of the test
+    const int n_local;
 
     int      dev     = -1;
     uint32_t table_a = 0;
     uint32_t table_b = 0;
 
-    // the three weights: [0] target layer 0 (table A), [1] draft layer 0 (table B), [2] draft layer 1 (table B)
+
     static constexpr int N_W = 3;
     ggml_tensor * as_w[N_W]   = {};
     ggml_tensor * as_full[N_W] = {};
@@ -8212,14 +9163,14 @@ struct test_mul_mat_id_expert_two_tables : public test_case {
         return build_graph(ctx, ctx);
     }
 
-    // routing counts of the two models: pseudo-random and different, so the two permutations differ
+
     static int64_t profile_count(int model, int layer, int expert) {
         return model == 0
             ? (int64_t) ((expert * 7919 + layer * 104729 + 17) % 101) + 1
             : (int64_t) ((expert * 6007 + layer * 3571 + 71) % 97) + 1;
     }
 
-    // a permutation table of n_layer layers from the counts of model `model`, activated
+
     uint32_t permuted_table(int model, int n_layer) const {
         ggml_expert_store_profile profile;
         profile.n_layer  = n_layer;
@@ -8258,8 +9209,8 @@ struct test_mul_mat_id_expert_two_tables : public test_case {
                 continue;
             }
 
-            // the two loaders: the target's table from its profile, the draft's from its own
-            // profile or the contiguous split of its slices; both activated, neither replaces the other
+
+
             table_a = permuted_table(0, 1);
             if (b_permuted) {
                 table_b = permuted_table(1, 2);
@@ -8271,12 +9222,12 @@ struct test_mul_mat_id_expert_two_tables : public test_case {
             ggml_expert_assignment_activate(table_a, nullptr, 0);
             ggml_expert_assignment_activate(table_b, nullptr, 0);
 
-            // the test only means something if the two tables give the nodes of layer 0 of this
-            // device different rows, and the target's row is not the contiguous segment
+
+
             const int16_t * ra = ggml_expert_assignment_local_of(table_a, dev, 0);
             const int16_t * rb = ggml_expert_assignment_local_of(table_b, dev, 0);
             GGML_ASSERT(ra != nullptr && rb != nullptr && ggml_expert_assignment_local_of(table_b, dev, 1) != nullptr);
-            GGML_ASSERT(ggml_expert_assignment_local_of(table_a, dev, 1) == nullptr); // the target has no layer 1
+            GGML_ASSERT(ggml_expert_assignment_local_of(table_a, dev, 1) == nullptr);
             bool differ = false;
             bool a_permuted = false;
             for (int e = 0; e < n_mats; ++e) {
@@ -8286,20 +9237,26 @@ struct test_mul_mat_id_expert_two_tables : public test_case {
             }
             GGML_ASSERT(differ && a_permuted);
 
-            // the meta backend marks every per-device node with its device, segment start and the
-            // table of its weight; the layers were set at build
+
+
             for (int w = 0; w < N_W; ++w) {
                 ggml_mul_mat_id_set_device(mm_w[w], dev);
                 ggml_mul_mat_id_set_expert_offset(mm_w[w], dev * n_local);
                 ggml_mul_mat_id_set_assignment(mm_w[w], (int32_t) w_table(w));
             }
 
-            // budgets: two experts per store tensor in the slots, the complement in the host arena
-            // with a staging area for the whole complement of one tensor
+
+
+
             const int n_store = b_in_store ? N_W : 1;
             const size_t blob_bytes  = expert_store_stride(type_a, k, m);
             const size_t slot_bytes  = 2 * blob_bytes * (size_t) n_store;
-            const size_t stage_bytes = blob_bytes * (size_t) n_local;
+            std::vector<std::pair<const char *, size_t>> complements;
+            for (int w = 0; w < n_store; ++w) {
+                complements.push_back({ as_w[w]->name, blob_bytes * (size_t) n_local });
+            }
+            const size_t stage_bytes = expert_stage_budget(complements);
+            ggml_expert_store_set_adaptive_min_host_per_pool(0);
             auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
             if (set_budget != nullptr) {
@@ -8317,7 +9274,7 @@ struct test_mul_mat_id_expert_two_tables : public test_case {
     }
 
     void check_weight_alloc(ggml_backend_t backend) override {
-        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, /*all_slot =*/ false);
+        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, false);
     }
 
     void after_eval(ggml_backend_t backend) override {
@@ -8332,7 +9289,7 @@ struct test_mul_mat_id_expert_two_tables : public test_case {
         ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
         ggml_set_name(b, "b");
 
-        // the target's gate weight of layer 0, the draft's gate weights of layers 0 and 1
+
         static const char * const names[N_W] = {
             "blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.1.ffn_gate_exps.weight",
         };
@@ -8358,7 +9315,7 @@ struct test_mul_mat_id_expert_two_tables : public test_case {
             ggml_mul_mat_id_set_expert_parallel(mm, true);
             ggml_mul_mat_id_set_n_expert_total(mm, n_mats);
             ggml_mul_mat_id_set_layer(mm, w_layer(w));
-            // the device, the segment start and the table follow in weight_buffer_type()
+
             snprintf(name, sizeof(name), "out_w%d", w);
             ggml_set_name(mm, name);
             mm_w[w] = mm;
@@ -8394,7 +9351,7 @@ struct test_mul_mat_id_expert_two_tables : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             const std::string name = t->name;
             if (name.compare(0, 4, "ids_") == 0) {
-                // top-k like: n_used distinct experts per token over the whole numbering
+
                 std::vector<int32_t> data(n_mats);
                 for (int i = 0; i < n_mats; i++) {
                     data[i] = i;
@@ -8404,13 +9361,13 @@ struct test_mul_mat_id_expert_two_tables : public test_case {
                     ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
                 }
             } else if (name.compare(0, 5, "mask_") == 0 || name.compare(0, 4, "blk.") == 0) {
-                // filled below from the ids / the full weights
+
             } else {
                 init_tensor_uniform(t);
             }
         }
 
-        // the mask of a weight: 1 for the slots routed to an expert this device holds of it
+
         for (int w = 0; w < N_W; ++w) {
             if (mask_w[w] == nullptr || !in_context(ctx, mask_w[w])) {
                 continue;
@@ -8421,15 +9378,15 @@ struct test_mul_mat_id_expert_two_tables : public test_case {
             ggml_backend_tensor_get(ids_w[w], ids.data(), 0, ids.size() * sizeof(int32_t));
             std::vector<float> mask(ids.size());
             for (size_t i = 0; i < ids.size(); ++i) {
-                // perf mode has no table: the node is the contiguous segment [0, n_local)
+
                 const bool local = row != nullptr ? row[ids[i]] >= 0 : ids[i] < n_local;
                 mask[i] = local ? 1.0f : 0.0f;
             }
             ggml_backend_tensor_set(mask_w[w], mask.data(), 0, mask.size() * sizeof(float));
         }
 
-        // the weight of the device: local expert kk is the global expert its own table names, what
-        // its loader writes. The compute context (the full weights) is initialized first.
+
+
         for (int w = 0; w < N_W; ++w) {
             if (!in_context(ctx, as_w[w])) {
                 continue;
@@ -8461,8 +9418,8 @@ struct test_mul_mat_id_expert_two_tables : public test_case {
     }
 };
 
-// expert parallelism with the gate/up GLU fusion: gate and up are each split along the expert
-// dim, fused with swiglu per shard, and the shard results sum to the full fused result.
+
+
 struct test_mul_mat_id_ep_fusion : public test_case {
     const ggml_type type_a;
     const int n_mats;
@@ -8489,7 +9446,7 @@ struct test_mul_mat_id_ep_fusion : public test_case {
         return 1e-2;
     }
 
-    // filter with -o MUL_MAT_ID_EP_FUSION
+
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_EP_FUSION";
@@ -8512,7 +9469,7 @@ struct test_mul_mat_id_ep_fusion : public test_case {
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
         ggml_set_name(ids, "ids");
 
-        // gate/up broadcast one activation row per token
+
         ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, 1, n);
         ggml_set_name(b, "b");
 
@@ -8538,7 +9495,7 @@ struct test_mul_mat_id_ep_fusion : public test_case {
         }
         ggml_set_name(out, "out_ep");
 
-        // full fused reference in the same graph
+
         ggml_tensor * gate_full = ggml_mul_mat_id(ctx, gate, b, ids);
         ggml_tensor * up_full   = ggml_mul_mat_id(ctx, up,   b, ids);
         ggml_tensor * glu_full  = ggml_swiglu_split(ctx, gate_full, up_full);
@@ -8550,7 +9507,7 @@ struct test_mul_mat_id_ep_fusion : public test_case {
         return diff;
     }
 
-    // the fusion only triggers when the whole graph is computed, and only the difference is checked
+
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out_diff }; }
 
@@ -8577,25 +9534,25 @@ struct test_mul_mat_id_ep_fusion : public test_case {
     ggml_tensor * out_diff = nullptr;
 };
 
-// The MoE FFN of a decode/verify batch under expert parallelism, as build_moe_ffn emits it: the
-// gate_up MUL_MAT_ID with the SwiGLU epilogue (or a given activation H), the down MUL_MAT_ID and the
-// weighted sum over the slots (MUL by the routing weights, views, ADD chain). The CUDA backend runs it
-// on the compact MMVQ kernels with the reduction (and the q8_1 hand-off of H) fused in. One shard of
-// the split (the last, offset > 0) is computed twice in the same graph: once in that form and once
-// with an exact CONT copy between the steps, which keeps every fusion of the chain from matching and
-// runs the separate kernels. The difference must be exactly zero: the fused path promises the same
-// bits, not a tolerance.
-// filter with -o MOE_FFN_FUSED
+
+
+
+
+
+
+
+
+
 struct test_moe_ffn_fused : public test_case {
     const ggml_type type_gu;
     const ggml_type type_down;
-    const ggml_type type_h;   // activation of the down projection when there is no gate_up node
-    const bool      gate_up;  // the chain starts at the gate_up projection
+    const ggml_type type_h;
+    const bool      gate_up;
     const int       n_mats;
     const int       n_used;
     const int       n_shards;
     const int64_t   n;
-    const bool      router;   // ids and weights from the router of build_moe_ffn on the activation
+    const bool      router;
     ggml_tensor *   out_diff = nullptr;
 
     static constexpr int64_t n_embd = 2560;
@@ -8635,7 +9592,7 @@ struct test_moe_ffn_fused : public test_case {
         GGML_ASSERT(!router || gate_up);
     }
 
-    // views of the slots and the ADD chain of build_moe_ffn
+
     ggml_tensor * reduce(ggml_context * ctx, ggml_tensor * experts, ggml_tensor * weights) {
         ggml_tensor * weighted = ggml_mul(ctx, experts, weights);
         ggml_tensor * out = nullptr;
@@ -8646,7 +9603,7 @@ struct test_moe_ffn_fused : public test_case {
         return out;
     }
 
-    // the expert weights of shard s ([start, end) of the experts)
+
     virtual void shard_weights(ggml_context * ctx, ggml_context * ctx_weights, int s, int64_t start, int64_t end,
             ggml_tensor *& gu_s, ggml_tensor *& dn_s) {
         GGML_UNUSED(ctx_weights);
@@ -8676,8 +9633,8 @@ struct test_moe_ffn_fused : public test_case {
         ggml_set_name(x2, "x");
         ggml_tensor * gate_inp = router ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_mats) : nullptr;
 
-        // the router of build_moe_ffn: softmax gating, top-k, normalized weights, expanded before the
-        // experts (as build_moe_ffn does) so that the CUDA backend fuses it into topk_moe
+
+
         auto route = [&](ggml_tensor *& ids_o, ggml_tensor *& weights_o) {
             if (!router) {
                 ids_o     = ids;
@@ -8704,9 +9661,9 @@ struct test_moe_ffn_fused : public test_case {
             ggml_mul_mat_id_set_n_expert_total(mm, n_mats);
         };
 
-        // one shard of the expert parallel split: the last one, so that the expert offset is not 0
-        // when there is more than one (the test context holds about a hundred tensors, the two forms
-        // of one shard take about eighty)
+
+
+
         ggml_tensor * diff = nullptr;
         {
             const int     s     = n_shards - 1;
@@ -8716,7 +9673,7 @@ struct test_moe_ffn_fused : public test_case {
             ggml_tensor * dn_s = nullptr;
             shard_weights(ctx, ctx_weights, s, start, end, gu_s, dn_s);
 
-            // fused form
+
             ggml_tensor * ids_f;
             ggml_tensor * weights_f;
             route(ids_f, weights_f);
@@ -8729,7 +9686,7 @@ struct test_moe_ffn_fused : public test_case {
             set_ep(e, start);
             ggml_tensor * out_f = reduce(ctx, e, weights_f);
 
-            // the same steps kept apart by exact copies
+
             ggml_tensor * ids_r;
             ggml_tensor * weights_r;
             route(ids_r, weights_r);
@@ -8752,8 +9709,8 @@ struct test_moe_ffn_fused : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         init_mul_mat_id_tensors(ctx, n_mats, 1.0f);
-        // every token routes to n_used distinct experts drawn from the whole range, so that every
-        // shard gets local and remote slots
+
+
         std::random_device rd;
         std::default_random_engine rng(rd());
         std::vector<int32_t> perm(n_mats);
@@ -8772,11 +9729,11 @@ struct test_moe_ffn_fused : public test_case {
     }
 };
 
-// MOE_FFN_FUSED on the expert store: the shard is its own gate_up and down store tensor with one
-// expert in a VRAM slot and the rest in the host arena, so a decode batch stages its routed host
-// experts (one staging launch per MUL_MAT_ID) and the kernels read the staging pointer table. The
-// fused path must stage in the same order as the separate nodes (the down staging after the gate_up
-// kernel: both share the per-stream staging area).
+
+
+
+
+
 struct test_moe_ffn_fused_expert : public test_moe_ffn_fused {
     std::vector<ggml_tensor *> expert_weights;
     ggml_backend_buffer_type_t expert_buft = nullptr;
@@ -8821,11 +9778,12 @@ struct test_moe_ffn_fused_expert : public test_moe_ffn_fused {
         for (ggml_backend_buffer_type_t * extra = get_extra(dev); extra && *extra; ++extra) {
             const std::string name = ggml_backend_buft_name(*extra);
             if (name.size() >= 8 && name.compare(name.size() - 8, 8, "_Experts") == 0) {
-                // one slot per store tensor (the gate_up and down tensors of the shard), the rest in
-                // the host arena; the staging area covers the host complement of the larger tensor
+
+
                 const int64_t shard_max = (n_mats + n_shards - 1) / n_shards;
                 const size_t  blob_gu   = expert_store_stride(type_gu, n_embd, 2*n_ff);
                 const size_t  blob_dn   = expert_store_stride(type_down, n_ff, n_embd);
+                ggml_expert_store_set_adaptive_min_host_per_pool(0);
                 auto set_budget = (void (*)(ggml_backend_buffer_type_t, size_t, size_t))
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
                 if (set_budget != nullptr) {
@@ -8842,7 +9800,7 @@ struct test_moe_ffn_fused_expert : public test_moe_ffn_fused {
     }
 
     void check_weight_alloc(ggml_backend_t backend) override {
-        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, /*all_slot=*/false);
+        check_expert_tiers(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)), expert_buft, false);
     }
 };
 
@@ -9203,19 +10161,34 @@ struct test_clamp : public test_case {
     const std::array<int64_t, 4> ne;
     float min;
     float max;
+    int v; // view (1 : non-contiguous a)
 
     std::string vars() override {
-        return VARS_TO_STR4(type, ne, min, max);
+        return VARS_TO_STR5(type, ne, min, max, v);
     }
 
     test_clamp(ggml_type type = GGML_TYPE_F32,
             std::array<int64_t, 4> ne = {10, 5, 4, 3},
-            float min = -0.5f, float max = 0.5f)
-        : type(type), ne(ne), min(min), max(max) {}
+            float min = -0.5f, float max = 0.5f, int v = 0)
+        : type(type), ne(ne), min(min), max(max), v(v) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
-        ggml_set_name(a, "a");
+        ggml_tensor * a;
+        if (v & 1) {
+            auto ne_a = ne;
+            ne_a[0] *= 3;
+            ne_a[1] *= 2;
+            ne_a[2] *= 5;
+            ne_a[3] *= 4;
+            a = ggml_new_tensor(ctx, type, 4, ne_a.data());
+            ggml_set_name(a, "a");
+
+            a = ggml_view_4d(ctx, a, ne[0], ne[1], ne[2], ne[3], a->nb[1], a->nb[2], a->nb[3], 0);
+            ggml_set_name(a, "view_of_a");
+        } else {
+            a = ggml_new_tensor(ctx, type, 4, ne.data());
+            ggml_set_name(a, "a");
+        }
 
         ggml_tensor * out = ggml_clamp(ctx, a, min, max);
         ggml_set_name(out, "out");
@@ -10426,6 +11399,46 @@ struct test_top_k : public test_case {
     }
 };
 
+// top_k over rows like log-probabilities: distinct negative values, fewer
+// than k +inf (none for k = 1, so the expected indices are unique) and many
+// -inf (masked tokens)
+struct test_top_k_inf : public test_top_k {
+    test_top_k_inf(std::array<int64_t, 4> ne, int k)
+        : test_top_k(GGML_TYPE_F32, ne, k, false) {}
+
+    std::string vars() override {
+        return test_top_k::vars() + ",inf=1";
+    }
+
+    // compare only the output: the input holds infinities, which err() would
+    // read as indices
+    bool run_whole_graph() override { return true; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<float> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = -1.0f - i;
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                const int n_pinf = k / 2;
+                for (int i = 0; i < t->ne[0]; i++) {
+                    if (i < n_pinf) {
+                        data[i] = INFINITY;
+                    } else if (i % 3 == 0) {
+                        data[i] = -INFINITY;
+                    }
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+            }
+        }
+    }
+};
+
 // qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
 struct test_topk_qsa : public test_case {
     const int64_t n_blocks;
@@ -10711,6 +11724,7 @@ enum mul_mat_add_mode {
     MUL_MAT_ADD_ROW,        // mm + a one-row res, which a same-shape fusion must leave alone
     MUL_MAT_ADD_RES_INPLACE, // res += mm
     MUL_MAT_ADD_B_INPLACE,   // b += mm: the sum overwrites the mat-mul input (m == k)
+    MUL_MAT_ADD_MM_MM,       // mm2 + mm: the residual is itself a mat-mul output, so both operands are MUL_MAT
 };
 
 static std::string var_to_str(mul_mat_add_mode mode) {
@@ -10720,6 +11734,7 @@ static std::string var_to_str(mul_mat_add_mode mode) {
         case MUL_MAT_ADD_ROW:         return "mm+row";
         case MUL_MAT_ADD_RES_INPLACE: return "res+=mm";
         case MUL_MAT_ADD_B_INPLACE:   return "b+=mm";
+        case MUL_MAT_ADD_MM_MM:       return "mm2+mm";
     }
     return "unknown";
 }
@@ -10765,6 +11780,12 @@ struct test_mul_mat_add : public test_case {
             case MUL_MAT_ADD_RES_MM:      out = ggml_add(ctx, res, mm);         break;
             case MUL_MAT_ADD_RES_INPLACE: out = ggml_add_inplace(ctx, res, mm); break;
             case MUL_MAT_ADD_B_INPLACE:   out = ggml_add_inplace(ctx, b, mm);   break;
+            case MUL_MAT_ADD_MM_MM:
+                {
+                    ggml_tensor * a2  = ggml_new_tensor_2d(ctx, type_a, k, m);
+                    ggml_tensor * mm2 = ggml_mul_mat(ctx, a2, b);
+                    out = ggml_add(ctx, mm2, mm);
+                } break;
         }
         ggml_set_name(out, "out");
 
@@ -11490,12 +12511,12 @@ struct test_roll : public test_case {
     }
 };
 
-// GGML_OP_SEQ_SCATTER / GGML_OP_SEQ_GATHER
-//
-// The single-backend forms: seq_scatter copies the [t0, t0 + n) slice of the token axis,
-// seq_gather is a cast/dup. The meta backend rewrites the per-device (t0, n) of every node
-// and turns them into the reduce-scatter / all-gather comm boundaries; those are exercised
-// by the per-rank comm test in tests/test-cuda-allreduce.cpp.
+
+
+
+
+
+
 struct test_seq_scatter : public test_case {
     const std::array<int64_t, 4> ne;
     const int axis;
@@ -11534,8 +12555,8 @@ struct test_seq_gather : public test_case {
                     ggml_type src_type = GGML_TYPE_F32, ggml_type type = GGML_TYPE_F16)
         : ne(ne), axis(axis), src_type(src_type), type(type) {}
 
-    // a cast F32 -> F16 is deterministic and both backends round the same way, but the
-    // compare goes through float, so allow the f16 ulp of values in [-1, 1]
+
+
     double max_nmse_err() override {
         return src_type == type ? 0.0 : 1e-6;
     }
@@ -11649,8 +12670,8 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
-    const bool causal; // use a causal mask instead of a random mask
-    const int range; // 0: dense f16 mask, 1: causal range mask (I32), 2: random range mask (I32), 3-5: deterministic range masks, 6: ring-wrap two-interval mask
+    const bool causal;
+    const int range;
 
     std::string vars() override {
         return VARS_TO_STR19(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, causal, range);
@@ -11766,19 +12787,19 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
-// GGML_OP_FLASH_ATTN_EXT with Q/K/V as head-window views of the per-device tensors used by the
-// multi-GPU attention split: Q is a window of g heads out of 8, K/V are single-head windows out
-// of 2 KV heads. The token strides stay those of the full tensors, so the row stride of the
-// window is larger than its width and the kernel must honor per-row strides (not the extent).
+
+
+
+
 struct test_flash_attn_ext_window : public test_case {
-    const int64_t g;   // number of Q heads in the window
-    const int64_t h0;  // first Q head of the window
-    const int64_t kvh; // KV head the window reads
-    const int64_t n_q; // number of query tokens
+    const int64_t g;
+    const int64_t h0;
+    const int64_t kvh;
+    const int64_t n_q;
     const int64_t n_kv; // KV length
 
     const ggml_type type_KV;
-    const bool range_mask; // false: dense f16 mask, true: I32 range mask
+    const bool range_mask;
 
     std::string vars() override {
         return VARS_TO_STR7(g, h0, kvh, n_q, n_kv, type_KV, range_mask);
@@ -11790,7 +12811,7 @@ struct test_flash_attn_ext_window : public test_case {
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        // Q*K^T and P*V, per head
+
         return 2 * g * n_q * (256 + 256) * n_kv;
     }
 
@@ -11852,13 +12873,13 @@ struct test_flash_attn_ext_window : public test_case {
     }
 };
 
-// GGML_OP_FLASH_ATTN_EXT with the non-uniform GQA mapping of the 3-card attention split: Q holds
-// the 8 local query heads and K/V hold the 2 local KV heads. Query head h reads KV head 0 when
-// h < g0 and KV head 1 otherwise. The sm70 grouped kernel and the CPU reference apply the same
-// mapping, so the standard CPU comparison covers it.
+
+
+
+
 struct test_flash_attn_ext_nonuniform : public test_case {
-    const int64_t g0;   // first local query head that reads KV head 1
-    const int64_t n_q;  // number of query tokens
+    const int64_t g0;
+    const int64_t n_q;
     const int64_t n_kv; // KV length
 
     const ggml_type type_KV;
@@ -11873,7 +12894,7 @@ struct test_flash_attn_ext_nonuniform : public test_case {
 
     uint64_t op_flops(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        // Q*K^T and P*V, per head
+
         return 2 * 8 * n_q * (256 + 256) * n_kv;
     }
 
@@ -12362,23 +13383,23 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
-// GGML_OP_QSA_SELECT (and GGML_OP_QSA_EXPAND after it)
-// integer-valued q and keys keep every score exact on every backend, so the selection, equal scores included, must
-// match the CPU id for id. The keys are read in place through pool_cells from a cache-like table: rows of raw key |
-// pooled key (the selection reads the second half, rows are strided), more rows than pools, the pools in shuffled rows.
-// real: uniform q and keys for the perf cases (a realistic spread of the scores for the top-k), not exact
-// mode 0: cell rows (ggml_qsa_select); 1: pool rows (ggml_qsa_select_pool); 2: pool rows expanded into cell rows
-// (ggml_qsa_expand), which must equal mode 0 id for id
+
+
+
+
+
+
+
 struct test_qsa_select : public test_case {
-    const int64_t n_pool;  // pools, the last n_pad of them padded
+    const int64_t n_pool;
     const int64_t n_pad;
     const int64_t nb;      // tokens
     const int64_t kpool;
     const int64_t n_top;
     const ggml_type type_K;
     const bool    real;
-    // the key table of the compact indexer cache (qwen4exp): one pooled key per row, [128, 1, n_rows], instead of the
-    // pooled half of raw key | pooled key rows
+
+
     const bool    compact;
     const int     mode;
 
@@ -12386,7 +13407,7 @@ struct test_qsa_select : public test_case {
         return VARS_TO_STR9(n_pool, n_pad, nb, kpool, n_top, type_K, real, compact, mode);
     }
 
-    // the ids are exact, so any wrong id fails, however close its cell number
+
     double max_nmse_err() override {
         return 0.0;
     }
@@ -12442,13 +13463,13 @@ struct test_qsa_select : public test_case {
         const int64_t n_real = n_pool - n_pad;
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->view_src != nullptr) {
-                continue; // k_pooled is a window of k
+                continue;
             }
             if (real && (strcmp(t->name, "q") == 0 || strcmp(t->name, "k") == 0)) {
                 init_tensor_uniform(t);
             } else if (strcmp(t->name, "q") == 0 || strcmp(t->name, "k") == 0) {
                 if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
-                    // small integers: exact in half, and many equal scores to exercise the tie order
+
                     std::uniform_int_distribution<int> dist(-2, 2);
                     std::vector<float> v(ggml_nelements(t));
                     for (float & x : v) {
@@ -12462,9 +13483,9 @@ struct test_qsa_select : public test_case {
                         ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
                     }
                 } else {
-                    // Q8_0 keys on the 1/128 grid with an exact amax of 127/128 in every block: the quantizer
-                    // picks d = 1/128, so the dequantized keys are exact in half and the CPU and the CUDA
-                    // scorer see the same values
+
+
+
                     GGML_ASSERT(t->type == GGML_TYPE_Q8_0);
                     std::uniform_int_distribution<int> dist(-127, 127);
                     std::vector<float> v(ggml_nelements(t));
@@ -12480,7 +13501,7 @@ struct test_qsa_select : public test_case {
                     ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
                 }
             } else if (strcmp(t->name, "pcell") == 0) {
-                // the real pools in distinct shuffled rows of the table, the padded ones on the first of them
+
                 std::vector<int32_t> rows(n_rows());
                 for (size_t i = 0; i < rows.size(); ++i) {
                     rows[i] = (int32_t) i;
@@ -12490,7 +13511,7 @@ struct test_qsa_select : public test_case {
                 std::copy(rows.begin(), rows.begin() + n_real, v.begin());
                 ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "pidx") == 0) {
-                // the real pools address distinct cells in a shuffled order, the padded ones are -1
+
                 std::vector<int32_t> cells(n_real*kpool);
                 for (size_t i = 0; i < cells.size(); ++i) {
                     cells[i] = (int32_t) i;
@@ -12508,8 +13529,8 @@ struct test_qsa_select : public test_case {
                 }
                 ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
             } else if (strcmp(t->name, "prng") == 0) {
-                // visible ranges inside the real pools: empty, shorter and longer than n_top (perf: all of them, as a
-                // decode step sees)
+
+
                 std::uniform_int_distribution<int64_t> dist(0, n_real);
                 std::vector<int32_t> v(2*nb);
                 for (int64_t i = 0; i < nb; ++i) {
@@ -12532,9 +13553,9 @@ struct test_qsa_select : public test_case {
     }
 };
 
-// GGML_OP_QSA_EXPAND on its own: pool rows with every kept-prefix length from 0 to n_top
+
 struct test_qsa_expand : public test_case {
-    const int64_t n_pool;  // pools, the last n_pad of them padded
+    const int64_t n_pool;
     const int64_t n_pad;
     const int64_t nb;      // tokens
     const int64_t kpool;
@@ -12544,7 +13565,7 @@ struct test_qsa_expand : public test_case {
         return VARS_TO_STR5(n_pool, n_pad, nb, kpool, n_top);
     }
 
-    // the ids are exact, so any wrong id fails
+
     double max_nmse_err() override {
         return 0.0;
     }
@@ -12570,7 +13591,7 @@ struct test_qsa_expand : public test_case {
         const int64_t n_real = n_pool - n_pad;
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "ids") == 0) {
-                // per token: n_kept distinct real pools ascending (empty, partial and full rows), then -1
+
                 std::vector<int32_t> v(n_top*nb, -1);
                 std::vector<int32_t> pools(n_real);
                 for (int64_t p = 0; p < n_real; ++p) {
@@ -12614,14 +13635,14 @@ struct test_qsa_expand : public test_case {
     }
 };
 
-// GGML_OP_QSA_ATTN
+
 struct test_qsa_attn : public test_case {
     const int64_t n_head_kv;
     const int64_t n_kv;
-    const int64_t nb;      // tokens over all streams
-    const int64_t ns;      // streams
+    const int64_t nb;
+    const int64_t ns;
     const int64_t n_sel;
-    const int64_t n_valid; // valid ids per token, a prefix of the row
+    const int64_t n_valid;
     const ggml_type type_KV;
 
     std::string vars() override {
@@ -12655,7 +13676,7 @@ struct test_qsa_attn : public test_case {
         std::mt19937 gen(0x9a77);
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "ids") == 0) {
-                // distinct cells per token, the first n_valid of a row, then -1; a few tokens see fewer
+
                 std::vector<int32_t> cells(n_kv);
                 for (int64_t i = 0; i < n_kv; ++i) {
                     cells[i] = (int32_t) i;
@@ -13398,6 +14419,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // fused add + unary + mul: the delta-net alpha gate, bias and scale broadcast over dim 0
+    for (ggml_unary_op op : { GGML_UNARY_OP_SILU, GGML_UNARY_OP_SIGMOID, GGML_UNARY_OP_SOFTPLUS }) {
+        test_cases.emplace_back(new test_add_unary_mul(op, GGML_TYPE_F32, { 32, 7, 1, 1 }));
+        test_cases.emplace_back(new test_add_unary_mul(op, GGML_TYPE_F32, { 32, 512, 1, 1 }));
+        test_cases.emplace_back(new test_add_unary_mul(op, GGML_TYPE_F32, { 5, 7, 11, 13 }));
+        // one token: no broadcast left, and the unary result may be either MUL operand
+        test_cases.emplace_back(new test_add_unary_mul(op, GGML_TYPE_F32, { 32, 1, 1, 1 }, false, "same_shape"));
+        test_cases.emplace_back(new test_add_unary_mul(op, GGML_TYPE_F32, { 32, 1, 1, 1 }, true, "same_shape"));
+        test_cases.emplace_back(new test_add_unary_mul(op, GGML_TYPE_F32, { 32, 7, 1, 1 }, false, "bcast", "consumer"));
+        // must not fuse
+        test_cases.emplace_back(new test_add_unary_mul(op, GGML_TYPE_F32, { 32, 7, 1, 1 }, false, "same_shape"));
+        test_cases.emplace_back(new test_add_unary_mul(op, GGML_TYPE_F32, { 32, 7, 1, 1 }, false, "rep_ne0"));
+        test_cases.emplace_back(new test_add_unary_mul(op, GGML_TYPE_F32, { 32, 7, 1, 1 }, false, "bcast", "reuse"));
+        test_cases.emplace_back(new test_add_unary_mul(op, GGML_TYPE_F16, { 32, 7, 1, 1 }));
+    }
+    // a unary op with no fused kernel must fall back to the three-op chain
+    test_cases.emplace_back(new test_add_unary_mul(GGML_UNARY_OP_GELU, GGML_TYPE_F32, { 32, 7, 1, 1 }));
+
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
         test_cases.emplace_back(new test_snake_fuse(type, {   5,   7, 1, 1}));   // primes sub-block
@@ -13441,66 +14480,66 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 21, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, false, true));
-    // production width: decode (n_tokens=1) and prefill (2048), the DSV4_HC_POST gate fused
-    // into the post kernel; identity comb, as qwen4exp builds the hyper-connection combine
+
+
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 2048, true, true));
-    // the post followed by the next mixer's RMS_NORM -> MUL: fused at the decode and verify widths,
-    // unfused below 1024 columns
+
+
     for (int64_t n_tokens : {1, 4, 8, 17}) {
         test_cases.emplace_back(new test_dsv4_hc_post_norm(2560, n_tokens));
     }
     test_cases.emplace_back(new test_dsv4_hc_post_norm(1280, 4));
     test_cases.emplace_back(new test_dsv4_hc_post_norm(512, 4));
-    // the mixer opening on Q8_0 projections: fused at M <= 16 (with and without the post before
-    // it), unfused at M = 17
+
+
     for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
         test_cases.emplace_back(new test_hc_mix_q8(2560, 320, n_tokens, true));
     }
     test_cases.emplace_back(new test_hc_mix_q8(2560, 320, 4, false));
     test_cases.emplace_back(new test_hc_mix_q8(1024, 128, 4, true));
-    // with the inject projection expanded before the down projection (qwen4exp build_hc_mix): the down
-    // launch also runs the inject rows at M <= 4 (F32 GEMV on mul_mat_vec_f), the inject runs on its
-    // own path inside the group at M = 5..16, everything unfused at M = 17
+
+
+
     for (int64_t n_tokens : {1, 2, 3, 4, 5, 8, 16, 17}) {
         test_cases.emplace_back(new test_hc_mix_q8(2560, 320, n_tokens, true, true));
     }
     test_cases.emplace_back(new test_hc_mix_q8(2560, 320, 4, false, true));
-    // with the hc_pre mixer after the up projection (computed in the up kernel at M <= 16) and the projections
-    // that read it as F16
+
+
     for (int64_t n_tokens : {1, 4, 8, 9, 16, 17}) {
         test_cases.emplace_back(new test_hc_mix_q8(2560, 320, n_tokens, true, true, 1));
         test_cases.emplace_back(new test_hc_mix_q8(2560, 320, n_tokens, true, true, 2));
     }
     test_cases.emplace_back(new test_hc_mix_q8(2560, 320, 4, false, false, 2));
-    // the previous mixer's inject projection as the post input (computed inside the norm kernel where the F32
-    // GEMV takes mul_mat_vec_f, M <= 4 on Volta)
+
+
     for (int64_t n_tokens : {1, 2, 3, 4, 5, 8, 16, 17}) {
         test_cases.emplace_back(new test_hc_mix_q8(2560, 320, n_tokens, true, false, 2, true));
     }
     test_cases.emplace_back(new test_hc_mix_q8(2560, 320, 4, true, false, 0, true));
-    // the mixer result handed to the projections that open the block as F16 (M <= 16; 17 unfused):
-    // GDN qkv + z on a 3-head and a 2-head card, QSA q/k/v, and a single projection
+
+
     for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
         test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {1920, 1152, 0}, n_tokens));
     }
     test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {1280, 768, 0}, 4));
     test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {2048, 256, 256}, 4));
     test_cases.emplace_back(new test_hc_pre_mm_q8(2560, {1024, 0, 0}, 4));
-    // the GDN gated norm (sigmoid: qwen4exp, silu: Qwen3.5) handed to ssm_out as F16 (M <= 16)
+
     for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
         test_cases.emplace_back(new test_gated_norm_q8(128, 9, 2560, n_tokens, true));
     }
     test_cases.emplace_back(new test_gated_norm_q8(128, 6, 2560, 4, true));
     test_cases.emplace_back(new test_gated_norm_q8(128, 8, 2560, 4, false));
     test_cases.emplace_back(new test_gated_norm_q8(64, 4, 1024, 3, true));
-    // the attention output gate handed to wo as F16 (M <= 16)
+
     for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
         test_cases.emplace_back(new test_attn_gate_q8(256, 4, 2560, n_tokens));
     }
     test_cases.emplace_back(new test_attn_gate_q8(128, 3, 1024, 4));
 
-    // scale + unary(silu): decode and prefill shapes of the hyper-connection mixer activation
+
     test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 320, 1, 1, 1 }));
     test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 320, 2048, 1, 1 }));
     test_cases.emplace_back(new test_scale_silu(GGML_TYPE_F32, { 128, 2, 2, 2 }, -1.5f));
@@ -13524,10 +14563,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    for (int v : {0, 1}) {
-        for (float alpha : {.5f, 1.702f}) {
-            for (float limit : {2.0f, 7.0f}) {
-                test_cases.emplace_back(new test_swiglu_oai(GGML_TYPE_F32, { 128, 2, 2, 2 }, v, alpha, limit));
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int v : {0, 1}) {
+            for (float alpha : {.5f, 1.702f}) {
+                for (float limit : {2.0f, 7.0f}) {
+                    test_cases.emplace_back(new test_swiglu_oai(type, { 128, 2, 2, 2 }, v, alpha, limit));
+                }
             }
         }
     }
@@ -13564,17 +14605,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
-    // the token embedding table of the shipped Q8_0 models has a 2560-wide row
+
     for (int b : {1, 7}) {
         test_cases.emplace_back(new test_get_rows(GGML_TYPE_Q8_0, 2560, 5, 4, b, 1, false, false));
     }
-    // IQ4_NL rows that are a multiple of the 32-value sub-block but not of QK_K
+
     for (int n : {32, 96, 160, 224}) {
         test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, n, 5, 4, 1, 1, false, false));
         test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, n, 5, 4, 7, 1, false, false));
     }
-    // the n-gram table of the PLE layer: a 160-value row, gathered with 64 rows in a decode step
-    // and with 32768 rows in a prefill block
+
+
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, 160,    64,    64, 1, 1, false, false));
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_IQ4_NL, 160, 32768, 32768, 1, 1, false, false));
 
@@ -13639,6 +14680,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                     }
                 }
             }
+            // MSA indexer block-max shape: wide 1-D window along ne0, no padding, non-divisible width
+            for (int64_t iw : {4096, 4160}) {
+                for (int blk : {32, 64, 128}) {
+                    test_cases.emplace_back(new test_pool2d(pool_type, type_input, {iw, 2, 1, 1}, blk, 1, blk, 1, 0, 0));
+                }
+            }
+            test_cases.emplace_back(new test_pool2d(pool_type, type_input, {259, 5, 3, 2}, 128, 3, 64, 2, 64, 1));
+            test_cases.emplace_back(new test_pool2d(pool_type, type_input, {193, 2, 1, 1}, 128, 1, 128, 1, 128, 2));
         }
     }
 
@@ -13712,6 +14761,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32, {2, 2, 1536, 729}, {2, 2, 1536, 4096}, 1, 1, 0, 0, 1, 1, true));
     test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {128, 128, 1, 2}, {32, 33, 1, 2}, 1, 1, 1, 1, 1, 1, true));
     test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_F16, {128, 128, 2, 1}, {33, 34, 2, 1}, 1, 1, 1, 1, 1, 1, true));
+    // non-overlapping (stride == kernel, no pad/dilation) with IC*KH well above 256, e.g. SD1.5 1x1 convs
+    for (ggml_type dst_type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, dst_type, {64, 64, 320, 1},  {1, 1, 320, 1},  1, 1, 0, 0, 1, 1, true));
+        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, dst_type, {16, 16, 1280, 2}, {1, 1, 1280, 1}, 1, 1, 0, 0, 1, 1, true));
+        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, dst_type, {8, 8, 2560, 1},   {1, 1, 2560, 1}, 1, 1, 0, 0, 1, 1, true));
+        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, dst_type, {32, 32, 192, 1},  {2, 2, 192, 1},  2, 2, 0, 0, 1, 1, true));
+        test_cases.emplace_back(new test_im2col(GGML_TYPE_F32, GGML_TYPE_F16, dst_type, {64, 512, 1, 1},   {2, 512, 1, 1},  2, 0, 0, 0, 1, 0, false));
+    }
 
     // im2col 3D
     test_cases.emplace_back(new test_im2col_3d(GGML_TYPE_F32, GGML_TYPE_F32, GGML_TYPE_F32));
@@ -14070,14 +15127,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_F32, {64, 16, 1, 1}, {1, 64, 16, 1}, {1, 2, 0, 3}, {0, 0, 0, 0}, false, {32, 64, 16, 1})); // permuted src, strided dst
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {64, 16, 1, 1}, {1, 64, 16, 1}, {1, 2, 0, 3}, {0, 0, 0, 0}, false, {32, 64, 16, 1})); // permuted src, strided dst
 
-    // CPY_BATCH - consecutive same-layout CPYs, one kernel launch instead of one per copy
+
     for (int64_t C : {64, 2560}) {
         for (int64_t K : {2, 8}) {
             test_cases.emplace_back(new test_cpy_batch(C, K, 8));
         }
     }
 
-    // SSM_CONV_ROLLBACK - conv-state gather + concat + snapshot copies + conv + silu in one kernel
+
     for (int64_t C : {64, 2560}) {
         for (int64_t n_tok : {1, 8}) {
             for (int64_t K : {1, 8}) {
@@ -14143,7 +15200,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // attention gate: sigmoid of a strided view, fused into the mul
+
     for (int64_t n_tokens : { 1, 8 }) {
         test_cases.emplace_back(new test_cont_sigmoid_mul(256, 24, n_tokens));
     }
@@ -14198,6 +15255,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         //add_test_bin_bcast(type, {3, 3, 2560, 1280}, {1, 1, 1, 1});
         //add_test_bin_bcast(type, {3, 3, 2560, 1280}, {2, 1, 1, 1});
     }
+
+    for (auto op : {ggml_add, ggml_mul}) {
+        test_cases.emplace_back(new test_bin_bcast(op, GGML_TYPE_F32, {1, 2, 2, 2}, {17, 1, 1, 1}, 1, false, false, GGML_TYPE_COUNT, true));
+    }
+    test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {2, 2, 2, 2}, {17, 1, 1, 1}, 1, false, false, GGML_TYPE_COUNT, true));
 
     // single inplace tests, especially important for WebGPU backend since kernels for inplace vs. not are different
     test_cases.emplace_back(new test_bin_bcast(ggml_add_inplace, GGML_TYPE_F32, {16, 5, 4, 3}, {1, 1, 1, 1}, 16));
@@ -14265,6 +15327,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // in-place tests
     test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {64, 5, 4, 3}, false, 1e-6f, true));
+    // shapes below exceed the CUDA gridDim.y/gridDim.z limit of 65535 (#27901)
+    test_cases.emplace_back(new test_norm        (GGML_TYPE_F32, {4, 1, 65536, 1}, false, 1e-6f));
+    test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 65536, 1}, false, 1e-6f, false));
+    test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 1, 65536}, false, 1e-6f, false));
+    test_cases.emplace_back(new test_l2_norm     (GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-12f, false, false));
+    test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-6f, false, false));
 
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
@@ -14288,19 +15356,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_add_rms_norm(GGML_TYPE_F32, {n, 1, 1, 1}, 1e-6f, false));
     }
 
-    // residual add -> rms norm -> weight mul, the add result feeds the next residual
+
     test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 5120,  1, 1, 1 }, 1e-6f));
     test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 5120,  8, 1, 1 }, 1e-6f));
     test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 5120, 16, 1, 1 }, 1e-6f));
     test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 4096,  3, 1, 1 }, 1e-6f));
     test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 4096,  3, 2, 1 }, 1e-6f));
-    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 5124,  8, 1, 1 }, 1e-6f)); // partial float4 tail of the register path
+    test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 5124,  8, 1, 1 }, 1e-6f));
     test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, { 5122,  8, 1, 1 }, 1e-6f)); // ncols not a multiple of 4
 
-    // rms norm -> weight mul, the mul result is the graph output
+
     test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, { 5120,  8, 1, 1 }, true,  1e-6f));
     test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, { 4096,  3, 2, 1 }, true,  1e-6f));
-    test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, { 5120,  8, 1, 1 }, false, 1e-6f)); // per-row weight, not the register path
+    test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, { 5120,  8, 1, 1 }, false, 1e-6f));
     test_cases.emplace_back(new test_rms_norm_mul(GGML_TYPE_F32, { 5122,  8, 1, 1 }, true,  1e-6f)); // ncols not a multiple of 4
 
     for (uint32_t n : {64, 1025}) {
@@ -14319,13 +15387,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 1536, 1, 1, 1 }, 1e-6f, false, false, false, true));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, { 256, 4, 1, 1 }, 1e-6f, false, false, false, true));
 
-    // gated norm at the output of the GDN layers
+
     for (int64_t n_tokens : { 1, 8 }) {
         test_cases.emplace_back(new test_rms_norm_mul_silu_mul({ 128, 12, n_tokens, 1 }, 1e-6f, false));
         test_cases.emplace_back(new test_rms_norm_mul_silu_mul({ 128, 12, n_tokens, 1 }, 1e-6f, true));
     }
 
-    // GDN gating: sigmoid(beta) and softplus(alpha + dt) * a in one kernel
+
     for (int64_t n_heads : { 12, 48 }) {
         for (int64_t n_seq_tokens : { 1, 8, 17 }) {
             for (int64_t n_seqs : { 1, 2 }) {
@@ -14333,7 +15401,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    // the alpha chain may also come first in the graph
+
     test_cases.emplace_back(new test_gdn_gating(12, 8, 1, true));
     test_cases.emplace_back(new test_gdn_gating(48, 1, 2, true));
 
@@ -14357,6 +15425,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // ne[2] > 65535 exceeds the CUDA gridDim.y limit (#27901)
+    test_cases.emplace_back(new test_rms_norm_mul_rope({4, 1, 65536, 1}, 1e-6f, false, false, false, GGML_ROPE_TYPE_NORMAL));
+    test_cases.emplace_back(new test_rms_norm_mul_rope({4, 1, 65536, 1}, 1e-6f, false, true,  false, GGML_ROPE_TYPE_NEOX));
     for (int64_t d_conv : {3, 4, 9}) {
         for (int64_t d_inner: {1024, 1536, 2048}) {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
@@ -14406,6 +15477,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 65, 2)); // SSD one chunk + 1-token sequential tail
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 128, 2)); // SSD multi-chunk, no tail (exercises the chunk-to-chunk state handoff)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 16, 2, 128, 2, false, /*K=*/1, /*weak_decay=*/true)); // SSD multi-chunk, carried state not numerically negligible
+
+    // ssm_scan + cache cpy fusion
+    test_cases.emplace_back(new test_ssm_scan_cache_fusion(GGML_TYPE_F32, 128, 64, 16, 2, 4, 1, 4));
+    test_cases.emplace_back(new test_ssm_scan_cache_fusion(GGML_TYPE_F32, 128, 64, 16, 2, 1, 1, 4)); // n_seq_tokens < K
+    test_cases.emplace_back(new test_ssm_scan_cache_fusion(GGML_TYPE_F32, 128, 64, 16, 2, 8, 1, 3)); // n_seq_tokens > K
+    test_cases.emplace_back(new test_ssm_scan_cache_fusion(GGML_TYPE_F32,  96, 64, 16, 2, 4, 1, 4));
+    test_cases.emplace_back(new test_ssm_scan_cache_fusion(GGML_TYPE_F32, 256, 64,  8, 2, 4, 1, 4));
+    test_cases.emplace_back(new test_ssm_scan_cache_fusion(GGML_TYPE_F32, 128, 64, 16, 2, 1, 1, 1)); // K == 1, final state only
+    test_cases.emplace_back(new test_ssm_scan_cache_fusion(GGML_TYPE_F32, 128, 64, 16, 2, 4, 1, 1));
+    test_cases.emplace_back(new test_ssm_scan_cache_fusion(GGML_TYPE_F32, 128, 64, 16, 2, 300, 1, 1)); // K == 1, SSD path over two chunks
 
     test_cases.emplace_back(new test_rwkv_wkv6(GGML_TYPE_F32, 32, 64, 1, 1));
     test_cases.emplace_back(new test_rwkv_wkv6(GGML_TYPE_F32, 32, 64, 32, 1));
@@ -14522,9 +15603,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_MXFP4, GGML_TYPE_F32, 2880, 32, 2880, {1, 1}, {1, 1}));
 
-    // Q8_0 skinny GEMM (repacked QPN8 layout, sm_70) on the DFlash2 verify shapes. M <= 16 uses
-    // the single-stage kernel, M = 17..32 the two-phase M=32 kernel, M = 33..64 two M=32 calls;
-    // N = 256 is too small and stays on the old path.
+
+
+
     const std::vector<std::pair<int64_t, int64_t>> q8_0_skinny_shapes = {
         { 4352, 5120}, { 5120, 4352}, { 2560, 5120}, { 1536, 5120}, { 5120, 1536}, { 3072, 5120}, {62080, 5120},
     };
@@ -14535,9 +15616,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 8, 5120, {1, 1}, {1, 1}));
 
-    // Q8_0 skinny GEMM on the narrow Qwen3.8-Flash-Next decode shapes (6-card tensor split): the
-    // hyper-connection down projection (N = 320, 10 tiles) splits K over several CTAs per tile
-    // for M <= 16; the up projection (K = 320) and the shared expert down (K = 640) keep one CTA
+
+
+
     for (int64_t n_tokens : {1, 2, 4, 7, 8, 9, 16, 17, 32}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320, n_tokens, 10240, {1, 1}, {1, 1}));
     }
@@ -14546,10 +15627,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, n_tokens, 640, {1, 1}, {1, 1}));
     }
 
-    // narrow F32/BF16 GEMV of the Qwen3.8-Flash-Next decode graph: few long rows (the
-    // hyper-connection inject [10240, 4], a GDN beta/alpha slice [2560, 8], the shared expert
-    // gate [2560, 1]) split each row over 8 CTAs; many rows at M > 1 (the router [2560, 512], the
-    // indexer projection, BF16) run 4 rows per block
+
+
+
+
     for (int64_t n_tokens : {1, 2, 4, 7, 8}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 4,   n_tokens, 10240, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32,  GGML_TYPE_F32, 8,   n_tokens, 2560,  {1, 1}, {1, 1}));
@@ -14560,18 +15641,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 16,  n_tokens, 2048,  {1, 1}, {1, 1}));
     }
 
-    // the qwen4exp router [2560, 512] stored as BF16 (the GGUF F32 router loaded with
-    // TENSOR_F32_AS_BF16): the verify batches 5 and 6, which the narrow GEMV takes over from cuBLAS
-    // for a BF16 weight, and the prefill batches (cuBLAS SGEMM after the BF16 -> F32 conversion)
+
+
+
     for (int64_t n_tokens : {5, 6, 16, 342, 2048}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 512, n_tokens, 2560,  {1, 1}, {1, 1}));
     }
 
-    // Q2_K/Q3_K/Q4_K/Q5_K/Q6_K skinny GEMM (repacked codes + raw super-block meta, sm_70):
-    // M <= 16 runs the single-stage kernel, M = 17..64 the two-phase M=32 kernel (split-16
-    // shapes), M > 64 expands the repacked weights to F16 and uses the regular dense path. The
-    // kernel rounds d*sc and dmin*m to F16 once per 32 values, a relative error of <= 2^-11 on
-    // a constant per sub-block, so the default 5e-4 NMSE of test_mul_mat covers it.
+
+
+
+
+
     const std::vector<ggml_type> q4_k_skinny_types = {
         GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
     };
@@ -14585,7 +15666,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    // M = 17..64 on the DFlash2 verify shapes, K = 5120 and the 2/4-card N splits
+
     const std::vector<std::pair<int64_t, int64_t>> q4_k_skinny_m32_shapes = {
         { 4352, 5120}, { 8704, 5120}, { 1536, 5120}, { 3072, 5120},
     };
@@ -14596,15 +15677,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    // smallest repackable shape: one 32-row tile and one 256-value super-block, so a single
-    // split-K=8 launch (M = 1) or one to_f16 tile (M = 17)
+
+
     for (ggml_type type : q4_k_skinny_types) {
         test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 32,  1, 256, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 32, 17, 256, {1, 1}, {1, 1}));
     }
 
-    // Q2_K~Q6_K skinny gated pair: both matmuls and the SWIGLU in one kernel on sm_70 for
-    // M <= 16, two M=32 two-phase kernels plus the elementwise SWIGLU for M = 17..64
+
+
     for (ggml_type type : q4_k_skinny_types) {
         for (int64_t n_tokens : {1, 8, 16}) {
             for (int64_t n_out : {4352, 8704}) {
@@ -14614,39 +15695,39 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, 32, 4352, 5120,
             false, 1, 1, false, false, true, false, {1, 1}));
-        // K = 4864 is a multiple of 256 but not of 512: M = 17..64 has no M=32 kernel and must
-        // fall back to the regular path instead of running with split-K 8
+
+
         for (int64_t n_tokens : {17, 24, 32}) {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, 4352, 4864,
                 false, 1, 1, false, false, true, false, {1, 1}));
         }
     }
 
-    // Q8_0 skinny gated pair: both matmuls and the SWIGLU in one kernel on sm_70, M > 16 as two
-    // M=32 kernels plus the elementwise SWIGLU
+
+
     for (int64_t n_tokens : {1, 8, 16, 24, 32, 48, 64}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n_tokens, 4352, 5120,
             false, 1, 1, false, false, true, false, {1, 1}));
     }
-    // the Qwen3.8-Flash-Next shared expert gate/up (N = 640, 20 tiles): K split over several CTAs
+
     for (int64_t n_tokens : {1, 2, 4, 8, 9, 16}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, n_tokens, 640, 2560,
             false, 1, 1, false, false, true, false, {1, 1}));
     }
-    // the shared expert tail, decode and prefill widths
+
     for (int64_t n_tokens : {1, 4, 17, 512}) {
         test_cases.emplace_back(new test_shexp_tail(2560, n_tokens));
     }
     test_cases.emplace_back(new test_shexp_tail(96, 3));
-    // the shared expert with its down projection: the gated pair hands F16 activations to the
-    // down projection (M <= 16), a wide pair keeps the F32 GLU output (N = 4352)
+
+
     for (int64_t n_tokens : {1, 4, 8, 16, 17}) {
         test_cases.emplace_back(new test_ffn_q8(2560, 640, n_tokens));
     }
     test_cases.emplace_back(new test_ffn_q8(5120, 4352, 4));
-    // the shared expert split over the devices under expert parallelism (64-row units of the 640
-    // rows): gate/up rows and down columns per device on 6 (64/128), 4 (128/192), 3 (192/256) and
-    // 2 (320) devices, the fused decode/verify path and the plain matmuls of decode and prefill
+
+
+
     for (int64_t n_ff : {64, 128, 192, 256, 320}) {
         for (int64_t n_tokens : {1, 4, 16, 17}) {
             test_cases.emplace_back(new test_ffn_q8(2560, n_ff, n_tokens));
@@ -14658,9 +15739,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, n_tokens, n_ff, {1, 1}, {1, 1}));
         }
     }
-    // with the shared expert gate after the down projection: it rides along in the pair launch where the
-    // F32 GEMV takes mul_mat_vec_f (M <= 4 on Volta), on its own path otherwise. The per-device row
-    // counts of the split shared expert above carry the gate on each card.
+
+
+
     for (int64_t n_tokens : {1, 2, 3, 4, 5, 8, 17}) {
         test_cases.emplace_back(new test_ffn_q8(2560, 640, n_tokens, true));
     }
@@ -14671,10 +15752,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // multiple repacked Q2_K~Q6_K matmuls sharing one input: the multi-weight kernel for
-    // M <= 16, one M=32 two-phase launch per weight for M = 17..64. The N columns follow the
-    // per-card qkv/z and q/k/v shapes of the 4-card (2560/1536, 3072/256/256) and 2-card
-    // (5120/3072, 6144/512/512) tensor splits; all weights use K = 5120 so they share one src1.
+
+
+
+
     for (ggml_type type : q4_k_skinny_types) {
         for (int64_t n_tokens : {1, 8, 16}) {
             test_cases.emplace_back(new test_mul_mat_multi({2560, 1536}, n_tokens, 5120, type));
@@ -14683,22 +15764,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_multi({6144, 512, 512}, n_tokens, 5120, type));
         }
         test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, 32, 5120, type));
-        // K = 4864 is a multiple of 256 but not of 512: M = 17..64 must fall back to the
-        // shared-input F16 path instead of the M=32 kernel
+
+
         for (int64_t n_tokens : {17, 24, 32}) {
             test_cases.emplace_back(new test_mul_mat_multi({2560, 1536}, n_tokens, 4864, type));
         }
     }
 
-    // multiple Q8_0 matmuls sharing one input: one input conversion and one multi-weight kernel
+
     for (int64_t n_tokens : {1, 8, 16, 32}) {
         test_cases.emplace_back(new test_mul_mat_multi({2560, 1536, 12, 12}, n_tokens, 5120));
         test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, n_tokens, 5120));
     }
 
-    // narrow F32/BF16 matmuls sharing one input (the qwen4exp GDN ssm_beta / ssm_alpha slices of a
-    // 6-card split: 9 or 6 rows each): one launch for all rows where mul_mat_vec_f takes them (F32 up to
-    // 4 tokens on Volta), the regular path above
+
+
+
     for (int64_t n_tokens : {1, 2, 3, 4, 5, 8}) {
         test_cases.emplace_back(new test_mul_mat_multi({9, 9}, n_tokens, 2560, GGML_TYPE_F32));
         test_cases.emplace_back(new test_mul_mat_multi({6, 6}, n_tokens, 2560, GGML_TYPE_F32));
@@ -14707,7 +15788,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_multi({8, 8, 3}, 4, 4096, GGML_TYPE_BF16));
     test_cases.emplace_back(new test_mul_mat_multi({8, 8}, 8, 4096, GGML_TYPE_BF16));
 
-    // the same matmuls with a large M: one shared input conversion across cuBLAS calls
+
     for (int64_t n_tokens : {64, 512}) {
         test_cases.emplace_back(new test_mul_mat_multi({2560, 1536, 12, 12}, n_tokens, 5120));
         test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, n_tokens, 5120));
@@ -14724,6 +15805,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 1, 509, 2051, {1, 1}, {1, 1}));
 
+    // testing very large N
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16, 2105344, 32, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 16, 8400000, 32, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16, 8400000, 32, {1, 1}, {1, 1}));
+    // same shapes with a repeat in dim 3
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 16, 8400000, 32, {1, 1}, {2, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 16, 8400000, 32, {1, 1}, {2, 1}));
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 31, 509, 2051, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
@@ -14734,8 +15823,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
         }
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 64, n, 256, {3, 2}, {2, 1}));
-        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0,
-                                 GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
+                                 GGML_TYPE_Q8_0, GGML_TYPE_Q1_0, GGML_TYPE_Q2_0, GGML_TYPE_MXFP4, GGML_TYPE_Q2_K, GGML_TYPE_Q3_K,
+                                 GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_TQ2_0,
+                                 GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,
+                                 GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 48,  n, 2560, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 3000, n, 512,  {1, 1}, {1, 1}));
@@ -14747,7 +15839,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
         for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q5_K, GGML_TYPE_F16}) {
-            for (mul_mat_add_mode mode : {MUL_MAT_ADD_MM_RES, MUL_MAT_ADD_RES_MM, MUL_MAT_ADD_ROW, MUL_MAT_ADD_RES_INPLACE}) {
+            for (mul_mat_add_mode mode : {MUL_MAT_ADD_MM_RES, MUL_MAT_ADD_RES_MM, MUL_MAT_ADD_ROW, MUL_MAT_ADD_RES_INPLACE, MUL_MAT_ADD_MM_MM}) {
                 test_cases.emplace_back(new test_mul_mat_add(type_a, 1000, n, 1024, mode));
             }
             test_cases.emplace_back(new test_mul_mat_add(type_a, 2048, n, 2048, MUL_MAT_ADD_B_INPLACE));
@@ -14758,7 +15850,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}, {0, 1, 2, 3}, 1280));
         }
         // a src1 with a nonzero mean, for the zero points and mins of quantized src0 types
-        for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_Q2_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
             test_cases.emplace_back(new test_mul_mat_pos(type_a, GGML_TYPE_F32, 1000, n, 1024, {1, 1}, {1, 1}));
         }
     }
@@ -14847,8 +15939,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 1, 256, {3, 2}, {2, 2}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_BF16, 16, 8, 256, {1, 1}, {1, 1}));
 
-    // BF16 weights in the decode (n = 1 and up to the MMVF batch limit of 8) and prefill
-    // (n = 16 and up) shapes of the hyper-connection and router weights (m = 160/256)
+
+
     for (int64_t m : {160, 256}) {
         for (int64_t n : {1, 8, 16, 512}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, m, n, 256, {1, 1}, {1, 1}));
@@ -14857,7 +15949,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 8, 8, false, m, 16, 256));
     }
 
-    // the same weight after the load-time BF16 -> F16 conversion, with BF16 data beyond the F16 range
+
     test_cases.emplace_back(new test_mul_mat_bf16_to_f16(160,  1, 256));
     test_cases.emplace_back(new test_mul_mat_bf16_to_f16(160,  8, 256));
     test_cases.emplace_back(new test_mul_mat_bf16_to_f16(160, 16, 256));
@@ -15027,46 +16119,46 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,   GGML_TYPE_F32, 1024, 10, false, 256, n, 128));
     }
 
-    // Qwen3.8-Flash-Next expert projections: Q2_0 weights, 512 experts, top-10,
-    // gate/up (m = 640, k = 2560) and down (m = 2560, k = 640)
+
+
     for (int n : {1, 8, 64}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q2_0, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
     }
 
-    // expert parallelism: split the experts along the expert dim and compare the sum of the
-    // per-shard results against the full computation. n covers the MMVQ single-token path,
-    // the MMVQ mmid path (n = 9..16), the grouped kernel (n = 9..64), the MMQ path and the
-    // 2048 prefill batch whose per-expert column count is estimated from the global expert count.
+
+
+
+
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_Q2_0}) {
         for (int n : {1, 8, 12, 16, 24, 64, 128, 512, 2048}) {
-            // gate/up shape, broadcast activation (this is what the model graph uses)
+
             test_cases.emplace_back(new test_mul_mat_id_ep(type_a, GGML_TYPE_F32, 512, 10, 6,  640, n, 2560, true));
             if (640 % ggml_blck_size(type_a) == 0) {
-                // down shape, one activation row per (token, slot)
+
                 test_cases.emplace_back(new test_mul_mat_id_ep(type_a, GGML_TYPE_F32, 512, 10, 6, 2560, n,  640, false));
             }
         }
     }
 
-    // Q5_1 as in UD-Q4_K_XL (the down projection uses Q5_1/Q8_0): the gate/up and down shapes at
-    // the grouped, MMQ and prefill batch sizes.
+
+
     for (int n : {64, 512, 2048}) {
         test_cases.emplace_back(new test_mul_mat_id_ep(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, 6,  640, n, 2560, true));
         test_cases.emplace_back(new test_mul_mat_id_ep(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, 6, 2560, n,  640, false));
     }
 
-    // expert parallelism with the gate/up GLU fusion: the shards must sum to the full fused result.
-    // The MMVQ fusion only handles up to 16 tokens per block on Volta.
+
+
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
         for (int n : {1, 8, 12, 16}) {
             test_cases.emplace_back(new test_mul_mat_id_ep_fusion(type_a, 512, 10, 6, 640, n, 2560));
         }
     }
 
-    // the MoE FFN of a decode/verify batch, fused against separate steps (exactly equal): the verify
-    // and draft widths, single device and 4/6-way expert parallelism, the expert types of UD-Q4_K_XL
-    // (gate_up Q4_K/Q5_K/Q8_0, down Q5_1/Q8_0), with and without the gate_up projection in the chain
+
+
+
     for (int n : {1, 2, 3, 4, 8, 16}) {
         for (int shards : {1, 4, 6}) {
             test_cases.emplace_back(new test_moe_ffn_fused(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, GGML_TYPE_F16, true,  64, 10, shards, n));
@@ -15075,209 +16167,265 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
         test_cases.emplace_back(new test_moe_ffn_fused(GGML_TYPE_Q5_K, GGML_TYPE_Q8_0, GGML_TYPE_F16, true, 64, 10, 4, n));
         test_cases.emplace_back(new test_moe_ffn_fused(GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_F16, true, 64, 10, 4, n));
-        // with the router in front: the activation is quantized in the topk_moe launch
+
         test_cases.emplace_back(new test_moe_ffn_fused(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, GGML_TYPE_F16, true, 64, 10, 4, n, true));
         test_cases.emplace_back(new test_moe_ffn_fused(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_F16, true, 64, 10, 1, n, true));
     }
-    // the real expert count: 512 experts, a 6-way slice has 85 or 86 of them
+
     for (int n : {1, 4}) {
         test_cases.emplace_back(new test_moe_ffn_fused(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, GGML_TYPE_F16, true, 512, 10, 6, n));
         test_cases.emplace_back(new test_moe_ffn_fused(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, GGML_TYPE_F16, true, 512, 10, 6, n, true));
     }
-    // the same on the expert store with a host complement: the decode staging and its pointer table
+
     for (int n : {1, 4, 8}) {
         test_cases.emplace_back(new test_moe_ffn_fused_expert(GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, 48, 10, 4, n));
         test_cases.emplace_back(new test_moe_ffn_fused_expert(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 48, 10, 1, n));
     }
 
-    // expert weights in a device-readable host buffer type (CUDA mapped host memory).
-    // n covers every dispatch path: MMVQ (1, 8), the grouped kernel (9..64), MMQ prefill (65+)
-    // and the large prefill batches (512, 2048). On a mapped weight none of these may allocate
-    // a full expert tensor in device memory; the mapped-MMQ path reads the weights in place.
-    // The framework does not expose the CUDA pool high-water mark, so on a machine verify with
-    // the CUDA pool peak logged at exit or by watching nvidia-smi during a 16K prefill: the
-    // mapped weight must not add an expert-sized allocation.
+
+
+
+
+
+
+
     for (int n : {1, 8, 16, 64, 512, 2048}) {
         test_cases.emplace_back(new test_mul_mat_id_mapped(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 4, 640, n, 2560));
     }
 
-    // expert store weights: a few experts in VRAM slots, the complement in the
-    // device-readable host arena, both read through a device pointer table. Prefill batches
-    // (64 and up) stage the host experts into VRAM before the MMQ kernel runs.
-    // The Q4_K/Q8_0 types cover the expert types of the target model.
+
+
+
+
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
         for (int n : {1, 8, 16, 64, 128, 512}) {
             test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 32, 4, 640, n, 2560));
         }
-        // expert parallelism: each shard is a separate expert tensor with its own offset
+
         for (int n : {1, 4, 8, 64, 512}) {
             test_cases.emplace_back(new test_mul_mat_id_expert_ep(type_a, GGML_TYPE_F32, 48, 4, 3, 640, n, 2560, true));
         }
     }
 
-    // Flash-Next expert store at the prefill batch sizes that reach the MMQ path on Volta:
-    // 512 experts, top-10, gate/up shape. n=512 and n=2048 give a per-expert column count of
-    // 10 and 40 (< 64), so the batched MMQ path runs. The all-slot budget keeps every expert
-    // in a VRAM slot (no host complement, no staging area at all); the part-host budget
-    // keeps two experts in the slots and stages the whole host complement. Q4_K/Q5_1/Q8_0
-    // are the types the model uses for its expert tensors.
+
+
+
+
+
+
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
         for (int n : {512, 2048}) {
-            test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 512, 10, 640, n, 2560, /*all_slot=*/true));
-            test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 512, 10, 640, n, 2560, /*all_slot=*/false));
+            test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 512, 10, 640, n, 2560, true));
+            test_cases.emplace_back(new test_mul_mat_id_expert(type_a, GGML_TYPE_F32, 512, 10, 640, n, 2560, false));
         }
     }
 
-    // The staging area of the cases above holds the whole host complement (510 experts), so a
-    // launch rarely fills it and rarely reuses a slot. These put a single host expert in the
-    // arena and size the staging area for exactly that one: every launch has to assign slot 0,
-    // copy the expert in and rewrite the whole staging table, and a plan that kept an entry or
-    // a slot of an earlier launch shows up in the result instead of in a log line.
-    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640,  512, 2560, /*all_slot=*/false, /*n_host=*/1));
-    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, 640, 2048, 2560, /*all_slot=*/false, /*n_host=*/1));
-    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q4_K, GGML_TYPE_F32,  32,  4, 640,  512, 2560, /*all_slot=*/false, /*n_host=*/1));
-    // two launches of the same shape with different routing in one graph: the staging table and
-    // the slots are reused between them, so this is the consecutive-launch case of one staging
-    // area on one stream. Both node results are compared against the reference.
-    test_cases.emplace_back(new test_mul_mat_id_expert_two_ids(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640,  512, 2560, /*n_host=*/1));
-    test_cases.emplace_back(new test_mul_mat_id_expert_two_ids(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640, 2048, 2560, /*n_host=*/4));
-    // the first launch of a stream, repeated: the staging state is created, cleared and staged into
-    // on every relaunch, with a 6 GiB staging area so that its clearing outlasts the kernel issue
-    // (see the class). The two shapes cover the 32-value (Q8_0) and the 256-value (Q4_K) weight paths.
-    test_cases.emplace_back(new test_mul_mat_id_expert_first_launch(GGML_TYPE_Q8_0,  32,  4, 640, 128, 2560, /*n_re=*/8, /*stage_bytes_min=*/6144ull << 20));
-    test_cases.emplace_back(new test_mul_mat_id_expert_first_launch(GGML_TYPE_Q4_K, 512, 10, 640, 512, 2560, /*n_re=*/8, /*stage_bytes_min=*/6144ull << 20));
 
-    // K not a multiple of MATRIX_ROW_PADDING (512): the MMQ loaders read the last row up to a
-    // 512-element boundary, so every expert needs trailing bytes past its data. With all_slot
-    // every expert is in the slots with the 256-byte pitch of the store and the LAST expert
-    // ends at the end of the slot allocation: a kernel that reads past data + row padding
-    // runs off the allocation (compute-sanitizer reports it). n=2048 takes the batched MMQ
-    // path. k=640 is the Flash-Next down projection (Q5_1/Q8_0; the K-quants need a multiple
-    // of 256, so Q4_K uses k=768).
+
+
+
+
+    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640,  512, 2560, false, 1));
+    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, 640, 2048, 2560, false, 1));
+
+    test_cases.emplace_back(new test_mul_mat_id_expert_decode_odd(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 512, 10, 640,  512, 2560));
+    test_cases.emplace_back(new test_mul_mat_id_expert(GGML_TYPE_Q4_K, GGML_TYPE_F32,  32,  4, 640,  512, 2560, false, 1));
+
+
+
+    test_cases.emplace_back(new test_mul_mat_id_expert_two_ids(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640,  512, 2560, 1));
+    test_cases.emplace_back(new test_mul_mat_id_expert_two_ids(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640, 2048, 2560, 4));
+
+
+
+
+
+
+
+
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_1}) {
+        for (int n : {512, 2048}) {
+            for (int n_host : {1, 341}) {
+                test_cases.emplace_back(new test_mul_mat_id_expert_split(type_a, GGML_TYPE_F32, 512, 10, 640, n, 2560, n_host, 3));
+            }
+        }
+    }
+
+
+    for (int n_host : {1, 341}) {
+        test_cases.emplace_back(new test_mul_mat_id_expert_mixed(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, 640, 512, 2560, n_host));
+    }
+
+
+
+    test_cases.emplace_back(new test_mul_mat_id_expert_first_launch(GGML_TYPE_Q8_0,  32,  4, 640, 128, 2560, 8, 6144ull << 20));
+    test_cases.emplace_back(new test_mul_mat_id_expert_first_launch(GGML_TYPE_Q4_K, 512, 10, 640, 512, 2560, 8, 6144ull << 20));
+
+
+
+
+
+
+
+
     for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
         test_cases.emplace_back(new test_mul_mat_id_expert_pad(type_a, 32, 2560, 2048, 640));
     }
     test_cases.emplace_back(new test_mul_mat_id_expert_pad(GGML_TYPE_Q4_K, 32, 640, 2048, 768));
 
-    // A fully resident store addresses an expert as base + expert * pitch in units of
-    // quantization blocks, so the pitch must be a whole number of blocks. These shapes have
-    // an expert span whose 256-byte aligned pitch the block size does not divide (Q2_0 blocks
-    // are 18 bytes): without the type size in the alignment the read of expert e starts
-    // e * (pitch mod 18) bytes too early. n=2048 reaches the batched MMQ path, n=16 the
-    // MMVQ one, both of which divide the pitch by the block size.
+
+
+
+
+
+
     test_cases.emplace_back(new test_mul_mat_id_expert_pad(GGML_TYPE_Q2_0, 32, 2560, 2048, 640));
     test_cases.emplace_back(new test_mul_mat_id_expert_pad(GGML_TYPE_Q2_0, 32, 2560, 16, 640));
 
-    // The same trailing-padding case through a view of the fully resident tensor: the view
-    // starts at expert n_skip and the store pitch (data + padding) differs from the tensor's own
-    // expert stride, so the kernels must use the store base and pitch of the view.
+
+
+
     test_cases.emplace_back(new test_mul_mat_id_expert_view(GGML_TYPE_Q5_1, 32, 4, 2560, 2048, 640, 7));
     test_cases.emplace_back(new test_mul_mat_id_expert_view(GGML_TYPE_Q4_K, 32, 4, 640, 2048, 768, 7));
     test_cases.emplace_back(new test_mul_mat_id_expert_view(GGML_TYPE_Q5_1, 32, 4, 640, 16, 2560, 3));
 
-    // MoE FFN of the expert store: gate/up/down as separate store tensors, one shared ids, the
-    // GLU between them. The MMQ prefill (n = 2048) stages the host experts of all three tensors
-    // through the one per-stream staging area, so the consecutive launches must not read a slot
-    // that a later prepare has overwritten; n = 16 checks the fused MMVQ gate/up path instead.
-    // down uses Q8_0: k = m = 640 is not a multiple of QK_K for the K-quants.
+
+
+
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (int n : { 8, 512 }) {
+            test_cases.emplace_back(new test_mul_mat_id_expert_swap(type_a, expert_adaptive_n_mats, 4, 640, n, 2560, 8));
+        }
+    }
+
+
+
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        for (int n : { 8, 512 }) {
+            test_cases.emplace_back(new test_mul_mat_id_expert_counts(type_a, n));
+        }
+    }
+
+
+
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id_expert_adaptive(type_a, expert_adaptive_n_mats, 4, 640, 8, 2560));
+    }
+
+
+
+
+
+
     test_cases.emplace_back(new test_mul_mat_id_expert_ffn(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 512, 10, 640, 2048, 2560));
     test_cases.emplace_back(new test_mul_mat_id_expert_ffn(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, 512, 10, 640, 2048, 2560));
     test_cases.emplace_back(new test_mul_mat_id_expert_ffn(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 512, 10, 640, 16,   2560));
 
-    // Expert store under a permuted expert assignment: the experts of the device are not a
-    // contiguous range of the numbering, every consumer of the ids goes through the row of the
-    // assignment (ggml_expert_store_node_lut). n covers the MMVQ paths (1, 8, 16), the grouped
-    // kernel (64), the fused-expert / MMQ prefill (128, with host experts staged) and the large
-    // batch (512). The naive variant checks the result against the full unpermuted weight in the
-    // same graph; the all-slot cases have no host tier. The device of the test is the device of
-    // the backend, so with 3 (2) devices in the assignment the test runs on CUDA0..2 (0..1).
+
+
+
+
+
+
+    test_cases.emplace_back(new test_mul_mat_id_expert_ffn_prefetch(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 512, 10, 640, 2048, 2560, 3));
+    test_cases.emplace_back(new test_mul_mat_id_expert_ffn_prefetch(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, 512, 10, 640, 512,  2560, 3));
+    test_cases.emplace_back(new test_mul_mat_id_expert_ffn_prefetch(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 512, 10, 640, 4096, 2560, 3));
+    test_cases.emplace_back(new test_mul_mat_id_expert_ffn_prefetch(GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, 512, 10, 640, 8192, 2560, 3));
+
+
+
+
+
+
+
+
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
         for (int n : {1, 8, 16, 64, 128, 512}) {
             for (bool check_naive : {false, true}) {
-                test_cases.emplace_back(new test_mul_mat_id_expert_permute(type_a, 48, 4, 3, 2, 640, n, 2560, /*all_slot=*/false, check_naive));
+                test_cases.emplace_back(new test_mul_mat_id_expert_permute(type_a, 48, 4, 3, 2, 640, n, 2560, false, check_naive));
             }
         }
-        test_cases.emplace_back(new test_mul_mat_id_expert_permute(type_a, 48, 4, 2, 1, 640, 16,  2560, /*all_slot=*/true, true));
-        test_cases.emplace_back(new test_mul_mat_id_expert_permute(type_a, 48, 4, 2, 1, 640, 512, 2560, /*all_slot=*/true, true));
+        test_cases.emplace_back(new test_mul_mat_id_expert_permute(type_a, 48, 4, 2, 1, 640, 16,  2560, true, true));
+        test_cases.emplace_back(new test_mul_mat_id_expert_permute(type_a, 48, 4, 2, 1, 640, 512, 2560, true, true));
     }
 
-    // Two models with two expert assignment tables in one graph, the target and its MTP draft: every
-    // node reads the table of its own weight, the draft's layer after the target's last one has its
-    // row in the draft's table. The draft's weights are plain device tensors laid out by the
-    // contiguous split (what the MTP draft is), or store tensors under another permutation. n covers
-    // the MMVQ path with decode staging (1, 16) and the prefill path with the staging area (128).
+
+
+
+
+
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q8_0}) {
         for (int n : {1, 16, 128}) {
             for (bool check_naive : {false, true}) {
                 test_cases.emplace_back(new test_mul_mat_id_expert_two_tables(type_a, 48, 4, 3, 640, n, 2560,
-                    /*b_permuted=*/false, /*b_in_store=*/false, check_naive));
+                    false, false, check_naive));
                 test_cases.emplace_back(new test_mul_mat_id_expert_two_tables(type_a, 48, 4, 3, 640, n, 2560,
-                    /*b_permuted=*/true,  /*b_in_store=*/true,  check_naive));
+                    true,  true,  check_naive));
             }
         }
     }
 
-    // the expert weights in a plain device weight buffer, exactly as model loading leaves them:
-    // the skinny prepass repacks eligible 2D Q8_0 weights in that buffer, so the 3D expert
-    // tensors must pass the repack admission untouched. n covers the MMVQ mmid paths (1, 2, 4, 8).
+
+
+
     for (int n : {1, 2, 4, 8}) {
-        test_cases.emplace_back(new test_mul_mat_id_wctx(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10,  640, n, 2560)); // gate/up
-        test_cases.emplace_back(new test_mul_mat_id_wctx(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, 2560, n,  640)); // down
+        test_cases.emplace_back(new test_mul_mat_id_wctx(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id_wctx(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, 2560, n,  640));
     }
 
-    // the shared-expert fusion must reject a repacked shared weight: the prepass repacks the
-    // 2D Q8_0 shexp pair before the fusion decision, and the fused kernel reads the original
-    // layout. Real Flash-Next shapes: m = 640, k = 2560, 512 experts rounded down to keep the
-    // weights small.
+
+
+
+
     for (int n : {1, 2, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat_id_shared_expert(GGML_TYPE_Q8_0, 8, 8, 640, n, 2560));
     }
 
-    // Unsloth Qwen3.8-Flash-Next UD-Q4_K_XL expert projections: 512 experts, top-10,
-    // gate/up (m = 640, k = 2560) and fused gate/up (m = 1280, k = 2560) with the K-quant types,
-    // down (m = 2560, k = 640) with the types the model actually uses there (K = 640 is not a
-    // multiple of QK_K, so Q4_K/Q5_K/Q6_K cannot be used for down).
-    // n = 8/16 are the MMVQ mmid limits, 17/65 sit just past the J = 16/64 grouped tile edges.
+
+
+
+
+
     for (int n : {1, 8, 9, 12, 16, 17, 24, 32, 48, 64, 65, 128}) {
         for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // gate/up
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560)); // fused gate/up
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560));
         }
         for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640)); // down
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
         }
     }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
 
-    // Decode and verify windows (T = 1..8) take the Volta grouped expert kernel: every entry
-    // routed to one expert is staged once and the weight row is read once, instead of one warp
-    // per token re-reading it (the MMVQ MoE kernel). Real UD-Q4_K_XL shapes and types.
+
+
+
     for (int n : {1, 2, 4, 8}) {
         for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, n, 2560)); // gate/up
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, n, 2560));
         }
         for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, n, 2560)); // gate/up
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n, 640)); // down
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n, 640));
         }
-        // merged gate_up: one MUL_MAT_ID over the (k, 2*n_ff) tensor, split into gate/up views
+
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560));
     }
 
-    // Prefill (n = 2048) takes the grouped kernel too: the real UD-Q4_K_XL shapes, 512 experts
-    // top-10. The average expert receives 40 columns; a skewed routing with hot experts takes
-    // far more, which exercises the per-expert column loop.
-    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
-        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, 2048, 2560)); // gate/up
-    }
-    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, 2048, 2560)); // merged gate_up
 
-    // the same merged gate_up tensor read with the fused SwiGLU epilogue: one MUL_MAT_ID over the
-    // (k, 2*n_ff) interleaved weight, F16 activation for the down projection instead of a separate
-    // swiglu_split pass. The real UD-Q4_K_XL expert shapes (512 experts, top-10, n_ff = 640,
-    // k = 2560) with the K-quant types the model uses there, F32 and F16 activations, and the
-    // decode/verify windows (T = 1..8, the MMVQ mmid kernel), the grouped-tile edge (n = 16, which
-    // is still inside the mmid batch on Volta) and the prefill widths (the fused-expert kernel).
+
+
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 640, 2048, 2560));
+    }
+    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, 2048, 2560));
+
+
+
+
+
+
+
     for (int n : {1, 2, 4, 8, 16, 64, 512, 2048}) {
         for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
             for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
@@ -15285,28 +16433,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    // the down projection reads the F16 H the SwiGLU epilogue writes: a plain MUL_MAT_ID with an F16
-    // activation, which the decode/verify widths take on the MMVQ mmid kernel after one conversion
+
+
     for (int n : {1, 8, 16, 512}) {
         for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F16, 512, 10, false, 2560, n, 640));
         }
     }
     for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
-        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, 2048, 640)); // down
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, 2048, 640));
     }
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
-        test_cases.emplace_back(new test_mul_mat_id_skew(type_a, 512, 10, 640, 2048, 2560, 8)); // skewed gate/up
+        test_cases.emplace_back(new test_mul_mat_id_skew(type_a, 512, 10, 640, 2048, 2560, 8));
     }
-    test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q4_K, 512, 10, 1280, 2048, 2560, 8)); // skewed merged gate_up
+    test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q4_K, 512, 10, 1280, 2048, 2560, 8));
     for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
-        test_cases.emplace_back(new test_mul_mat_id_skew(type_a, 512, 10, 2560, 2048, 640, 8)); // skewed down
+        test_cases.emplace_back(new test_mul_mat_id_skew(type_a, 512, 10, 2560, 2048, 640, 8));
     }
 
     // multiple blocks per row: exercises the block-stride loop and the
     // per-expert base offset, which k == 256 alone leaves untested
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 128, 8, false, 1024, 1, 2048));
+
+    // TODO: disabled until CUDA backend support is added [TAG_MUL_MAT_ID_DUPLICATE_ID]
+#if 0
+    // repeated expert ids within a row
+    for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int n : {9, 16, 33, 64}) {
+            test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 28, 10, false, 1024, n, 256));
+        }
+    }
+
+    for (ggml_type ta : {GGML_TYPE_F16, GGML_TYPE_Q4_0}) {
+        test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 1025, 10, false, 64, 33, 256, 1.0f, 0, true));
+        test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
+    }
+#endif
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));
@@ -15417,6 +16580,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_sin       (type));
         test_cases.emplace_back(new test_cos       (type));
         test_cases.emplace_back(new test_clamp     (type));
+        test_cases.emplace_back(new test_clamp     (type, {10, 5, 4, 3}, -0.5f, 0.5f, 1));
         test_cases.emplace_back(new test_leaky_relu(type));
         test_cases.emplace_back(new test_floor     (type));
         test_cases.emplace_back(new test_ceil      (type));
@@ -15670,6 +16834,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));
         }
     }
+    for (int k : {1, 10, 40}) {
+        test_cases.emplace_back(new test_top_k_inf({4096, 2, 1, 1}, k));
+        test_cases.emplace_back(new test_top_k_inf({248320, 1, 1, 1}, k));
+    }
+
     for (int i = 0; i < 20; ++i) {
         for (int k : {1, 2, 3, 7, 15, 100, 500, 1023, 9999}) {
             if (k <= 1<<i) {
@@ -15690,7 +16859,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // DFlash2 draft: per-GPU top-k over a vocab slice, 8 rows at a time
+
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {62080,  8, 1, 1}, 16));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {62080,  8, 1, 1}, 32));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, 16));
@@ -15717,6 +16886,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 8192,  2, 1, 1 }, 2051, true));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 33024, 4, 1, 1 }, 2051, true));
+
+    // rows that CUDA processes in several chunks (bitonic, radix)
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 500,  40000, 1, 1 }, 16));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, { 1100, 33000, 1, 1 }, 16));
 
     // qwen4exp QSA indexer top-k fusion (get_rows + f16 mask + top_k)
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  1, 1, 1500));
@@ -15796,25 +16969,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {100, 1, 1, 1}, 100, 0, false));
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {100, 1, 1, 1}, 0, 100, false));
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {100, 100, 1, 1}, 50, 50, false));
-    test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {1, 62080, 8, 1}, 0, 1, false)); // single-column rows
+    test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {1, 62080, 8, 1}, 0, 1, false));
+    // more than 65535 rows or slices, beyond the CUDA grid.y/grid.z limit
+    test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {4, 70000, 1, 1}, 1, 1, false));
+    test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {4, 70000, 1, 1}, 1, 1, true));
+    test_cases.emplace_back(new test_pad_ext(GGML_TYPE_F32, {4, 2, 300, 300}, 1, 1, 0, 0, 0, 0, 0, 0, 0, false));
 
     test_cases.emplace_back(new test_pad_reflect_1d());
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 384, 4, 1}));
-    test_cases.emplace_back(new test_seq_scatter()); // identity: full token axis
-    test_cases.emplace_back(new test_seq_scatter({64, 4, 2048, 1}, 2, 0, 342));    // 2048/6 first share (Tp = 342)
-    test_cases.emplace_back(new test_seq_scatter({64, 4, 2048, 1}, 2, 1710, 338)); // 2048/6 last (remainder)
-    test_cases.emplace_back(new test_seq_scatter({64, 4, 512, 1}, 2, 0, 86));      // ub 512 / 6
-    test_cases.emplace_back(new test_seq_scatter({2560, 4, 2000, 1}, 2, 0, 334));   // 2000-token tail block, first
-    test_cases.emplace_back(new test_seq_scatter({2560, 4, 2000, 1}, 2, 1670, 330)); // 2000-token tail block, last
-    test_cases.emplace_back(new test_seq_scatter({2560, 1, 341, 1}, 2, 100, 100));  // middle slice
-    test_cases.emplace_back(new test_seq_scatter({32, 341, 1, 1}, 1, 0, 341));      // axis 1
+    test_cases.emplace_back(new test_seq_scatter());
+    test_cases.emplace_back(new test_seq_scatter({64, 4, 2048, 1}, 2, 0, 342));
+    test_cases.emplace_back(new test_seq_scatter({64, 4, 2048, 1}, 2, 1710, 338));
+    test_cases.emplace_back(new test_seq_scatter({64, 4, 512, 1}, 2, 0, 86));
+    test_cases.emplace_back(new test_seq_scatter({2560, 4, 2000, 1}, 2, 0, 334));
+    test_cases.emplace_back(new test_seq_scatter({2560, 4, 2000, 1}, 2, 1670, 330));
+    test_cases.emplace_back(new test_seq_scatter({2560, 1, 341, 1}, 2, 100, 100));
+    test_cases.emplace_back(new test_seq_scatter({32, 341, 1, 1}, 1, 0, 341));
 
-    test_cases.emplace_back(new test_seq_gather({64, 4, 341, 1}, 2, GGML_TYPE_F32, GGML_TYPE_F32)); // dup
-    test_cases.emplace_back(new test_seq_gather({64, 4, 341, 1}, 2, GGML_TYPE_F32, GGML_TYPE_F16)); // F32 -> F16
+    test_cases.emplace_back(new test_seq_gather({64, 4, 341, 1}, 2, GGML_TYPE_F32, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_seq_gather({64, 4, 341, 1}, 2, GGML_TYPE_F32, GGML_TYPE_F16));
     test_cases.emplace_back(new test_seq_gather({2560, 4, 338, 1}, 2, GGML_TYPE_F32, GGML_TYPE_F16));
     test_cases.emplace_back(new test_seq_gather({2560, 1, 342, 1}, 2, GGML_TYPE_F32, GGML_TYPE_F16));
-    test_cases.emplace_back(new test_seq_gather({32, 341, 1, 1}, 1, GGML_TYPE_F32, GGML_TYPE_F16)); // axis 1
-    test_cases.emplace_back(new test_seq_gather({64, 4, 341, 1}, 2, GGML_TYPE_I32, GGML_TYPE_I32)); // ids dup
+    test_cases.emplace_back(new test_seq_gather({32, 341, 1, 1}, 1, GGML_TYPE_F32, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_seq_gather({64, 4, 341, 1}, 2, GGML_TYPE_I32, GGML_TYPE_I32));
 
     test_cases.emplace_back(new test_roll());
     test_cases.emplace_back(new test_roll(3, -2, 1, -1, true));
@@ -15841,8 +17018,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_xielu());
     test_cases.emplace_back(new test_xielu(GGML_TYPE_F16));
+    test_cases.emplace_back(new test_xielu(GGML_TYPE_BF16));
     test_cases.emplace_back(new test_xielu(GGML_TYPE_F32, { 512, 16, 1, 1 }));
     test_cases.emplace_back(new test_xielu(GGML_TYPE_F16, { 512, 16, 1, 1 }));
+    test_cases.emplace_back(new test_xielu(GGML_TYPE_BF16, { 512, 16, 1, 1 }));
 
     test_cases.emplace_back(new test_tri(GGML_TRI_TYPE_LOWER));
     test_cases.emplace_back(new test_tri(GGML_TRI_TYPE_LOWER_DIAG));
@@ -15961,7 +17140,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // grouped decode / verify with n_q <= 16 (sm_70 kernel): head size 256, gqa 6
+
     for (int nh : { 1, 4 }) {
         for (int kv : { 113, 1025, 4096 }) {
             for (int nb : { 2, 3, 8, 9, 16 }) {
@@ -15972,7 +17151,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // the same grouped shapes with q4_0 KV: raw q4_0 rows are staged and dequantized in shared memory
+
+
+
+
+
+
+
+    for (int nh : { 2, 3 }) {
+        for (int kv : { 113, 1025, 4096 }) {
+            for (int nb : { 8, 16 }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
+            }
+        }
+    }
+
+
     for (int nh : { 1, 4 }) {
         for (int kv : { 113, 1025, 4096 }) {
             for (int nb : { 2, 9, 16 }) {
@@ -15981,7 +17175,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // mixed K/V quantization pairs of the grouped kernel, one side q4_0
+
     for (const std::array<ggml_type, 2> & type_KV : {
             std::array<ggml_type, 2>{GGML_TYPE_Q4_0, GGML_TYPE_Q8_0},
             std::array<ggml_type, 2>{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0},
@@ -15993,8 +17187,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // grouped verify with GQA 2 and 4: the head groups round up, so the padding slots of a
-    // partial group must not load Q and must not write output
+
+
     for (int gqa : { 2, 4 }) {
         for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
             for (int nb : { 8, 16 }) {
@@ -16003,12 +17197,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // D256 prefill production shapes for the sm_70 Split-D kernel: 6 Q heads
-    // sharing 1 KV head (TP4 per-device shape), full 2048-row chunks, the
-    // q >= 17 lower bound and a long-context KV length. The long KV length is
-    // only tested with q8_0 KV: with F16 V the CPU reference accumulates
-    // softmax*V in f16, and at kv=32768 that rounding alone exceeds the
-    // tolerance (the MMA kernel fails those cases as well).
+
+
+
+
+
+
     for (int kv : { 4096, 32768 }) {
         for (int nb : { 2048, 17, 64, 128 }) {
             for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
@@ -16020,8 +17214,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // the same production shapes with the real-model causal mask (zero prefix,
-    // -inf suffix), including the permuted Q layout the model uses
+
+
     for (int kv : { 4096, 32768 }) {
         for (int nb : { 2048, 17, 100 }) {
             for (const std::array<int32_t, 4> & perm : { std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3} }) {
@@ -16035,7 +17229,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // the same production shapes with range masks (I32): causal and random
+
     for (int kv : { 4096, 32768 }) {
         for (int nb : { 2048, 17, 100 }) {
             for (const std::array<int32_t, 4> & perm : { std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3} }) {
@@ -16048,8 +17242,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
-    // the same causal range-mask production shapes with q4_0 KV: the split-d
-    // conversion mirrors the q4_0 rows below the range limit
+
+
     for (int kv : { 4096, 32768 }) {
         for (int nb : { 2048, 17, 100 }) {
             for (const std::array<int32_t, 4> & perm : { std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3} }) {
@@ -16064,26 +17258,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 0, false, 2));
     }
 
-    // windowed KV mirror (K/V wider than one 64K-row window): a range mask that
-    // (a) stays inside the first window, (b) crosses window borders or (c) spans
-    // a non-multiple of the window size must match the reference
+
+
+
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 3));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 131072,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 2));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 163840, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, 1));
-    // KV-split edges (mode 4): rows whose range lies only in the upper half of
-    // the first window leave split 0 empty, rows whose range lies only in the
-    // second window leave the whole first window empty, and all -inf rows must
-    // come out zero. The second case also runs the split with a full q block grid.
+
+
+
+
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 163840,   64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, 4));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 163840, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 4));
-    // non-windowed KV split (K/V view inside one window, mode 5): whole q
-    // blocks with a range inside the first two KV blocks leave one split
-    // segment empty, and fully masked q blocks (all -inf rows) leave both
-    // empty; the empty accumulator rows must still merge and normalize to zero.
+
+
+
+
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 5));
 
-    // range masks that stop at half of the KV view (the split-d conversion must
-    // follow the bounds, not the view width)
+
+
     for (int kv : { 4096, 32768 }) {
         for (int nb : { 2048, 100 }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 3));
@@ -16096,22 +17290,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 4096, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, 0, false, 3));
 
-    // ring wrap (mode 6): the visible columns are [a, n_kv) plus [0, b), so the two-interval
-    // mask covers a window that crosses the array end. Split-D prefill, grouped verify and the
-    // dense expansion must all union the two intervals
+
+
+
     for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 4096, 2048, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, true, false, 0, false, 6));
     }
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 32768, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, 6));
-    // the sliding-window ring of the online MTP draft: same shape, ring size and batch
+
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 34816, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 6));
-    // q = 8 with GQA 6 reaches the grouped sm_70 verify kernel
+
     for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 1025, 8, true, false, 0, 0, GGML_PREC_F32, type_KV, type_KV, {0, 1, 2, 3}, true, false, 0, false, 6));
     }
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {1, 1}, 1024, 7, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, false, 6));
 
-    // grouped decode / verify shapes with range masks
+
     for (int nh : { 1, 4 }) {
         for (int kv : { 113, 1025, 4096 }) {
             for (int nb : { 2, 8, 16 }) {
@@ -16124,7 +17318,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // the same grouped range-mask shapes with q4_0 KV
+
     for (int nh : { 1, 4 }) {
         for (int kv : { 113, 1025 }) {
             for (int nb : { 2, 16 }) {
@@ -16135,7 +17329,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // grouped GQA 2 and 4 with range masks
+
     for (int gqa : { 2, 4 }) {
         for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
             for (int nb : { 8, 16 }) {
@@ -16144,8 +17338,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // the same grouped shapes with a range mask that stops at half of the KV view: the split must
-    // follow the range, not the view width
+
+
     for (int nh : { 1, 4 }) {
         for (int kv : { 1025, 4096 }) {
             for (int nb : { 2, 8, 16 }) {
@@ -16159,9 +17353,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // multi-stream (non-unified KV) range masks: one sequence per stream, so the mask row of a
-    // token is indexed by (stream, token) like the dense mask. Split-D prefill and grouped verify
-    // must read each stream's own range.
+
+
+
     for (int n_stream : { 2, 3 }) {
         for (int kv : { 1024, 4096 }) {
             for (int nb : { 64, 256 }) {
@@ -16172,7 +17366,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
-        // verify: q = 8 per stream reaches the grouped sm_70 kernel
+
         for (int kv : { 1024, 4096 }) {
             for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
                 for (int range : { 1, 2 }) {
@@ -16182,22 +17376,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // the same multi-stream shapes with q4_0 KV
+
     for (int n_stream : { 2, 3 }) {
         for (int kv : { 1024, 4096 }) {
             for (int range : { 1, 2 }) {
                 test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, n_stream}, kv, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, range));
             }
         }
-        // verify: q = 8 per stream reaches the grouped sm_70 kernel
+
         for (int range : { 1, 2, 3 }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, n_stream}, 1024, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, range));
         }
-        // split-d prefill that views a longer cache but attends only its first half
+
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, n_stream}, 4096, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 0, false, 3));
     }
 
-    // generic fallback shapes with range masks
+
     for (const std::array<int64_t, 2> & nr23 : { std::array<int64_t, 2>{1, 1}, std::array<int64_t, 2>{4, 1} }) {
         for (int kv : { 512, 1024 }) {
             for (int nb : { 1, 7, 32, 512 }) {
@@ -16242,6 +17436,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1},  113,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 1024,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {8, 1}, 4096,  24, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, true));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {8, 1}, 4096,  24, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false));
 
     // Sparse mask hint: supported decode/prefill layouts and dense fallbacks.
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
@@ -16283,6 +17479,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // KV not a multiple of the compaction workgroup size.
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 5003, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
 
+    // Sparse gather: native block sizes, padded slots, and head/batch strides.
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_NL}) {
+        test_cases.emplace_back(new test_flash_attn_ext(128, 96, 2, {8, 2}, 5003, 3, true, false, 0, 0, GGML_PREC_F32, type, type, {0, 1, 2, 3}, true, false, 257));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(128, 96, 2, {8, 2}, 5003, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, 257));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 96, 2, {8, 2}, 5003, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, {0, 2, 1, 3}, true, false, 257));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 96, 2, {8, 2}, 5003, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_F32, {0, 1, 2, 3}, true, false, 257));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 96, 2, {8, 2}, 5003, 3, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F32, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 257));
+
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {8, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
@@ -16311,6 +17516,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {1, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, false));
 
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 1024, 320, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(96, 96, 8, {4, 1}, 512, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {8, 1}, 512, 259, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 512, 288, true, false, 0, 30.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {8, 1}, 1024, 320, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 2, 1, 3}, false));
+    test_cases.emplace_back(new test_flash_attn_ext(64, 64, 4, {8, 1}, 512, 259, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 2, 1, 3}, false));
+
     // FLASH_ATTN_EXT MMA: non-pow2 head size and MLA K/V view.
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 8, {8, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {20, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
@@ -16321,8 +17533,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {2, 1}, 1024, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, {2, 1}, 1024,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
-    // head-window views of the multi-GPU attention split: Q is a window of g heads out of 8
-    // (with the token stride of the full tensor), K/V are single-head windows out of 2 KV heads
+
+
     for (const std::array<int64_t, 3> & w : {
             std::array<int64_t, 3>{6, 0, 0},
             std::array<int64_t, 3>{2, 6, 1},
@@ -16341,8 +17553,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // non-uniform GQA head mapping of the 3-card attention split: local Q head h reads KV head 0
-    // when h < g0, matching the 6+2/4+4/2+6 windows of the three devices
+
+
     for (int g0 : { 6, 4, 2 }) {
         for (int n_q : { 2, 8, 16 }) {
             for (int n_kv : { 1025, 4096 }) {
@@ -16353,11 +17565,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // BF16 K/V for the other head sizes of the Metal tensor API kernel
+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 4, {12, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, { 8, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 4, { 4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 4, { 4, 1}, 512, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, true));
+
     // FLASH_ATTN_EXT: large logits
     test_cases.emplace_back(new test_flash_attn_ext_large_logits( 64,  64, 16, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(128, 128,  8, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 10.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_flash_attn_ext_large_logits(256, 256,  4, {4, 1}, 1024, 75, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16));
 
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
@@ -16490,6 +17709,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
 
+    // MMA-eligible GDN shapes: whole heads, value slices, tails, and the HIP prefill threshold.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   65, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   65, 3, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   64, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  257, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  513, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  513, 2, 2, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 2));
+    // Keep the WebGPU dispatch below 65535 workgroups (32 per token for this shape).
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2047, 2, 3));
+
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
     // exact-match cases (K == n_seq_tokens):
@@ -16499,21 +17730,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128,  4, 1, 1, false, false, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,   4, 2, 2, false, true,  /*K=*/4));
-    // overflow: n_tokens > K — only the last K snapshots kept.
-    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
-    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
 
-    // TP4 per-device shape (12 v heads, 4 q/k heads), long enough for the sm_70
-    // chunked prefill path, including a tail that is not a multiple of 64 and K snapshot slots.
+
+
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128,  130, 1, 3, false, false, /*K=*/8));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 2048, 1, 3, false, false, /*K=*/1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 2048, 1, 3, false, false, /*K=*/8));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 2100, 1, 3, false, false, /*K=*/8));
 
-    // sm_70 chunked prefill at per-device head splits other than TP4 (H_v = 3 * H_k),
-    // with long sequences and a tail that is not a multiple of the chunk size. The
-    // chunked path stages q/k/v/a through f16, so it needs a looser NMSE bound than
-    // the f32 recurrent kernel.
+
+
+
+
     for (int64_t head_count : {2, 3, 4, 5, 6, 8, 16}) {
         for (int64_t n_seq_tokens : {200, 1000, 2085}) {
             test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, head_count, 128, n_seq_tokens, 1, 3, false, false, /*K=*/1, 5e-6));
@@ -16527,14 +17755,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 8, 32,   4, 2, 4));
     test_cases.emplace_back(new test_gated_delta_net_cache_fusion(GGML_TYPE_F32, 4, 32,   8, 1, 4));
 
-    // gdn prologue fusion: q/k norm + gating computed in the gdn kernel
+
     test_cases.emplace_back(new test_gdn_prologue(4, 12, 128, 1, 1, 1));
     test_cases.emplace_back(new test_gdn_prologue(4, 12, 128, 1, 1, 8));
     test_cases.emplace_back(new test_gdn_prologue(4, 12, 128, 8, 1, 1));
     test_cases.emplace_back(new test_gdn_prologue(4, 12, 128, 8, 1, 8));
 
-    // TP4 per-device shape (12 v heads, 4 q/k heads), long enough for the sm_70
-    // chunked prefill path, including a tail that is not a multiple of 64 and K snapshot slots.
+
+
     test_cases.emplace_back(new test_gdn_prologue(4, 12, 128, 2048, 1, 1));
     test_cases.emplace_back(new test_gdn_prologue(4, 12, 128, 2048, 1, 8));
     test_cases.emplace_back(new test_gdn_prologue(4, 12, 128, 2100, 1, 8));
@@ -16567,17 +17795,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    // qsa_select: the tile scorer (>= 8 tokens) and the vector scorer, ranges shorter and longer than n_top,
-    // batches that end inside a 16-token wmma tile; the 2048-token case below spans several scoring passes
+
+
     for (ggml_type type_K : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
         for (int64_t nb : { 1, 3, 8, 16, 70, 130 }) {
             test_cases.emplace_back(new test_qsa_select(512, 8, nb, 4, 64, type_K));
         }
         test_cases.emplace_back(new test_qsa_select(4096, 3, 20, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(100, 0, 9, 4, 100, type_K));
-        // the top-k kernels: the register kernel at each of its sizes (up to 4096, 8192, 16384 and 24576 pools), past
-        // them the multi-block kernels for passes of up to 16 tokens and the wide kernel for larger passes (20 tokens;
-        // 70 tokens: a 64-token pass and a 6-token pass, both on the wide kernel)
+
+
+
         test_cases.emplace_back(new test_qsa_select(6000, 8, 4, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(12000, 8, 4, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(20000, 8, 4, 4, 512, type_K));
@@ -16586,19 +17814,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_select(50000, 8, 4, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(30000, 8, 20, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(30000, 8, 70, 4, 512, type_K));
-        // a pool count of the 65536 order (not the full 200K context) that is not a multiple of the 256-key
-        // block of the Volta wmma scorer: the last block scores only its first keys
+
+
         test_cases.emplace_back(new test_qsa_select(8192 + 7, 7, 70, 4, 512, type_K));
-        // the Volta wmma scorer (>= 8 tokens) at the production pool counts of the 16K (4104), 64K (16392) and
-        // 200K (51208) contexts: one full 64-token scoring pass (QSA_SELECT_TILE), and a batch that crosses passes
-        // and ends inside a 16-token tile
+
+
+
         test_cases.emplace_back(new test_qsa_select(4104,  8, 64,  4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(16392, 8, 130, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(51208, 8, 64,  4, 512, type_K));
-        // the pool counts qwen4exp takes (llama_memory_hybrid_idx::kpool_n_pool): the pools of the used cells padded
-        // to the n_kv grain plus one, so up to a grain of padded pools after the real ones. A short context, decode
-        // and prompt; 16K; past 16K and past 128K the count picks a larger register kernel and the multi-block kernel
-        // while the real pools still fit the smaller ones; 200K; the whole 256K cache
+
+
+
+
         test_cases.emplace_back(new test_qsa_select(513,   497,  4,  4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(513,   497,  66, 4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(4097,  81,   4,  4, 512, type_K));
@@ -16608,9 +17836,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_select(51201, 1951, 4,  4, 512, type_K));
         test_cases.emplace_back(new test_qsa_select(65537, 1,    4,  4, 512, type_K));
 
-        // pool rows (ggml_qsa_select_pool) and the rows expanded back into cells (ggml_qsa_expand), the same
-        // shapes: every top-k kernel (register at 4096/8192/16384/24576 pools, multi-block, wide), ranges shorter and
-        // longer than n_top, the cross-pass batches
+
+
+
         for (int mode : { 1, 2 }) {
             test_cases.emplace_back(new test_qsa_select(512,   8, 16,  4, 64,  type_K, false, false, mode));
             test_cases.emplace_back(new test_qsa_select(4096,  3, 20,  4, 512, type_K, false, false, mode));
@@ -16625,12 +17853,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_qsa_select(51208, 8, 64,  4, 512, type_K, false, false, mode));
         }
     }
-    // the 200K prefill batch itself: 2048 tokens against 51208 pools (32 scoring passes), Q8_0 pooled keys as -ctk q8_0
+
     test_cases.emplace_back(new test_qsa_select(51208, 8, 2048, 4, 512, GGML_TYPE_Q8_0));
 
-    // qsa_select over the compact indexer cache's table (qwen4exp: one pooled key per 128-wide row, so the Q8_0 rows
-    // are 136 bytes apart): decode and MTP verify on the register, multi-block and wide top-k, a prompt pass on the
-    // tensor-core scorer, the pool counts kpool_n_pool gives at 16K, 128K, 200K and 256K
+
+
+
     for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
         for (int64_t nb : { 1, 4, 70 }) {
             test_cases.emplace_back(new test_qsa_select(513,   497,  nb, 4, 512, type_K, false, true));
@@ -16641,8 +17869,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_select(51201, 1951, 4,  4, 512, type_K, false, true));
         test_cases.emplace_back(new test_qsa_select(65537, 1,    4,  4, 512, type_K, false, true));
         test_cases.emplace_back(new test_qsa_select(30000, 8,    20, 4, 512, type_K, false, true));
-        // pool rows and expanded rows over the same table: what a device of the meta collective computes for its token
-        // slice, and the expansion every device runs
+
+
         for (int mode : { 1, 2 }) {
             for (int64_t nb : { 4, 70 }) {
                 test_cases.emplace_back(new test_qsa_select(513,   497,  nb, 4, 512, type_K, false, true, mode));
@@ -16654,21 +17882,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_qsa_select(30000, 8,    20, 4, 512, type_K, false, true, mode));
         }
     }
-    // the 2048-token prompt batch at 16K / 64K / 200K pools over the compact table with Q8_0 keys (-ctk q8_0): pool rows
-    // and expanded rows
+
+
     for (int mode : { 1, 2 }) {
         test_cases.emplace_back(new test_qsa_select(4104,  8, 2048, 4, 512, GGML_TYPE_Q8_0, false, true, mode));
         test_cases.emplace_back(new test_qsa_select(16392, 8, 2048, 4, 512, GGML_TYPE_Q8_0, false, true, mode));
         test_cases.emplace_back(new test_qsa_select(51208, 8, 2048, 4, 512, GGML_TYPE_Q8_0, false, true, mode));
     }
-    // qsa_expand alone: every kept-prefix length, the padded pools never kept, the production shapes
+
     test_cases.emplace_back(new test_qsa_expand(512,   8, 16,   4, 64));
     test_cases.emplace_back(new test_qsa_expand(100,   0, 9,    4, 100));
     test_cases.emplace_back(new test_qsa_expand(4104,  8, 2048, 4, 512));
     test_cases.emplace_back(new test_qsa_expand(16392, 8, 2048, 4, 512));
     test_cases.emplace_back(new test_qsa_expand(51208, 8, 2048, 4, 512));
 
-    // qsa_attn: the chunked kernel (<= 16 tokens) and the prompt kernel, partial chunks, streams, both cache types
+
     for (ggml_type type_KV : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
         for (int64_t nb : { 1, 4, 8, 16, 17, 64 }) {
             test_cases.emplace_back(new test_qsa_attn(2, 4096, nb, 1, 2051, 2051, type_KV));
@@ -16678,8 +17906,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_qsa_attn(1, 4096, 40, 2, 2051, 2051, type_KV));
         test_cases.emplace_back(new test_qsa_attn(2, 300, 5, 1, 67, 67, type_KV));
         test_cases.emplace_back(new test_qsa_attn(2, 300, 33, 1, 67, 50, type_KV));
-        // a short context under the n_kv-grain pool count: the full 2051 slots with a few valid ones, the rest
-        // empty chunks of the chunked kernel or skipped steps of the prompt kernel
+
+
         for (int64_t nb : { 1, 4, 33 }) {
             test_cases.emplace_back(new test_qsa_attn(2, 300, nb, 1, 2051, 67, type_KV));
         }
@@ -16695,22 +17923,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
-    // Q8_0 weights of Qwen3.8-27B split over 4 GPUs at decode (1), DFlash2 verify (8) and 16 rows
+
     for (const auto & [n_out, k_red] : std::vector<std::pair<int64_t, int64_t>>{
             {4352, 5120}, {5120, 4352}, {2560, 5120}, {1536, 5120}, {5120, 1536}, {3072, 5120}, {62080, 5120}}) {
         for (int64_t n_tokens : {1, 8, 16}) {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, n_out, n_tokens, k_red, {1, 1}, {1, 1}));
         }
     }
-    // the same gate/up pair with the fused SWIGLU (verify width) for a direct comparison
+
     test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q8_0, GGML_GLU_OP_SWIGLU, 8, 4352, 5120,
         false, 1, 1, false, false, true, false, {1, 1}));
 
-    // the multi-weight kernel in the GDN (qkv/z/beta/alpha) and full attention (q/k/v) shapes
+
     test_cases.emplace_back(new test_mul_mat_multi({2560, 1536, 12, 12}, 8, 5120));
     test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, 8, 5120));
 
-    // the same shapes at prefill M: one shared input conversion across cuBLAS calls
+
     test_cases.emplace_back(new test_mul_mat_multi({2560, 1536, 12, 12}, 2048, 5120));
     test_cases.emplace_back(new test_mul_mat_multi({3072, 256, 256}, 2048, 5120));
     test_cases.emplace_back(new test_mul_mat_multi({4352, 4352}, 2048, 5120));
@@ -16733,6 +17961,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t n_kv : { 2048, 2304 }) {
         test_cases.emplace_back(new test_cont(
             GGML_TYPE_F32, {n_kv, 512, 64, 1}, false, {2, 1, 0, 3}));
+    }
+
+    // POOL_2D max over MiniMax-M3 indexer block scores:
+    // sc is [n_ps, n_head=4, n_tokens] and gets ggml_pool_2d(.., MAX, blk=128, 1, blk=128, 1, 0, 0).
+    for (int64_t n_ps : { 8192, 32768 }) {
+        for (int64_t n_tokens : { 1, 512 }) {
+            test_cases.emplace_back(new test_pool2d(
+                GGML_OP_POOL_MAX, GGML_TYPE_F32, {n_ps, 4, n_tokens, 1}, 128, 1, 128, 1, 0, 0));
+        }
     }
 
     // LEAKY_RELU at FFN activation width, for direct comparison with RELU
@@ -16816,7 +18053,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1,   1, 1, 1}));
     test_cases.emplace_back(new test_bin_bcast(ggml_add, GGML_TYPE_F32, {4096, 1, 1, 1}, {1, 512, 1, 1}));
-    // residual add -> rms norm -> weight mul at the DFlash2 verify width
+
     test_cases.emplace_back(new test_add_rms_norm_mul(GGML_TYPE_F32, {5120, 8, 1, 1}, 1e-6f));
 
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F32,  GGML_TYPE_F16,  {512, 3072, 1, 1}));
@@ -16836,10 +18073,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_cpy(GGML_TYPE_F16, GGML_TYPE_F16, {768, 1024, 256, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
     test_cases.emplace_back(new test_cpy(GGML_TYPE_BF16, GGML_TYPE_BF16, {768, 1024, 256, 1}, {-1,-1,-1,-1}, {0, 0, 0, 0}, {0, 0, 0, 0}, true));
 
-    // CPY_BATCH - consecutive same-layout CPYs, one kernel launch instead of one per copy
+
     test_cases.emplace_back(new test_cpy_batch(2560, 8, 8));
 
-    // SSM_CONV_ROLLBACK - conv-state gather + concat + snapshot copies + conv + silu in one kernel
+
     test_cases.emplace_back(new test_ssm_conv_rollback(2560, 8, 8));
 
     test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {4096, 4096, 5, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
@@ -16861,7 +18098,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 384, 1, 1}));
     test_cases.emplace_back(new test_pad_reflect_1d(GGML_TYPE_F32, {3000, 384, 4, 1}));
 
-    // DFlash2 draft: add the zero row for the GET_ROWS padding
+
     test_cases.emplace_back(new test_pad(GGML_TYPE_F32, {1, 62080, 8, 1}, 0, 1, false));
 
     // SNAKE activation fusion at BigVGAN scale (T=7680 = 24 kHz x 320 ms, C=192)
@@ -16881,6 +18118,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 2048, 128));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 256, 2048, 256));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 512, 2048, 512));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 1, 128));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 64, 1, 64));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 256, 1, 256));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 32, 128));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 64, 2048, 64));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 128, 2048, 128));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 256, 2048, 256));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 512, 2048, 512));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 1024, 2048, 1024));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 4096, 2048, 4096));
+    test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 8192, 2048, 8192));
 
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 64, 64, 4, 4 }, { 32, 64, 4, 4 }));
     test_cases.emplace_back(new test_solve_tri(GGML_TYPE_F32, { 128, 128, 4, 2 }, { 32, 128, 4, 2 }));
@@ -16964,6 +18212,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true,   512));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 2048));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, {0, 1, 2, 3}, true, false, 2048));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_BF16, GGML_TYPE_BF16, {0, 1, 2, 3}, true, false, 2048));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0));
     }
 
@@ -17011,21 +18261,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
 
-    // grouped decode / verify with n_q <= 16 (sm_70 kernel): head size 256, gqa 6
+
     for (int nh : { 1, 4 }) {
         for (int nb : { 1, 8, 16 }) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {6, 1}, 131072, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
         }
     }
 
-    // D256 prefill production shape for the sm_70 Split-D kernel with the
-    // causal mask: permuted Q (f16 staging), q8_0 KV, 2048-row chunk
+
+
     for (int kv : { 4096, 32768, 131072 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, true));
     }
 
-    // The sm_70 kernels read a range mask natively: dense causal vs range causal
-    // must reach the same Split-D / grouped kernel.
+
+
     for (int kv : { 32768, 131072 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, true,  0));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 1));
@@ -17034,17 +18284,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, true,  0));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, kv, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 1));
     }
-    // a verify batch (grouped kernel) that views a 256K cache but attends only its first half
+
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 262144, 8, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 3));
 
-    // a prompt ubatch that views a 256K cache but only attends its first half with a
-    // range mask: the q8_0 mirror must scale with the range, not with the view width
+
+
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 262144, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 3));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 131072, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 1));
-    // long-context append prefill (2048 new rows after a long cache) for the Split-D kernel
+
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 262144, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 1));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 524288, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 1));
-    // same FLOP as kv=32768/nb=2048 with 2x / 0.5x CTAs, to check the tail wave of the Split-D grid
+
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 16384, 4096, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 1));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {6, 1}, 65536, 1024, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 1));
 
@@ -17131,7 +18381,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 16, 1, 1}));
 
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2, 1, 1, 1}, 1));
-    // DFlash2 draft: per-GPU top-k over a vocab slice, 8 rows at a time
+
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {62080,  8, 1, 1}, 16));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {62080,  8, 1, 1}, 32));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {248320, 1, 1, 1}, 16));
@@ -17154,6 +18404,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (auto cols : {8192, 32768, 131072}) {
         for (auto nrows : {1, 2, 4, 8, 16, 32}) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 2048));
+        }
+    }
+    // bitonic vs radix crossover
+    for (auto cols : {520, 1000, 2048, 3000, 4096}) {
+        for (auto nrows : {2, 16, 32, 48, 64, 128, 256, 512}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {cols, nrows, 1, 1}, 16));
         }
     }
     // backend sampler: one row of the vocab (llama-sampler.cpp top_k)
@@ -17215,7 +18471,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
 
-    // GDN prologue fusion at the per-device TP4 verify shape
+
     test_cases.emplace_back(new test_gdn_prologue(4, 12, 128, 8, 1, 8));
 
     // lightning_indexer
@@ -17231,35 +18487,35 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    // qsa_select top-k dispatch: the 256-thread kernel, the 1024-thread register kernel (at and below its
-    // 1024*33-pool bound) and the wide kernel, so the three can be timed against each other.
-    // production prefill shape: 2048 tokens per batch
-    // 4104 / 25608 / 51208 pools: the 16K context, the mean over a 200K prefill and its last batch; Q8_0 pooled keys
-    // as -ctk q8_0
+
+
+
+
+
     for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
         for (int64_t n_pool : { 512, 4104, 6000, 25608, 33792, 46080, 51208, 65536 }) {
             test_cases.emplace_back(new test_qsa_select(n_pool, 8, 2048, 4, 512, type_K));
         }
     }
 
-    // qwen4exp decode/verify shapes at 16K and 200K context: 16384 and 204800 cells, kpool 4 so 4096 and 51200
-    // pools, indexer_top_k 2048 cells = 512 pools, so n_sel = 4*512 + 3 = 2051 cells. nb covers the decode (1) and
-    // the MTP verify (2/4/8) token counts.
+
+
+
     for (int64_t nb : { 1, 2, 4, 8 }) {
-        // qsa_select over the pooled keys, 8 padded pools at the end
+
         for (ggml_type type_K : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
-            test_cases.emplace_back(new test_qsa_select(4104,  8, nb, 4, 512, type_K)); // 16K context
-            test_cases.emplace_back(new test_qsa_select(51208, 8, nb, 4, 512, type_K)); // 200K context
+            test_cases.emplace_back(new test_qsa_select(4104,  8, nb, 4, 512, type_K));
+            test_cases.emplace_back(new test_qsa_select(51208, 8, nb, 4, 512, type_K));
         }
-        // qsa_attn over the 2051 selected cells, both cache types of the production run
+
         for (ggml_type type_KV : { GGML_TYPE_Q8_0, GGML_TYPE_F16 }) {
-            test_cases.emplace_back(new test_qsa_attn(2, 16384,  nb, 1, 2051, 2051, type_KV)); // 16K context
-            test_cases.emplace_back(new test_qsa_attn(2, 204800, nb, 1, 2051, 2051, type_KV)); // 200K context
+            test_cases.emplace_back(new test_qsa_attn(2, 16384,  nb, 1, 2051, 2051, type_KV));
+            test_cases.emplace_back(new test_qsa_attn(2, 204800, nb, 1, 2051, 2051, type_KV));
         }
     }
-    // the same selection on uniform data (a realistic spread of the scores for the top-k), Q8_0 keys as with -ctk q8_0:
-    // decode (1) and MTP verify (4) at 16K, 128K and 200K (kpool_pad: 64 above the real pools), one prefill pass (64)
-    // and a whole prefill batch (2048)
+
+
+
     for (int64_t nb : { 1, 4, 64 }) {
         for (int64_t n_pool : { 4032, 32832, 52288 }) {
             test_cases.emplace_back(new test_qsa_select(n_pool, 40, nb, 4, 512, GGML_TYPE_Q8_0, true));
@@ -17268,25 +18524,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int64_t n_pool : { 16448, 52288 }) {
         test_cases.emplace_back(new test_qsa_select(n_pool, 40, 2048, 4, 512, GGML_TYPE_Q8_0, true));
     }
-    // the same over the compact indexer cache's table (136-byte Q8_0 rows instead of the pooled half of 272-byte rows)
+
     for (int64_t nb : { 1, 4, 64 }) {
         for (int64_t n_pool : { 4032, 32832, 52288 }) {
             test_cases.emplace_back(new test_qsa_select(n_pool, 40, nb, 4, 512, GGML_TYPE_Q8_0, true, true));
         }
     }
     test_cases.emplace_back(new test_qsa_select(52288, 40, 2048, 4, 512, GGML_TYPE_Q8_0, true, true));
-    // the pool rows of a 2048-token batch over the compact table (one device of the meta collective scores 2048/n of
-    // them) and their expansion into cells
+
+
     for (int64_t n_pool : { 4104, 25608, 51208 }) {
         test_cases.emplace_back(new test_qsa_select(n_pool, 40, 2048, 4, 512, GGML_TYPE_Q8_0, true, true, 1));
         test_cases.emplace_back(new test_qsa_select(n_pool, 40, 342,  4, 512, GGML_TYPE_Q8_0, true, true, 1));
         test_cases.emplace_back(new test_qsa_expand(n_pool, 8, 2048, 4, 512));
     }
 
-    // the cost of the padded pools: the same real pools under a count padded to 64 pools and under the n_kv-grain
-    // count (llama_memory_hybrid_idx::kpool_n_pool), F32 keys read through pool_cells. MTP verify at 16K, at the
-    // start of the n_kv bucket (3584 real) and late in it (4016 real); at 200K at the start of the bucket (49152 real);
-    // a prompt batch past 64K, where the grain is 4096 cells (16896 real)
+
+
+
+
     for (int64_t n_real : { 3584, 4016 }) {
         test_cases.emplace_back(new test_qsa_select(GGML_PAD(n_real + 1, 64), GGML_PAD(n_real + 1, 64) - n_real, 4, 4, 512, GGML_TYPE_F32));
         test_cases.emplace_back(new test_qsa_select(4097, 4097 - n_real, 4, 4, 512, GGML_TYPE_F32));
@@ -17305,86 +18561,86 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
-    // Qwen3.8-Flash-Next expert projections: 512 experts, top-10, Q2_0/Q8_0 weights.
-    // gate/up: m = 640, k = 2560; down: m = 2560, k = 640.
+
+
     for (ggml_type type_a : {GGML_TYPE_Q2_0, GGML_TYPE_Q8_0}) {
         for (int64_t n : {1, 2, 4, 8, 16, 64, 512, 2048}) {
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // Qwen3.8-Flash-Next
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640)); // Qwen3.8-Flash-Next
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
         }
     }
 
-    // Unsloth Qwen3.8-Flash-Next UD-Q4_K_XL expert projections: 512 experts, top-10,
-    // Q4_K/Q5_K gate/up and Q5_1/Q8_0 down (K = 640 is not a multiple of QK_K, so the K-quant
-    // types cannot be used for down). n covers the grouped decode/verify window (1/2/4/8),
-    // the MMVQ -> grouped-kernel boundary (16/32/64) and the prefill path (128/512/2048).
+
+
+
+
     for (int64_t n : {1, 2, 4, 8, 16, 32, 64, 128, 512, 2048}) {
         for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // gate/up
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
         }
         for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // gate/up
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640)); // down
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
         }
     }
 
-    // the merged gate_up tensor (k = 2560, m = 1280) at the verify window width: one grouped
-    // MUL_MAT_ID, then the graph splits the result into gate and up views
+
+
     for (int64_t n : {1, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560));
     }
 
-    // the merged gate_up tensor at the prefill width (n = 2048), and a skewed routing where a
-    // few hot experts take most of the slots (the average expert column count is 40, a hot one
-    // is far past the grouped kernel's staged-entry capacity)
+
+
+
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, 2048, 2560));
     test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q4_K, 512, 10, 640, 2048, 2560, 8));
     test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_Q4_K, 512, 10, 1280, 2048, 2560, 8));
 
-    // the fused SwiGLU gate_up at the prefill width, the same shapes as the merged gate_up line
-    // above: the epilogue saves the swiglu_split pass and halves the activation traffic
+
+
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q8_0}) {
         for (ggml_type type_b : {GGML_TYPE_F32, GGML_TYPE_F16}) {
             test_cases.emplace_back(new test_mul_mat_id_swiglu(type_a, type_b, 512, 10, false, 1280, 2048, 2560));
         }
     }
 
-    // the decode windows of the epilogue against the same shapes without it: both run on MMVQ
-    // there, so the difference is the fused pair plus the halved activation traffic
+
+
     for (int64_t n : {1, 4, 8}) {
         test_cases.emplace_back(new test_mul_mat_id_swiglu(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560));
     }
 
-    // prefill blocks wider than -ub 2048: how the per-expert column count (n*10/512 = 40 at
-    // n = 2048) drives the efficiency of the grouped expert kernels (TM = 64 token tiles)
+
+
     for (int64_t n : {3072, 4096, 6144, 8192}) {
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false,  640, n, 2560)); // gate/up
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560)); // merged gate_up
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, n,  640)); // down
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 1280, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2560, n,  640));
     }
 
-    // the same expert projections cut along the expert ff dimension for a 6-way tensor split
-    // (640 = 20 Q5_1 blocks -> 128/128/96/96/96/96 rows per device): every device runs all the
-    // routed experts at a sixth of the width, against a sixth of the routed entries at full
-    // width when the experts are split across the devices instead
+
+
+
+
     for (int64_t n : {1, 4, 8, 512, 2048}) {
         for (int64_t m : {128, 96}) {
-            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false,   m, n, 2560)); // gate/up slice
-            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 2*m, n, 2560)); // merged gate_up slice
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false,   m, n, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false, 2*m, n, 2560));
             for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
-                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n, m)); // down slice
+                test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 512, 10, false, 2560, n, m));
             }
         }
     }
 
-    // the fused-expert kernel keeps its X tile in F16, so it takes an F16 src1 as it is: the X
-    // traffic of the main kernel is halved against the F32 lines above (which the kernel
-    // converts once per launch, same halves). n <= 8 is left out, that window goes to MMVQ and
-    // reads the F32 activation.
+
+
+
+
     for (int64_t n : {16, 64, 512, 2048}) {
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K,  GGML_TYPE_F16, 512, 10, false, 1280, n, 2560)); // merged gate_up
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K,  GGML_TYPE_F16, 512, 10, false, 1280, n, 2560));
         for (ggml_type type_a : {GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
-            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F16, 512, 10, false, 2560, n, 640)); // down
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F16, 512, 10, false, 2560, n, 640));
         }
     }
 
@@ -17605,6 +18861,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
 
         std::atomic<size_t> n_ok = 0;
         std::atomic<size_t> tests_run = 0;
+
+
+        std::atomic<bool> fatal = false;
         std::vector<std::string> failed_tests;
         std::mutex failed_tests_mutex;
 
@@ -17625,12 +18884,20 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
         const auto & run_tests = [&](ggml_backend_t b, ggml_backend_t b_cpu) {
             size_t my_begin, my_end;
             next_chunk(my_begin, my_end);
-            while (my_begin < test_cases.size()) {
+            while (my_begin < test_cases.size() && !fatal) {
                 for (size_t i = my_begin; i < my_end; ++i) {
                     auto & test = test_cases[i];
                     test_status_t status = test->eval(b, b_cpu, op_names_filter, output_printer);
                     if (status == test_status_t::SKIPPED || status == test_status_t::NOT_SUPPORTED) {
                         continue;
+                    }
+                    if (status == test_status_t::FATAL) {
+
+
+                        std::lock_guard<std::mutex> guard(failed_tests_mutex);
+                        failed_tests.push_back(test->current_op_name + "(" + test->vars() + ")");
+                        fatal = true;
+                        break;
                     }
                     tests_run++;
                     if (status == test_status_t::OK) {
@@ -17683,8 +18950,16 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
             }
         }
 
+        if (fatal) {
+            printf("the run stopped: a backend refused to build the buffer a case needs, so the machine state the cases that follow need was never established\n");
+        }
+
         output_printer->print_summary(test_summary_info(n_ok, tests_run, false));
         output_printer->print_failed_tests(failed_tests);
+
+        if (fatal) {
+            return false;
+        }
 
         const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
 
@@ -17861,6 +19136,90 @@ static void usage(char ** argv) {
     printf("  %s perf -o 'MUL_MAT.*'\n", argv[0]);
 }
 
+
+
+
+static std::string backend_family(const std::string & name) {
+    const size_t pos = name.find_last_not_of("0123456789");
+    return name.substr(0, pos + 1);
+}
+
+
+static std::vector<std::string> detected_backend_names() {
+    std::vector<std::string> names;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        names.push_back(ggml_backend_dev_name(ggml_backend_dev_get(i)));
+    }
+    return names;
+}
+
+
+
+
+static std::string backend_unavailable_message(const std::string & requested,
+                                                const std::vector<std::string> & detected,
+                                                const std::string & init_error) {
+    const std::string family = backend_family(requested);
+
+    size_t n_family = 0;
+    for (const std::string & name : detected) {
+        if (backend_family(name) == family) {
+            n_family++;
+        }
+    }
+
+    std::string msg = "ERROR: backend '" + requested + "' requested with -b is not available: " +
+                      std::to_string(n_family) + " " + family + " device(s) detected";
+    if (detected.empty()) {
+        msg += " (no backend detected)";
+    } else {
+        msg += " (detected backends: ";
+        for (size_t i = 0; i < detected.size(); i++) {
+            msg += (i == 0 ? "" : ", ") + detected[i];
+        }
+        msg += ")";
+    }
+    if (n_family > 0) {
+        msg += "\n  note: -b matches a device name exactly";
+    }
+    if (!init_error.empty()) {
+        msg += "\n  initialization error: " + init_error;
+    }
+    msg += "\n  no test was run for backend '" + requested + "'";
+    return msg;
+}
+
+
+
+
+static std::mutex          g_tbo_log_mutex;
+static std::string         g_tbo_last_error;
+static ggml_log_callback   g_tbo_prev_log_callback   = nullptr;
+static void *              g_tbo_prev_log_user_data = nullptr;
+
+static void tbo_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
+    (void) user_data;
+    if (text != nullptr && level == GGML_LOG_LEVEL_ERROR) {
+        std::string msg(text);
+        while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r')) {
+            msg.pop_back();
+        }
+        std::lock_guard<std::mutex> lock(g_tbo_log_mutex);
+        g_tbo_last_error = msg;
+    }
+    if (g_tbo_prev_log_callback != nullptr) {
+        g_tbo_prev_log_callback(level, text, g_tbo_prev_log_user_data);
+    }
+}
+
+
+static std::string take_last_ggml_error() {
+    std::lock_guard<std::mutex> lock(g_tbo_log_mutex);
+    const std::string err = g_tbo_last_error;
+    g_tbo_last_error.clear();
+    return err;
+}
+
 int main(int argc, char ** argv) {
     test_mode mode = MODE_TEST;
     output_formats output_format = CONSOLE;
@@ -17942,6 +19301,11 @@ int main(int argc, char ** argv) {
         }
     }
 
+
+
+    ggml_log_get(&g_tbo_prev_log_callback, &g_tbo_prev_log_user_data);
+    ggml_log_set(tbo_log_callback, nullptr);
+
     // load and enumerate backends
     ggml_backend_load_all();
 
@@ -17953,37 +19317,93 @@ int main(int argc, char ** argv) {
 
     output_printer->print_testing_start(testing_start_info(ggml_backend_dev_count()));
 
+    const size_t n_dev = ggml_backend_dev_count();
+
+
+
+
+    auto is_selected = [&](ggml_backend_dev_t dev) {
+        if (backend_filter != NULL) {
+            return strcmp(backend_filter, ggml_backend_dev_name(dev)) == 0;
+        }
+        return !(ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && mode != MODE_GRAD);
+    };
+
+
+    size_t n_selected = 0;
+    for (size_t i = 0; i < n_dev; i++) {
+        if (is_selected(ggml_backend_dev_get(i))) {
+            n_selected++;
+        }
+    }
+
+
+
+    const std::string load_error = take_last_ggml_error();
+
+
+
+
+    const bool requested_backend_missing = (backend_filter != NULL && n_selected == 0);
+    if (requested_backend_missing) {
+        n_selected++;
+    }
+
     size_t n_ok = 0;
 
-    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+    for (size_t i = 0; i < n_dev; i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
 
         if (backend_filter != NULL && strcmp(backend_filter, ggml_backend_dev_name(dev)) != 0) {
+
+
             output_printer->print_backend_init(
-                backend_init_info(i, ggml_backend_dev_count(), ggml_backend_dev_name(dev), true, "Skipping"));
-            n_ok++;
+                backend_init_info(i, n_dev, ggml_backend_dev_name(dev), true,
+                                  "Skipping (not requested by -b " + std::string(backend_filter) + ")"));
             continue;
         }
 
         if (backend_filter == NULL && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU && mode != MODE_GRAD) {
+
             output_printer->print_backend_init(backend_init_info(
-                i, ggml_backend_dev_count(), ggml_backend_dev_name(dev), true, "Skipping CPU backend"));
-            n_ok++;
+                i, n_dev, ggml_backend_dev_name(dev), true, "Skipping CPU backend"));
             continue;
         }
 
+        take_last_ggml_error();
+
         ggml_backend_ptr backend(ggml_backend_dev_init(dev, NULL));
-        GGML_ASSERT(backend != NULL);
+        if (!backend) {
+
+            std::string reason = "Failed to initialize backend '" + std::string(ggml_backend_dev_name(dev)) + "'";
+            const std::string init_error = take_last_ggml_error();
+            if (!init_error.empty()) {
+                reason += ": " + init_error;
+            }
+            output_printer->print_backend_init(backend_init_info(
+                i, n_dev, ggml_backend_dev_name(dev), true, reason));
+            output_printer->print_backend_status(
+                backend_status_info(ggml_backend_dev_name(dev), test_status_t::FAIL));
+            continue;
+        }
 
         ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
         auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
         if (ggml_backend_set_n_threads_fn) {
-            ggml_backend_set_n_threads_fn(backend.get(), std::max<int>(1, N_THREADS/2));
+
+
+
+
+
+
+            const char * tbo_jobs_env = std::getenv("TBO_JOBS");
+            const int    tbo_jobs     = tbo_jobs_env != nullptr ? std::max(1, std::atoi(tbo_jobs_env)) : 1;
+            ggml_backend_set_n_threads_fn(backend.get(), std::max<int>(1, (int) N_THREADS / tbo_jobs));
         }
 
         size_t free, total;  // NOLINT
         ggml_backend_dev_memory(dev, &free, &total);
-        output_printer->print_backend_init(backend_init_info(i, ggml_backend_dev_count(), ggml_backend_dev_name(dev),
+        output_printer->print_backend_init(backend_init_info(i, n_dev, ggml_backend_dev_name(dev),
                                                              false, "", ggml_backend_dev_description(dev),
                                                              total / 1024 / 1024, free / 1024 / 1024, true));
 
@@ -17996,16 +19416,31 @@ int main(int argc, char ** argv) {
             backend_status_info(ggml_backend_name(backend.get()), ok ? test_status_t::OK : test_status_t::FAIL));
     }
 
+    if (requested_backend_missing) {
+        output_printer->print_backend_error(
+            backend_unavailable_message(backend_filter, detected_backend_names(), load_error));
+        output_printer->print_backend_status(backend_status_info(backend_filter, test_status_t::FAIL));
+    } else if (n_selected == 0) {
+        output_printer->print_backend_error(
+            "ERROR: no backend was selected for testing (the CPU backend is the reference and is "
+            "only tested when it is requested with -b)");
+    }
+
     ggml_quantize_free();
 
     if (output_printer) {
         output_printer->print_footer();
     }
 
-    output_printer->print_overall_summary(
-        overall_summary_info(n_ok, ggml_backend_dev_count(), n_ok == ggml_backend_dev_count()));
 
-    if (n_ok != ggml_backend_dev_count()) {
+    const bool all_passed = n_selected > 0 && n_ok == n_selected;
+
+    output_printer->print_overall_summary(
+        overall_summary_info(n_ok, n_selected, all_passed));
+
+    ggml_log_set(g_tbo_prev_log_callback, g_tbo_prev_log_user_data);
+
+    if (!all_passed) {
         return 1;
     }
 

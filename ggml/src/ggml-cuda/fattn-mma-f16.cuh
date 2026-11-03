@@ -123,8 +123,8 @@ static constexpr __host__ __device__ fattn_mma_config ggml_cuda_fattn_mma_get_co
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 32, 128, 2,  32, 160, 128,  64, 1, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(576, 512, 64, 256, 1,  32, 160, 128,  64, 1, false);
 
-    // D=256: with Q resident in registers the kernel needs 255 registers and spills about 2 KB on sm_70,
-    // stage Q through shared memory instead
+
+
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256,  8, 128, 2,  32, 128, 128, 128, 2, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 16, 128, 2,  32, 128, 128, 128, 2, false);
     GGML_CUDA_FATTN_MMA_CONFIG_CASE(256, 256, 32, 128, 2,  32, 128, 128, 128, 2, false);
@@ -373,8 +373,8 @@ static __host__ int ggml_cuda_fattn_mma_get_nstages(const int DKQ, const int DV,
     return cp_async_available(cc) && ncols2 >= 2 ? ggml_cuda_fattn_mma_get_nstages_target(DKQ, DV, ncols1*ncols2, cc) : 0;
 }
 
-// Dynamic shared memory the MMA kernel variant needs. ggml_cuda_flash_attn_ext_mma_f16_case passes
-// this to cudaFuncSetAttribute, so it has to fit into the device's shared memory limit.
+
+
 static size_t ggml_cuda_fattn_mma_get_nbytes_shared(
         const int DKQ, const int DV, const int ncols1, const int ncols2, const int cc, const int warp_size) {
     const int  ncols          = ncols1*ncols2;
@@ -1814,7 +1814,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
                 }
             }
         }
-        if (np > 1) {
+        if (np > 1 || nbatch_combine != DKQ/2) {
             __syncthreads();
         }
     }

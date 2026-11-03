@@ -103,8 +103,8 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
-// write_f16: also store the result rounded to F16 (as the F32 -> F16 conversion does) into a
-// contiguous [n_embd, n_tokens] buffer, the input of the projections that follow the mixer.
+
+
 template <bool gated, bool write_f16 = false>
 static __global__ void dsv4_hc_pre_f32(
         const float * x,
@@ -155,9 +155,9 @@ static __global__ void dsv4_hc_pre_f32(
     }
 }
 
-// gated_post: `post` is the raw inject tensor; qwen4exp builds 2*sigmoid(inject/hc), and
-// folding those two scales and the sigmoid into this kernel is what the Strata fused_gr.cu
-// up epilogue does for `rv = fmaf(bo, 2*sigmoid(inj/HC), rv)` (Strata src/kernels/cuda/fused_gr.cu, gr_up_kernel).
+
+
+
 template <bool has_comb, bool gated_post = false>
 static __global__ void dsv4_hc_post_f32(
         const float * x,
@@ -351,9 +351,9 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     dsv4_hc_post_launch(ctx, dst, dst->src[2], 0.0f, 0.0f, false);
 }
 
-// SCALE -> UNARY(SIGMOID) -> SCALE fused into the post kernel: the second scale node holds
-// the gate factor (2.0) and the first one the inverse stream count (1/hc); both are run here,
-// `dst` is the DSV4_HC_POST node.
+
+
+
 void ggml_cuda_op_dsv4_hc_post_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                      ggml_tensor * scale_inv_hc, ggml_tensor * scale_gate) {
     GGML_ASSERT(scale_inv_hc->op == GGML_OP_SCALE);

@@ -8,6 +8,62 @@ Releases: [2.0.1.1](#2011) · [2.0.1](#201) · [2.0.0](#200) · [1.1.1](#111) ·
 
 ---
 
+## 2.0.1.2
+
+### Conditions
+
+- **Table A / Table A2**: IBM AC922 + two Tesla V100-SXM2-16GB (same CPU socket, 0 and 1), context 262144, block sizes 2048 / 4096; about 200K tokens of real code (209,075 prompt tokens measured on our side, 209,102 on the other engine), 1024 output tokens; thinking on + the model card's official sampling parameters; **both sides load the vision module**, this project runs MTP speculation (3 drafts per round) and the other side runs its own speculative decoding; interleaved same-session measurement, median of 8 measurements per arm per block size.
+- **Table D**: concurrency and multimodal. The 27B row = 4 V100-16GB, Q8_0 + DFlash2 draft + vision module, 16K tokens of real code, `-np 2`; the Flash-Next row = two V100-16GB (same socket), UD-Q4_K_XL + MTP draft + vision module, 96K tokens of real code, `-np 2`; the multimodal row is a single request with an image. In both concurrency rows the two requests return non-empty bodies with a cold prefix (`cache_n=0`), and the draft acceptance rates are measured values.
+- **Same-block comparison**: the competitor comparison is only done on the same machine, in the same time window, at the same block size, with the two sides configured item by item identically (thinking switch, sampling parameters, vision module, speculation switch).
+
+### Table A: two cards on one CPU socket (0, 1) + MTP speculation, two block sizes (2048 / 4096)
+
+| Block size | Context | Prompt tokens | Prefill (tok/s) | Decode per token (ms) | Draft acceptance rate | Decode 1024-token total (ms) | Tokens per round | Per-GPU VRAM peak: max / min / spread (MiB) | Peak host memory (GiB) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2048 | 262144 | `209075` | `1155.48` | `22.941` | `0.4536` | `23491` | `2.362` | `14824 / 14812 / 12` | `75.08` |
+| 4096 | 262144 | `209075` | `2151.70` | `24.075` | `0.4578` | `24653` | `2.373` | `14856 / 14842 / 14` | `77.00` |
+
+<sub>Test data: median of n=8 per arm per block size; 209075 prompt tokens measured. Host memory is the server process RSS peak (pinned pages included). Conditions: MTP-3 speculation (3 drafts per round) + vision module + thinking on + the model card's official sampling parameters.</sub>
+
+- Larger blocks prefill faster and decode slower; **2048 is the balanced point for two cards on one socket**.
+- **Block 8192 is not recommended with MTP and is not listed.** MTP must be enabled explicitly; the command-line defaults are unchanged.
+
+### Table A2: two cards on one socket, head-to-head against the other engine (both sides speculate)
+
+| Block size | Prefill (tok/s): ours → theirs | Prefill change | Decode per token (ms): ours → theirs | Decode change | Their draft acceptance rate |
+|---|---:|---:|---:|---:|---:|
+| 2048 | `1155.48 → 1050.80` | `+9.96%` | `22.941 → 21.898` | `4.76% slower` | `0.5793` |
+| 4096 | `2151.70 → 1902.00` | `+13.13%` | `24.075 → 20.710` | `16.25% slower` | `0.5871` |
+
+<sub>Test data: same-session alternating measurement (A-B-B-A), median of n=8 per arm per block size; **both sides run speculation and both load the vision module**, with identical sampling parameters and thinking switch on both sides. The 8192 row is recorded only.</sub>
+
+- Note on conditions: each side loads its draft mechanism and its vision module the way its own engine does; what is compared is the whole service under equal conditions.
+- **Block 8192 is not recommended with MTP and is not listed.**
+### Table C: 1 GPU / 3 GPUs runnable (new configurations)
+
+| GPUs | Block size | Context | Starts |
+|---|---:|---:|---|
+| 1 | 2048 | 262144 | Yes |
+| 1 | 4096 | 262144 | Yes |
+| 1 | 8192 | 262144 | Yes |
+| 3 | 2048 | 262144 | Yes |
+| 3 | 4096 | 262144 | Yes |
+| 3 | 8192 | 262144 | Yes |
+
+
+- That machine has 768 MiB more usable VRAM per GPU than the standard test machine, so its VRAM figures are optimistic; speed conclusions still come from the standard test machine.
+
+### Table D: concurrency and multimodal
+
+| Case | Concurrency | Prompt tokens | Prefill per lane (tok/s) | Time per round per lane (ms) | Draft tokens accepted | Note |
+|---|---:|---:|---|---:|---|---|
+| 27B + DFlash2 + vision module, `-np 2` | 2 | 12932 | 1867.9 / 728.6 | 30.886 / 22.410 | 721 / 634 | Both lanes returned non-empty output, `cache_n=0` (cold prefix) |
+| Multimodal (one image) | 1 | — | — | — | — | Non-empty answer text with a thinking section; with `--reasoning-format none` the thinking stays in the answer text with no separate section |
+
+
+- Both the thinking-on and thinking-off paths passed the template self-check (the thinking goes to `reasoning_content`, the answer text carries no thinking section).
+- No bit-for-bit comparison is made under concurrency: with `-np` ≥ 2 the text of the same request may differ from 2.0.1.1 (the single-request and cache-hit paths are unchanged).
+
 ## 2.0.1.1
 
 ### Qwen3.8-Flash-Next, 2 × V100-16GB (new in this release)

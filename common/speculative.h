@@ -47,6 +47,10 @@ struct common_speculative_output_limits {
 common_speculative_output_limits common_speculative_get_output_limits(
         int32_t n_batch, int32_t n_parallel, int32_t n_draft);
 
+
+
+common_speculative_output_limits common_get_output_limits(const common_params & params);
+
 // return true if the target and draft models have compatible vocabs
 bool common_speculative_are_compatible(const llama_model * model_tgt, const llama_model * model_dft);
 
@@ -81,11 +85,11 @@ struct common_speculative_draft_params {
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
 
-    // rejection sampling (draft-dflash with a selector lattice only)
+
     bool use_rejection = false;
 
-    // proposal distribution of each token in `result`, enabled with use_rejection;
-    // separate from `result_q`, which carries the candidate distributions of draft-simple/draft-mtp
+
+
     std::vector<common_sampler_draft_q> * result_q_dflash = nullptr;
 };
 
@@ -94,11 +98,11 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
-// tell the speculative driver the absolute position of the last prompt token (inclusive), before
-// the first prompt batch is processed. The MTP draft uses it to skip the catch-up of prompt
-// positions that its attention window can never read again. A negative pos_end disables the skip
-// for that sequence. Only implementations with a windowed draft KV make use of it; the base
-// implementation ignores the call.
+
+
+
+
+
 void common_speculative_set_prompt_end(common_speculative * spec, llama_seq_id seq_id, llama_pos pos_end);
 
 // process the batch and update the internal state of the speculative context

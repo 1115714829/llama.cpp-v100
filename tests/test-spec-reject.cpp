@@ -12,8 +12,8 @@
 #include <random>
 #include <vector>
 
-// tests for the speculative rejection core: the draft token is sampled from q and
-// the output token must follow p; fixed seeds keep the test deterministic
+
+
 
 static const int n_samples = 100000;
 
@@ -72,7 +72,7 @@ static double tv_distance(const std::vector<double> & counts, const std::vector<
     return 0.5*tv;
 }
 
-// single draft step: the first output token must follow p
+
 static void test_single_step(const std::vector<float> & p, const std::vector<float> & q, uint32_t seed) {
     test_rng rng(seed);
 
@@ -95,10 +95,10 @@ static void test_single_step(const std::vector<float> & p, const std::vector<flo
 }
 
 static void test_multi_step() {
-    // q1 == p1, so the first draft token is always accepted
+
     const std::vector<float> q1 = { 0.05f, 0.10f, 0.15f, 0.20f, 0.20f, 0.15f, 0.10f, 0.05f };
     const std::vector<float> p1 = q1;
-    // the second draft token is always token 0, which has p2[0] < 1
+
     const std::vector<float> q2 = { 1.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f };
     const std::vector<float> p2 = { 0.30f, 0.20f, 0.10f, 0.10f, 0.10f, 0.10f, 0.05f, 0.05f };
     const std::vector<float> p3 = { 0.20f, 0.20f, 0.15f, 0.15f, 0.10f, 0.10f, 0.05f, 0.05f };
@@ -131,7 +131,7 @@ static void test_multi_step() {
     assert(tv_distance(counts1, p1, n_samples) < 0.01);
     assert(tv_distance(counts2, p2, n_samples) < 0.01);
 
-    // bonus tokens only occur when all draft tokens are accepted
+
     assert(n_bonus > 1000);
     assert(tv_distance(counts3, p3, n_bonus) < 0.03);
 }
@@ -174,8 +174,8 @@ static void test_sparse_penalties() {
         row.push_back({ id, logit_dist(gen), 0.0f });
     }
 
-    // the penalty window holds the best logits, so that penalizing them pushes them out of the raw
-    // top_k and replacements from below the cutoff are needed
+
+
     std::vector<llama_token_data> sorted = row;
     std::sort(sorted.begin(), sorted.end(), [](const llama_token_data & a, const llama_token_data & b) {
         return a.logit > b.logit;
@@ -200,12 +200,12 @@ static void test_sparse_penalties() {
         llama_sampler_accept(chain, id);
     }
 
-    // full vocabulary row through the chain
+
     std::vector<llama_token_data> full = row;
     llama_token_data_array cur_full = { full.data(), full.size(), -1, false };
     llama_sampler_apply(chain, &cur_full);
 
-    // sparse row: the raw top_k + n_distinct candidates, as the rejection path builds them
+
     std::vector<llama_token_data> sparse = sorted;
     sparse.resize(top_k + n_distinct);
     llama_token_data_array cur_sparse = { sparse.data(), sparse.size(), -1, false };
@@ -229,7 +229,7 @@ static void test_sparse_penalties() {
         assert(fabs(p_full[i] - p_sparse[j]) < 1e-5f);
     }
 
-    // top_k candidates alone keep the penalized tokens: the window must be reserved
+
     std::vector<llama_token_data> short_row = sorted;
     short_row.resize(top_k);
     llama_token_data_array cur_short = { short_row.data(), short_row.size(), -1, false };
@@ -251,8 +251,8 @@ static bool find_logit(const llama_token_data_array & cur_p, llama_token id, flo
     return false;
 }
 
-// a draft token accepted in the same round must enter the penalty window of the later rows: the
-// sparse row 1 is replayed on a clone of the chain advanced with draft[0], like the sequential path
+
+
 static void test_sparse_penalty_draft_in_window() {
     const int32_t n_vocab = 256;
     const int32_t top_k   = 20;
@@ -260,21 +260,21 @@ static void test_sparse_penalty_draft_in_window() {
     const float   freq    = 2.0f;
     const float   present = 5.0f;
 
-    const llama_token draft0 = 0; // drafted from row 0, not yet in the penalty window
+    const llama_token draft0 = 0;
 
     std::vector<llama_token_data> row(n_vocab);
     for (llama_token id = 0; id < n_vocab; ++id) {
         row[id] = { id, -20.0f, 0.0f };
     }
 
-    // row 1: the draft token is the raw top-1, the next top_k - 1 tokens follow just below it
+
     row[draft0].logit = 9.0f;
     for (llama_token id = 1; id < top_k; ++id) {
         row[id].logit = 9.0f - 0.1f * id;
     }
 
-    // the penalty window holds last_n - 1 distinct tokens below the raw top-k, none of them is
-    // draft0; accepting draft0 then fills the window without pushing an older token out of it
+
+
     for (llama_token id = 100; id < 100 + last_n - 1; ++id) {
         row[id].logit = 7.0f - 0.01f * (id - 100);
     }
@@ -292,7 +292,7 @@ static void test_sparse_penalty_draft_in_window() {
         llama_sampler_accept(chain, id);
     }
 
-    // sequential path: row 1 sees the chain after draft0 was accepted
+
     llama_sampler * chain_seq = llama_sampler_clone(chain);
     llama_sampler_accept(chain_seq, draft0);
 
@@ -300,7 +300,7 @@ static void test_sparse_penalty_draft_in_window() {
     llama_token_data_array cur_full = { full.data(), full.size(), -1, false };
     llama_sampler_apply(chain_seq, &cur_full);
 
-    // sparse path with the fix: same, but replayed on the raw top_k + last_n candidates
+
     llama_sampler * chain_sparse = llama_sampler_clone(chain);
     llama_sampler_accept(chain_sparse, draft0);
 
@@ -309,7 +309,7 @@ static void test_sparse_penalty_draft_in_window() {
     llama_token_data_array cur_sparse = { sparse.data(), sparse.size(), -1, false };
     llama_sampler_apply(chain_sparse, &cur_sparse);
 
-    // without the draft token accepted the stale row keeps its raw logit
+
     llama_sampler * chain_stale = llama_sampler_clone(chain);
 
     std::vector<llama_token_data> stale = sorted;
@@ -339,7 +339,7 @@ static void test_sparse_penalty_draft_in_window() {
         assert(fabs(p_full[i] - p_sparse[j]) < 1e-5f);
     }
 
-    // draft0 was accepted, so row 1 penalizes it in both the sequential and the fixed sparse row
+
     float logit_full = 0.0f;
     float logit_sparse = 0.0f;
     float logit_stale = 0.0f;
@@ -351,7 +351,7 @@ static void test_sparse_penalty_draft_in_window() {
     assert(fabs(logit_sparse - logit_full) < 1e-5f);
     assert(fabs(logit_stale  - 9.0f) < 1e-5f);
 
-    // the stale chain keeps the draft token on top, the fixed one demotes it below the unpenalized tokens
+
     assert(cur_full.data[0].id == 1);
     assert(cur_stale.data[0].id == draft0);
 
@@ -364,32 +364,32 @@ static void test_sparse_penalty_draft_in_window() {
 }
 
 int main() {
-    // p == q
+
     test_single_step(
             { 0.05f, 0.10f, 0.15f, 0.20f, 0.20f, 0.15f, 0.10f, 0.05f },
             { 0.05f, 0.10f, 0.15f, 0.20f, 0.20f, 0.15f, 0.10f, 0.05f }, 1);
 
-    // disjoint supports
+
     test_single_step(
             { 0.40f, 0.30f, 0.20f, 0.10f, 0.00f, 0.00f, 0.00f, 0.00f },
             { 0.00f, 0.00f, 0.00f, 0.00f, 0.40f, 0.30f, 0.20f, 0.10f }, 2);
 
-    // q is a point mass
+
     test_single_step(
             { 0.30f, 0.20f, 0.10f, 0.10f, 0.10f, 0.10f, 0.05f, 0.05f },
             { 1.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f }, 3);
 
-    // p_x == 0 for the drafted token
+
     test_single_step(
             { 0.00f, 0.50f, 0.30f, 0.20f, 0.00f, 0.00f, 0.00f, 0.00f },
             { 1.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f, 0.00f }, 4);
 
-    // p == q point mass
+
     test_single_step(
             { 0.00f, 0.00f, 0.00f, 1.00f, 0.00f, 0.00f, 0.00f, 0.00f },
             { 0.00f, 0.00f, 0.00f, 1.00f, 0.00f, 0.00f, 0.00f, 0.00f }, 5);
 
-    // q is a top-k truncated proposal (its support is a subset of p's), as draft-mtp/dflash report it
+
     test_single_step(
             { 0.20f, 0.20f, 0.15f, 0.15f, 0.10f, 0.10f, 0.05f, 0.05f },
             { 0.00f, 0.00f, 0.00f, 0.30f, 0.25f, 0.20f, 0.15f, 0.10f }, 6);

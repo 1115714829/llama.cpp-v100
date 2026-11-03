@@ -54,6 +54,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_llama_embed(params);
         case LLM_ARCH_MAINCODER:
             return new llama_model_maincoder(params);
+        case LLM_ARCH_MAION_CODER:
+            return new llama_model_maion_coder(params);
         case LLM_ARCH_TALKIE:
             return new llama_model_talkie(params);
         case LLM_ARCH_DECI:
@@ -158,6 +160,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_gemma4_assistant(params);
         case LLM_ARCH_GEMMA_EMBEDDING:
             return new llama_model_gemma_embedding(params);
+        case LLM_ARCH_GEMMA_EMBEDDING2:
+            return new llama_model_gemma_embedding2(params);
         case LLM_ARCH_STARCODER2:
             return new llama_model_starcoder2(params);
         case LLM_ARCH_MAMBA:
@@ -330,6 +334,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_qwen35moe(params);
         case LLM_ARCH_CLEF:
             return new llama_model_clef(params);
+        case LLM_ARCH_VLLM_DECISION2:
+            return new llama_model_vllm_decision2(params);
         case LLM_ARCH_QWEN4EXP:
             return new llama_model_qwen4exp(params);
         case LLM_ARCH_MISTRAL3:
@@ -350,6 +356,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_step35(params);
         case LLM_ARCH_SPARK2_5:
             return new llama_model_spark2_5(params);
+        case LLM_ARCH_K2_HORIZON:
+            return new llama_model_k2_horizon(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -378,18 +386,18 @@ llama_model * llama_model_create(llama_model_loader & ml, const llama_model_para
     return llama_model_create(arch, params);
 }
 
-// 3-card attention load balancing: the Q heads are split evenly, but the KV heads are not,
-// so the KV slices of adjacent devices overlap by one head; for now only Qwen3.5 dense is
-// wired up on the graph side, the other fused Q+gate models keep the old split
+
+
+
 bool attn_kv_overlap_3card(const llama_hparams & hparams, const llama_model & model, uint32_t il) {
     if (model.arch != LLM_ARCH_QWEN35) {
         return false;
     }
-    // only the meta device used for tensor parallelism is split across devices
+
     if (model.split_mode() != LLAMA_SPLIT_MODE_TENSOR || model.get_split_state_ud.n_devices != 3) {
         return false;
     }
-    // the Q windows assume an even split: no --tensor-split, or equal proportions (e.g. 1,1,1)
+
     const float * ts = model.tensor_split();
     if (ts != nullptr && !(ts[0] == ts[1] && ts[1] == ts[2])) {
         return false;
@@ -409,12 +417,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const std::string tensor_name = tensor->name;
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
-    // expert parallelism: split the routed experts along the expert dim instead of the intermediate dim
+
     const bool is_ep = llm_arch_uses_expert_parallel(ud->model->arch) &&
         ud->model->split_mode() == LLAMA_SPLIT_MODE_TENSOR;
 
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
+    static const std::regex pattern_v_exps_weight   ("blk\\.\\d*\\.attn_v_exps.weight"); // K2 Horizon MoVA
     static const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
     static const std::regex pattern_q_bias          ("blk\\.\\d*\\.attn_q\\.bias");
     static const std::regex pattern_kv_bias         ("blk\\.\\d*\\.attn_(k|v)\\.bias");
@@ -468,8 +477,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         size_t   rotation; // when assigning tensor slices, rotate how the rounding is done for more even allocation
     };
 
-    // per-device share of ne elements, cut at multiples of g, with the device order rotated by `rotation`:
-    // the slices of every split tensor below, and what the MTP block compares to pick its rotation
+
+
     auto split_units = [&](const int64_t ne, const int64_t g, const size_t rotation) -> std::vector<int64_t> {
         const float * tensor_split = ud->model->tensor_split();
         std::vector<float> tensor_split_scan;
@@ -510,21 +519,21 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return ret;
         };
 
-        // The MTP block (the layers after the trunk) runs next to the trunk on every step and has fewer KV heads
-        // than there are devices, so its rotation decides which devices hold its attention weights and KV cache.
-        // Continuing the round robin of the trunk's attention layers keeps the KV heads spread evenly, but when
-        // the trunk already holds the same number of heads on every device, any rotation is as even, and the
-        // continuation can land on the devices that the expert split (rotation 0, an expert count the device
-        // count does not divide) gives one expert more in every layer: with 6 devices the 2 KV heads and the
-        // 2 extra experts both land on devices 2 and 5. So the block takes the rotation that first keeps the most
-        // KV heads on any device lowest and then puts its heads on the devices with the fewest experts, the
-        // round robin continuation on a tie. A head is computed the same way on any device, only its place changes.
+
+
+
+
+
+
+
+
+
         auto get_rotation = [&](const uint32_t il) -> size_t {
             const size_t rotation_rr = get_il_eff(il) % ud->n_devices;
             if (!is_ep || il < hparams.n_layer() || hparams.is_recr(il) || hparams.n_expert == 0) {
                 return rotation_rr;
             }
-            // KV heads per device of the trunk's layers of the same kind, with their round robin rotations
+
             std::vector<int64_t> n_head_kv_trunk(ud->n_devices, 0);
             for (uint32_t il_prev = 0; il_prev < hparams.n_layer(); il_prev++) {
                 if (hparams.is_recr(il_prev) != hparams.is_recr(il) || hparams.is_swa(il_prev) != hparams.is_swa(il)) {
@@ -536,7 +545,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 }
             }
             const std::vector<int64_t> n_expert_dev = split_units(hparams.n_expert, 1, 0);
-            // (most KV heads on a device, experts on the devices that hold the block's heads): lower is better
+
             auto score = [&](const size_t rotation) -> std::pair<int64_t, int64_t> {
                 const std::vector<int64_t> n_head_kv_dev = split_units(hparams.n_head_kv(il), 1, rotation);
                 int64_t max_heads = 0;
@@ -629,12 +638,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
-        // the attention rotation matrices are used in full by every device, they are not tied to a layer
+
         if (std::regex_match(tensor_name, pattern_kv_rot)) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
         }
 
-        // the DFlash2 feature sinks and the nextn h sink are written and read by every device in full
+
         if (std::regex_match(tensor_name, pattern_layer_inp_sink)) {
             return {GGML_BACKEND_SPLIT_AXIS_MIRRORED, tensor, 0, 0};
         }
@@ -642,6 +651,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         // standard attention
         if (std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_kv_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight", "ssm_out.weight");
+        }
+        // routed value experts {n_embd, n_embd_v_gqa, n_expert} produce V, so they split like attn_v
+        if (std::regex_match(tensor_name, pattern_v_exps_weight)) {
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "attn_output.weight");
         }
         if (std::regex_match(tensor_name, pattern_q_bias) || std::regex_match(tensor_name, pattern_kv_bias)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "attn_output.weight", "ssm_out.weight");
@@ -695,19 +708,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                  std::regex_match(tensor_name, pattern_ffn_gate_weight) ||
                  std::regex_match(tensor_name, pattern_ffn_gate_up_weight) ||
                  std::regex_match(tensor_name, pattern_ffn_down_weight))) {
-            // expert parallelism: each device holds a contiguous slice of the routed experts.
-            // Keep the device order unrotated so the slices line up with the source order and
-            // the per-device expert offset is the plain prefix sum of the slice lengths.
+
+
+
             tensor_config tc = get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_2);
             tc.rotation = 0;
             return tc;
         }
         if (is_ep && (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                       std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight))) {
-            // expert parallelism: the shared expert is split like a dense FFN, gate/up by rows and
-            // down by columns. Its down projection is a partial sum next to the partial sum of the
-            // routed experts, and the meta backend delays the routed experts' all-reduce to the sum
-            // of the two (ffn_out), so the layer keeps a single all-reduce.
+
+
+
+
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
         }
         if (is_ep && std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
@@ -762,7 +775,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 GGML_ASSERT(hparams.n_embd_k_gqa(il) == n_embd_gqa);
                 GGML_ASSERT(tensor->ne[axis] == n_embd + 2*n_embd_gqa);
                 if (attn_kv_overlap_3card(hparams, *ud->model, il)) {
-                    // K and V need separate offsets because their slices overlap between devices
+
                     return {{n_embd, 1}, {n_embd_gqa, 1}, {n_embd_gqa, 1}};
                 }
                 return {{n_embd, 1}, {n_embd_gqa, 2}};
@@ -887,7 +900,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                     return {hparams.n_head(il) / hparams.dsv4_o_group_count};
                 }
                 if (attn_kv_overlap_3card(hparams, *ud->model, il)) {
-                    // one value per head, so the split must not cross a head boundary
+
                     return {1};
                 }
                 return {granularity_head};
@@ -918,7 +931,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE || ud->model->arch == LLM_ARCH_CLEF ||
                         ud->model->arch == LLM_ARCH_QWEN4EXP) {
                     if (attn_kv_overlap_3card(hparams, *ud->model, il)) {
-                        // one Q+gate head per unit, the per-device slices must not cross a head boundary
+
                         GGML_ASSERT(2*hparams.n_embd_head_k(il) % blck_size == 0);
                         return {2*hparams.n_embd_head_k(il)};
                     }
@@ -929,7 +942,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             if (std::regex_match(tensor_name, pattern_attn_out_weight)) {
                 GGML_ASSERT(segments.size() == 1);
                 if (attn_kv_overlap_3card(hparams, *ud->model, il)) {
-                    // one output column per head, so each device holds whole heads
+
                     GGML_ASSERT(hparams.n_embd_head_v(il) % blck_size == 0);
                     return {hparams.n_embd_head_v(il)};
                 }
@@ -949,6 +962,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             // three stay in lockstep per device
             const int64_t granularity_v  = (granularity_kv / hparams.n_embd_head_k(il)) * hparams.n_embd_head_v(il);
             if (std::regex_match(tensor_name, pattern_kv_weight) ||
+                std::regex_match(tensor_name, pattern_v_exps_weight) ||
                 std::regex_match(tensor_name, pattern_kv_bias) ||
                 std::regex_match(tensor_name, pattern_kv_cache)) {
                 GGML_ASSERT(segments.size() == 1);
@@ -985,14 +999,14 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
             if (is_ep && tensor_name.find("_exps") != std::string::npos) {
-                // expert parallelism splits along the expert dim, so the granularity is one whole expert
+
                 return std::vector<int64_t>(segments.size(), 1);
             }
             if (is_ep && tensor_name.find("_shexp") != std::string::npos) {
-                // the shared expert is narrow (640 rows on Flash-Next): units of 128 rows would leave
-                // one of 6 devices without a slice, and a partial branch that a device skips cannot
-                // share the routed experts' all-reduce. Units of 64 rows give each of 6 devices a
-                // slice and keep the q8 skinny split-K of the down projection (K = slice, k % 64 == 0).
+
+
+
+
                 GGML_ASSERT(segments.size() == 1);
                 return {std::lcm(blck_size, (int64_t) 64)};
             }
@@ -1001,8 +1015,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return {blck_size_perf};
         }
 
-        // output: whole blocks of 32 vocab rows per device, which the q8 skinny kernels need (n % 32 == 0);
-        // a split that is already a multiple of 32 per device (e.g. 4 devices) keeps its boundaries
+
+
         if (std::regex_match(tensor_name, pattern_output_weight) || std::regex_match(tensor_name, pattern_output_bias)) {
             GGML_ASSERT(segments.size() == 1);
             return {32};
@@ -1026,16 +1040,16 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                                                std::regex_match(tensor_name, pattern_kv_weight) || std::regex_match(tensor_name, pattern_kv_bias));
         if (attn_3card && (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_qkv_bias) ||
                 is_sep_qkv || std::regex_match(tensor_name, pattern_kv_cache))) {
-            // 3-card attention load balancing: write the per-device slices explicitly,
-            // the K/V slices of adjacent devices overlap by one KV head
+
+
             const int64_t n_embd_head_k = hparams.n_embd_head_k(tc.il);
             const int64_t n_embd_head_v = hparams.n_embd_head_v(tc.il);
             const int64_t n_head_d      = hparams.n_head(tc.il) / ud->n_devices;
             const int64_t n_gqa         = hparams.n_gqa(tc.il);
             split_state.has_off = true;
             if (is_sep_qkv) {
-                // separate Q/K/V tensors: one segment per tensor; Q+gate is interleaved per head,
-                // so each device holds n_head_d whole heads, K/V overlap like the cache
+
+
                 const bool is_q = std::regex_match(tensor_name, pattern_q_weight) || std::regex_match(tensor_name, pattern_q_bias);
                 const bool is_v = tensor_name.find("attn_v") != std::string::npos;
                 const int64_t n_embd_head = is_v ? n_embd_head_v : n_embd_head_k;
@@ -1043,11 +1057,11 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 split_state.nr[0]      = 1;
                 for (size_t j = 0; j < ud->n_devices; j++) {
                     if (is_q) {
-                        const int64_t ne_q = 2*n_embd_head_k*n_head_d; // n_head_d heads of Q+gate per device
+                        const int64_t ne_q = 2*n_embd_head_k*n_head_d;
                         split_state.ne[j]  = ne_q;
                         split_state.off[j] = j*ne_q;
                     } else {
-                        const int64_t kv0_d = j*n_head_d / n_gqa; // global index of the first KV head of this device
+                        const int64_t kv0_d = j*n_head_d / n_gqa;
                         split_state.ne[j]  = 2*n_embd_head;
                         split_state.off[j] = kv0_d*n_embd_head;
                     }
@@ -1060,7 +1074,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 split_state.n_segments = 1;
                 split_state.nr[0]      = 1;
                 for (size_t j = 0; j < ud->n_devices; j++) {
-                    const int64_t kv0_d = j*n_head_d / n_gqa; // global index of the first KV head of this device
+                    const int64_t kv0_d = j*n_head_d / n_gqa;
                     split_state.ne[j]  = 2*n_embd_head;
                     split_state.off[j] = kv0_d*n_embd_head;
                 }
@@ -1071,8 +1085,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             split_state.n_segments = 3;
             split_state.nr[0] = split_state.nr[1] = split_state.nr[2] = 1;
             for (size_t j = 0; j < ud->n_devices; j++) {
-                const int64_t ne_q       = 2*n_embd_head_k*n_head_d; // Q+gate slice of this device
-                const int64_t kv0_d      = j*n_head_d / n_gqa;       // global index of the first KV head of this device
+                const int64_t ne_q       = 2*n_embd_head_k*n_head_d;
+                const int64_t kv0_d      = j*n_head_d / n_gqa;
                 split_state.ne[0*ud->n_devices + j]  = ne_q;
                 split_state.off[0*ud->n_devices + j] = j*ne_q;
                 split_state.ne[1*ud->n_devices + j]  = 2*n_embd_head_k;
@@ -1095,8 +1109,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
         split_state.n_segments = segments.size();
         if (attn_3card && (std::regex_match(tensor_name, pattern_attn_out_weight) || std::regex_match(tensor_name, pattern_attn_sinks))) {
-            // the slices are equal, so record the implicit per-device offsets explicitly:
-            // the output projection must compare equal to the attention output, which carries offsets
+
+
             int64_t off = 0;
             for (size_t j = 0; j < ud->n_devices; j++) {
                 split_state.off[j] = off;
@@ -1294,18 +1308,47 @@ static llama_rope_scaling_type llama_rope_scaling_type_from_string(const std::st
     return LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED;
 }
 
-// Maps the GGUF `<arch>.hidden_activation` string to the FFN op type used by the
-// graph builders. Only gated activations that map cleanly to llm_ffn_op_type are
-// listed; unrecognized values fall back to GeGLU, which matches the historical
-// default for ModernBert-style architectures.
+static const std::map<llama_rope_section_order, const char *> LLAMA_ROPE_SECTION_ORDERS = {
+    { LLAMA_ROPE_SECTION_ORDER_TYXZ, "tyxz" },
+    { LLAMA_ROPE_SECTION_ORDER_ZYXT, "zyxt" },
+};
+
+std::string llama_rope_section_order_name(llama_rope_section_order rope_section_order) {
+    return LLAMA_ROPE_SECTION_ORDERS.at(rope_section_order);
+}
+
+static llama_rope_section_order llama_rope_section_order_from_string(const std::string & name) {
+    for (const auto & kv : LLAMA_ROPE_SECTION_ORDERS) {
+        if (kv.second == name) {
+            return kv.first;
+        }
+    }
+
+    return LLAMA_ROPE_SECTION_ORDER_UNSPECIFIED;
+}
+
+// Maps GGUF activation names to the FFN op type used by the graph builders.
 static const std::map<std::string, llm_ffn_op_type> LLM_FFN_OP_TYPES_FROM_STRING = {
-    { "gelu",   LLM_FFN_GEGLU  },
-    { "geglu",  LLM_FFN_GEGLU  },
-    { "silu",   LLM_FFN_SWIGLU },
-    { "swish",  LLM_FFN_SWIGLU },
-    { "swiglu", LLM_FFN_SWIGLU },
-    { "relu",   LLM_FFN_RELU   },
-    { "reglu",  LLM_FFN_REGLU  },
+    { "gelu",              LLM_FFN_GEGLU_ERF },
+    { "gelu_python",       LLM_FFN_GEGLU_ERF },
+    { "gelu_pytorch_tanh", LLM_FFN_GEGLU     },
+    { "gelu_new",          LLM_FFN_GEGLU     },
+    { "gelu_fast",         LLM_FFN_GEGLU     },
+    { "gelu_accurate",     LLM_FFN_GEGLU     },
+    { "gelu_python_tanh",  LLM_FFN_GEGLU     },
+    { "geglu",             LLM_FFN_GEGLU     },
+    { "silu",              LLM_FFN_SWIGLU    },
+    { "swish",             LLM_FFN_SWIGLU    },
+    { "swiglu",            LLM_FFN_SWIGLU    },
+    { "relu",              LLM_FFN_RELU      },
+    { "reglu",             LLM_FFN_REGLU     },
+};
+
+// transformers names, "gelu" is the exact (erf) variant
+static const std::map<std::string, ggml_unary_op> LLM_CLS_ACT_TYPES_FROM_STRING = {
+    { "gelu", GGML_UNARY_OP_GELU_ERF },
+    { "silu", GGML_UNARY_OP_SILU     },
+    { "tanh", GGML_UNARY_OP_TANH     },
 };
 
 llm_ffn_op_type llm_ffn_op_type_from_string(const std::string & name, llm_ffn_op_type fallback) {
@@ -1431,9 +1474,9 @@ struct llama_model::impl {
     impl() = default;
     ~impl() = default;
 
-    // the expert assignment table the expert weights of the model are laid out by (see
-    // ggml_expert_assignment_activate), released with the model. Declared first so that it goes
-    // last, after the buffers of the weights it describes.
+
+
+
     struct expert_assignment_holder {
         uint32_t id = 0;
         expert_assignment_holder() = default;
@@ -1546,12 +1589,12 @@ static bool buft_is_device_expert(ggml_backend_buffer_type_t buft) {
     return is_expert != nullptr && is_expert(buft);
 }
 
-// true if an override keeps the weight on the GPU for the pipeline: a GPU buffer type that is
-// neither a host buffer nor device-readable host memory. the expert store buffer type is
-// allowed - it belongs to the GPU of its layer, and its host complement lives inside the
-// expert buffer, not in a separate override. a null buft is not a host placement: the loader
-// ignores it and selects the default buffer. a buffer type with no device is a host buffer
-// type (ggml_backend_cpu_buffer_type has device == NULL), so it counts as non-GPU.
+
+
+
+
+
+
 static bool tensor_override_is_on_gpu(const llama_model_tensor_buft_override & over) {
     if (over.buft == nullptr) {
         return false;
@@ -1626,6 +1669,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         gguf_kv.emplace(name, value);
     }
 
+    load_hparams_hadamard(ml);
+
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
 
@@ -1641,6 +1686,12 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_CAUSAL,        hparams.causal_attn,     false);
     ml.get_key(LLM_KV_POOLING_TYPE,            hparams.pooling_type,    false);
     ml.get_key(LLM_KV_CLASSIFIER_POOLING_TYPE, hparams.pooling_type_cls, false);
+    std::string act_cls;
+    if (ml.get_key(LLM_KV_CLASSIFIER_ACTIVATION, act_cls, false)) {
+        const auto it = LLM_CLS_ACT_TYPES_FROM_STRING.find(act_cls);
+        GGML_ASSERT(it != LLM_CLS_ACT_TYPES_FROM_STRING.end() && "unsupported classifier activation");
+        hparams.act_cls = it->second;
+    }
     ml.get_key(LLM_KV_BLOCK_COUNT,             hparams.n_layer_all);
     GGML_ASSERT(hparams.n_layer_all > 0 && hparams.n_layer_all <= LLAMA_MAX_LAYERS);
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS,    hparams.n_layer_nextn,   false);
@@ -1736,6 +1787,13 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     hparams.rope_scaling_type_train = llama_rope_scaling_type_from_string(rope_scaling);
     GGML_ASSERT(hparams.rope_scaling_type_train != LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED);
 
+    std::string rope_section_order("tyxz");
+    ml.get_key(LLM_KV_ROPE_SECTION_ORDER, rope_section_order, false);
+    hparams.rope_section_order = llama_rope_section_order_from_string(rope_section_order);
+    if (hparams.rope_section_order == LLAMA_ROPE_SECTION_ORDER_UNSPECIFIED) {
+        throw std::runtime_error("unknown rope section order: " + rope_section_order);
+    }
+
     // TODO: Handle SWA metadata similarly when models start implementing it
     // rope_freq_scale (inverse of the kv) is optional
     float ropescale = 0.0f;
@@ -1806,6 +1864,10 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     }
 
     hparams.rope_type = llama_model_rope_type(this);
+
+    if (hparams.rope_section_order != LLAMA_ROPE_SECTION_ORDER_TYXZ && hparams.n_pos_per_embd() != 4) {
+        throw std::runtime_error("rope section order " + llama_rope_section_order_name(hparams.rope_section_order) + " requires M-RoPE");
+    }
 }
 
 void llama_model_base::load_vocab(llama_model_loader & ml) {
@@ -1900,7 +1962,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         splits[i] = split_sum;
     }
     for (size_t i = 0; i < n_devices(); ++i) {
-        splits[i] /= split_sum;
+        splits[i] = split_sum != 0.0f ? splits[i] / split_sum : float(i + 1) / n_devices();
     }
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
@@ -1930,12 +1992,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
 
-    // the lazy PLE table is consumed by the device that holds the PLE layer: load it into
-    // device-readable mapped host memory and read it there. this is a capability branch (only
-    // CUDA offers a mapped weights buffer); without it the table stays in a CPU mmap buffer
-    // and GET_ROWS runs on the CPU
-    // when the table is read from the model file row by row (ple_host_read), it stays in the
-    // CPU mmap buffer in any case: it is neither pinned nor mapped into the page tables
+
+
+
+
+
+
     if (hparams.ple_n_heads > 0 && !params.ple_host_read) {
         for (uint32_t il = 0; il < (uint32_t) n_layer_all; ++il) {
             if (hparams.is_ple(il)) {
@@ -1946,11 +2008,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // the token embedding table is read by the device that holds layer 0: load it into
-    // device-readable mapped host memory and run the input layer GET_ROWS there. this is a
-    // capability branch (only CUDA offers a mapped weights buffer); without it the table keeps
-    // the regular input layer path (a CPU buffer) and GET_ROWS runs on the CPU. the memory-fit
-    // pass keeps the regular accounting (no_alloc)
+
+
+
+
+
     if (!ml.no_alloc && n_layer_all > 0) {
         ml.embd.dev = pimpl->dev_layer[0].dev;
         if (ml.embd.buft() == nullptr) {
@@ -2134,8 +2196,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
-    // the prefetch touches the pages of the table: when the table is read from the model file
-    // row by row, its pages must stay untouched (the reader reads them with O_DIRECT)
+
+
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd) && !params.ple_host_read) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
 
@@ -2162,12 +2224,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
-    std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
-    ctx_buf_maps.reserve(ml.ctx_map.size());
+    // note: the buffers are owned by pimpl->ctxs_bufs, this is a raw-pointer view used to load the data
+    std::vector<std::pair<ggml_context *, std::vector<ggml_backend_buffer_t>>> ctx_bufs;
+    ctx_bufs.reserve(ml.ctx_map.size());
 
-    // Ensure we have enough capacity for the maximum backend buffer we will potentially create
-    const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
-    pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
+    // reserve hint: each context creates one buffer per file, or more when its tensors are spread
+    //     across disjoint ranges of a file (see get_mapping_ranges)
+    pimpl->ctxs_bufs.reserve(ml.ctx_map.size() * ml.files.size());
 
     for (auto & [ctx_key, ctx_ptr] : ml.ctx_map) {
         ggml_backend_buffer_type_t buft = ctx_key.buft;
@@ -2177,9 +2240,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (ggml_get_first_tensor(ctx) == nullptr) {
             continue;
         }
-
-        llama_buf_map buf_map;
-        buf_map.reserve(n_max_backend_buffer);
 
         // check if it is possible to use buffer_from_host_ptr with this buffer type
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
@@ -2200,8 +2260,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        // weights converted to another type (BF16 to F16, F32 to BF16) are rewritten while loading,
-        // they cannot point into the mapping
+
+
         bool ctx_has_converted = false;
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
             if (ml.is_type_converted(t)) {
@@ -2212,24 +2272,24 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && !ctx_has_converted && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
+            const size_t max_size = ggml_get_max_tensor_size(ctx);
+
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                // only the mmap region containing the tensors in the model is mapped to the backend buffer
-                // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
-                //     then we could just use metal for all layers
-                // this allows using partial offloading when the model size exceeds the metal buffer size, but not the RAM size
-                void * addr = nullptr;
-                size_t first, last; // NOLINT
-                ml.get_mapping_range(&first, &last, &addr, idx, ctx);
-                if (first >= last) {
-                    continue;
+                // map the mmap regions that contain the tensors of this context
+                // this is important for metal with apple silicon: a backend buffer pins everything it
+                //     wraps, so the regions owned by the other contexts (lazy tensors read on demand
+                //     from disk, MoE tensors kept on the CPU, etc) are left out and stay out of RAM
+                // this also allows using partial offloading when the model size exceeds the metal buffer
+                //     size, but not the RAM size
+                void * addr = ml.mappings.at(idx)->addr();
+
+                for (const auto & range : ml.get_mapping_ranges(idx, ctx)) {
+                    ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + range.first, range.last - range.first, max_size);
+                    if (buf == nullptr) {
+                        throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                    }
+                    bufs.emplace_back(buf);
                 }
-                const size_t max_size = ggml_get_max_tensor_size(ctx);
-                ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
-                if (buf == nullptr) {
-                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
-                }
-                bufs.emplace_back(buf);
-                buf_map.emplace(idx, buf);
             }
         } else {
             ggml_backend_buffer_t buf;
@@ -2251,20 +2311,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
             }
             bufs.emplace_back(buf);
-            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
-                buf_map.emplace(idx, buf);
-            }
         }
+
+        std::vector<ggml_backend_buffer_t> buf_ptrs;
+        buf_ptrs.reserve(bufs.size());
 
         for (auto & buf : bufs) {
             // indicate that this buffer contains weights
             // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+            buf_ptrs.emplace_back(buf.get());
         }
 
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
 
-        ctx_buf_maps.emplace_back(ctx, buf_map);
+        ctx_bufs.emplace_back(ctx, std::move(buf_ptrs));
     }
 
     if (llama_supports_gpu_offload()) {
@@ -2297,17 +2359,17 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // without mmap, load non-host buffers first: their tensors go through a staging buffer, which is cheapest while the fewest weights are resident
     if (!ml.use_mmap) {
-        std::stable_partition(ctx_buf_maps.begin(), ctx_buf_maps.end(), [](const auto & ctx_buf_map) {
-            const auto & buf_map = ctx_buf_map.second;
-            return !buf_map.empty() && !ggml_backend_buffer_is_host(buf_map.begin()->second);
+        std::stable_partition(ctx_bufs.begin(), ctx_bufs.end(), [](const auto & x) {
+            const auto & bufs = x.second;
+            return !bufs.empty() && !ggml_backend_buffer_is_host(bufs[0]);
         });
     }
 
-    // The expert weights that are split over the devices along the expert dim: hand the loader the
-    // number of experts every device holds (the same split the meta buffer applies) and the expert
-    // assignment table of the model, it lays the experts of these tensors out by that table
-    // (llama_expert_layout). The weights are those this loader created, in the expert store or
-    // plain device weights (a draft): borrowed tensors of another model keep that model's table.
+
+
+
+
+
     for (const ggml_tensor * t : ml.expert_weights) {
         if (t->ne[2] <= 1 || t->buffer == nullptr || !ggml_backend_buffer_is_meta(t->buffer)) {
             continue;
@@ -2316,8 +2378,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         if (ss.axis != GGML_BACKEND_SPLIT_AXIS_2) {
             continue;
         }
-        // the slices are per simple device of the meta device the buffer belongs to (the model's
-        // own device list holds the meta device as one entry)
+
+
         ggml_backend_dev_t meta_dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
         GGML_ASSERT(meta_dev != nullptr && ggml_backend_dev_is_meta(meta_dev));
         const size_t nd = ggml_backend_meta_dev_n_devs(meta_dev);
@@ -2330,11 +2392,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ml.expert_dev_slices.emplace(t, std::move(slices));
     }
 
-    // The table: one per model, for all its split expert weights, which therefore have to be split
-    // alike (the experts of a layer, gate/up and down, live on one device). Experts in the expert
-    // stores are laid out by the proposal the stores were planned with (the profile's permutation),
-    // plain device weights by the contiguous split the meta buffer applies to them; either way the
-    // table is placed by the loader, activated after the load and checked before the first graph.
+
+
+
+
+
     if (!ml.expert_dev_slices.empty()) {
         const ggml_tensor *          first    = ml.expert_dev_slices.begin()->first;
         const std::vector<int64_t> & slices   = ml.expert_dev_slices.begin()->second;
@@ -2364,30 +2426,30 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             throw std::runtime_error(format("%s: no expert assignment table for %d layers of %lld experts over %zu devices%s",
                 __func__, n_layer, (long long) n_expert, slices.size(), in_store ? " (the expert buffers were planned with other sizes or not at all)" : ""));
         }
-        // released with the model
+
         pimpl->expert_assignment.id = table;
         ml.expert_assignment = table;
     }
 
     // load tensor data
-    for (auto & [ctx, buf_map] : ctx_buf_maps) {
-        if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+    for (auto & [ctx, bufs] : ctx_bufs) {
+        if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
 
-    // every expert tensor that is split over the devices is written in the layout of the table
-    // now: activate it for them, before the placement check below and before the first graph
-    // addresses the experts
+
+
+
     if (ml.expert_assignment != 0) {
         ggml_expert_assignment_activate(ml.expert_assignment, ml.expert_tensors_by_table.data(), ml.expert_tensors_by_table.size());
         LLAMA_LOG_INFO("%s: %zu expert tensors laid out by the expert assignment (version %u)\n",
             __func__, ml.expert_tensors_by_table.size(), ml.expert_assignment);
     }
 
-    // The expert store buffer types need all tensor data written before they can check their
-    // byte-level placement. The check runs now, after the loader and before any graph, for
-    // every backend that provides the "model loaded" hook.
+
+
+
     for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
         ggml_backend_reg_t reg = ggml_backend_reg_get(i);
         typedef void (*ggml_backend_expert_store_model_loaded_t)(void);
@@ -2398,7 +2460,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // the source hashes of the placement check were consumed by the hooks above
+
     ggml_expert_store_clear_source_hashes();
 
     if (use_mmap_buffer) {
@@ -2407,10 +2469,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    // the reader of the n-gram table: the table stays in the model file and the reader reads the
-    // rows the graph needs from it, so the table takes no pinned host memory. Every failure here
-    // stops the load: a model that says it reads the table from the file and cannot is worse
-    // than one that never tried, because the graph would read the table from the page cache.
+    load_tensors_hadamard();
+
+
+
+
+
     if (params.ple_host_read) {
         if (per_layer_tok_embd == nullptr) {
             throw std::runtime_error(format("%s: the n-gram table is read from the model file, but the model has none", __func__));
@@ -2429,9 +2493,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 (long long) w->tensor->ne[0], (long long) w->tensor->ne[1]));
         }
         if (per_layer_tok_embd->type != w->tensor->type) {
-            // the reader returns the bytes of the file, so the table of the file must have the
-            // type of the tensor: a table that is converted while loading would be read as the
-            // bytes of the file
+
+
+
             throw std::runtime_error(format("%s: the n-gram table '%s' of the model has the type %s, the one in the file has the type %s",
                 __func__, per_layer_tok_embd->name,
                 ggml_type_name(per_layer_tok_embd->type), ggml_type_name(w->tensor->type)));
@@ -2443,8 +2507,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         ple_reader->n_rows    = (size_t) w->tensor->ne[1];
         ple_reader->row_bytes = ggml_row_size(w->tensor->type, w->tensor->ne[0]);
 
-        // check the file here, so that a wrong path or a wrong offset stops the load instead of
-        // the first decode; the reader itself is opened at the end of the load
+
+
         const size_t table_bytes = ple_reader->n_rows * ple_reader->row_bytes;
         const size_t file_size    = ml.files[w->idx]->size();
         FILE * f = fopen(ple_reader->file.c_str(), "rb");
@@ -2463,15 +2527,347 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             __func__, per_layer_tok_embd->name, ple_reader->file.c_str(), ple_reader->offset,
             ple_reader->n_rows, ple_reader->row_bytes);
 
-        // open the file and start the read threads now: a table that can not be read stops the
-        // load here, not in the middle of the first request
+
+
         if (!ple_reader->init()) {
             throw std::runtime_error(format("%s: the n-gram table '%s' in '%s' can not be read",
                 __func__, per_layer_tok_embd->name, ple_reader->file.c_str()));
         }
     }
 
+
     return true;
+}
+
+// read and check the prism.hadamard metadata, and record the folded weights (load_tensors_hadamard makes the tensors)
+void llama_model_base::load_hparams_hadamard(llama_model_loader & ml) {
+    uint32_t hadamard_version = 0;
+    ml.get_key(LLM_KV_PRISM_HADAMARD_TIED_OUTPUT, hdmd.tied_output, false);
+    if (ml.get_key(LLM_KV_PRISM_HADAMARD_VERSION, hadamard_version, false)) {
+        if (hadamard_version != 1 && hadamard_version != 2) {
+            throw std::runtime_error(format("unsupported prism.hadamard.version: %u", hadamard_version));
+        }
+
+        if ((hadamard_version == 2) != hdmd.tied_output) {
+            throw std::runtime_error("prism.hadamard version 2 requires tied_output=true; version 1 forbids it");
+        }
+        if (hdmd.tied_output && ml.get_weight("output.weight")) {
+            throw std::runtime_error("prism.hadamard.tied_output requires output.weight to be absent");
+        }
+
+        uint32_t block_size = 0;
+        std::string transform;
+        std::string axis;
+        std::string sign_mode;
+        std::vector<std::string> weight_names;
+
+        ml.get_key(LLM_KV_PRISM_HADAMARD_BLOCK_SIZE, block_size);
+        ml.get_key(LLM_KV_PRISM_HADAMARD_TRANSFORM, transform);
+        ml.get_key(LLM_KV_PRISM_HADAMARD_AXIS, axis);
+        ml.get_key(LLM_KV_PRISM_HADAMARD_SIGN_MODE, sign_mode);
+        ml.get_arr(LLM_KV_PRISM_HADAMARD_WEIGHT_NAMES, weight_names);
+
+        if (block_size == 0 || (block_size & (block_size - 1)) != 0) {
+            throw std::runtime_error(format("invalid prism.hadamard.block_size: %u", block_size));
+        }
+        if (transform != "normalized-sylvester-walsh-hadamard") {
+            throw std::runtime_error(format("unsupported prism.hadamard.transform: %s", transform.c_str()));
+        }
+        if (axis != "input-last-dimension") {
+            throw std::runtime_error(format("unsupported prism.hadamard.axis: %s", axis.c_str()));
+        }
+        if (sign_mode != "identity" && sign_mode != "explicit") {
+            throw std::runtime_error(format("unsupported prism.hadamard.sign_mode: %s", sign_mode.c_str()));
+        }
+        if (weight_names.empty()) {
+            throw std::runtime_error("prism.hadamard.weight_names is empty");
+        }
+
+        if (sign_mode == "explicit") {
+            std::vector<int32_t> sign_widths;
+            std::vector<int32_t> sign_values;
+            ml.get_arr(LLM_KV_PRISM_HADAMARD_SIGN_WIDTHS, sign_widths);
+            ml.get_arr(LLM_KV_PRISM_HADAMARD_SIGN_VALUES, sign_values);
+            // explicit mode with no widths gives an empty sign table, which acts as identity and changes the model
+            if (sign_widths.empty()) {
+                throw std::runtime_error("prism.hadamard.sign_mode is explicit but sign_widths is empty");
+            }
+            size_t off = 0;
+            for (const int32_t width : sign_widths) {
+                if (width <= 0 || (uint32_t) width % block_size != 0 || off + width > sign_values.size()) {
+                    throw std::runtime_error(format("invalid prism.hadamard sign width: %d", width));
+                }
+                if (hdmd.sign_data.count(width)) {
+                    throw std::runtime_error(format("duplicate prism.hadamard sign width: %d", width));
+                }
+                auto & vec = hdmd.sign_data[width];
+                vec.assign(sign_values.begin() + off, sign_values.begin() + off + width);
+                for (const int32_t v : vec) {
+                    if (v != 1 && v != -1) {
+                        throw std::runtime_error("prism.hadamard sign values must be +/-1");
+                    }
+                }
+                off += width;
+            }
+            if (off != sign_values.size()) {
+                throw std::runtime_error("prism.hadamard.sign_values length mismatch");
+            }
+        }
+
+        ml.get_key(LLM_KV_PRISM_HADAMARD_GDN_V_GROUPED, hdmd.gdn_v_grouped, false);
+
+        // only build_lora_mm/build_lora_mm_id apply the transform: refuse archs and tensor kinds that can skip them
+        switch (arch) {
+            case LLM_ARCH_LLAMA:
+            case LLM_ARCH_QWEN3:
+            case LLM_ARCH_QWEN3MOE:
+            case LLM_ARCH_QWEN35:
+            case LLM_ARCH_QWEN35MOE:
+            case LLM_ARCH_QWEN3NEXT:
+                break;
+            default:
+                throw std::runtime_error(format(
+                    "prism.hadamard: arch '%s' is not verified to apply the activation transform to all folded weights",
+                    llm_arch_name(arch)));
+        }
+
+        // a folded weight W_f = W*D*H is the weight W with the +1/-1 signs D and the normalized block Hadamard H folded in
+        // H*H = I and D*D = I, so W*x = W_f*(H*(D*x)): the graph applies D, then H, to the matmul input
+        const auto is_foldable_weight = [](const std::string & name) {
+            static const char * kinds[] = {
+                "attn_q", "attn_k", "attn_v", "attn_qkv", "attn_gate", "attn_output",
+                "ffn_gate", "ffn_up", "ffn_down",
+                "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_up_exps",
+                "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+                "ssm_out",
+            };
+            if (name == "output.weight") {
+                return true; // the output head is built through build_lora_mm in every arch
+            }
+            if (name.compare(0, 4, "blk.") != 0) {
+                return false;
+            }
+            size_t pos = 4;
+            while (pos < name.size() && isdigit((unsigned char) name[pos])) {
+                pos++;
+            }
+            if (pos == 4 || pos >= name.size() || name[pos] != '.') {
+                return false;
+            }
+            pos++;
+            for (const char * kind : kinds) {
+                const std::string suffix = std::string(kind) + ".weight";
+                if (name.compare(pos, std::string::npos, suffix) == 0) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        for (const auto & weight_name : weight_names) {
+            if (!is_foldable_weight(weight_name)) {
+                throw std::runtime_error(format(
+                    "prism.hadamard: weight '%s' is not on a verified Hadamard-aware matmul path", weight_name.c_str()));
+            }
+            if (!hdmd.weight_blocks.emplace(weight_name, block_size).second) {
+                throw std::runtime_error(format("duplicate prism.hadamard weight: %s", weight_name.c_str()));
+            }
+        }
+
+        // tables read by row lookup store latent rows: the inverse transform goes on the lookup result
+        std::vector<std::string> inverse_names;
+        ml.get_arr(LLM_KV_PRISM_HADAMARD_INVERSE_WEIGHT_NAMES, inverse_names, false);
+        for (const auto & name : inverse_names) {
+            // the graph applies the inverse only after the token-embedding lookup, other latent tables stay rotated
+            if (name != "token_embd.weight") {
+                throw std::runtime_error(format(
+                    "prism.hadamard: weight '%s' is not a verified inverse-after-lookup table", name.c_str()));
+            }
+            if (hdmd.weight_blocks.count(name) || !hdmd.inverse_blocks.emplace(name, block_size).second) {
+                throw std::runtime_error(format("duplicate prism.hadamard inverse weight: %s", name.c_str()));
+            }
+        }
+    }
+
+    if (hdmd.tied_output) {
+        if (hadamard_version != 2) {
+            throw std::runtime_error("prism.hadamard.tied_output requires version 2");
+        }
+        const auto it = hdmd.inverse_blocks.find("token_embd.weight");
+        if (it == hdmd.inverse_blocks.end()) {
+            throw std::runtime_error("prism.hadamard.tied_output requires a latent token embedding");
+        }
+        hdmd.weight_blocks.emplace("token_embd.weight", it->second);
+    } else if (hdmd.inverse_blocks.count("token_embd.weight") && !ml.get_weight("output.weight")) {
+        throw std::runtime_error("a tied Hadamard output requires version 2 and tied_output=true");
+    }
+}
+
+// make one Hadamard matrix per block size and one sign vector per width (the GGUF does not contain them)
+// each tensor goes on the buffer type of its weights (never a CPU extra type), and each transform goes in hdmd.rot or hdmd.inv
+void llama_model_base::load_tensors_hadamard() {
+    if (hdmd.weight_blocks.empty() && hdmd.inverse_blocks.empty()) {
+        return;
+    }
+
+    struct hadamard_rotation {
+        uint32_t block_size;
+        ggml_backend_buffer_type_t buft;
+        ggml_tensor * tensor;
+    };
+
+    std::vector<hadamard_rotation> rotations;
+    std::map<std::pair<uint32_t, ggml_backend_buffer_type_t>, ggml_tensor *> sign_tensors;
+
+    const std::pair<const std::unordered_map<std::string, uint32_t> *, llama_hadamard_rotations *> groups[] = {
+        { &hdmd.weight_blocks,  &hdmd.rot },
+        { &hdmd.inverse_blocks, &hdmd.inv  },
+    };
+    // inverse transforms use the buffer type of the forward rotations, not the host type of a CPU-mapped table (no PCIe round trip per token)
+    ggml_backend_buffer_type_t preferred_buft = nullptr;
+
+    for (const auto & [blocks, target] : groups) {
+        for (const auto & entry : *blocks) {
+            const std::string & weight_name = entry.first;
+            const uint32_t block_size = entry.second;
+            const ggml_tensor * weight = get_tensor(weight_name.c_str());
+            if (hdmd.tied_output && weight_name == "token_embd.weight") {
+                weight = target == &hdmd.rot ? output : tok_embd;
+                if (!weight || strcmp(weight->name, "token_embd.weight") != 0) {
+                    throw std::runtime_error("prism.hadamard.tied_output is not bound to the token embedding");
+                }
+            }
+            if (weight == nullptr) {
+                throw std::runtime_error(format("prism.hadamard weight not found: %s", weight_name.c_str()));
+            }
+            if (weight->ne[0] % block_size != 0) {
+                throw std::runtime_error(format(
+                    "prism.hadamard block size %u does not divide input dimension %lld for %s",
+                    block_size, (long long) weight->ne[0], weight_name.c_str()));
+            }
+            if (weight->buffer == nullptr) {
+                throw std::runtime_error(format("prism.hadamard weight has no buffer: %s", weight_name.c_str()));
+            }
+
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
+            // CPU extra buffer types (e.g. CPU_REPACK) only accept tensors they can repack
+            if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    buft = ggml_backend_dev_buffer_type(dev);
+                }
+            }
+            if (target == &hdmd.rot) {
+                preferred_buft = buft;
+            } else if (preferred_buft) {
+                buft = preferred_buft;
+            }
+            auto it = std::find_if(rotations.begin(), rotations.end(),
+                    [block_size, buft](const hadamard_rotation & rotation) {
+                        return rotation.block_size == block_size && rotation.buft == buft;
+                    });
+
+            if (it == rotations.end()) {
+                ggml_init_params params = {
+                    /*.mem_size   =*/ ggml_tensor_overhead(),
+                    /*.mem_buffer =*/ NULL,
+                    /*.no_alloc   =*/ true,
+                };
+                ggml_context_ptr ctx { ggml_init(params) };
+                if (!ctx) {
+                    throw std::runtime_error("failed to create Hadamard rotation context");
+                }
+
+                ggml_tensor * rotation = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, block_size, block_size);
+                char rotation_name[GGML_MAX_NAME];
+                snprintf(rotation_name, sizeof(rotation_name), "prism.hadamard.%u", block_size);
+                ggml_set_name(rotation, rotation_name);
+
+                ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+                if (!buffer) {
+                    throw std::runtime_error(format("unable to allocate %s Hadamard rotation buffer", ggml_backend_buft_name(buft)));
+                }
+                ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+                std::vector<float> data((size_t) block_size * block_size);
+                const float scale = 1.0f / sqrtf((float) block_size);
+                for (uint32_t row = 0; row < block_size; ++row) {
+                    for (uint32_t col = 0; col < block_size; ++col) {
+                        uint32_t parity = row & col;
+                        parity ^= parity >> 16;
+                        parity ^= parity >> 8;
+                        parity ^= parity >> 4;
+                        parity ^= parity >> 2;
+                        parity ^= parity >> 1;
+                        data[(size_t) row * block_size + col] = (parity & 1) ? -scale : scale;
+                    }
+                }
+                ggml_backend_tensor_set(rotation, data.data(), 0, data.size() * sizeof(float));
+
+                std::vector<ggml_backend_buffer_ptr> buffers;
+                buffers.emplace_back(std::move(buffer));
+                pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+                rotations.push_back({ block_size, buft, rotation });
+                it = std::prev(rotations.end());
+            }
+
+            ggml_tensor * sign_tensor = nullptr;
+            if (!hdmd.sign_data.empty()) {
+                const uint32_t width = (uint32_t) weight->ne[0];
+                const auto sd = hdmd.sign_data.find(width);
+                if (sd == hdmd.sign_data.end()) {
+                    throw std::runtime_error(format(
+                        "prism.hadamard has no sign vector for width %u (%s)", width, weight_name.c_str()));
+                }
+                const auto key = std::make_pair(width, buft);
+                auto st = sign_tensors.find(key);
+                if (st == sign_tensors.end()) {
+                    ggml_init_params params = {
+                        /*.mem_size   =*/ ggml_tensor_overhead(),
+                        /*.mem_buffer =*/ NULL,
+                        /*.no_alloc   =*/ true,
+                    };
+                    ggml_context_ptr ctx { ggml_init(params) };
+                    if (!ctx) {
+                        throw std::runtime_error("failed to create Hadamard sign context");
+                    }
+
+                    ggml_tensor * signs = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, width);
+                    char sign_name[GGML_MAX_NAME];
+                    snprintf(sign_name, sizeof(sign_name), "prism.hadamard.signs.%u", width);
+                    ggml_set_name(signs, sign_name);
+
+                    ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+                    if (!buffer) {
+                        throw std::runtime_error(format("unable to allocate %s Hadamard sign buffer", ggml_backend_buft_name(buft)));
+                    }
+                    ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+                    std::vector<float> data(width);
+                    for (uint32_t i = 0; i < width; ++i) {
+                        data[i] = (float) sd->second[i];
+                    }
+                    ggml_backend_tensor_set(signs, data.data(), 0, data.size() * sizeof(float));
+
+                    std::vector<ggml_backend_buffer_ptr> buffers;
+                    buffers.emplace_back(std::move(buffer));
+                    pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+                    st = sign_tensors.emplace(key, signs).first;
+                }
+                sign_tensor = st->second;
+            }
+
+            llama_hadamard_transform transform { it->tensor, sign_tensor };
+            // the GDN output projection reads its value heads in tiled order, see set_gdn_v_perm
+            if (hdmd.gdn_v_grouped && weight_name.find(".ssm_out.") != std::string::npos &&
+                !transform.set_gdn_v_perm(weight->ne[0], hparams.ssm_dt_rank, hparams.ssm_n_group)) {
+                throw std::runtime_error(format("prism.hadamard: bad GDN head geometry for %s", weight_name.c_str()));
+            }
+            target->emplace(weight, transform);
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: loaded %zu Hadamard-folded weight(s) (%zu inverse-lookup) using %zu rotation(s) and %zu sign vector(s)\n",
+            __func__, hdmd.rot.size() + hdmd.inv.size(), hdmd.inv.size(), rotations.size(), sign_tensors.size());
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags,
@@ -2644,6 +3040,9 @@ void llama_model::print_info() const {
         // MRoPE (Multi-axis Rotary Position Embedding) sections
         if (const auto & s = hparams.rope_sections; s[0] || s[1] || s[2] || s[3]) {
             LLAMA_LOG_INFO("%s: mrope sections        = [%d, %d, %d, %d]\n", __func__, s[0], s[1], s[2], s[3]);
+        }
+        if (hparams.rope_section_order != LLAMA_ROPE_SECTION_ORDER_TYXZ) {
+            LLAMA_LOG_INFO("%s: rope section order    = %s\n", __func__, llama_rope_section_order_name(hparams.rope_section_order).c_str());
         }
         if (!classifier_labels.empty()) {
             LLAMA_LOG_INFO("%s: n_cls_out             = %u\n", __func__, hparams.n_cls_out);
@@ -2873,13 +3272,18 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
 }
 
 bool llama_model::kq_range_mask_supported() const {
-    // these architectures feed the attention mask to ggml_flash_attn_ext only (qwen4exp: its QSA layers attend
-    // through ggml_qsa_select ids, the mask serves the dense blocks)
+
+
     return arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN4EXP;
 }
 
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
+
+    // the non-causal LFM2 decision graph reads the whole prompt in one batch, nothing is kept
+    if (arch == LLM_ARCH_LFM2 && !hparams.causal_attn && hparams.n_layer_decision > 0) {
+        return nullptr;
+    }
 
     switch (arch) {
         // Models that need specific instantiation should be handled in the
@@ -2894,6 +3298,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_WAVTOKENIZER_DEC:
         case LLM_ARCH_MODERN_BERT:
         case LLM_ARCH_GEMMA_EMBEDDING:
+        case LLM_ARCH_GEMMA_EMBEDDING2:
         case LLM_ARCH_DREAM:
         case LLM_ARCH_LLADA:
         case LLM_ARCH_LLADA_MOE:
@@ -3245,8 +3650,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         if (arch == LLM_ARCH_QWEN4EXP && params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
                             filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
                             filter_recr = [&](uint32_t)    { return false; };
-                            // the indexer cache only serves QSA blocks (compress ratio > 0): a dense MTP block keeps
-                            // no indexer cache and no k-pool, which a windowed (ring) attention cache could not track
+
+
                             bool mtp_qsa = false;
                             for (uint32_t il = hparams.n_layer(); il < hparams.n_layer_all; ++il) {
                                 mtp_qsa = mtp_qsa || hparams.dsv4_compress_ratios[il] > 0;
@@ -3280,8 +3685,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     } else if (needs_mem_idx) {
-                        // a dense MTP draft layer only proposes tokens that the target then verifies, so it can
-                        // attend a bounded window of recently written cells; the caches are sized to that window
+
+
                         const bool mtp_window = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && cparams.n_swa_mtp > 0;
 
                         uint32_t       attn_kv_size = cparams.n_ctx_seq;
@@ -3291,7 +3696,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         if (mtp_window) {
                             attn_n_swa = cparams.n_swa_mtp;
                             attn_swa   = LLAMA_SWA_TYPE_STANDARD;
-                            // same bound as the SWA cache of llama_kv_cache_iswa: the window plus one ubatch of slack
+
                             attn_kv_size = GGML_PAD(std::min(cparams.n_ctx_seq,
                                     attn_n_swa*(cparams.kv_unified ? cparams.n_seq_max : 1) + cparams.n_ubatch), 256);
                         }
@@ -3319,12 +3724,12 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_idx        */ std::move(filter_idx));
 
                         if (mtp_window) {
-                            // a bounded cache views the whole cache for 2+ token ubatches: the window mask hides the
-                            // out-of-window cells and the graph no longer depends on the used length
+
+
                             mem->get_mem_attn()->set_view_full(true);
 
                             if (llama_kv_cache * mem_idx = mem->get_mem_idx()) {
-                                // the indexer cache tracks the attention cache cell for cell
+
                                 mem_idx->set_view_full(true);
                             }
                         }
@@ -3465,10 +3870,13 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // add on pooling layer
     llm->build_pooling(cls, cls_b, cls_out, cls_out_b, cls_norm);
 
+    // add the LM head (if the context outputs logits)
+    llm->build_logits();
+
     // add backend sampling layers (if any)
     llm->build_sampling();
 
-    // add the top-k logits output (if enabled)
+
     llm->build_logits_topk();
 
     // if the gguf model was converted with --sentence-transformers-dense-modules
@@ -3477,10 +3885,10 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     // TODO: move reranking logic here and generalize
     llm->build_dense_out(dense_2_out_layers, dense_2_out_layers_b, dense_3_out_layers);
 
-    // DFlash2: copy the extracted layer inputs into the device sink (if enabled)
+
     llm->build_layer_inp_sink();
 
-    // r-mtpdev: copy the nextn hidden state into the device sink (if enabled)
+
     llm->build_h_nextn_sink();
 
     llm->res->set_outputs(params);
@@ -3506,15 +3914,15 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
-        /*.model_shared                =*/ nullptr,
+        nullptr,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
-        /*.no_expert_store             =*/ false,
-        /*.ple_host_read               =*/ false,
+        false,
+        false,
     };
 
     return result;
@@ -3708,6 +4116,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_DREAM:
         case LLM_ARCH_QWEN2MOE:
         case LLM_ARCH_QWEN3:
+        case LLM_ARCH_VLLM_DECISION2:
         case LLM_ARCH_QWEN3MOE:
         case LLM_ARCH_LLADA_MOE:
         case LLM_ARCH_RND1:
@@ -3724,8 +4133,10 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_GEMMA3:
         case LLM_ARCH_GEMMA3N:
         case LLM_ARCH_GEMMA4:
+        case LLM_ARCH_MAION_CODER:
         case LLM_ARCH_GEMMA4_ASSISTANT:
         case LLM_ARCH_GEMMA_EMBEDDING:
+        case LLM_ARCH_GEMMA_EMBEDDING2:
         case LLM_ARCH_STARCODER2:
         case LLM_ARCH_OPENELM:
         case LLM_ARCH_GPTNEOX:
@@ -3761,6 +4172,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_STEP35:
         case LLM_ARCH_SPARK2_5:
         case LLM_ARCH_TALKIE:
+        case LLM_ARCH_K2_HORIZON:
         case LLM_ARCH_MELLUM:
         case LLM_ARCH_MAPLE:
         case LLM_ARCH_HRM_TEXT:
@@ -3939,6 +4351,12 @@ int32_t llama_model_n_expert(const struct llama_model * model) {
     return model->hparams.n_expert;
 }
 
+int32_t llama_model_n_expert_used(const struct llama_model * model) {
+
+
+    return model->hparams.n_expert_used();
+}
+
 int32_t llama_model_n_devices(const struct llama_model * model) {
     return (int32_t)model->devices.size();
 }
@@ -3953,6 +4371,10 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
 ggml_backend_meta_split_state llama_model_tensor_split_state(const struct llama_model * model, const struct ggml_tensor * tensor) {
     return llama_meta_device_get_split_state(
         tensor, const_cast<llama_meta_device_get_split_state_userdata *>(&model->get_split_state_ud));
+}
+
+void llama_model_set_attn_rot(struct llama_model * model, bool value) {
+    model->attn_rot = value;
 }
 
 //
@@ -3987,10 +4409,10 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
 
     layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED | flags_extra);
     if (layer.ffn_gate_up_exps == nullptr && (flags_extra & TENSOR_GATE_UP_INTERLEAVE)) {
-        // the file ships the gate and the up weight separately and the model wants the fused
-        // SwiGLU path, which reads them as pairs from one tensor: let the loader merge them while
-        // loading. their rows can only be interleaved when both weights have the same type and
-        // shape, otherwise the loader loads them as two separate tensors
+
+
+
+
         const LLM_TN_IMPL tn_gate = tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", bid);
         const LLM_TN_IMPL tn_up   = tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", bid);
 
@@ -4007,9 +4429,9 @@ void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, 
                 return;
             }
         } else if (!(flags & TENSOR_NOT_REQUIRED)) {
-            // the model asked for the fused path and cannot get it: a warning, not an info line,
-            // because the common log drops INFO unless -lv 4 is given and a silent fallback to the
-            // two separate weights is exactly what must not go unnoticed
+
+
+
             LLAMA_LOG_WARN("%s: '%s' and '%s' cannot be merged (%s / %s), loading them separately\n", __func__,
                     tn_gate.str().c_str(), tn_up.str().c_str(),
                     t_gate ? llama_format_tensor_shape(t_gate).c_str() : "missing",
@@ -4058,6 +4480,27 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         layer.wk_b = create_tensor(tn(LLM_TENSOR_ATTN_K, "bias", bid), {n_embd_k_}, TENSOR_NOT_REQUIRED);
         layer.wv_b = create_tensor(tn(LLM_TENSOR_ATTN_V, "bias", bid), {n_embd_v_}, TENSOR_NOT_REQUIRED);
     }
+}
+
+llama_model_base::nextn_flags_t llama_model_base::nextn_flags(llama_model_loader & ml, llm_tensor trunk_probe) const {
+    int trunk = 0;
+    int mtp   = 0;
+
+    // a file without the first trunk layer is MTP-only, a file without the first NextN layer is trunk-only
+    if (hparams.n_layer_nextn > 0) {
+        if (ml.get_weight(tn(trunk_probe, "weight", 0).str().c_str()) == nullptr) {
+            trunk = TENSOR_NOT_REQUIRED;
+        }
+        if (ml.get_weight(tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", hparams.n_layer()).str().c_str()) == nullptr) {
+            mtp = TENSOR_NOT_REQUIRED;
+        }
+    }
+
+    if (!ml.load_mtp) {
+        mtp |= TENSOR_SKIP;
+    }
+
+    return { trunk, mtp };
 }
 
 void llama_model_base::load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first) {

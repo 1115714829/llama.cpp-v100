@@ -43,7 +43,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_chunk_local_cumsum_kernel_ker
   if ((((chunk_idx * 64) + seq_start_idx) + 64) <= seq_end_idx) {
     #pragma unroll
     for (int i = 0; i < 3; ++i) {
-      float broadcast_var = 0x0p+0f/*0.000000e+00*/;
+      float broadcast_var = 0x0p+0f ;
       float2 condval_2;
       if ((((((chunk_idx * 64) + (((i * 64) + (((int)threadIdx.x) >> 1)) / 3)) + seq_start_idx) < num_tokens) && (0 <= (((chunk_idx * 64) + (((i * 64) + (((int)threadIdx.x) >> 1)) / 3)) + seq_start_idx)))) {
         condval_2 = *(float2*)(g_raw + ((((((int64_t)chunk_idx) * (int64_t)768) + (((int64_t)i) * (int64_t)256)) + (((int64_t)seq_start_idx) * (int64_t)12)) + (((int64_t)((int)threadIdx.x)) * (int64_t)2)));
@@ -56,7 +56,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_chunk_local_cumsum_kernel_ker
     #pragma unroll
     for (int i_1 = 0; i_1 < 3; ++i_1) {
       if ((((chunk_idx * 64) + (((i_1 * 64) + (((int)threadIdx.x) >> 1)) / 3)) + seq_start_idx) < seq_end_idx) {
-        float broadcast_var_1 = 0x0p+0f/*0.000000e+00*/;
+        float broadcast_var_1 = 0x0p+0f ;
         float2 condval_3;
         if (((0 <= (((chunk_idx * 64) + (((i_1 * 64) + (((int)threadIdx.x) >> 1)) / 3)) + seq_start_idx)) && ((((chunk_idx * 64) + (((i_1 * 64) + (((int)threadIdx.x) >> 1)) / 3)) + seq_start_idx) < num_tokens))) {
           condval_3 = *(float2*)(g_raw + ((((((int64_t)chunk_idx) * (int64_t)768) + (((int64_t)i_1) * (int64_t)256)) + (((int64_t)seq_start_idx) * (int64_t)12)) + (((int64_t)((int)threadIdx.x)) * (int64_t)2)));
@@ -65,7 +65,7 @@ __global__ void __launch_bounds__(128, 1) tilelang_chunk_local_cumsum_kernel_ker
         }
         *(float2*)(gT_fragment + (i_1 * 2)) = condval_3;
       } else {
-        float broadcast_var_2 = 0x0p+0f/*0.000000e+00*/;
+        float broadcast_var_2 = 0x0p+0f ;
         *(float2*)(gT_fragment + (i_1 * 2)) = make_float2(broadcast_var_2, broadcast_var_2);
       }
     }
@@ -120,5 +120,5 @@ __global__ void __launch_bounds__(128, 1) tilelang_chunk_local_cumsum_kernel_ker
   }
 }
 
-} // namespace gdn_chunk_sm70
+}
 
