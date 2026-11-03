@@ -71,7 +71,7 @@ Step 6: do you want the web UI (chat in a browser)?
 | GPUs and VRAM | Host memory needed (approx.) | Command |
 |---|---|---|
 | 6 × 16 GB | 42 GiB | [Qwen3.8-Flash-Next command A](moe-2.0.0.en.md#a-6--16-gb-gpus-ac922-context-262144-with-mtp) |
-| 2 × 16 GB | 63 GiB; the two GPUs should be on different CPU sockets (see step 3) | [Qwen3.8-Flash-Next command C](moe-2.0.0.en.md#c-2--16-gb-gpus-ac922-two-gpus-on-different-cpu-sockets) |
+| 2 × 16 GB | about 75–77 GiB with MTP on; two GPUs on the same CPU socket are recommended (see step 3) | [Qwen3.8-Flash-Next command C](moe-2.0.0.en.md#c-2--16-gb-gpus-ac922-two-gpus-on-the-same-cpu-socket) |
 | 4 × 32 GB (x86) | 27 GiB | [Qwen3.8-Flash-Next command B](moe-2.0.0.en.md#b-4--32-gb-gpus-x86) |
 | Other combinations | The less VRAM, the more is needed | Not fully tested; start from command A and change `CUDA_VISIBLE_DEVICES` |
 
@@ -83,7 +83,7 @@ Step 6: do you want the web UI (chat in a browser)?
 ## 3. Host memory, CPU sockets and platform
 
 - **Machines like the AC922** (GPU memory onlined into system memory): prefix the command with `numactl --membind=<nodes with CPUs>` (usually `0,8` on the AC922); otherwise page cache from reading the model may occupy VRAM, which shows up as out-of-memory; wrap downloads and copies of large files in it too. With Docker, use `-e LLAMA_NUMA_MEMBIND=0,8` instead. Plain x86 servers do not need it.
-- **Qwen3.8-Flash-Next on 2 GPUs**: pick two GPUs on different CPU sockets (on the AC922, GPUs 0–2 and 3–5 usually belong to the two CPUs, e.g. `0,3`; on other machines choose from the `nvidia-smi topo -m` result of step 1). Two GPUs on the same socket also work, but the host memory headroom is very small, no other programs can run, and each round is slightly slower; machines with more memory per CPU node have more headroom (not measured).
+- **Qwen3.8-Flash-Next on 2 GPUs**: two GPUs on the same CPU socket are recommended (on the AC922, GPUs 0–2 and 3–5 usually belong to the two CPUs, e.g. `0,1`; on other machines choose from the `nvidia-smi topo -m` result of step 1); `numactl --membind` must list both CPU nodes, the experts are placed half on each node, and each node needs about 36 GiB free. Two GPUs on different sockets also work.
 - **Qwen3.8-Flash-Next speed and host memory**: what does not fit in VRAM lives in host memory, so host memory bandwidth and capacity and the link between GPU and host (NVLink 2.0 on the AC922, usually PCIe 3.0 on x86) all affect speed: it is faster with all memory channels populated and enough capacity.
 - **27B**: host memory is mainly used for the prompt cache (`--cache-ram`) and checkpoints (`--ctx-checkpoints`); see step 4.
 - **Docker**: one image tag covers x86_64 and ppc64le (AC922 only), so it works on both kinds of machines; x86 uses the NVIDIA Container Toolkit with `--gpus all`, the AC922 uses podman with CDI. The image includes the web UI as well. Full commands in [27B detail page · Docker](27b.en.md#docker).

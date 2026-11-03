@@ -4,7 +4,7 @@
 
 本页说明怎样在 V100 上运行 Qwen3.8-Flash-Next：支持的配置、模型下载、官方推荐采样参数、启动命令、专家路由画像、主机内存与显存、编译与 Docker、已知限制。还没选好配置时，先按 [AI 部署指引](ai-deploy.md) 判断。
 
-> **支持的配置**（主模型 UD-Q4_K_XL + MTP 草稿，上下文 262144）：6 × V100-16GB 是标准配置；2 × V100-16GB 自 2.0.1.1 起可用，需要约 63 GiB 主机内存；4 × V100-32GB（x86）可以运行。其他卡数与量化后续陆续兼容。
+> **支持的配置**（主模型 UD-Q4_K_XL + MTP 草稿，上下文 262144）：6 × V100-16GB 是标准配置；2 × V100-16GB 自 2.0.1.2 起推荐同一 CPU 插槽的两张卡，开 MTP 时需要约 75～77 GiB 主机内存；1 卡、3 卡自 2.0.1.2 起可以启动；4 × V100-32GB（x86）可以运行。其他卡数与量化后续陆续兼容。
 
 ---
 
@@ -19,16 +19,16 @@
 
 ## 实测数据
 
-当前版本 2.0.1.1，IBM AC922 标准测试机，上下文 262144，真实代码，每档新起服务：
+当前版本 2.0.1.2，IBM AC922 标准测试机，上下文 262144，真实代码，每档新起服务：
 
 | 配置 | 约 20 万 token：预填充 / 吐字（tok/s） | 约 1.6 万 token：预填充 / 吐字（tok/s） | 口径 |
 |---|---|---|---|
-| 6 × V100-16GB（命令 A，草稿换成 shared-Q8_0） | 3402 / 122.5 | 2805 / 140.5 | 温度 0、不开思考 |
-| 2 × V100-16GB，分属不同 CPU 插槽（命令 C） | 1300 / 43.1 | 1173 / 38.0 | 思考模式 + 模型卡官方采样参数 |
+| 6 × V100-16GB（命令 A，草稿换成 shared-Q8_0） | 3402 / 122.5 | 2805 / 140.5 | 温度 0、不开思考（2.0.1.1 实测，本版未复测） |
+| 2 × V100-16GB，同一 CPU 插槽（命令 C，块 2048） | 1155.5 / 43.6 | 1084.6 / 42.7 | 思考模式 + 模型卡官方采样参数 + 视觉模块 + MTP-3 |
 
-- 两行口径不同（温度 0、不开思考 对 思考模式 + temperature 1.0），速度不能直接比较。
-- 6 卡与 2.0.1 同场对比无退化，温度 0 输出相同，每卡显存相同。2 卡是 2.0.1.1 新增的配置，没有上一版的对照数字。
-- 测试条件、同一插槽两张卡的对照、显存与历次版本的全部数据见[历次实测数据](benchmarks.md#2011)。
+- 两行口径不同，速度不能直接比较。
+- 2 卡改用块 4096（`-b 4096 -ub 4096`）时，约 20 万 token 预填充 2151.7 tok/s、吐字 41.5 tok/s：预填充更快，吐字略慢。
+- 测试条件、与同类项目的同场对比与历次版本的数据见[历次实测数据](benchmarks.md#2012)。
 
 ---
 
@@ -99,27 +99,32 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 numactl --membind=0,8 ./build/bin/llama-server 
 
 命令 A 去掉 `numactl --membind=0,8`，改 `CUDA_VISIBLE_DEVICES=0,1,2,3`，其余不变。需要约 27 GiB 主机内存。
 
-### C. 2 卡 16 GB（AC922），分属不同 CPU 插槽的两张卡
+### C. 2 卡 16 GB（AC922），同一 CPU 插槽的两张卡
 
-2.0.1.1 起提供。
+2.0.1.1 起 2 卡可用，2.0.1.2 起推荐这条命令（本版实测配置）。
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,3 numactl --membind=0,8 ./build/bin/llama-server \
+CUDA_VISIBLE_DEVICES=0,1 numactl --membind=0,8 ./build/bin/llama-server \
   -m ./models/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -ngl 999 \
   --split-mode tensor --tensor-split 1,1 \
   -c 262144 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 --jinja \
   --expert-profile ./models/flash-next-profile.txt \
-  --model-draft ./models/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-ubatch 256 --spec-draft-sampling greedy \
+  --model-draft ./models/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-ubatch 256 \
+  --mmproj ./models/mmproj-F16.gguf --image-min-tokens 1024 \
+  --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 \
   --host 127.0.0.1 --port 8080 --metrics
 ```
 
-- **选卡**：用分属不同 CPU 插槽的两张卡。AC922 每颗 CPU 连 3 张卡（通常 0～2 号属一颗、3～5 号属另一颗），所以写 `0,3`；其他机器用 `nvidia-smi topo -m` 看每张卡的 NUMA 节点，选分属两个节点的两张。同一插槽的两张卡（例如 `0,1`）也能跑，但主机内存余量很小，不能再运行别的程序，每轮也稍慢。
+- **选卡**：用同一 CPU 插槽的两张卡。AC922 每颗 CPU 连 3 张卡（通常 0～2 号属一颗、3～5 号属另一颗），所以写 `0,1`；其他机器用 `nvidia-smi topo -m` 看每张卡的 NUMA 节点。分属不同插槽的两张卡（例如 `0,3`）也能跑。
+- **`numactl --membind=0,8`**：两个 CPU 内存节点都要写上，专家补集会在两个节点上对半放置；同时把主机内存限定在有 CPU 的节点，不让分配和页缓存落到被系统当作内存的显存里。
+- **主机内存**：开 MTP 时约需 75～77 GiB（上下文 262144，块 2048 / 4096；`-c` 越小需要的越少），每个 CPU 节点要有约 36 GiB 空闲；另留系统余量；运行服务的用户要 `ulimit -l unlimited`。
 - **模型文件**：2 卡运行时请把模型文件放在本机的 SSD / NVMe 上；放在网络盘或机械硬盘上会明显变慢。
-- **主机内存**：约需 63 GiB（上下文 262144；`-c` 越小需要的越少），另留系统余量；运行服务的用户要 `ulimit -l unlimited`。
-- **草稿**：本页 2 卡实测用的是 shared-Q8_0；命令 A 用的 shared-Q4_K_M 占显存更小，2 卡上没有实测。
+- **草稿与并发**：本版 2 卡实测用 shared-Q4_K_M；MTP 投机目前请配 `-np 1` 使用。
+- **块大小**：`-b` / `-ub` 2048 适合吐字为主的对话与写代码；4096 预填充更快、吐字略慢；8192 不建议配 MTP。
+- **视觉模块**：`--mmproj` 用 Flash-Next 的 `mmproj-F16.gguf`（在 `Qwen3.8-Flash-Next-GGUF` 仓库，约 0.9 GB，与 27B 的不是同一个文件）；不处理图片时可以去掉 `--mmproj` 与 `--image-min-tokens`。
 - **显存**：每卡显存几乎用满是正常的；启动时显存不足先调小 `-c`。
-- 本页 2 卡实测按思考模式与模型卡官方采样参数（在命令末尾加 `--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0`，或在请求里带）。
+- 本页 2 卡实测按思考模式、模型卡官方采样参数（命令末尾的 `--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0`）并加载视觉模块。
 
 **其他卡数与显存**没有做完整测试。显存总量越少，需要的主机内存越多，吐字也越慢；主机内存不够时无法启动。改 `CUDA_VISIBLE_DEVICES` 即可，显存不够时先调小 `-c`。
 
@@ -174,9 +179,9 @@ llama-server ... --spec-type draft-mtp -md <草稿文件> --spec-draft-window 81
 
 ## 主机内存、显存与启动
 
-- **主机内存**：需要的主机内存随卡数与显存变化——6 × 16 GB 约 42 GiB，2 × 16 GB 约 63 GiB（上下文 262144），4 × 32 GB 约 27 GiB；另要留出系统、页缓存与 `--cache-ram` 的余量。主机内存不够时无法启动。
+- **主机内存**：需要的主机内存随卡数与显存变化——6 × 16 GB 约 42 GiB，2 × 16 GB 开 MTP 约 75～77 GiB（上下文 262144），4 × 32 GB 约 27 GiB；另要留出系统、页缓存与 `--cache-ram` 的余量。主机内存不够时无法启动。
 - **锁页内存上限**：运行服务的用户需要足够的锁页内存上限（`ulimit -l`，建议 `unlimited`；Docker 加 `--ulimit memlock=-1`），否则无法启动。
-- **多 CPU 插槽的机器**：AC922 上要用 `numactl --membind=0,8` 启动；2 卡时用分属不同插槽的两张卡（见命令 C）。
+- **多 CPU 插槽的机器**：AC922 上要用 `numactl --membind=0,8` 启动；2 卡推荐同一插槽的两张卡，`--membind` 两个 CPU 节点都要写上（见命令 C）。
 - **显存**：启动后每卡显存占用接近可用显存是正常的（多出来的显存用来提速），不表示显存不够；这些 GPU 不要再与其他程序共用。长时间运行中出现显存不足时调大 `-fitt`（默认 800 MiB）。显存很紧时可以调小 `--spec-draft-ubatch`，或不开 MTP。
 - **启动时间**：要读入全部分片并准备主机内存，需要几分钟（实测见[历次实测数据](benchmarks.md#200)）。
 

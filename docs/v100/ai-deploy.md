@@ -71,7 +71,7 @@
 | 卡与显存 | 需要的主机内存（约） | 命令 |
 |---|---|---|
 | 6 × 16 GB | 42 GiB | [Qwen3.8-Flash-Next 命令 A](moe-2.0.0.md#a-6-卡-16-gbac922上下文-262144带-mtp) |
-| 2 × 16 GB | 63 GiB；两张卡要分属不同 CPU 插槽（见第 3 步） | [Qwen3.8-Flash-Next 命令 C](moe-2.0.0.md#c-2-卡-16-gbac922分属不同-cpu-插槽的两张卡) |
+| 2 × 16 GB | 开 MTP 约 75～77 GiB；推荐同一 CPU 插槽的两张卡（见第 3 步） | [Qwen3.8-Flash-Next 命令 C](moe-2.0.0.md#c-2-卡-16-gbac922同一-cpu-插槽的两张卡) |
 | 4 × 32 GB（x86） | 27 GiB | [Qwen3.8-Flash-Next 命令 B](moe-2.0.0.md#b-4-卡-32-gbx86) |
 | 其他组合 | 显存越少，需要越多 | 没有完整测试；从命令 A 起步改 `CUDA_VISIBLE_DEVICES` |
 
@@ -83,7 +83,7 @@
 ## 3. 主机内存、CPU 插槽与平台
 
 - **AC922 这类机器**（GPU 显存并入系统内存）：命令前加 `numactl --membind=<有 CPU 的节点>`（AC922 一般是 `0,8`），否则读模型产生的页缓存可能占用显存，表现为显存不足；下载、复制大文件时也用它包起来。Docker 改用 `-e LLAMA_NUMA_MEMBIND=0,8`。普通 x86 服务器不加。
-- **Qwen3.8-Flash-Next 用 2 张卡**：选分属不同 CPU 插槽的两张（AC922 上通常 0～2 号与 3～5 号分属两颗 CPU，例如 `0,3`；其他机器按第 1 步 `nvidia-smi topo -m` 的结果选）。同一插槽的两张卡也能跑，但主机内存余量很小，不能再运行别的程序，每轮也稍慢；每个 CPU 节点内存更大的机器余量会多一些（没有实测）。
+- **Qwen3.8-Flash-Next 用 2 张卡**：推荐同一 CPU 插槽的两张（AC922 上通常 0～2 号与 3～5 号分属两颗 CPU，例如 `0,1`；其他机器按第 1 步 `nvidia-smi topo -m` 的结果选）；`numactl --membind` 两个 CPU 节点都要写上，专家会在两个节点上对半放置，每个节点要有约 36 GiB 空闲。分属不同插槽的两张也能跑。
 - **Qwen3.8-Flash-Next 的速度与主机内存**：显存放不下的部分在主机内存里，主机内存的带宽、容量以及 GPU 与主机之间的链路（AC922 为 NVLink 2.0，x86 一般为 PCIe 3.0）都会影响速度：内存通道插满、容量充足时更快。
 - **27B**：主机内存主要用于提示词缓存（`--cache-ram`）与检查点（`--ctx-checkpoints`），见第 4 步。
 - **Docker**：同一个镜像标签含 x86_64 与 ppc64le（仅 AC922），两种机器都能用；x86 用 NVIDIA Container Toolkit 与 `--gpus all`，AC922 用 podman 与 CDI。镜像里同样自带网页界面。完整命令见 [27B 详情页 · Docker](27b.md#docker)。

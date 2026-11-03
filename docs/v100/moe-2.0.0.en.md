@@ -4,7 +4,7 @@
 
 This page explains how to run Qwen3.8-Flash-Next on V100: supported configurations, model download, official sampling recommendations, start commands, the expert routing profile, host memory and VRAM, build and Docker, and known limitations. If you have not chosen a configuration yet, decide with the [AI deployment guide](ai-deploy.en.md) first.
 
-> **Supported configurations** (UD-Q4_K_XL main model + MTP draft, context 262144): 6 × V100-16GB is the standard configuration; 2 × V100-16GB is available since 2.0.1.1 and needs about 63 GiB of host memory; 4 × V100-32GB (x86) can run it. Other GPU counts and quantizations will follow.
+> **Supported configurations** (UD-Q4_K_XL main model + MTP draft, context 262144): 6 × V100-16GB is the standard configuration; for 2 × V100-16GB, two GPUs on the same CPU socket are recommended since 2.0.1.2 and need about 75–77 GiB of host memory with MTP on; 1 and 3 GPUs start since 2.0.1.2; 4 × V100-32GB (x86) can run it. Other GPU counts and quantizations will follow.
 
 ---
 
@@ -19,16 +19,16 @@ This page explains how to run Qwen3.8-Flash-Next on V100: supported configuratio
 
 ## Measured results
 
-Current release 2.0.1.1, IBM AC922 standard test machine, context 262144, real code, a fresh server for each prompt size:
+Current release 2.0.1.2, IBM AC922 standard test machine, context 262144, real code, a fresh server for each prompt size:
 
 | Configuration | ~200K tokens: prefill / decode (tok/s) | ~16K tokens: prefill / decode (tok/s) | Methodology |
 |---|---|---|---|
-| 6 × V100-16GB (command A, with the draft switched to shared-Q8_0) | 3402 / 122.5 | 2805 / 140.5 | temperature 0, thinking off |
-| 2 × V100-16GB, on different CPU sockets (command C) | 1300 / 43.1 | 1173 / 38.0 | thinking mode + the model card's recommended sampling parameters |
+| 6 × V100-16GB (command A, with the draft switched to shared-Q8_0) | 3402 / 122.5 | 2805 / 140.5 | temperature 0, thinking off (measured on 2.0.1.1, not re-measured in this release) |
+| 2 × V100-16GB, same CPU socket (command C, block 2048) | 1155.5 / 43.6 | 1084.6 / 42.7 | thinking mode + the model card's recommended sampling parameters + vision module + MTP-3 |
 
-- The two rows use different methodologies (temperature 0, thinking off vs. thinking mode + temperature 1.0), so their speeds cannot be compared directly.
-- 6 GPUs: no regression versus 2.0.1 in a same-session A/B comparison, identical output at temperature 0, the same VRAM per GPU. 2 GPUs is a configuration added in 2.0.1.1, so there are no numbers from the previous release to compare with.
-- Test conditions, the comparison with two GPUs on the same socket, VRAM, and all data from previous releases are in [Benchmark history](benchmarks.en.md#2011).
+- The two rows use different methodologies, so their speeds cannot be compared directly.
+- With block 4096 on 2 GPUs (`-b 4096 -ub 4096`), ~200K tokens prefill at 2151.7 tok/s and decode at 41.5 tok/s: faster prefill, slightly slower decode.
+- Test conditions, the same-session comparison with a similar project and all data from previous releases are in [Benchmark history](benchmarks.en.md#2012).
 
 ---
 
@@ -99,27 +99,32 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 numactl --membind=0,8 ./build/bin/llama-server 
 
 Command A without `numactl --membind=0,8` and with `CUDA_VISIBLE_DEVICES=0,1,2,3`; everything else stays the same. Needs about 27 GiB of host memory.
 
-### C. 2 × 16 GB GPUs (AC922), two GPUs on different CPU sockets
+### C. 2 × 16 GB GPUs (AC922), two GPUs on the same CPU socket
 
-Available since 2.0.1.1.
+2 GPUs are available since 2.0.1.1; this command is recommended since 2.0.1.2 (the configuration measured in this release).
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,3 numactl --membind=0,8 ./build/bin/llama-server \
+CUDA_VISIBLE_DEVICES=0,1 numactl --membind=0,8 ./build/bin/llama-server \
   -m ./models/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -ngl 999 \
   --split-mode tensor --tensor-split 1,1 \
   -c 262144 -np 1 -fa on -ctk q8_0 -ctv q8_0 -b 2048 -ub 2048 --jinja \
   --expert-profile ./models/flash-next-profile.txt \
-  --model-draft ./models/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
-  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-ubatch 256 --spec-draft-sampling greedy \
+  --model-draft ./models/MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf \
+  --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-ubatch 256 \
+  --mmproj ./models/mmproj-F16.gguf --image-min-tokens 1024 \
+  --temp 1.0 --top-p 0.95 --top-k 20 --min-p 0 \
   --host 127.0.0.1 --port 8080 --metrics
 ```
 
-- **Choosing GPUs**: use two GPUs on different CPU sockets. On the AC922 each CPU is connected to 3 GPUs (usually GPUs 0–2 belong to one CPU and 3–5 to the other), hence `0,3`; on other machines, check each GPU's NUMA node with `nvidia-smi topo -m` and pick two GPUs on two different nodes. Two GPUs on the same socket (for example `0,1`) also work, but the host memory headroom is very small, no other programs can be run, and the time per round is also slightly longer.
+- **Choosing GPUs**: use two GPUs on the same CPU socket. On the AC922 each CPU is connected to 3 GPUs (usually GPUs 0–2 belong to one CPU and 3–5 to the other), hence `0,1`; on other machines, check each GPU's NUMA node with `nvidia-smi topo -m`. Two GPUs on different sockets (for example `0,3`) also work.
+- **`numactl --membind=0,8`**: list both CPU memory nodes; the expert complement is placed half on each node. It also keeps host memory on the nodes that have CPUs, so allocations and page cache do not land in the GPU memory that the system exposes as memory.
+- **Host memory**: about 75–77 GiB with MTP on (context 262144, block 2048 / 4096; the smaller `-c`, the less is needed), with about 36 GiB free on each CPU node, plus headroom for the system; the user running the server needs `ulimit -l unlimited`.
 - **Model files**: when running on 2 GPUs, put the model files on a local SSD / NVMe; on a network drive or a mechanical hard disk it is noticeably slower.
-- **Host memory**: about 63 GiB is needed (context 262144; the smaller `-c`, the less is needed), plus headroom for the system; the user running the server needs `ulimit -l unlimited`.
-- **Draft**: the 2-GPU measurements on this page use shared-Q8_0; the shared-Q4_K_M used by command A takes less VRAM and has not been measured on 2 GPUs.
+- **Draft and concurrency**: the 2-GPU measurements in this release use shared-Q4_K_M; use MTP speculation with `-np 1` for now.
+- **Block size**: `-b` / `-ub` 2048 suits decode-heavy chat and coding; 4096 prefills faster and decodes slightly slower; MTP is not recommended at 8192.
+- **Vision module**: `--mmproj` takes Flash-Next's `mmproj-F16.gguf` (in the `Qwen3.8-Flash-Next-GGUF` repository, about 0.9 GB; not the same file as 27B's); drop `--mmproj` and `--image-min-tokens` if you do not process images.
 - **VRAM**: nearly full VRAM on every GPU is normal; if VRAM is short at startup, lower `-c` first.
-- The 2-GPU measurements on this page use thinking mode and the model card's recommended sampling parameters (append `--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0` to the command, or pass them in the request).
+- The 2-GPU measurements on this page use thinking mode, the model card's recommended sampling parameters (the `--temp 1.0 --top-p 0.95 --top-k 20 --min-p 0` at the end of the command) and the vision module.
 
 **Other GPU counts and VRAM sizes** have not been fully tested. The less VRAM in total, the more host memory is needed and the slower decode gets; if host memory is not enough, the server does not start. Just change `CUDA_VISIBLE_DEVICES`; if VRAM is short, lower `-c` first.
 
@@ -174,9 +179,9 @@ Getting a profile:
 
 ## Host memory, VRAM and startup
 
-- **Host memory**: the host memory needed varies with the GPU count and VRAM: about 42 GiB for 6 × 16 GB, about 63 GiB for 2 × 16 GB (context 262144), about 27 GiB for 4 × 32 GB; plus headroom for the system, page cache and `--cache-ram`. If host memory is not enough, the server does not start.
+- **Host memory**: the host memory needed varies with the GPU count and VRAM: about 42 GiB for 6 × 16 GB, about 75–77 GiB for 2 × 16 GB with MTP on (context 262144), about 27 GiB for 4 × 32 GB; plus headroom for the system, page cache and `--cache-ram`. If host memory is not enough, the server does not start.
 - **Pinned memory limit**: the user running the server needs a sufficient locked-memory limit (`ulimit -l`, `unlimited` recommended; add `--ulimit memlock=-1` in Docker), otherwise the server does not start.
-- **Machines with multiple CPU sockets**: on the AC922, start with `numactl --membind=0,8`; with 2 GPUs, use two GPUs on different sockets (see command C).
+- **Machines with multiple CPU sockets**: on the AC922, start with `numactl --membind=0,8`; with 2 GPUs, two GPUs on the same socket are recommended and `--membind` must list both CPU nodes (see command C).
 - **VRAM**: after startup, per-GPU VRAM usage close to the available VRAM is normal (the extra VRAM is used for speed) and does not mean VRAM is short; do not share these GPUs with other programs. If VRAM runs out during a long run, raise `-fitt` (default 800 MiB). When VRAM is very tight, you can lower `--spec-draft-ubatch` or run without MTP.
 - **Startup time**: all shards have to be read and host memory prepared, which takes a few minutes (measurements in [Benchmark history](benchmarks.en.md#200)).
 
