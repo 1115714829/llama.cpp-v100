@@ -15,7 +15,7 @@ This project started with one goal: let people run large models on low-cost V100
 The project is maintained by one person. Two things are scarcest in keeping up the current pace:
 
 - **Time**: the project keeps growing and has to stay compatible with two model lines, 27B and Qwen3.8-Flash-Next (MoE). Testing and development time has multiplied and now cuts deep into my working hours. One release takes three machines running for about 12 hours to finish every acceptance check and produce the release data.
-- **Tokens**: development, debugging and testing are done mainly with AI assistance, which consumes a lot of tokens. The free tokens are used up, the Claude 20x plan expires at the end of November, and the test machines are all on loan and may be returned at any time.
+- **Tokens**: development, debugging and testing are done mainly with AI assistance, which consumes a lot of tokens. The free tokens are used up, ~~the Claude 20x plan expires at the end of November~~ (**Claude got banned on 2026-11-02; may Anthropic go under soon**), and the test machines are all on loan and may be returned at any time.
 
 So updates will definitely slow down; please plan accordingly. The project will not stop, and there will be no pause in the short term: many ideas are still waiting, including implementations written from the ground up and items logged for later optimization when time ran short.
 
