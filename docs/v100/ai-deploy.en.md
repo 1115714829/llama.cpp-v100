@@ -8,6 +8,51 @@ This page is for AI assistants and first-time users: follow steps 1–3 to check
 
 ---
 
+## 0. Mandatory system configuration
+
+Complete these two steps before proceeding, or the NVIDIA driver will not work correctly and GPU performance will be severely degraded.
+
+### iommu=pt
+
+IOMMU passthrough mode significantly reduces GPU DMA address translation overhead. Without it, V100 performance may drop by 30% or more.
+
+```bash
+# Check current configuration
+cat /proc/cmdline | grep -o 'iommu=[a-z]*'
+
+# If iommu=pt is missing, add it to the kernel boot parameters:
+# x86_64: edit /etc/default/grub, append iommu=pt to GRUB_CMDLINE_LINUX_DEFAULT
+sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 iommu=pt"/' /etc/default/grub
+sudo update-grub  # Debian/Ubuntu; RHEL/CentOS: grub2-mkconfig -o /boot/grub2/grub.cfg
+
+# IBM AC922 (POWER9): same edit, use ppc64le grub2-mkconfig
+# Reboot to take effect
+```
+
+### Blacklist the open-source display driver (nouveau)
+
+The open-source nouveau driver conflicts with the official NVIDIA driver and must be blacklisted:
+
+```bash
+# Create the blacklist file
+sudo bash -c 'cat > /etc/modprobe.d/blacklist-nouveau.conf << EOF
+blacklist nouveau
+options nouveau modeset=0
+EOF'
+
+# Update initramfs
+sudo update-initramfs -u    # Debian/Ubuntu
+# sudo dracut --force       # RHEL/CentOS/AC922
+
+# Verify after reboot
+lsmod | grep nouveau          # should output nothing
+nvidia-smi                    # should show GPU info
+```
+
+**Reboot after both steps, then continue below.**
+
+---
+
 ## 1. Check the hardware
 
 First find out the following on the machine you are deploying to:

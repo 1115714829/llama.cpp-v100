@@ -8,6 +8,51 @@
 
 ---
 
+## 0. 系统必备配置（必做）
+
+部署前必须完成以下两项系统配置，否则 NVIDIA 驱动无法正常工作或 GPU 性能严重下降：
+
+### iommu=pt
+
+IOMMU 直通模式（passthrough）可以大幅降低 GPU 的 DMA 地址翻译开销。不开的话 V100 性能可能下降 30% 以上。
+
+```bash
+# 查看当前配置
+cat /proc/cmdline | grep -o 'iommu=[a-z]*'
+
+# 如果没有 iommu=pt，需要加入内核启动参数：
+# x86_64：编辑 /etc/default/grub，在 GRUB_CMDLINE_LINUX_DEFAULT 里追加 iommu=pt
+sudo sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 iommu=pt"/' /etc/default/grub
+sudo update-grub  # Debian/Ubuntu；RHEL/CentOS 用 grub2-mkconfig -o /boot/grub2/grub.cfg
+
+# IBM AC922（POWER9）：编辑 /etc/default/grub 同样追加，或用 ppc64le 的 grub2-mkconfig
+# 重启后生效
+```
+
+### 屏蔽开源显卡驱动（nouveau blacklist）
+
+开源 nouveau 驱动会与 NVIDIA 官方驱动冲突，必须屏蔽：
+
+```bash
+# 创建屏蔽文件
+sudo bash -c 'cat > /etc/modprobe.d/blacklist-nouveau.conf << EOF
+blacklist nouveau
+options nouveau modeset=0
+EOF'
+
+# 更新 initramfs
+sudo update-initramfs -u    # Debian/Ubuntu
+# sudo dracut --force       # RHEL/CentOS/AC922
+
+# 重启后确认
+lsmod | grep nouveau          # 应无输出
+nvidia-smi                    # 应正常显示 GPU 信息
+```
+
+**两项都配置完重启后才继续往下走。**
+
+---
+
 ## 1. 查硬件
 
 先在要部署的机器上查清这几件事：
