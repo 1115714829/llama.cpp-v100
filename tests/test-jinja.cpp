@@ -44,11 +44,6 @@ int main(int argc, char *argv[]) {
     testing t(std::cout);
     t.verbose = true;
 
-    // usage: test-jinja [-py] [filter_regex]
-    //  -py : enable python mode (use python jinja2 for rendering expected output)
-    //        only use this for cross-checking, not for correctness
-    //        note: the implementation of this flag is basic, only intented to be used by maintainers
-
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "-py") {
@@ -532,7 +527,6 @@ static void test_expressions(testing & t) {
         "-1.5"
     );
 
-    // Unary binds tighter than filter: -n|abs == (-n)|abs, not -(n|abs)
     test_template(t, "unary minus then abs filter",
         "{{ -n|abs }}",
         {{"n", -3}},
@@ -1058,7 +1052,6 @@ static void test_literals(testing & t) {
         "3.14"
     );
 
-    // Python writes the shortest digits that read back as the same value
     test_template(t, "tojson floats",
         "{{ data|tojson }}",
         {{"data", json::array({0.1, 1.0, 100.0, 8.3, 123456789.0, 48.858844, 0.30000000000000004, -0.0, 5.960464477539063e-08})}},
@@ -1083,7 +1076,6 @@ static void test_literals(testing & t) {
         "1.0 1e+308 inf"
     );
 
-    // json.dumps writes NaN and Infinity, str() writes nan and inf
     test_template(t, "nan and inf",
         "{{ [p|float, n|float, q|float]|tojson }} {{ {p|float: 1}|tojson }} {{ p|float|string }} {{ n|float|string }} {{ q|float|safe }}",
         {{"p", "inf"}, {"n", "-inf"}, {"q", "nan"}},
@@ -1192,6 +1184,18 @@ static void test_namespace(testing & t) {
         "{% set ns = namespace(count=0) %}{% for i in range(3) %}{% set ns.count = ns.count + 1 %}{% endfor %}{{ ns.count }}",
         json::object(),
         "3"
+    );
+
+    test_template(t, "namespace attribute named like a dict method",
+        "{% set ns = namespace(items=[]) %}{{ 'yes' if ns.items else 'no' }}{% set ns.items = ns.items + [1] %}{{ ns.items | length }}{{ 'yes' if ns.items else 'no' }}",
+        json::object(),
+        "no1yes"
+    );
+
+    test_template(t, "dict keeps its methods",
+        "{% set d = dict(items=1) %}{% for k, v in d.items() %}{{ k }}={{ v }}{% endfor %}",
+        json::object(),
+        "items=1"
     );
 }
 
@@ -1686,6 +1690,54 @@ static void test_array_methods(testing & t) {
         "z y "
     );
 
+    test_template(t, "array|select with test",
+        "{{ items|select('odd')|join(',') }}",
+        {{"items", json::array({1, 2, 3, 4, 5})}},
+        "1,3,5"
+    );
+
+    test_template(t, "array|reject with test",
+        "{{ items|reject('odd')|join(',') }}",
+        {{"items", json::array({1, 2, 3, 4, 5})}},
+        "2,4"
+    );
+
+    test_template(t, "array|select without test",
+        "{{ items|select|join(',') }}",
+        {{"items", json::array({0, 1, "", "a", nullptr, false})}},
+        "1,a"
+    );
+
+    test_template(t, "array|selectattr with test",
+        "{% for p in items|selectattr('type', 'defined') %}{{ p.type }} {% endfor %}",
+        {{"items", json::array({
+            {{"type", "string"}},
+            {{"enum", json::array({1})}},
+            {{"type", "integer"}}
+        })}},
+        "string integer "
+    );
+
+    test_template(t, "array|rejectattr with test",
+        "{{ items|rejectattr('type', 'defined')|list|length }}",
+        {{"items", json::array({
+            {{"type", "string"}},
+            {{"enum", json::array({1})}},
+            {{"type", "integer"}}
+        })}},
+        "1"
+    );
+
+    test_template(t, "array|selectattr with attr named like a test",
+        "{% for p in items|selectattr('odd', 'even') %}{{ p.odd }} {% endfor %}",
+        {{"items", json::array({
+            {{"odd", 1}},
+            {{"odd", 2}},
+            {{"odd", 4}}
+        })}},
+        "2 4 "
+    );
+
     test_template(t, "array|tojson",
         "{{ arr|tojson }}",
         {{"arr", json::array({1, 2, 3})}},
@@ -1869,13 +1921,6 @@ static void test_array_methods(testing & t) {
         })}},
         "{\"x\": 2}"
     );
-
-    // not used by any chat templates
-    // test_template(t, "array.insert()",
-    //     "{% set _ = arr.insert(1, 'x') %}{{ arr|join(',') }}",
-    //     {{"arr", json::array({"a", "b", "c"})}},
-    //     "a,x,b,c"
-    // );
 
     test_template(t, "undefined|select",
         "{% for item in items|select('odd') %}{{ item.name }} {% endfor %}",
@@ -2238,7 +2283,7 @@ static void test_hasher(testing & t) {
         size_t hash1 = hasher1.digest();
 
         for (int i = 0; i < 16; ++i) {
-            random_data.push_back('A');  // change length
+            random_data.push_back('A');
             jinja::hasher hasher2;
             hasher2.update(random_data);
             size_t hash2 = hasher2.digest();
@@ -2274,7 +2319,7 @@ static void test_stats(testing & t) {
             "{{val.arr[0]}} "
             "{{val.obj.key1}} "
             "{{val.nested | tojson}}",
-            // Note: the json below will be wrapped inside "val" in the context
+
             json{
                 {"num", 1},
                 {"str", "abc"},
@@ -2328,7 +2373,7 @@ static void test_caps(testing & t) {
     });
 
     t.test("typed content, raises on string", [](testing & t) {
-        // 'selectattr' is not a String filter, so it throws
+
         auto caps = get_caps(
             "{% for message in messages %}"
             "{% for content in message['content'] | selectattr('type', 'equalto', 'text') %}"
@@ -2341,7 +2386,7 @@ static void test_caps(testing & t) {
     });
 
     t.test("typed content, silently drops string", [](testing & t) {
-        // no throw here, but content[0]['text'] is undefined for a string (MiniMax-M1 case)
+
         auto caps = get_caps(
             "{% for message in messages %}"
             "{{ message['content'][0]['text'] }}"
@@ -2367,7 +2412,7 @@ static void test_string_parts(testing & t) {
     };
 
     t.test("merge joins only the neighbours with the same type", [](testing & t) {
-        // "AB" comes from the input and merges, "-" comes from the template and must not
+
         jinja::string res = render("{{ val.a }}{{ val.b }}-{{ val.c }}",
                                    json{{"val", json{{"a", "A"}, {"b", "B"}, {"c", "C"}}}});
 
@@ -2448,7 +2493,7 @@ sys.stdout.buffer.write(result.encode())
 
 static void test_template_py(testing & t, const std::string & name, const std::string & tmpl, const json & vars, const std::string & expect) {
     t.test(name, [&tmpl, &vars, &expect](testing & t) {
-        // Prepare arguments
+
         json merged;
         merged["tmpl"] = json(tmpl);
         merged["vars"] = vars;
@@ -2474,7 +2519,6 @@ static void test_template_py(testing & t, const std::string & name, const std::s
         }
         FILE * p_stdin = subprocess.stdin_file();
 
-        // Write input
         std::string input = merged.dump();
         auto written = fwrite(input.c_str(), 1, input.size(), p_stdin);
         if (written != input.size()) {
@@ -2485,9 +2529,8 @@ static void test_template_py(testing & t, const std::string & name, const std::s
             return;
         }
         fflush(p_stdin);
-        subprocess.close_stdin(); // Close stdin to signal EOF to the Python process
+        subprocess.close_stdin();
 
-        // Read output
         std::string output;
         char buffer[1024];
         FILE * p_stdout = subprocess.stdout_file();
@@ -2520,13 +2563,8 @@ static void test_template(testing & t, const std::string & name, const std::stri
     }
 }
 
-//
-// fuzz tests to ensure no crashes occur on malformed inputs
-//
-
 constexpr int JINJA_FUZZ_ITERATIONS = 100;
 
-// Helper to generate random string
 static std::string random_string(std::mt19937 & rng, size_t max_len) {
     static const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_";
     std::uniform_int_distribution<size_t> len_dist(0, max_len);
@@ -2540,10 +2578,9 @@ static std::string random_string(std::mt19937 & rng, size_t max_len) {
     return result;
 }
 
-// Helper to execute a fuzz test case - returns true if no crash occurred
 static bool fuzz_test_template(const std::string & tmpl, const json & vars) {
     try {
-        // printf("Fuzz testing template: %s\n", tmpl.c_str());
+
         jinja::lexer lexer;
         auto lexer_res = lexer.tokenize(tmpl);
         jinja::program ast = jinja::parse_from_tokens(lexer_res);
@@ -2552,25 +2589,23 @@ static bool fuzz_test_template(const std::string & tmpl, const json & vars) {
         jinja::runtime runtime(ctx);
         const jinja::value results = runtime.execute(ast);
         runtime.gather_string_parts(results);
-        return true; // success
+        return true;
     } catch (const std::exception &) {
-        return true; // exception is acceptable, not a crash
+        return true;
     } catch (...) {
-        return true; // any exception is acceptable, not a crash
+        return true;
     }
 }
 
 static void test_fuzzing(testing & t) {
     const int num_iterations = JINJA_FUZZ_ITERATIONS;
-    const unsigned int seed = 42; // fixed seed for reproducibility
+    const unsigned int seed = 42;
     std::mt19937 rng(seed);
 
-    // Distribution helpers
     std::uniform_int_distribution<int> choice_dist(0, 100);
     std::uniform_int_distribution<int> int_dist(-1000, 1000);
     std::uniform_int_distribution<size_t> idx_dist(0, 1000);
 
-    // Template fragments for fuzzing
     const std::vector<std::string> var_names = {
         "x", "y", "z", "arr", "obj", "items", "foo", "bar", "undefined_var",
         "none", "true", "false", "None", "True", "False"
@@ -2596,7 +2631,7 @@ static void test_fuzzing(testing & t) {
         for (int i = 0; i < num_iterations; ++i) {
             std::string var = random_string(rng, 20);
             std::string tmpl = "{{ " + var + " }}";
-            json vars = json::object(); // empty context
+            json vars = json::object();
             t.assert_true("should not crash", fuzz_test_template(tmpl, vars));
         }
     });
@@ -2657,25 +2692,22 @@ static void test_fuzzing(testing & t) {
     });
 
     t.test("macro edge cases", [&](testing & t) {
-        // Macro with no args called with args
+
         t.assert_true("macro no args with args", fuzz_test_template(
             "{% macro foo() %}hello{% endmacro %}{{ foo(1, 2, 3) }}",
             json::object()
         ));
 
-        // Macro with args called with no args
         t.assert_true("macro with args no args", fuzz_test_template(
             "{% macro foo(a, b, c) %}{{ a }}{{ b }}{{ c }}{% endmacro %}{{ foo() }}",
             json::object()
         ));
 
-        // Recursive macro reference
         t.assert_true("recursive macro", fuzz_test_template(
             "{% macro foo(n) %}{% if n > 0 %}{{ foo(n - 1) }}{% endif %}{% endmacro %}{{ foo(5) }}",
             json::object()
         ));
 
-        // Nested macro definitions
         for (int i = 0; i < num_iterations / 10; ++i) {
             std::string tmpl = "{% macro outer() %}{% macro inner() %}x{% endmacro %}{{ inner() }}{% endmacro %}{{ outer() }}";
             t.assert_true("nested macro", fuzz_test_template(tmpl, json::object()));
@@ -2715,7 +2747,7 @@ static void test_fuzzing(testing & t) {
     });
 
     t.test("deeply nested structures", [&](testing & t) {
-        // Deeply nested loops
+
         for (int depth = 1; depth <= 10; ++depth) {
             std::string tmpl;
             for (int d = 0; d < depth; ++d) {
@@ -2729,7 +2761,6 @@ static void test_fuzzing(testing & t) {
             t.assert_true("nested loops depth " + std::to_string(depth), fuzz_test_template(tmpl, vars));
         }
 
-        // Deeply nested conditionals
         for (int depth = 1; depth <= 10; ++depth) {
             std::string tmpl;
             for (int d = 0; d < depth; ++d) {
@@ -2796,8 +2827,8 @@ static void test_fuzzing(testing & t) {
             "{% endfor %}",
             "{% endif %}",
             "{{ | filter }}",
-            "{% if x %}", // unclosed
-            "{% for i in x %}", // unclosed
+            "{% if x %}",
+            "{% for i in x %}",
             "{{ x | }}",
             "{% macro %}{% endmacro %}",
             "{{{{",
@@ -2826,7 +2857,7 @@ static void test_fuzzing(testing & t) {
                 case 2: op = "*"; break;
                 case 3: op = "/"; break;
                 case 4: op = "=="; break;
-                case 5: op = "~"; break; // string concat
+                case 5: op = "~"; break;
             }
 
             std::string left_var = var_names[choice_dist(rng) % var_names.size()];
@@ -2848,7 +2879,7 @@ static void test_fuzzing(testing & t) {
     });
 
     t.test("fuzz builtin functions", [&](testing & t) {
-        // pair of (type_name, builtin_name)
+
         std::vector<std::pair<std::string, std::string>> builtins;
         auto add_fns = [&](std::string type_name, const jinja::func_builtins & added) {
             for (const auto & it : added) {
@@ -2867,32 +2898,30 @@ static void test_fuzzing(testing & t) {
             "base", "attribute", "default", "reverse", "case_sensitive", "by", "safe", "chars", "separators", "sort_keys", "indent", "ensure_ascii",
         };
 
-        // Generate random argument values
         auto gen_random_arg = [&]() -> std::string {
             int type = choice_dist(rng) % 8;
             switch (type) {
-                case 0: return std::to_string(int_dist(rng));           // int
-                case 1: return std::to_string(int_dist(rng)) + ".5";    // float
-                case 2: return "\"" + random_string(rng, 10) + "\"";    // string
-                case 3: return "true";                                   // bool true
-                case 4: return "false";                                  // bool false
-                case 5: return "none";                                   // none
-                case 6: return "[1, 2, 3]";                              // array
-                case 7: return "{\"a\": 1}";                             // object
+                case 0: return std::to_string(int_dist(rng));
+                case 1: return std::to_string(int_dist(rng)) + ".5";
+                case 2: return "\"" + random_string(rng, 10) + "\"";
+                case 3: return "true";
+                case 4: return "false";
+                case 5: return "none";
+                case 6: return "[1, 2, 3]";
+                case 7: return "{\"a\": 1}";
                 default: return "0";
             }
         };
 
         for (int i = 0; i < num_iterations; ++i) {
-            // Pick a random builtin
+
             auto & [type_name, fn_name] = builtins[choice_dist(rng) % builtins.size()];
 
-            // Generate random number of args
             int num_args = choice_dist(rng) % (max_args + 1);
             std::string args_str;
             for (int a = 0; a < num_args; ++a) {
                 if (a > 0) args_str += ", ";
-                // Sometimes use keyword args
+
                 if (choice_dist(rng) % 3 == 0 && !kwarg_names.empty()) {
                     std::string kwarg = kwarg_names[choice_dist(rng) % kwarg_names.size()];
                     args_str += kwarg + "=" + gen_random_arg();
@@ -2903,10 +2932,10 @@ static void test_fuzzing(testing & t) {
 
             std::string tmpl;
             if (type_name == "global") {
-                // Global function call
+
                 tmpl = "{{ " + fn_name + "(" + args_str + ") }}";
             } else {
-                // Method call on a value
+
                 std::string base_val;
                 if (type_name == "int") {
                     base_val = std::to_string(int_dist(rng));

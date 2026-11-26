@@ -1,32 +1,5 @@
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #include "arg.h"
 #include "common.h"
 #include "log.h"
@@ -71,7 +44,6 @@ static test_status merge_status(test_status a, test_status b) {
     return test_status::SKIP;
 }
 
-
 struct span {
     llama_seq_id s;
     llama_pos    p0;
@@ -111,7 +83,6 @@ struct kpool_case {
         return true;
     }
 
-
     bool check(const char * what, int step) {
         ++n_checks;
         const std::string diff = mem->kpool_layout_diff();
@@ -141,12 +112,9 @@ struct kpool_case {
         return decode(spans) && check(what, step);
     }
 
-
-
     bool check_edit(const char * what, int step) {
         return mem->get_kstore() == nullptr || check(what, step);
     }
-
 
     bool decode_toks(llama_seq_id s, llama_pos p0, const std::vector<llama_token> & toks, const char * what) {
         common_batch batch(ctx.get());
@@ -160,7 +128,6 @@ struct kpool_case {
         return check(what, 0);
     }
 
-
     std::vector<llama_token> toks(llama_seq_id s, llama_pos p0, llama_pos p1, bool bad = false) const {
         std::vector<llama_token> res;
         for (llama_pos pos = p0; pos < p1; ++pos) {
@@ -172,7 +139,6 @@ struct kpool_case {
     llama_pos pos_next(llama_seq_id s) const {
         return llama_memory_seq_pos_max(mem_i(), s) + 1;
     }
-
 
     bool spec_rounds(llama_seq_id s, int n_rounds, const char * what) {
         for (int r = 0; r < n_rounds; ++r) {
@@ -190,7 +156,6 @@ struct kpool_case {
         return true;
     }
 };
-
 
 static bool make_case(kpool_case & tc, const common_params & params, llama_model * model, const char * name,
         uint32_t n_seq_max, bool unified, test_status & res, uint32_t n_ctx_seq = 1024) {
@@ -241,7 +206,6 @@ static double nmse(const float * a, const float * b, int n) {
     return mse_a0 == 0.0 ? (mse_ab == 0.0 ? 0.0 : std::numeric_limits<double>::infinity()) : mse_ab/mse_a0;
 }
 
-
 static test_status test_single(const common_params & params, llama_model * model) {
     kpool_case tc;
     test_status res = test_status::SKIP;
@@ -249,12 +213,10 @@ static test_status test_single(const common_params & params, llama_model * model
         return res;
     }
 
-
     if (!tc.decode_check({ { 0, 0, 71 } }, "prefill", 0) ||
         !tc.spec_rounds(0, 48, "spec")) {
         return test_status::FAIL;
     }
-
 
     {
         kpool_case ref;
@@ -288,9 +250,6 @@ static test_status test_single(const common_params & params, llama_model * model
         tc.n_checks += ref.n_checks;
     }
 
-
-
-
     {
         const llama_pos pos = tc.pos_next(0);
         const llama_pos a   = pos/3 + 1;
@@ -314,7 +273,6 @@ static test_status test_single(const common_params & params, llama_model * model
         }
     }
 
-
     if (llama_memory_can_shift(tc.mem_i())) {
 
         const llama_pos c = (tc.mem->get_idx_cells()->seq_pos_min(0) + tc.pos_next(0))/2;
@@ -330,8 +288,6 @@ static test_status test_single(const common_params & params, llama_model * model
         if (!tc.decode_check({ { 0, pos, pos + 2 } }, "shift-up", 0) || !tc.spec_rounds(0, 8, "shift spec")) {
             return test_status::FAIL;
         }
-
-
 
         const llama_pos kpool = (llama_pos) tc.mem->get_kpool();
         const llama_pos pmin  = tc.mem->get_idx_cells()->seq_pos_min(0);
@@ -355,7 +311,6 @@ static test_status test_single(const common_params & params, llama_model * model
         LOG_INF("%s: the cache cannot shift, no seq_add\n", __func__);
     }
 
-
     if (!llama_memory_seq_rm(tc.mem_i(), 0, -1, -1)) {
         LOG_ERR("%s: clearing the sequence was refused\n", __func__);
         return test_status::FAIL;
@@ -367,7 +322,6 @@ static test_status test_single(const common_params & params, llama_model * model
     LOG_INF("%s: %d layout checks\n", __func__, tc.n_checks);
     return test_status::PASS;
 }
-
 
 static test_status test_streams(const common_params & params, llama_model * model) {
     kpool_case tc;
@@ -404,7 +358,6 @@ static test_status test_streams(const common_params & params, llama_model * mode
     LOG_INF("%s: %d layout checks\n", __func__, tc.n_checks);
     return test_status::PASS;
 }
-
 
 static test_status test_shared(const common_params & params, llama_model * model) {
     kpool_case tc;
@@ -445,9 +398,6 @@ static test_status test_shared(const common_params & params, llama_model * model
     return test_status::PASS;
 }
 
-
-
-
 static test_status test_many(const common_params & params, llama_model * model) {
     constexpr uint32_t n_seq = 32;
 
@@ -456,7 +406,6 @@ static test_status test_many(const common_params & params, llama_model * model) 
     if (!make_case(tc, params, model, "many", n_seq, true, res)) {
         return res;
     }
-
 
     const llama_pos kpool = (llama_pos) tc.mem->get_kpool();
     if (!tc.decode_check({ { 0, 0, kpool } }, "first pool", 0)) {
@@ -501,10 +450,6 @@ static test_status test_many(const common_params & params, llama_model * model) 
     return test_status::PASS;
 }
 
-
-
-
-
 static test_status test_grain(const common_params & params, llama_model * model) {
     kpool_case tc;
     test_status res = test_status::SKIP;
@@ -532,7 +477,6 @@ static test_status test_grain(const common_params & params, llama_model * model)
         return true;
     };
 
-
     const llama_pos p_bound = 2048;
     for (llama_pos p0 = 0; p0 < p_bound - 16; p0 += 256) {
         const llama_pos p1 = std::min<llama_pos>(p0 + 256, p_bound - 16);
@@ -549,7 +493,6 @@ static test_status test_grain(const common_params & params, llama_model * model)
         LOG_ERR("%s: the pool count moved %d times across the boundary at %d cells, expected once\n", __func__, n_moves, (int) p_bound);
         return test_status::FAIL;
     }
-
 
     for (int r = 0; r < 24; ++r) {
         const llama_pos pos   = tc.pos_next(0);
@@ -573,7 +516,6 @@ static test_status test_grain(const common_params & params, llama_model * model)
     return test_status::PASS;
 }
 
-
 static bool logits_match(kpool_case & tc, kpool_case & ref, const char * what) {
     const float * a = llama_get_logits_ith(tc.ctx.get(),  -1);
     const float * b = llama_get_logits_ith(ref.ctx.get(), -1);
@@ -589,12 +531,6 @@ static bool logits_match(kpool_case & tc, kpool_case & ref, const char * what) {
     LOG_INF("%s: %s: %s: logits match a straight decode, nmse %g\n", __func__, tc.name, what, e);
     return true;
 }
-
-
-
-
-
-
 
 static test_status test_states(const common_params & params, llama_model * model) {
     kpool_case tc;
@@ -623,7 +559,6 @@ static test_status test_states(const common_params & params, llama_model * model
         return test_status::FAIL;
     }
 
-
     const llama_pos p_on = p_ckpt + 6*kpool + 1;
     for (llama_pos p = p_ckpt; p < p_on; p += kpool + 1) {
         const llama_pos p1 = std::min(p + kpool + 1, p_on);
@@ -635,7 +570,6 @@ static test_status test_states(const common_params & params, llama_model * model
         LOG_ERR("%s: rolling back past the checkpoint failed\n", __func__);
         return test_status::FAIL;
     }
-
 
     if (llama_state_seq_set_data_ext(tc.ctx.get(), ckpt.data(), ckpt.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != ckpt.size()) {
         LOG_ERR("%s: restoring the checkpoint failed\n", __func__);
@@ -653,7 +587,6 @@ static test_status test_states(const common_params & params, llama_model * model
         return test_status::FAIL;
     }
 
-
     if (!llama_memory_seq_rm(tc.mem_i(), 1, -1, -1)) {
         LOG_ERR("%s: clearing sequence 1 failed\n", __func__);
         return test_status::FAIL;
@@ -670,7 +603,6 @@ static test_status test_states(const common_params & params, llama_model * model
         !logits_match(tc, ref, "copy after the checkpoint")) {
         return test_status::FAIL;
     }
-
 
     std::vector<uint8_t> full(llama_state_seq_get_size(tc.ctx.get(), 1));
     if (full.empty() || llama_state_seq_get_data(tc.ctx.get(), full.data(), full.size(), 1) != full.size()) {
@@ -696,8 +628,6 @@ static test_status test_states(const common_params & params, llama_model * model
     LOG_INF("%s: %d layout checks\n", __func__, tc.n_checks);
     return test_status::PASS;
 }
-
-
 
 static test_status test_copy_streams(const common_params & params, llama_model * model) {
     kpool_case tc;
@@ -728,7 +658,6 @@ static test_status test_copy_streams(const common_params & params, llama_model *
     if (!tc.check_edit("stream copied", 0)) {
         return test_status::FAIL;
     }
-
 
     if (!tc.decode_toks(0, p0, tc.toks(0, p0, p0 + kpool + 3, true), "source on")) {
         return test_status::FAIL;
@@ -796,7 +725,6 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-
     std::string models_dir;
     std::vector<char *> filtered_argv;
     filtered_argv.push_back(argv[0]);
@@ -813,7 +741,6 @@ int main(int argc, char ** argv) {
     }
     filtered_argv.push_back(nullptr);
     const int fargc = (int) filtered_argv.size() - 1;
-
 
     if (!models_dir.empty()) {
         params.model.path = models_dir;

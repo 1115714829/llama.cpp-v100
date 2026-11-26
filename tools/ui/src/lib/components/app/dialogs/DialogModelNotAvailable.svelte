@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { AlertTriangle, ArrowRight } from '@lucide/svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
@@ -74,7 +75,7 @@
 		</div>
 
 		<AlertDialog.Footer>
-			<AlertDialog.Action onclick={() => handleOpenChange(false)}>Cancel</AlertDialog.Action>
+			<AlertDialog.Action onclick={() => handleOpenChange(false)}>{tr("Cancel")}</AlertDialog.Action>
 		</AlertDialog.Footer>
 	</AlertDialog.Content>
 </AlertDialog.Root>

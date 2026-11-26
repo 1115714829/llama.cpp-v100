@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Server } from '@lucide/svelte';
 	import { ServerStatus } from '$lib/components/app';
 	import { fade } from 'svelte/transition';
@@ -18,7 +19,7 @@
 				<Server class="h-8 w-8 animate-pulse text-muted-foreground" />
 			</div>
 
-			<h2 class="mb-2 text-xl font-semibold">Connecting to Server</h2>
+			<h2 class="mb-2 text-xl font-semibold">{tr("Connecting to Server")}</h2>
 
 			<p class="text-sm text-muted-foreground">
 				{message}

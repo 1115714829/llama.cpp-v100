@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import SidebarNavigationConversationItem from './SidebarNavigationConversationItem.svelte';
 	import { buildConversationTree } from '$lib/utils';
 
@@ -49,7 +50,7 @@
 		<div
 			class="text-muted-foreground flex h-8 shrink-0 items-center rounded-md px-2 text-xs font-medium"
 		>
-			Search results
+			{tr("Search results")}
 		</div>
 	{/if}
 

@@ -1,15 +1,5 @@
 
 
-
-
-
-
-
-
-
-
-
-
 #include "llama-ple-reader.h"
 
 #include <cstdio>
@@ -25,8 +15,6 @@
 #  include <sys/wait.h>
 #  include <unistd.h>
 #endif
-
-
 
 #if !defined(_WIN32) && defined(O_DIRECT)
 static bool fs_has_direct(const std::string & path) {
@@ -80,7 +68,6 @@ static bool write_file(const std::string & path, const std::vector<uint8_t> & da
     return ok;
 }
 
-
 static std::string self_path(const char * argv0) {
 #if defined(__linux__)
     char buf[4096];
@@ -93,10 +80,6 @@ static std::string self_path(const char * argv0) {
     return std::string(argv0 ? argv0 : "");
 }
 
-
-
-
-
 static int compare_rows(const std::vector<uint8_t> & data, size_t prefix, size_t row_bytes,
                         const std::vector<int32_t> & rows, const std::vector<uint8_t> & dst) {
     for (size_t i = 0; i < rows.size(); ++i) {
@@ -108,9 +91,6 @@ static int compare_rows(const std::vector<uint8_t> & data, size_t prefix, size_t
     return -1;
 }
 
-
-
-
 static int read_and_compare(const std::vector<uint8_t> & data, size_t prefix, size_t row_bytes,
                              const std::vector<int32_t> & rows, const std::vector<uint8_t> & dst,
                              const std::string & path) {
@@ -121,12 +101,6 @@ static int read_and_compare(const std::vector<uint8_t> & data, size_t prefix, si
     }
     return 0;
 }
-
-
-
-
-
-
 
 static int run_case(const std::string & path, size_t prefix, size_t n_rows, size_t row_bytes, unsigned seed, bool corrupt) {
     std::vector<uint8_t> data(prefix + n_rows*row_bytes);
@@ -145,14 +119,12 @@ static int run_case(const std::string & path, size_t prefix, size_t n_rows, size
     reader.n_rows    = n_rows;
     reader.row_bytes = row_bytes;
 
-
     std::mt19937 rng_rows(seed + 1);
     const size_t n = 4096;
     std::vector<int32_t> rows(n);
     for (size_t i = 0; i < n; ++i) {
         rows[i] = (int32_t) (rng_rows() % n_rows);
     }
-
 
     rows[0] = 0;
     rows[1] = (int32_t) (n_rows - 1);
@@ -176,7 +148,6 @@ static int run_case(const std::string & path, size_t prefix, size_t n_rows, size
         remove(path.c_str());
         return 1;
     }
-
 
     {
         const std::vector<int32_t> last_row = { (int32_t) (n_rows - 1) };
@@ -209,7 +180,6 @@ static int run_case(const std::string & path, size_t prefix, size_t n_rows, size
             }
         }
 
-
         const std::vector<int32_t> last_row = { (int32_t) (n_rows - 1) };
         std::vector<uint8_t> again(row_bytes, 0);
         if (!reader.read_rows(last_row.data(), 1, again.data())) {
@@ -233,7 +203,6 @@ static int run_case(const std::string & path, size_t prefix, size_t n_rows, size
         return 1;
     }
 
-
     const bool expect_direct = fs_has_direct(path);
     if (reader.is_direct() != expect_direct) {
         fprintf(stderr, "the reader on %s used %s, the file system offers %s\n", path.c_str(),
@@ -252,13 +221,11 @@ static int run_case(const std::string & path, size_t prefix, size_t n_rows, size
         return 1;
     }
 
-
     if (!reader.read_rows(nullptr, 0, nullptr)) {
         fprintf(stderr, "an empty batch failed on %s\n", path.c_str());
         remove(path.c_str());
         return 1;
     }
-
 
     std::vector<int32_t> bad = { (int32_t) n_rows };
     if (reader.read_rows(bad.data(), bad.size(), dst.data())) {
@@ -276,13 +243,6 @@ static int run_case(const std::string & path, size_t prefix, size_t n_rows, size
 
     return 0;
 }
-
-
-
-
-
-
-
 
 static int run_selfcheck(const std::string & dir, const std::string & self) {
     const std::string path = dir + "/test-ple-reader-corrupt.bin";
@@ -380,7 +340,6 @@ int main(int argc, char ** argv) {
 
     const std::string dir = argc > 1 ? argv[1] : ".";
 
-
     const size_t n_rows    = (64*1024*1024) / 90;
     const size_t row_bytes = 90;
 
@@ -391,14 +350,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-
     {
         const size_t n_rows_f16 = (16*1024*1024) / 160;
         if (run_case(dir + "/test-ple-reader-d.bin", 333, n_rows_f16, 160, 97531, false) != 0) {
             return 1;
         }
     }
-
 
     {
         FILE * f = fopen("/dev/shm/test-ple-reader-c.bin", "wb");
@@ -417,7 +374,6 @@ int main(int argc, char ** argv) {
             printf("/dev/shm is not writable, the capability branch was not covered\n");
         }
     }
-
 
     if (run_selfcheck(dir, self_path(argv[0])) != 0) {
         return 1;

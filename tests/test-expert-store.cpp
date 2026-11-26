@@ -9,9 +9,6 @@
 #include <cstring>
 #include <vector>
 
-
-
-
 #if defined(__SIZEOF_INT128__)
 #define TEST_HAVE_REF 1
 __extension__ typedef unsigned __int128 test_u128;
@@ -43,12 +40,10 @@ static const mul_div_case g_cases[] = {
 
     { 0xFFFFFFFFFFF, 0xFFFFFFFFF, (uint64_t) 1 << 48, 4294967295ULL },
 
-
     { 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFFULL },
 
     { 0xFFFFFFFFFFFFFFFF, 0x8000000000000000ULL, 0xFFFFFFFFFFFFFFFF, 0x8000000000000000ULL },
 };
-
 
 static bool test_case(uint64_t a, uint64_t b, uint64_t c, uint64_t expect) {
 #if TEST_HAVE_REF
@@ -67,8 +62,6 @@ static bool test_case(uint64_t a, uint64_t b, uint64_t c, uint64_t expect) {
     }
     return true;
 }
-
-
 
 struct placement_snapshot {
     std::vector<int32_t> residency;
@@ -100,8 +93,6 @@ struct placement_snapshot {
     }
 };
 
-
-
 static void * test_alloc(void *, size_t size) {
     return malloc(size);
 }
@@ -128,7 +119,6 @@ static const ggml_expert_store_backend g_test_backend = {
     nullptr, test_alloc, test_free, test_alloc_host, test_free, test_copy_h2d, test_copy_d2h, nullptr,
 };
 
-
 static uint64_t g_rng = 0x0123456789ABCDEFULL;
 
 static int64_t test_rand(int64_t n) {
@@ -138,14 +128,12 @@ static int64_t test_rand(int64_t n) {
     return (int64_t) (g_rng % (uint64_t) n);
 }
 
-
 static bool test_swap(void) {
     const int64_t n_expert  = 16;
     const size_t  blob      = 1024;
     const size_t  pad       = 512;
     const size_t  type_size = 32;
     const size_t  stride    = ggml_expert_store_stride(blob, pad, type_size);
-
 
     const int64_t slot_experts[] = { 2, 5, 9, 11, 13 };
     const int64_t n_slot = (int64_t) (sizeof(slot_experts) / sizeof(slot_experts[0]));
@@ -157,7 +145,7 @@ static bool test_swap(void) {
     }
 
     const int tensor_id = ggml_expert_store_add_tensor(store, 0, 0, 0, n_expert, blob, pad, type_size,
-        slot_experts, n_slot, -1);
+        slot_experts, n_slot, -1, nullptr, 0);
     if (tensor_id < 0) {
         fprintf(stderr, "%s: cannot add the tensor\n", __func__);
         ggml_expert_store_free(store);
@@ -189,7 +177,6 @@ static bool test_swap(void) {
             return false;
         }
     }
-
 
     for (int64_t i = 0; i < 200; ++i) {
         int64_t host = -1;
@@ -246,7 +233,6 @@ static bool test_swap(void) {
             return false;
         }
     }
-
 
     int64_t host_a = -1;
     int64_t host_b = -1;
@@ -315,12 +301,6 @@ static bool test_swap(void) {
     return true;
 }
 
-
-
-
-
-
-
 static bool test_swap_to(void) {
     const int64_t n_expert  = 16;
     const size_t  blob      = 1024;
@@ -338,14 +318,13 @@ static bool test_swap_to(void) {
         return false;
     }
 
-
     const auto pattern = [&](int t, int64_t e, size_t i) {
         return (uint8_t) (t * 97 + e * 31 + (int64_t) i * 7 + (int64_t) (i >> 8));
     };
 
     int tid[2] = { -1, -1 };
     for (int t = 0; t < 2; ++t) {
-        tid[t] = ggml_expert_store_add_tensor(store, t, 0, 0, n_expert, blob, pad, type_size, slot_experts, n_slot, -1);
+        tid[t] = ggml_expert_store_add_tensor(store, t, 0, 0, n_expert, blob, pad, type_size, slot_experts, n_slot, -1, nullptr, 0);
         if (tid[t] < 0) {
             fprintf(stderr, "%s: cannot add tensor %d\n", __func__, t);
             ggml_expert_store_free(store);
@@ -359,7 +338,6 @@ static bool test_swap_to(void) {
         }
         ggml_expert_store_write(store, tid[t], data.data(), 0, data.size());
     }
-
 
     std::vector<std::vector<char>> spare_mem((size_t) n_spare, std::vector<char>(stride, 0));
     std::vector<char *> pool;
@@ -389,7 +367,6 @@ static bool test_swap_to(void) {
         char * const  fresh  = pool.back();
         pool.pop_back();
 
-
         memcpy(fresh, st->host_host + off_in, stride);
         memcpy(st->host_host + off_in, st->table_host[(size_t) e_out], stride);
 
@@ -414,7 +391,6 @@ static bool test_swap_to(void) {
         }
     }
 
-
     for (int t = 0; t < 2 && ok; ++t) {
         std::vector<uint8_t> got(blob);
         for (int64_t e = 0; e < n_expert && ok; ++e) {
@@ -428,7 +404,6 @@ static bool test_swap_to(void) {
             }
         }
     }
-
 
     if (ok) {
         ggml_expert_store_tensor * st = &store->tensors[(size_t) tid[0]];
@@ -460,9 +435,6 @@ int main(void) {
         }
     }
 
-
-
-
     for (const mul_div_case & t : g_cases) {
         if (t.c > UINT64_MAX / 2) {
             continue;
@@ -472,7 +444,6 @@ int main(void) {
             return 1;
         }
     }
-
 
     for (uint64_t c = 1; c <= 64; ++c) {
         for (uint64_t b = 1; b <= 64; ++b) {

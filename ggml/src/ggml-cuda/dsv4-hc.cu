@@ -1,12 +1,9 @@
-// DeepSeek-V4 hyper-connection ops. The gated post epilogue (2*sigmoid(inject/hc)) ports the
-// gate arithmetic of Strata's fused_gr kernels (MIT, https://github.com/Niko1221/Strata
-// src/kernels/cuda/fused_gr.cu, see licenses/LICENSE-strata).
+// Portions from Strata and its AC922 fork; Copyright (c) 2026 Niko1221 and the Strata contributors (MIT); see licenses/LICENSE-strata.
+
 #include "common.cuh"
 #include "dsv4-hc.cuh"
 
-
 static constexpr int DSV4_HC = 4;
-
 
 static __device__ void dsv4_hc_comb_norm_cols(float * comb, float eps) {
     for (int idst = 0; idst < DSV4_HC; ++idst) {
@@ -103,8 +100,6 @@ static __global__ void dsv4_hc_comb_f32(
     }
 }
 
-
-
 template <bool gated, bool write_f16 = false>
 static __global__ void dsv4_hc_pre_f32(
         const float * x,
@@ -154,9 +149,6 @@ static __global__ void dsv4_hc_pre_f32(
         dst_f16[ir] = __float2half(value);
     }
 }
-
-
-
 
 template <bool has_comb, bool gated_post = false>
 static __global__ void dsv4_hc_post_f32(
@@ -350,9 +342,6 @@ static void dsv4_hc_post_launch(
 void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     dsv4_hc_post_launch(ctx, dst, dst->src[2], 0.0f, 0.0f, false);
 }
-
-
-
 
 void ggml_cuda_op_dsv4_hc_post_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                      ggml_tensor * scale_inv_hc, ggml_tensor * scale_gate) {

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Eject, Loader2, MessageSquare, Power, SquarePen } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { conversationsStore, deviceStore } from '$lib/stores';
@@ -54,7 +55,7 @@
 			<Button class="flex-1 gap-1.5" onclick={onUseInNewChat} {size}>
 				<SquarePen class="h-3.5 w-3.5" />
 
-				Start a new chat
+				{tr("Start a new chat")}
 			</Button>
 		{/if}
 

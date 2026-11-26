@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { RefreshCw } from '@lucide/svelte';
 	import {
 		SettingsChatDesktopSidebar,
@@ -164,7 +165,7 @@
 								<div class="flex justify-end">
 									<Button onclick={() => window.location.reload()} variant="outline">
 										<RefreshCw class="h-3 w-3" />
-										Reload app
+										{tr("Reload app")}
 									</Button>
 								</div>
 							{/if}
@@ -173,7 +174,7 @@
 				</div>
 
 				<div class="mt-8 border-t border-border/30 pt-6">
-					<p class="text-xs text-muted-foreground">Settings are saved in browser's localStorage</p>
+					<p class="text-xs text-muted-foreground">{tr("Settings are saved in browser's localStorage")}</p>
 				</div>
 			</div>
 

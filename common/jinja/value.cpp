@@ -2,7 +2,6 @@
 #include "unicode.h"
 #include "value.h"
 
-// for converting from JSON to jinja values
 #include "json.h"
 
 #include <sstream>
@@ -20,8 +19,6 @@
 #define FILENAME "jinja-value"
 
 namespace jinja {
-
-// func_args method implementations
 
 value func_args::get_kwarg(const std::string & key, value default_val) const {
     for (const auto & arg : args) {
@@ -71,9 +68,6 @@ const std::vector<value> & func_args::get_args() const {
     return args;
 }
 
-/**
- * Function that mimics Python's array slicing.
- */
 template<typename T>
 static T slice(const T & array, int64_t start, int64_t stop, int64_t step = 1) {
     int64_t len = static_cast<int64_t>(array.size());
@@ -254,17 +248,17 @@ static value tojson(const func_args & args) {
     value val_sort       = args.get_kwarg_or_pos("sort_keys",    4);
     int indent = -1;
     if (args.ctx.is_get_stats) {
-        // mark as used (recursively) for stats
+
         auto val_input = args.get_pos(0);
         value_t::stats_t::mark_used(const_cast<value&>(val_input), true);
     }
     if (is_val<value_int>(val_indent)) {
         indent = static_cast<int>(val_indent->as_int());
     }
-    if (val_sort->as_bool()) { // undefined == false
+    if (val_sort->as_bool()) {
         throw not_implemented_exception("tojson sort_keys=true not implemented");
     }
-    const bool ensure_ascii = val_ascii->as_bool(); // undefined == false
+    const bool ensure_ascii = val_ascii->as_bool();
     auto separators = (is_val<value_array>(val_separators) ? val_separators : mk_val<value_array>())->as_array();
     std::string item_sep = separators.size() > 0 ? separators[0]->as_string().str() : (indent < 0 ? ", " : ",");
     std::string key_sep = separators.size() > 1 ? separators[1]->as_string().str() : ": ";
@@ -299,81 +293,59 @@ static value & get_attribute(const value & val, const value & attr, value & defa
     return default_val;
 }
 
-template<bool is_reject>
-static value selectattr(const func_args & args) {
-    args.ensure_count(2, 4);
-    args.ensure_vals<value_array, value_string, value_string, value_string>(true, true, false, false);
+template<bool is_reject, bool lookup_attr>
+static value select_or_reject(const func_args & args) {
+
+    constexpr size_t test_pos = lookup_attr ? 2 : 1;
+    args.ensure_count(test_pos);
+    args.ensure_val<value_array>(args.get_pos(0));
+    value attr;
+    if constexpr (lookup_attr) {
+        attr = args.get_pos(1);
+        args.ensure_val<value_string>(attr);
+    }
+
+    auto & builtins = global_builtins();
+    auto test_it = builtins.end();
+    if (args.count() > test_pos) {
+        args.ensure_val<value_string>(args.get_pos(test_pos));
+        std::string test_name = args.get_pos(test_pos)->as_string().str();
+        test_it = builtins.find("test_is_" + test_name);
+        if (test_it == builtins.end()) {
+            throw raised_exception(args.func_name + ": unknown test '" + test_name + "'");
+        }
+    }
 
     auto arr = args.get_pos(0)->as_array();
-    auto attribute = args.get_pos(1);
     auto out = mk_val<value_array>();
     value val_default = mk_val<value_undefined>();
 
-    if (args.count() == 2) {
-        // example: array | selectattr("active")
-        for (const auto & item : arr) {
-            value attr_val = get_attribute(item, attribute, val_default);
-            bool is_selected = attr_val->as_bool();
-            if constexpr (is_reject) is_selected = !is_selected;
-            if (is_selected) out->push_back(item);
+    for (const auto & item : arr) {
+        value val = item;
+        if constexpr (lookup_attr) {
+            val = get_attribute(item, attr, val_default);
         }
-        return out;
-
-    } else if (args.count() == 3) {
-        // example: array | selectattr("equalto", "text")
-        // translated to: test_is_equalto(item, "text")
-        std::string test_name = args.get_pos(1)->as_string().str();
-        value test_val = args.get_pos(2);
-        auto & builtins = global_builtins();
-        auto it = builtins.find("test_is_" + test_name);
-        if (it == builtins.end()) {
-            throw raised_exception("selectattr: unknown test '" + test_name + "'");
-        }
-        auto test_fn = it->second;
-        for (const auto & item : arr) {
+        bool is_selected;
+        if (test_it == builtins.end()) {
+            is_selected = val->as_bool();
+        } else {
             func_args test_args(args.ctx);
-            test_args.push_back(item); // current object
-            test_args.push_back(test_val); // extra argument
-            value test_result = test_fn(test_args);
-            bool is_selected = test_result->as_bool();
-            if constexpr (is_reject) is_selected = !is_selected;
-            if (is_selected) out->push_back(item);
+            test_args.push_back(val);
+            for (size_t i = test_pos + 1; i < args.count(); i++) {
+                test_args.push_back(args.get_pos(i));
+            }
+            is_selected = test_it->second(test_args)->as_bool();
         }
-        return out;
-
-    } else if (args.count() == 4) {
-        // example: array | selectattr("status", "equalto", "active")
-        // translated to: test_is_equalto(item.status, "active")
-        std::string test_name = args.get_pos(2)->as_string().str();
-        auto extra_arg = args.get_pos(3);
-        auto & builtins = global_builtins();
-        auto it = builtins.find("test_is_" + test_name);
-        if (it == builtins.end()) {
-            throw raised_exception("selectattr: unknown test '" + test_name + "'");
-        }
-        auto test_fn = it->second;
-        for (const auto & item : arr) {
-            value attr_val = get_attribute(item, attribute, val_default);
-            func_args test_args(args.ctx);
-            test_args.push_back(attr_val); // attribute value
-            test_args.push_back(extra_arg); // extra argument
-            value test_result = test_fn(test_args);
-            bool is_selected = test_result->as_bool();
-            if constexpr (is_reject) is_selected = !is_selected;
-            if (is_selected) out->push_back(item);
-        }
-        return out;
-    } else {
-        throw raised_exception("selectattr: invalid number of arguments");
+        if constexpr (is_reject) is_selected = !is_selected;
+        if (is_selected) out->push_back(item);
     }
-
     return out;
 }
 
 static value default_value(const func_args & args) {
     args.ensure_count(2, 3);
     value val_check = args.get_kwarg_or_pos("boolean", 2);
-    bool check_bool = val_check->as_bool(); // undefined == false
+    bool check_bool = val_check->as_bool();
     bool no_value = check_bool
         ? (!args.get_pos(0)->as_bool())
         : (args.get_pos(0)->is_undefined() || args.get_pos(0)->is_none());
@@ -425,12 +397,16 @@ const func_builtins & global_builtins() {
             throw raised_exception("Jinja Exception: " + msg);
         }},
         {"dict", toobject},
-        {"namespace", toobject},
+        {"namespace", [](const func_args & args) -> value {
+
+            value out = toobject(args);
+            cast_val<value_object>(out)->has_builtins = false;
+            return out;
+        }},
         {"strftime_now", [](const func_args & args) -> value {
             args.ensure_vals<value_string>();
             std::string format = args.get_pos(0)->as_string().str();
-            // get current time
-            // TODO: make sure this is the same behavior as Python's strftime
+
             char buf[100];
             if (std::strftime(buf, sizeof(buf), format.c_str(), std::localtime(&args.ctx.current_time))) {
                 return mk_val<value_string>(std::string(buf));
@@ -478,7 +454,6 @@ const func_builtins & global_builtins() {
         }},
         {"tojson", tojson},
 
-        // tests
         {"test_is_boolean", test_type_fn<value_bool>},
         {"test_is_callable", test_type_fn<value_func>},
         {"test_is_odd", [](const func_args & args) -> value {
@@ -573,7 +548,7 @@ const func_builtins & global_builtins() {
             return mk_val<value_bool>(res);
         }},
         {"test_is_sameas", [](const func_args & args) -> value {
-            // Check if an object points to the same memory address as another object
+
             args.ensure_count(2);
             auto a = args.get_pos(0);
             auto b = args.get_pos(1);
@@ -587,7 +562,7 @@ const func_builtins & global_builtins() {
                     }
                 } else if (is_val<value_int>(a) && is_val<value_int>(b)) {
                     const int64_t x = a->as_int();
-                    // Allow comparison within small-int cache range
+
                     if (x >= -5 && x <= 256 && x == b->as_int()) {
                         res = true;
                     }
@@ -608,7 +583,6 @@ const func_builtins & global_builtins() {
     };
     return builtins;
 }
-
 
 const func_builtins & value_int_t::get_builtins() const {
     static const func_builtins builtins = {
@@ -634,9 +608,8 @@ const func_builtins & value_int_t::get_builtins() const {
     return builtins;
 }
 
-
 const func_builtins & value_float_t::get_builtins() const {
-    // Python's str() of a float, nan and inf stay as they are (tojson writes NaN and Infinity)
+
     static const func_handler tostring = [](const func_args & args) -> value {
         args.ensure_vals<value_float>();
         return mk_val<value_string>(float_repr(args.get_pos(0)->as_float()));
@@ -755,7 +728,7 @@ const func_builtins & value_string_t::get_builtins() const {
                 throw raised_exception("split() first argument must be a string");
             }
             std::string str = val_input->as_string().str();
-            // FIXME: Support non-specified delimiter (split on consecutive (no leading or trailing) whitespace)
+
             std::string delim = (args.count() > 1) ? args.get_pos(1)->as_string().str() : " ";
             if (delim.empty()) {
                 throw raised_exception("empty separator");
@@ -782,7 +755,7 @@ const func_builtins & value_string_t::get_builtins() const {
                 throw raised_exception("rsplit() first argument must be a string");
             }
             std::string str = val_input->as_string().str();
-            // FIXME: Support non-specified delimiter (split on consecutive (no leading or trailing) whitespace)
+
             std::string delim = (args.count() > 1) ? args.get_pos(1)->as_string().str() : " ";
             if (delim.empty()) {
                 throw raised_exception("empty separator");
@@ -852,7 +825,7 @@ const func_builtins & value_string_t::get_builtins() const {
                 }
             };
 
-            size_t arg_idx = 1; // positional args follow the format string
+            size_t arg_idx = 1;
             for (size_t i = 0; i < str.size(); ++i) {
                 if (str[i] != '{') {
                     literal += str[i];
@@ -875,7 +848,7 @@ const func_builtins & value_string_t::get_builtins() const {
             value val_base    = args.get_kwarg_or_pos("base",    2);
             const int base = val_base->is_undefined() ? 10 : val_base->as_int();
             if (base != 0 && (base < 2 || base > 36)) {
-                // an out-of-range base makes std::stoi fail fast on the MSVC CRT instead of throwing
+
                 throw raised_exception("int() base must be 0 or between 2 and 36");
             }
             if (is_val<value_string>(val_input) == false) {
@@ -899,7 +872,7 @@ const func_builtins & value_string_t::get_builtins() const {
             }
         }},
         {"string", [](const func_args & args) -> value {
-            // no-op
+
             args.ensure_vals<value_string>();
             return mk_val<value_string>(args.get_pos(0)->as_string());
         }},
@@ -912,7 +885,7 @@ const func_builtins & value_string_t::get_builtins() const {
             if (args.count() > 1 && !args.get_pos(1)->is_undefined()) {
                 default_val = args.get_pos(1);
             }
-            value boolean_val = args.get_kwarg_or_pos("boolean", 2); // undefined == false
+            value boolean_val = args.get_kwarg_or_pos("boolean", 2);
             if (input->is_undefined() || (boolean_val->as_bool() && !input->as_bool())) {
                 return default_val;
             } else {
@@ -951,7 +924,7 @@ const func_builtins & value_string_t::get_builtins() const {
             return res;
         }},
         {"safe", [](const func_args & args) -> value {
-            // no-op for now
+
             args.ensure_vals<value_string>();
             return args.get_pos(0);
         }},
@@ -960,8 +933,8 @@ const func_builtins & value_string_t::get_builtins() const {
             args.ensure_count(1, 4);
             value val_input  = args.get_pos(0);
             value val_width  = args.get_kwarg_or_pos("width", 1);
-            const bool first = args.get_kwarg_or_pos("first", 2)->as_bool(); // undefined == false
-            const bool blank = args.get_kwarg_or_pos("blank", 3)->as_bool(); // undefined == false
+            const bool first = args.get_kwarg_or_pos("first", 2)->as_bool();
+            const bool blank = args.get_kwarg_or_pos("blank", 3)->as_bool();
             if (!is_val<value_string>(val_input)) {
                 throw raised_exception("indent() first argument must be a string");
             }
@@ -1001,7 +974,6 @@ const func_builtins & value_string_t::get_builtins() const {
     };
     return builtins;
 }
-
 
 const func_builtins & value_bool_t::get_builtins() const {
     static const func_handler tostring = [](const func_args & args) -> value {
@@ -1094,10 +1066,10 @@ const func_builtins & value_array_t::get_builtins() const {
             auto arr = slice(val->as_array(), start, stop, step);
             return is_val<value_tuple>(val) ? mk_val<value_tuple>(std::move(arr)) : mk_val<value_array>(std::move(arr));
         }},
-        {"selectattr", selectattr<false>},
-        {"select", selectattr<false>},
-        {"rejectattr", selectattr<true>},
-        {"reject", selectattr<true>},
+        {"selectattr", select_or_reject<false, true>},
+        {"select", select_or_reject<false, false>},
+        {"rejectattr", select_or_reject<true, true>},
+        {"reject", select_or_reject<true, false>},
         {"join", [](const func_args & args) -> value {
             args.ensure_count(1, 3);
             if (!is_val<value_array>(args.get_pos(0))) {
@@ -1127,7 +1099,7 @@ const func_builtins & value_array_t::get_builtins() const {
         {"string", [](const func_args & args) -> value {
             args.ensure_vals<value_array>();
             if (args.ctx.is_get_stats) {
-                // mark as used (recursively) for stats
+
                 auto val_input = args.get_pos(0);
                 value_t::stats_t::mark_used(const_cast<value&>(val_input), true);
             }
@@ -1159,7 +1131,7 @@ const func_builtins & value_array_t::get_builtins() const {
                 throw raised_exception("append: first argument must be an array");
             }
             const value_array_t * arr = cast_val<value_array>(args.get_pos(0));
-            // need to use const_cast here to modify the array
+
             value_array_t * arr_editable = const_cast<value_array_t *>(arr);
             arr_editable->push_back(args.get_pos(1));
             return args.get_pos(0);
@@ -1169,7 +1141,7 @@ const func_builtins & value_array_t::get_builtins() const {
             args.ensure_vals<value_array, value_int>(true, false);
             int64_t index = args.count() == 2 ? args.get_pos(1)->as_int() : -1;
             const value_array_t * arr = cast_val<value_array>(args.get_pos(0));
-            // need to use const_cast here to modify the array
+
             value_array_t * arr_editable = const_cast<value_array_t *>(arr);
             return arr_editable->pop_at(index);
         }},
@@ -1182,11 +1154,10 @@ const func_builtins & value_array_t::get_builtins() const {
             value val_reverse = args.get_kwarg_or_pos("reverse",        1);
             value val_case    = args.get_kwarg_or_pos("case_sensitive", 2);
             value attribute   = args.get_kwarg_or_pos("attribute",      3);
-            // FIXME: sorting is currently always case sensitive
-            //const bool case_sensitive = val_case->as_bool(); // undefined == false
-            const bool reverse = val_reverse->as_bool(); // undefined == false
+
+            const bool reverse = val_reverse->as_bool();
             value undef = mk_val<value_undefined>();
-            std::vector<value> arr = val->as_array(); // copy
+            std::vector<value> arr = val->as_array();
             std::sort(arr.begin(), arr.end(),[&](const value & a, const value & b) {
                 value val_a = a;
                 value val_b = b;
@@ -1201,7 +1172,7 @@ const func_builtins & value_array_t::get_builtins() const {
         {"reverse", [](const func_args & args) -> value {
             args.ensure_vals<value_array>();
             value val = args.get_pos(0);
-            std::vector<value> arr = val->as_array(); // copy
+            std::vector<value> arr = val->as_array();
             std::reverse(arr.begin(), arr.end());
             return is_val<value_tuple>(val) ? mk_val<value_tuple>(std::move(arr)) : mk_val<value_array>(std::move(arr));
         }},
@@ -1210,7 +1181,7 @@ const func_builtins & value_array_t::get_builtins() const {
             args.ensure_vals<value_array>();
             value val_case    = args.get_kwarg_or_pos("case_sensitive", 1);
             value attribute   = args.get_kwarg_or_pos("attribute",      2);
-            // FIXME: min is currently always case sensitive
+
             (void) val_case;
             value undef = mk_val<value_undefined>();
             const auto & arr = args.get_pos(0)->as_array();
@@ -1236,7 +1207,7 @@ const func_builtins & value_array_t::get_builtins() const {
             args.ensure_vals<value_array>();
             value val_case    = args.get_kwarg_or_pos("case_sensitive", 1);
             value attribute   = args.get_kwarg_or_pos("attribute",      2);
-            // FIXME: max is currently always case sensitive
+
             (void) val_case;
             value undef = mk_val<value_undefined>();
             const auto & arr = args.get_pos(0)->as_array();
@@ -1273,7 +1244,7 @@ const func_builtins & value_object_t::get_builtins() const {
     }
 
     static const func_builtins builtins = {
-        // {"default", default_value}, // cause issue with gpt-oss
+
         {"get", [](const func_args & args) -> value {
             args.ensure_count(2, 3);
             if (!is_val<value_object>(args.get_pos(0))) {
@@ -1322,7 +1293,7 @@ const func_builtins & value_object_t::get_builtins() const {
         {"string", [](const func_args & args) -> value {
             args.ensure_vals<value_object>();
             if (args.ctx.is_get_stats) {
-                // mark as used (recursively) for stats
+
                 auto val_input = args.get_pos(0);
                 value_t::stats_t::mark_used(const_cast<value&>(val_input), true);
             }
@@ -1335,7 +1306,7 @@ const func_builtins & value_object_t::get_builtins() const {
         }},
         {"tojson", [](const func_args & args) -> value {
             args.ensure_vals<value_object>();
-            // use global to_json
+
             return global_builtins().at("tojson")(args);
         }},
         {"dictsort", [](const func_args & args) -> value {
@@ -1343,11 +1314,10 @@ const func_builtins & value_object_t::get_builtins() const {
             value val_case    = args.get_kwarg_or_pos("case_sensitive", 1);
             value val_by      = args.get_kwarg_or_pos("by",             2);
             value val_reverse = args.get_kwarg_or_pos("reverse",        3);
-            // FIXME: sorting is currently always case sensitive
-            //const bool case_sensitive = val_case->as_bool(); // undefined == false
-            const bool reverse = val_reverse->as_bool(); // undefined == false
+
+            const bool reverse = val_reverse->as_bool();
             const bool by_value = is_val<value_string>(val_by) && val_by->as_string().str() == "value" ? true : false;
-            auto result = mk_val<value_object>(val_input); // copy
+            auto result = mk_val<value_object>(val_input);
             std::sort(result->val_obj.begin(), result->val_obj.end(), [&](const auto & a, const auto & b) {
                 if (by_value) {
                     return value_compare(a.second, b.second, reverse ? value_compare_op::gt : value_compare_op::lt);
@@ -1381,7 +1351,6 @@ const func_builtins & value_none_t::get_builtins() const {
     };
     return builtins;
 }
-
 
 const func_builtins & value_undefined_t::get_builtins() const {
     static const func_builtins builtins = {
@@ -1417,10 +1386,6 @@ const func_builtins & value_undefined_t::get_builtins() const {
     return builtins;
 }
 
-
-//////////////////////////////////
-
-
 static value from_json(const common_json & j, bool mark_input) {
     if (j.is_null()) {
         return mk_val<value_none>();
@@ -1453,10 +1418,9 @@ static value from_json(const common_json & j, bool mark_input) {
     }
 }
 
-// compare operator for value_t
 bool value_compare(const value & a, const value & b, value_compare_op op) {
     auto cmp = [&]() {
-        // compare numeric types
+
         if ((is_val<value_int>(a) || is_val<value_float>(a)) &&
             (is_val<value_int>(b) || is_val<value_float>(b))){
             try {
@@ -1475,8 +1439,7 @@ bool value_compare(const value & a, const value & b, value_compare_op op) {
                 }
             } catch (...) {}
         }
-        // compare string and number
-        // TODO: not sure if this is the right behavior
+
         if ((is_val<value_string>(b) && (is_val<value_int>(a) || is_val<value_float>(a))) ||
             (is_val<value_string>(a) && (is_val<value_int>(b) || is_val<value_float>(b))) ||
             (is_val<value_string>(a) && is_val<value_string>(b))) {
@@ -1496,7 +1459,7 @@ bool value_compare(const value & a, const value & b, value_compare_op op) {
                 }
             } catch (...) {}
         }
-        // compare boolean simple
+
         if (is_val<value_bool>(a) && is_val<value_bool>(b)) {
             if (op == value_compare_op::eq) {
                 return a->as_bool() == b->as_bool();
@@ -1506,7 +1469,7 @@ bool value_compare(const value & a, const value & b, value_compare_op op) {
                 throw std::runtime_error("Unsupported comparison operator for bool type");
             }
         }
-        // compare by type
+
         if (a->type() != b->type()) {
             return false;
         }
@@ -1519,7 +1482,7 @@ bool value_compare(const value & a, const value & b, value_compare_op op) {
 
 template<>
 void global_from_json(context & ctx, const common_json & json_obj, bool mark_input) {
-    // printf("global_from_json: %s\n" , json_obj.dump(2).c_str());
+
     if (json_obj.is_null() || !json_obj.is_object()) {
         throw std::runtime_error("global_from_json: input JSON value must be an object");
     }
@@ -1529,26 +1492,22 @@ void global_from_json(context & ctx, const common_json & json_obj, bool mark_inp
     }
 }
 
-// a float as Python's repr() and str() write it: the shortest digits that read back as the same value
 static std::string float_repr(double val) {
     if (!std::isfinite(val)) {
         return std::isnan(val) ? "nan" : val < 0 ? "-inf" : "inf";
     }
     const double mag = std::fabs(val);
 
-    // at a power of 2 the gap to the value below is half the gap above, the nearest digits can miss while the next ones up read back
     int exp2 = 0;
     const bool is_pow2 = std::frexp(mag, &exp2) == 0.5;
 
-    // a normal double has at most one decimal of up to DBL_DIG digits that reads back as it, the search can start at DBL_DIG digits
-    // 17 digits always read back
     std::string digits;
     int exp10 = 0;
     for (int prec = mag < DBL_MIN ? 0 : DBL_DIG - 1; digits.empty(); prec++) {
         char buf[32];
         snprintf(buf, sizeof(buf), "%.*e", prec, mag);
         const char * e = std::strchr(buf, 'e');
-        // only the digits, the decimal point depends on the locale
+
         std::string d(buf, e - buf);
         d.erase(std::remove_if(d.begin(), d.end(), [](char c) { return c < '0' || c > '9'; }), d.end());
         exp10 = std::atoi(e + 1);
@@ -1558,7 +1517,7 @@ static std::string float_repr(double val) {
         if (prec == 16 || reads_back(d)) {
             digits = d;
         } else if (is_pow2 && d.back() != '9') {
-            // a last digit 9 is not bumped (it would carry): no power of 2, from 2^-1074 to 2^1023, needs it
+
             d.back()++;
             if (reads_back(d)) {
                 digits = d;
@@ -1569,9 +1528,8 @@ static std::string float_repr(double val) {
         digits.pop_back();
     }
 
-    // fixed notation for 1e-4 <= |val| < 1e16, else d.ddde+XX
     const int n     = static_cast<int>(digits.size());
-    const int point = exp10 + 1; // number of digits before the decimal point
+    const int point = exp10 + 1;
     std::string out = std::signbit(val) ? "-" : "";
     if (point > -4 && point <= 16) {
         if (point <= 0) {
@@ -1589,7 +1547,6 @@ static std::string float_repr(double val) {
     return out;
 }
 
-// a float as json.dumps writes it: nan and inf as NaN and Infinity, which are not valid JSON
 static std::string float_json(double val) {
     if (std::isnan(val)) {
         return "NaN";
@@ -1600,8 +1557,6 @@ static std::string float_json(double val) {
     return float_repr(val);
 }
 
-// recursively convert value to JSON string
-// TODO: avoid circular references
 static void value_to_json_internal(std::ostringstream & oss, const value & val, int curr_lvl, int indent, const std::string_view item_sep, const std::string_view key_sep) {
     auto indent_str = [indent, curr_lvl]() -> std::string {
         return (indent > 0) ? std::string(curr_lvl * indent, ' ') : "";
@@ -1657,7 +1612,7 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
         }
         oss << "]";
     } else if (is_val<value_object>(val)) {
-        const auto & obj = val->as_ordered_object(); // IMPORTANT: need to keep exact order
+        const auto & obj = val->as_ordered_object();
         oss << "{";
         if (!obj.empty()) {
             oss << newline();
@@ -1689,7 +1644,6 @@ std::string value_to_json(const value & val, int indent, const std::string_view 
     return oss.str();
 }
 
-// TODO: avoid circular references
 std::string value_to_string_repr(const value & val) {
     if (is_val<value_string>(val)) {
         const std::string val_str = val->as_string().str();
@@ -1704,7 +1658,6 @@ std::string value_to_string_repr(const value & val) {
     }
 }
 
-// stats utility
 void value_t::stats_t::mark_used(value & val, bool deep) {
     val->stats.used = true;
     if (deep) {
@@ -1721,4 +1674,4 @@ void value_t::stats_t::mark_used(value & val, bool deep) {
     }
 }
 
-} // namespace jinja
+}

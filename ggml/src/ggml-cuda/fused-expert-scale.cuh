@@ -1,24 +1,8 @@
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 #pragma once
 
 #include "common.cuh"
-
-
-
 
 void ggml_cuda_fused_expert_x16_scaled(
         const float * x, __half * y, int32_t * row_k,

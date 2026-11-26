@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Shield, ShieldOff } from '@lucide/svelte';
 	import * as AlertDialog from '$lib/components/ui/alert-dialog';
 	import { Checkbox } from '$lib/components/ui/checkbox';
@@ -59,15 +60,15 @@
 				for="include-sensitive"
 			>
 				{#if includeSensitiveData}
-					<span class="text-destructive">Include sensitive data (not recommended)</span>
+					<span class="text-destructive">{tr("Include sensitive data (not recommended)")}</span>
 				{:else}
-					<span>Include sensitive data</span>
+					<span>{tr("Include sensitive data")}</span>
 				{/if}
 			</Label>
 		</div>
 
 		<AlertDialog.Footer>
-			<AlertDialog.Cancel onclick={onCancel}>Cancel</AlertDialog.Cancel>
+			<AlertDialog.Cancel onclick={onCancel}>{tr("Cancel")}</AlertDialog.Cancel>
 
 			<AlertDialog.Action
 				class="bg-destructive text-white hover:bg-destructive/80"

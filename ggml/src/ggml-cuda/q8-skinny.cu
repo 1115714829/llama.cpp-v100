@@ -1,8 +1,4 @@
-// Q8_0 skinny GEMM for sm_70 (Volta).
-//
-// Adapted from 1Cat-vLLM csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu (Apache-2.0). The QPN8
-// execution layout is derived from dnv2003/v100-skinny (MIT) and its block-scale adaptation
-// in haohervchb/sglang-V100. See licenses/LICENSE-v100-skinny in the repository root.
+// Portions from 1Cat-vLLM, v100-skinny and haohervchb/sglang-V100; see licenses/LICENSE-1Cat-vLLM and licenses/LICENSE-v100-skinny.
 
 #include "common.cuh"
 #include "convert.cuh"
@@ -14,7 +10,6 @@
 #include <algorithm>
 #include <vector>
 
-// sentinel object whose address tags a repacked tensor (not const: it is stored in tensor->extra)
 static char q8_skinny_marker = 0;
 
 static int q8_skinny_split_k(const int64_t k) {
@@ -31,26 +26,18 @@ static int q8_skinny_split_k(const int64_t k) {
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
-// ---- int8 decoder (replaces the 1Cat FP8 decoder) ----
-
-// Byte i of q.x and q.y hold the two int8 values of the i-th half2. Xor flips the sign bit,
-// so each byte becomes an offset-binary u in [0, 255]. Byte i of x and y are merged into
-// (1024 + u0, 1024 + u1) with the f16 bits of 1024 (0x6400) or-ed in: 1024..1279 are exactly
-// representable in f16, so subtracting 1152 gives the signed values without rounding.
 __device__ __forceinline__ void s8x8_to_half2x4(uint2 q, half2 out[4]) {
     const unsigned x = q.x ^ 0x80808080u;
     const unsigned y = q.y ^ 0x80808080u;
-    const unsigned bias_bits = 0x64806480u; // f16 1152, 1152
+    const unsigned bias_bits = 0x64806480u;
     const half2 bias = *reinterpret_cast<const half2 *>(&bias_bits);
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        // bytes (x_i, x_0, y_i, x_0): the two filler bytes are masked off before or-ing in 0x64
+
         const unsigned packed = (__byte_perm(x, y, 0x0400u + 0x0101u*i) & 0x00FF00FFu) | 0x64006400u;
         out[i] = __hsub2(*reinterpret_cast<const half2 *>(&packed), bias);
     }
 }
-
-// ---- 1Cat fp8_qpn8_sm70.cu:168-175 (mma.m8n8k4 macro, unchanged) ----
 
 #define Q8_SKINNY_MMA_8N8K4(C, A0, A1, B0, B1)                       \
   asm volatile(                                                      \
@@ -61,10 +48,6 @@ __device__ __forceinline__ void s8x8_to_half2x4(uint2 q, half2 out[4]) {
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                           \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
-// ---- repack: Q8_0 row-major -> codes + scales ----
-
-// One CTA per tile. src points at the first tile of the range, codes at its codes
-// destination and scales at the full scales array indexed by the global tile.
 __global__ void q8_skinny_repack_kernel(const uint8_t * __restrict__ src, uint8_t * __restrict__ codes,
                                         half * __restrict__ scales, int n, int k, int tile0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
@@ -93,15 +76,10 @@ __global__ void q8_skinny_repack_kernel(const uint8_t * __restrict__ src, uint8_
 #endif
 }
 
-// ---- dequantize: codes -> dense F16 [N][K], same layout as the Q8_0 to F16 conversion ----
-
-// One CTA per tile of 32 rows and 8 groups (128 K). A code word decodes to one output row,
-// so warps stage the decoded values in shared memory first. That keeps the stores to global
-// memory coalesced along K instead of one 4-byte store per row.
 __global__ void q8_skinny_to_f16_kernel(half * __restrict__ output, const uint8_t * __restrict__ codes,
                                         const half * __restrict__ scales, int n, int k) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
-    // 64 half2 per row plus 4 half2 of padding
+
     __shared__ __align__(8) half2 tile_smem[32][8 * 8 + 4];
 
     const int lane   = threadIdx.x & 31;
@@ -111,7 +89,6 @@ __global__ void q8_skinny_to_f16_kernel(half * __restrict__ output, const uint8_
     const int g0     = blockIdx.x * 8;
     const int group  = g0 + warp;
 
-    // warp `warp` decodes group `g0 + warp` into the rows of the tile
     if (group < groups) {
         const uint4 packed =
             reinterpret_cast<const uint4 *>(codes)[((size_t) tile * groups + group) * 32 + lane];
@@ -129,7 +106,6 @@ __global__ void q8_skinny_to_f16_kernel(half * __restrict__ output, const uint8_
     }
     __syncthreads();
 
-    // 4 rows per warp, 2 half2 (8 bytes) per lane and row
     const int groups_here = groups - g0 < 8 ? groups - g0 : 8;
     half * out_tile = output + (size_t) tile * 32 * k + g0 * 16;
 #pragma unroll
@@ -145,8 +121,6 @@ __global__ void q8_skinny_to_f16_kernel(half * __restrict__ output, const uint8_
     GGML_UNUSED_VARS(output, codes, scales, n, k);
 #endif
 }
-
-// ---- 1Cat fp8_qpn8_sm70.cu:207-432 (main kernel, adapted) ----
 
 template <int SplitK, int NAcc, bool PrefetchCodes, bool M1Only = false, int RowTiles = 1>
 __global__ void q8_skinny_kernel(
@@ -281,7 +255,6 @@ __global__ void q8_skinny_kernel(
     }
     __syncthreads();
 
-    // fixed reduction order over the split-K warps keeps the result reproducible
     constexpr int kOutputElements = M1Only ? 32 : RowTiles * 256;
     for (int element = threadIdx.x; element < kOutputElements;
          element += blockDim.x) {
@@ -306,17 +279,6 @@ __global__ void q8_skinny_kernel(
 #endif
 }
 
-// ---- the up projection of a hyper-connection mixer with the DSV4_HC_PRE that reads it ----
-
-// qwen4exp build_hc_mix: gate = up(lo) is [n_embd, HC, T] (column c * n_embd + d of the up weight is
-// channel d of stream c), and hc_pre mixes it right away: mixed[t][d] = scale * sum_c xn[t][c][d] *
-// sigmoid(gate[t][c][d]). One CTA per 32 channels runs the HC tiles of those channels (tile
-// c * n_embd / 32 + blockIdx.x), each on SplitK warps exactly as q8_skinny_kernel runs a tile (the same
-// loop, accumulator chains, shared-memory partials and reduction order), writes the gate as
-// q8_skinny_kernel writes its output, and then computes mixed with the expressions of
-// dsv4_hc_pre_f32<true, *> (the streams in order 0..HC-1), so gate and mixed are bitwise those of the
-// two kernels. Strata computes its mixer output in the epilogue of its up kernel as well (Strata
-// src/kernels/cuda/fused_gr.cu, gr_up_kernel: 80 blocks of 32 channels x 4 streams).
 template <int SplitK, int NAcc, bool M1Only, int RowTiles, int HC>
 __global__ void __launch_bounds__(32 * SplitK * HC) q8_skinny_hc_up_pre_kernel(
     const uint8_t * __restrict__ codes, const half * __restrict__ scales,
@@ -346,7 +308,6 @@ __global__ void __launch_bounds__(32 * SplitK * HC) q8_skinny_hc_up_pre_kernel(
                              (size_t) tile * groups_k16 * 32 + lane;
     const half * scale_ptr = scales + tile * 32 + lane;
 
-    // q8_skinny_kernel<SplitK, NAcc, false, M1Only, RowTiles>
     float accum[RowTiles][NAcc][8];
 #pragma unroll
     for (int row_tile = 0; row_tile < RowTiles; ++row_tile) {
@@ -441,8 +402,6 @@ __global__ void __launch_bounds__(32 * SplitK * HC) q8_skinny_hc_up_pre_kernel(
     }
     __syncthreads();
 
-    // the fixed reduction order of q8_skinny_kernel over the split-K warps; the gate of each element
-    // stays in partials[s][0] (only the thread that sums an element reads it)
     for (int e = threadIdx.x; e < HC * kOutputElements; e += blockDim.x) {
         const int s       = e / kOutputElements;
         const int element = e - s * kOutputElements;
@@ -465,7 +424,6 @@ __global__ void __launch_bounds__(32 * SplitK * HC) q8_skinny_hc_up_pre_kernel(
     }
     __syncthreads();
 
-    // dsv4_hc_pre_f32<true, *> for channels blockIdx.x * 32 .. + 31
     for (int e = threadIdx.x; e < 32 * m; e += blockDim.x) {
         const int t = e >> 5;
         const int d = blockIdx.x * 32 + (e & 31);
@@ -488,11 +446,6 @@ __global__ void __launch_bounds__(32 * SplitK * HC) q8_skinny_hc_up_pre_kernel(
 #endif
 }
 
-// ---- multiple projections of one input in one launch ----
-
-// One segment is a repacked weight (N is a multiple of 32) plus its output tile range.
-// first_tile is the running sum of n / 32 over the previous segments, so a CTA finds its
-// segment from blockIdx.x with a short scan.
 struct q8_skinny_multi_seg {
     const uint8_t * codes;
     const half *    scales;
@@ -501,10 +454,6 @@ struct q8_skinny_multi_seg {
     int             first_tile;
 };
 
-// A narrow weight (N is not a multiple of 32, e.g. ssm_beta/ssm_alpha at 12) keeps the
-// standard Q8_0 rows: K/32 blocks of 34 bytes per row, half d first, then 32 int8.
-// One warp computes one row for all M tokens. Like the repacked tiles above, first_row
-// is a running sum of n_rows.
 struct q8_skinny_multi_dot {
     const uint8_t * rows;
     int             n_rows;
@@ -512,7 +461,6 @@ struct q8_skinny_multi_dot {
     int             first_row;
 };
 
-// Passed by value. The repacked tiles come first in the grid, the dot rows follow.
 struct q8_skinny_multi_params {
     q8_skinny_multi_seg seg[4];
     q8_skinny_multi_dot dot[4];
@@ -525,8 +473,6 @@ struct q8_skinny_multi_params {
     int m;
 };
 
-// Same execution as q8_skinny_kernel, but each CTA picks its segment from blockIdx.x and
-// writes to that segment's dst with its own row length. The dot CTAs have no split-K.
 template <int SplitK, int NAcc, bool M1Only = false, int RowTiles = 1>
 __global__ void q8_skinny_multi_kernel(const q8_skinny_multi_params p) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
@@ -540,10 +486,7 @@ __global__ void q8_skinny_multi_kernel(const q8_skinny_multi_params p) {
     const int warp = threadIdx.x >> 5;
 
     if ((int) blockIdx.x >= p.n_main_tiles) {
-        // One narrow row per CTA: all threads split K, so that each warp step reads exactly one
-        // Q8_0 block (a broadcast scale and 32 contiguous quants), then the block reduces in a
-        // fixed order. With one warp per row the K loop was latency bound and these few rows
-        // outlasted all repacked tiles of the launch.
+
         const int row_all = (int) blockIdx.x - p.n_main_tiles;
         int seg = 0;
         while (seg + 1 < p.n_dot && row_all >= p.dot[seg + 1].first_row) {
@@ -569,7 +512,6 @@ __global__ void q8_skinny_multi_kernel(const q8_skinny_multi_params p) {
             }
         }
 
-        // the partials buffer holds at least 16 values per warp (SplitK * 256 >= warps * 16)
         float * red = &partials[0][0];
         const int n_warps = blockDim.x >> 5;
 #pragma unroll
@@ -712,7 +654,6 @@ __global__ void q8_skinny_multi_kernel(const q8_skinny_multi_params p) {
     }
     __syncthreads();
 
-    // fixed reduction order over the split-K warps keeps the result reproducible
     constexpr int kOutputElements = M1Only ? 32 : RowTiles * 256;
     for (int element = threadIdx.x; element < kOutputElements;
          element += blockDim.x) {
@@ -737,11 +678,6 @@ __global__ void q8_skinny_multi_kernel(const q8_skinny_multi_params p) {
 #endif
 }
 
-// ---- 1Cat fp8_qpn8_sm70.cu:588-770 (gated pair kernel, adapted) ----
-
-// gate and up are two separate tensors instead of one combined weight: projection p
-// (0 = gate, 1 = up) reads its own codes/scales, both for the tile at blockIdx.x. The
-// epilogue applies silu(gate) * up and writes float.
 template <int SplitK, int NAcc, bool PrefetchCodes, bool M1Only = false, int RowTiles = 1>
 __global__ void q8_skinny_gated_kernel(
     const uint8_t * __restrict__ gate_codes, const half * __restrict__ gate_scales,
@@ -907,8 +843,6 @@ __global__ void q8_skinny_gated_kernel(
 #endif
 }
 
-// Static split-K/accumulator-chain/prefetch table from 1Cat's sm_70 measurements
-// (fp8.py:121-129). Shapes outside the table keep the generic rule.
 struct q8_skinny_config {
     int  split_k;
     int  n_acc;
@@ -921,8 +855,7 @@ static q8_skinny_config q8_skinny_config_for(const int64_t n, const int64_t k) {
     }
     if (k == 5120) {
         if (n == 4352) {
-            // 1Cat's unfused gate/up (5120, 8704) also uses one chain with prefetching;
-            // here that weight is two separate (5120, 4352) tensors
+
             return {16, 1, true};
         }
         return {16, 2, false};
@@ -930,7 +863,6 @@ static q8_skinny_config q8_skinny_config_for(const int64_t n, const int64_t k) {
     return {q8_skinny_split_k(k), k >= 4096 ? 2 : 1, false};
 }
 
-// The multi-weight kernel never prefetches, so the K=5120/N=4352 special case is not used.
 static q8_skinny_config q8_skinny_multi_config_for(const int64_t k) {
     if (k == 4352 || k == 1536) {
         return {16, 1, false};
@@ -964,7 +896,7 @@ static void q8_skinny_mul_mat_launch(const uint8_t * codes, const half * scales,
                                      float * output, int n, int k, int m, cudaStream_t stream) {
     const q8_skinny_config config = q8_skinny_config_for(n, k);
     if (config.prefetch) {
-        // only (K=5120, N=4352) selects prefetching, always at split 16 with one chain
+
         GGML_ASSERT(config.split_k == 16 && config.n_acc == 1);
         if (m == 1) {
             q8_skinny_launch<16, 1, true, true, 1>(codes, scales, input, output, n, k, m, stream);
@@ -985,14 +917,6 @@ static void q8_skinny_mul_mat_launch(const uint8_t * codes, const half * scales,
 
 #undef Q8_SKINNY_LAUNCH
 
-// ---- 1Cat fp8_qpn8_sm70.cu:445-573 (M=32 two-phase kernel, adapted) ----
-
-// M=32 needs four 8-row accumulator tiles. Keeping all logical split-K warps resident would
-// need 64 KiB of reduction storage for split-16, so half of the physical warps run the
-// original logical warp ranges in two ordered phases. The compact first-half sum keeps the
-// final reduction in the p0 + ... + p(SplitK-1) order at 36 KiB of shared memory. As in
-// q8_skinny_kernel, the FP8 decoder is replaced by s8x8_to_half2x4 plus the Q8_0 block
-// scale (one scale per two 16-element groups).
 template <int SplitK>
 __global__ void q8_skinny_m32_kernel(
     const uint8_t * __restrict__ codes, const half * __restrict__ scales,
@@ -1114,8 +1038,6 @@ __global__ void q8_skinny_m32_kernel(
 #endif
 }
 
-// Only split-16 is enabled in the launcher below: the shapes that reach M > 16 all select
-// split 16, and the kernel keeps the 1Cat split-12 variant unused.
 static void q8_skinny_m32_mul_mat_launch(const uint8_t * codes, const half * scales,
                                          const half * input, float * output, int n, int k, int m,
                                          cudaStream_t stream) {
@@ -1125,9 +1047,6 @@ static void q8_skinny_m32_mul_mat_launch(const uint8_t * codes, const half * sca
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Dispatches an already F16-converted input: M <= 16 keeps the single-stage kernel, M = 17..32
-// uses the two-phase M=32 kernel and M = 33..64 runs it on two row blocks. Shapes whose
-// split-K is not 16 have no M > 16 kernel and return false so the caller can fall back.
 static bool q8_skinny_mul_mat_dispatch(const uint8_t * codes, const half * scales,
                                        const half * input, float * output, int n, int k, int m,
                                        cudaStream_t stream) {
@@ -1175,7 +1094,6 @@ static void q8_skinny_gated_mul_mat_launch(const uint8_t * gate_codes, const hal
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Same epilogue as q8_skinny_gated_kernel, applied after both projections of an M > 16 run.
 __global__ void q8_skinny_swiglu_kernel(float * __restrict__ gate, const float * __restrict__ up,
                                         int count) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x) {
@@ -1186,7 +1104,7 @@ __global__ void q8_skinny_swiglu_kernel(float * __restrict__ gate, const float *
 
 template <int SplitK, int NAcc, bool M1Only, int RowTiles>
 static void q8_skinny_multi_launch(const q8_skinny_multi_params & p, cudaStream_t stream) {
-    // one CTA per narrow row after the repacked tiles
+
     const int n_tiles = p.n_main_tiles + p.n_dot_rows;
     q8_skinny_multi_kernel<SplitK, NAcc, M1Only, RowTiles><<<n_tiles, 32 * SplitK, 0, stream>>>(p);
 }
@@ -1215,20 +1133,6 @@ static void q8_skinny_multi_mul_mat_launch(const q8_skinny_multi_params & p, cud
 
 #undef Q8_SKINNY_MULTI_LAUNCH
 
-// ---- split-K over several CTAs per tile, for weights with few 32-column tiles ----
-
-// Loads of one warp's K range [group_begin, group_end) issued ahead of their use: code words and
-// scales Depth groups ahead, the input A fragments InDepth groups ahead. The arithmetic of a
-// group and the order of its four mma are those of q8_skinny_kernel, so the accumulators are
-// bitwise the same. Two code-generation rules keep the loads in flight (checked on the SASS
-// scoreboard bits):
-//  - the loads are unconditional, the group index clamped to the last group of the range (the
-//    clamped reloads are never consumed), and the scales sit in 32-bit registers: a conditional
-//    16-bit reload compiles to a byte permute that merges the new value into the old register
-//    and waits for the load at once;
-//  - a slot is consumed before its refill is issued: refilling while the old value is still
-//    live makes the compiler load into temporaries and move them into the slot, and the move
-//    waits for the load at once.
 template <int NAcc, int RowTiles, int Depth, int InDepth>
 static __device__ __forceinline__ void q8_skinny_warp_loop_ahead(
         const uint4 * __restrict__ code_ptr, const half * __restrict__ scale_ptr, const int n,
@@ -1267,15 +1171,12 @@ static __device__ __forceinline__ void q8_skinny_warp_loop_ahead(
         }
     }
 
-    // full chunks of Depth groups: one basic block per chunk, so that the decode of a group can be
-    // scheduled into the mma latency of the previous one; then the remaining groups
     int base = group_begin;
     for (; base + Depth <= group_end; base += Depth) {
 #pragma unroll
         for (int slot = 0; slot < Depth; ++slot) {
             const int group = base + slot;
-            // base - group_begin is a multiple of Depth, hence of InDepth: the input fragments
-            // of this group sit in slot % InDepth
+
             const int in_slot     = slot % InDepth;
             const int group_code  = min(group + Depth, group_last);
             const int group_input = min(group + InDepth, group_last);
@@ -1320,8 +1221,7 @@ static __device__ __forceinline__ void q8_skinny_warp_loop_ahead(
             if (group >= group_end) {
                 break;
             }
-            // base - group_begin is a multiple of Depth, hence of InDepth: the input fragments
-            // of this group sit in slot % InDepth
+
             const int in_slot     = slot % InDepth;
             const int group_code  = min(group + Depth, group_last);
             const int group_input = min(group + InDepth, group_last);
@@ -1361,21 +1261,6 @@ static __device__ __forceinline__ void q8_skinny_warp_loop_ahead(
     }
 }
 
-// A narrow weight puts only N/32 CTAs on the GPU (the hyper-connection down projection of
-// Qwen3.8-Flash-Next, N = 320, is 10 CTAs; the shared expert gate/up, N = 640, is 20), and even a
-// kernel that only streams the codes reaches about 200 GB/s on 10 SMs: the memory concurrency of
-// a few SMs bounds it, not DRAM. Here the SplitK warps of a tile are spread over Parts CTAs.
-// Every warp runs the K range and the accumulator chains it has in q8_skinny_kernel (or
-// q8_skinny_gated_kernel), with its loads issued ahead, and stores its chain-summed partial tile
-// to a global scratch. The last CTA of the tile (one atomic counter per tile) then adds the
-// SplitK partials in warp order, as the shared-memory reduction of those kernels does, so the
-// output is bitwise the same. It also resets the counter: counters are zero between launches.
-// Gated: the first SplitK / Parts warps of a CTA run the gate weight, the others the up weight,
-// and the epilogue writes silu(gate) * up.
-// Epilogue of the last CTA of a tile: write the result (F32); write silu(epi_scale * sum) rounded to
-// F16 into output_f16 (the SCALE -> UNARY(SILU) -> F32 -> F16 conversion before the up projection of
-// a qwen4exp hyper-connection mixer, with the expressions of those kernels); or write the result
-// rounded to F16 (the F32 -> F16 conversion before the down projection of a gated pair).
 enum q8_skinny_epilogue {
     Q8_SKINNY_EPI_F32,
     Q8_SKINNY_EPI_SCALE_SILU_F16,
@@ -1394,9 +1279,7 @@ __global__ void __launch_bounds__((Gated ? 64 : 32) * (SplitK / Parts)) q8_skinn
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     static_assert(Parts > 1 && SplitK % Parts == 0, "Q8 skinny split: the parts must divide split-K");
     if constexpr (Epilogue == Q8_SKINNY_EPI_F16) {
-        // The CTAs after those of the tiles run the narrow F32 projections that read the same input
-        // (the qwen4exp shared expert gate next to the shared expert gate/up pair), each warp one warp of
-        // their split GEMV (mmvf-narrow.cuh), so they are bitwise those of the separate launch.
+
         const int n_main_ctas = (n / 32) * Parts;
         if ((int) blockIdx.x >= n_main_ctas) {
             const int vwarp = ((int) blockIdx.x - n_main_ctas) * (int) (blockDim.x / WARP_SIZE) + (int) (threadIdx.x / WARP_SIZE);
@@ -1416,7 +1299,7 @@ __global__ void __launch_bounds__((Gated ? 64 : 32) * (SplitK / Parts)) q8_skinn
     const int projection    = warp_in_block / kWarps;
     const int part          = blockIdx.x % Parts;
     const int tile          = blockIdx.x / Parts;
-    // the split-K warp of the single-CTA kernels this warp stands for
+
     const int warp          = part * kWarps + (warp_in_block - projection * kWarps);
     const int quadpair      = (lane >> 2) & 3;
     const int row           = (lane & 3) + ((lane & 16) ? 4 : 0);
@@ -1453,7 +1336,6 @@ __global__ void __launch_bounds__((Gated ? 64 : 32) * (SplitK / Parts)) q8_skinn
         }
     }
 
-    // [tile][projection][split-K warp][element], the element order of the shared-memory partials
     float * warp_partials = scratch + ((size_t) (tile * kProj + projection) * SplitK + warp) * kElements;
     if constexpr (M1Only) {
         if ((lane & 17) == 0) {
@@ -1482,7 +1364,6 @@ __global__ void __launch_bounds__((Gated ? 64 : 32) * (SplitK / Parts)) q8_skinn
         }
     }
 
-    // publish the partials, then count this CTA; the last one of the tile reduces
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -1498,7 +1379,6 @@ __global__ void __launch_bounds__((Gated ? 64 : 32) * (SplitK / Parts)) q8_skinn
         return __ldcg(tile_partials + index);
     };
 
-    // fixed reduction order over the split-K warps, as in q8_skinny_kernel / q8_skinny_gated_kernel
     for (int element = threadIdx.x; element < kElements; element += blockDim.x) {
         float value = 0.0f;
 #pragma unroll
@@ -1525,11 +1405,11 @@ __global__ void __launch_bounds__((Gated ? 64 : 32) * (SplitK / Parts)) q8_skinn
         }
         if (out_valid) {
             if constexpr (Epilogue == Q8_SKINNY_EPI_SCALE_SILU_F16) {
-                // scale_silu_kernel, then the F32 -> F16 conversion
+
                 const float v = epi_scale * value;
                 output_f16[out_index] = __float2half(ggml_cuda_op_silu_single(v));
             } else if constexpr (Epilogue == Q8_SKINNY_EPI_F16) {
-                // the F32 -> F16 conversion
+
                 output_f16[out_index] = __float2half(value);
             } else {
                 output[out_index] = value;
@@ -1545,10 +1425,8 @@ __global__ void __launch_bounds__((Gated ? 64 : 32) * (SplitK / Parts)) q8_skinn
 #endif
 }
 
-// Weights with at most this many 32-column tiles take the split kernel.
 static constexpr int q8_skinny_split_max_tiles = 32;
 
-// Parts per tile: about 80 CTAs (one per V100 SM), a power of two that divides split-K, at most 8.
 static int q8_skinny_split_parts(const int tiles, const int split_k) {
     int parts = 2;
     while (parts * 2 <= split_k && parts * 2 <= 8 && tiles * parts * 2 <= 80) {
@@ -1562,17 +1440,12 @@ static size_t q8_skinny_split_scratch_floats(const int n, const int split_k, con
     return (size_t) (n / 32) * (gated ? 2 : 1) * split_k * elements;
 }
 
-// Load depths from the cold-weight benchmark (tests/bench-q8-skinny-cold.cpp): code words 9
-// groups ahead and input fragments 3 ahead for one row tile, 4 and 2 for two row tiles and for
-// the gated pair (two projections per CTA).
-// output for Q8_SKINNY_EPI_F32, output_f16 and epi_scale for Q8_SKINNY_EPI_SCALE_SILU_F16
 struct q8_skinny_split_out {
     float * output;
     half *  output_f16;
     float   epi_scale;
     int     epilogue;
-    // Q8_SKINNY_EPI_F16 (the gated pair) only: narrow F32 projections of the same input run by extra
-    // CTAs (nrows = 0: none)
+
     mmvf_narrow_side_rows side;
 };
 
@@ -1608,9 +1481,6 @@ static void q8_skinny_split_launch_one_d(const uint8_t * codes0, const half * sc
     }
 }
 
-// Load depths from the cold-weight benchmark (tests/bench-q8-skinny-cold.cpp, chunked ring): code
-// words 8 groups ahead and input fragments 4 ahead for one row tile, 4 and 4 for the gated pair
-// (two projections per CTA), 4 and 2 for two row tiles.
 template <int SplitK, int NAcc, int Parts, bool Gated, bool M1Only, int RowTiles>
 static void q8_skinny_split_launch_one(const uint8_t * codes0, const half * scales0, const uint8_t * codes1,
                                        const half * scales1, const half * input, const q8_skinny_split_out & out,
@@ -1664,7 +1534,6 @@ static void q8_skinny_split_launch_m(const uint8_t * codes0, const half * scales
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Single weight on the split kernel, with the split-K and chain count of q8_skinny_config_for().
 static void q8_skinny_split_launch_single(const q8_skinny_config & config, const uint8_t * codes, const half * scales,
                                           const half * input, const q8_skinny_split_out & out, float * scratch,
                                           unsigned int * counters, int n, int k, int m, cudaStream_t stream) {
@@ -1679,7 +1548,7 @@ static void q8_skinny_split_launch_single(const q8_skinny_config & config, const
     }
 }
 
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif
 
 bool ggml_cuda_q8_skinny_is_repacked(const ggml_tensor * t) {
     return t->extra == (const void *) &q8_skinny_marker;
@@ -1707,11 +1576,7 @@ bool ggml_cuda_q8_skinny_can_repack(const ggml_tensor * t) {
     }
     const int64_t k = t->ne[0];
     const int64_t n = t->ne[1];
-    // the small-M kernel needs a split-K that divides the group count; the N >= 32 bound only
-    // keeps the tile grid non-empty. Small-N weights (wk/wv at 256, ...) usually run in a
-    // group of projections that share the input, the multi-weight kernel below handles them.
-    // k >= 32: under tensor split a device can hold an empty K slice (e.g. attn_output on a
-    // device that gets no attention heads); such a weight is never multiplied, leave it as is.
+
     return k >= 32 && k % 32 == 0 && n % 32 == 0 && n >= 32 && q8_skinny_split_k(k) != 0;
 #endif
 }
@@ -1744,10 +1609,6 @@ void ggml_cuda_q8_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_te
     CUDA_CHECK(cudaMalloc(&staging, tiles_per_chunk * tile_src_bytes));
     CUDA_CHECK(cudaMalloc(&scales_tmp, scales_bytes));
 
-    // Chunk [t0, t1) writes codes to [t0*32K, t1*32K), which ends before the source
-    // [t1*34K, ...) of the remaining tiles, and its own source was copied to staging first.
-    // The scales region [N*K, N*K*17/16) overlaps the sources of the last tiles, so it is
-    // written only after all codes are done.
     for (int64_t t0 = 0; t0 < ntiles; t0 += (int64_t) tiles_per_chunk) {
         const int64_t t1 = std::min(t0 + (int64_t) tiles_per_chunk, ntiles);
         CUDA_CHECK(cudaMemcpyAsync(staging, data + t0 * tile_src_bytes, (t1 - t0) * tile_src_bytes,
@@ -1759,7 +1620,6 @@ void ggml_cuda_q8_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_te
     }
     CUDA_CHECK(cudaMemcpyAsync(data + n * k, scales_tmp, scales_bytes, cudaMemcpyDeviceToDevice, stream));
 
-    // no pool: the staging must not stay resident after the one-time repack
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(staging));
     CUDA_CHECK(cudaFree(scales_tmp));
@@ -1768,13 +1628,11 @@ void ggml_cuda_q8_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_te
 }
 
 void ggml_cuda_q8_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph) {
-    // Skipping the scan is safe: a weight that is missed stays on the regular path and only
-    // loses the acceleration, the result is still correct. A new model gets a new context.
+
     if (ctx.q8_skinny_idle_scans >= 1024) {
         return;
     }
 
-    // candidates: Q8_0 weights used as MUL_MAT src0; none in steady state
     std::vector<ggml_tensor *> candidates;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -1795,16 +1653,12 @@ void ggml_cuda_q8_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * 
     }
     ctx.q8_skinny_idle_scans = 0;
 
-    // repacking cannot be recorded into a CUDA graph; the capture is checked only here so that
-    // the steady state costs no CUDA API call
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture_status));
     if (capture_status != cudaStreamCaptureStatusNone) {
         return;
     }
 
-    // Repacked data can only be read by the new kernel, so drop candidates that are read
-    // anywhere else (non-MUL_MAT src, MUL_MAT src1) or viewed by another tensor.
     for (int i = 0; i < cgraph->n_nodes && !candidates.empty(); ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (node->view_src != nullptr) {
@@ -1832,7 +1686,6 @@ void ggml_cuda_q8_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * 
     }
 }
 
-// The shapes ggml_cuda_q8_skinny_mul_mat covers (src0 is a repacked weight).
 static bool q8_skinny_mul_mat_covers(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
     const int64_t k = src0->ne[0];
     const int64_t n = src0->ne[1];
@@ -1934,7 +1787,6 @@ bool ggml_cuda_q8_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const gg
         return true;
     }
 
-    // M = 17..64: run both projections with the M=32 kernel, then the SwiGLU epilogue
     float * gate = (float *) dst->data;
     ggml_cuda_pool_alloc<float> up(ctx.pool(), n * m);
     const bool gate_ok = q8_skinny_mul_mat_dispatch(gate_data, (const half *) (gate_data + n * k),
@@ -1962,8 +1814,6 @@ bool ggml_cuda_q8_skinny_hc_down_up_supported(const ggml_tensor * w_down, const 
            q8_skinny_split_k(k_down) != 0 && w_up->ne[0] == n_down && q8_skinny_split_k(n_down) != 0;
 }
 
-// Fills the side rows of a split launch: the narrow F32 projection w (rows after the first_counter
-// counters of the launch) of the F32 input src1 into dst; the scratch comes from the caller.
 static void q8_skinny_side_rows_set(mmvf_narrow_side_rows & side, ggml_cuda_pool_alloc<float> & side_scratch,
                                     unsigned int * counters, int first_counter, const ggml_tensor * w,
                                     const ggml_tensor * src1, ggml_tensor * dst, int64_t k, int64_t m) {
@@ -1995,7 +1845,6 @@ void ggml_cuda_q8_skinny_hc_down_up(ggml_backend_cuda_context & ctx, const ggml_
     const int64_t n_up   = w_up->ne[1];
     unsigned int * counters = ctx.tile_counters + ctx.curr_stream_no * GGML_CUDA_MAX_SPLIT_TILES;
 
-    // down: split kernel, the last CTA of a tile writes silu(scale * sum) as F16
     const q8_skinny_config config = q8_skinny_config_for(n_down, k_down);
     ggml_cuda_pool_alloc<half>  lo(ctx.pool(), m * n_down);
     ggml_cuda_pool_alloc<float> scratch(ctx.pool(), q8_skinny_split_scratch_floats((int) n_down, config.split_k, false, (int) m));
@@ -2004,7 +1853,6 @@ void ggml_cuda_q8_skinny_hc_down_up(ggml_backend_cuda_context & ctx, const ggml_
     q8_skinny_split_launch_single(config, down, (const half *) (down + n_down * k_down), input, out, scratch.get(),
                                   counters, (int) n_down, (int) k_down, (int) m, ctx.stream());
 
-    // up: reads the F16 activations directly; with the hc_pre mixer in its epilogue if requested
     if (pre_mixed != nullptr) {
         ggml_cuda_q8_skinny_hc_up_pre(ctx, w_up, lo.get(), m, gate, pre_xn, pre_mixed, pre_mixed_f16, pre_scale);
         return;
@@ -2015,9 +1863,6 @@ void ggml_cuda_q8_skinny_hc_down_up(ggml_backend_cuda_context & ctx, const ggml_
     GGML_ASSERT(ok);
 }
 
-// The hc_pre mixer in the epilogue of the up projection: hc = 4 streams, the configuration that
-// q8_skinny_mul_mat_launch() takes for this weight is split 4 with one chain and no prefetching (the
-// qwen4exp up projection, K = hc_lr = 320), and the tiles of one CTA fit its shared memory.
 bool ggml_cuda_q8_skinny_hc_up_pre_supported(const ggml_tensor * w_up, int64_t m, int64_t hc) {
     if (!ggml_cuda_q8_skinny_is_repacked(w_up) || hc != 4 || m < 1 || m > 16) {
         return false;
@@ -2065,7 +1910,7 @@ bool ggml_cuda_q8_skinny_gated_down(ggml_backend_cuda_context & ctx, const ggml_
     const int64_t n = gate_w->ne[1];
     const int64_t m = src1->ne[1];
     const int64_t n_down = down_w->ne[1];
-    // the pair takes the split path (narrow, M <= 16, the checks of ggml_cuda_q8_skinny_mul_mat_gated)
+
     if (!ggml_are_same_shape(gate_w, up_w) ||
             src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
             !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
@@ -2083,8 +1928,6 @@ bool ggml_cuda_q8_skinny_gated_down(ggml_backend_cuda_context & ctx, const ggml_
     GGML_ASSERT(to_fp16 != nullptr);
     to_fp16(src1->data, input.get(), m * k, ctx.stream());
 
-    // the pair: its last CTAs write silu(gate) * up rounded to F16; the narrow F32 projection of the same
-    // input (the shared expert gate), if any, rides along after the tile counters of the pair
     unsigned int * counters = ctx.tile_counters + ctx.curr_stream_no * GGML_CUDA_MAX_SPLIT_TILES;
     ggml_cuda_pool_alloc<half>  act(ctx.pool(), m * n);
     ggml_cuda_pool_alloc<float> scratch(ctx.pool(), q8_skinny_split_scratch_floats((int) n, 8, true, (int) m));
@@ -2099,7 +1942,6 @@ bool ggml_cuda_q8_skinny_gated_down(ggml_backend_cuda_context & ctx, const ggml_
                                          (const half *) (up_data + n * k), input.get(), out,
                                          scratch.get(), counters, (int) n, (int) k, (int) m, ctx.stream());
 
-    // the down projection reads the F16 activations, on the path ggml_cuda_q8_skinny_mul_mat takes
     const uint8_t * down = (const uint8_t *) down_w->data;
     if (n_down / 32 <= q8_skinny_split_max_tiles) {
         const q8_skinny_config config = q8_skinny_config_for(n_down, n);
@@ -2116,7 +1958,6 @@ bool ggml_cuda_q8_skinny_gated_down(ggml_backend_cuda_context & ctx, const ggml_
     return true;
 }
 
-// Checks the nodes of a multi-weight group and fills the launch parameters except the input.
 static bool q8_skinny_multi_prepare(const ggml_tensor * const src0s[4], ggml_tensor * const dsts[4],
                                     int n_nodes, const ggml_tensor * src1, q8_skinny_multi_params & p) {
     if (n_nodes < 2 || n_nodes > 4) {
@@ -2154,8 +1995,7 @@ static bool q8_skinny_multi_prepare(const ggml_tensor * const src0s[4], ggml_ten
             seg.n = (int) n;
             seg.dst = (float *) dst->data;
         } else {
-            // narrow rows keep the row-major Q8_0 layout, the dot path reads them directly;
-            // the M=32 kernel has no dot path, so M > 16 only takes repacked weights
+
             if (m > 16 || w->type != GGML_TYPE_Q8_0 || w->view_src != nullptr ||
                     w->op != GGML_OP_NONE || n % 32 == 0) {
                 return false;
@@ -2212,8 +2052,6 @@ bool ggml_cuda_q8_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
         return true;
     }
 
-    // M = 17..64: the M=32 kernel has no segment/dot dispatch, so each repacked weight gets
-    // its own launch from the one converted input
     for (int s = 0; s < p.n_seg; ++s) {
         const q8_skinny_multi_seg & seg = p.seg[s];
         const bool ok = q8_skinny_mul_mat_dispatch(seg.codes, seg.scales, p.input, seg.dst,
@@ -2233,7 +2071,7 @@ void ggml_cuda_q8_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStream
     CUDA_CHECK(cudaGetLastError());
 }
 
-#else // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#else
 
 void ggml_cuda_q8_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_tensor * t) {
     GGML_UNUSED(ctx);
@@ -2316,4 +2154,4 @@ void ggml_cuda_q8_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStream
     GGML_UNUSED(stream);
 }
 
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif

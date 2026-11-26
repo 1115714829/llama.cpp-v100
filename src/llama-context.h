@@ -13,6 +13,7 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <future>
 #include <map>
 #include <unordered_map>
 #include <vector>
@@ -24,11 +25,9 @@ class llama_moe_cache;
 class llama_io_read_i;
 class llama_io_write_i;
 
-// "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
 
-// stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
     int n_tensors = 0;
     size_t total_size = 0;
@@ -43,8 +42,6 @@ struct llama_memory_buffer {
 
 using llama_memory_buffers = std::map<ggml_backend_buffer_type_t, llama_memory_buffer>;
 
-
-
 struct llama_embd_link {
     ggml_backend_event_t ev_tgt_done  = nullptr;
     ggml_backend_event_t ev_copy_done = nullptr;
@@ -52,14 +49,13 @@ struct llama_embd_link {
     ggml_tensor * t_layer_inp_sink = nullptr;
     ggml_tensor * t_embd_src_sink  = nullptr;
 
-
-
-
-
     ggml_backend_event_t ev_h_tgt_done[2]  = { nullptr, nullptr };
     ggml_backend_event_t ev_h_read_done[2] = { nullptr, nullptr };
     ggml_tensor * t_h_sink_tgt = nullptr;
     int32_t h_sink_group_last = 0;
+    std::shared_future<void> h_submitted[2];
+    uint64_t h_generation = 0;
+    uint64_t h_slot_generation[2] = {};
 
     ~llama_embd_link() {
         ggml_backend_event_free(ev_tgt_done);
@@ -72,35 +68,20 @@ struct llama_embd_link {
 };
 
 struct llama_context {
-    // init scheduler and compute buffers, reserve worst-case graphs
+
     llama_context(
             const llama_model & model,
                   llama_context_params params);
 
     ~llama_context();
 
-    // reserve a new backend scheduler (if needed)
-    // for example, when:
-    //   - changing loras
-    //   - changing samplers
-    //   - changing attention type
-    //   - etc.
     void sched_reserve();
 
     void synchronize();
 
-
-
-
-
-
     void synchronize_outputs();
 
-
-
     void wait_outputs();
-
-
 
     void pipeline_drain();
 
@@ -120,7 +101,6 @@ struct llama_context {
 
     llama_memory_t get_memory() const;
 
-    // return true if the memory was updated
     bool memory_update(bool optimize);
 
     enum llama_pooling_type pooling_type() const;
@@ -173,7 +153,6 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
-
     bool enable_layer_inp_sink(const std::vector<uint32_t> & lids);
 
     bool link_embd(llama_context * ctx_dft);
@@ -182,56 +161,36 @@ struct llama_context {
 
     bool layer_inp_sink_get(size_t token_offset, size_t n_tokens, float * dst);
 
-
     int32_t layer_inp_sink_col(llama_seq_id seq_id, llama_pos pos) const;
 
-
-
-
-
-
     bool enable_h_nextn_sink(bool is_target, uint32_t n_h_rows);
-
 
     bool enable_draft_ring(int32_t n_max, bool with_p);
     void draft_ring_begin(const llama_token * ids, size_t n);
     const llama_token * draft_ring_tokens(int32_t step) const;
     const float       * draft_ring_p     (int32_t step) const;
 
-
     bool link_h_nextn(llama_context * ctx_dft);
 
-
     void set_h_source(bool enable, const int32_t * cols, size_t n_cols);
-
-
 
     void set_h_src_group(int32_t group);
 
     int32_t h_nextn_sink_group() const;
 
-
     void set_h_sink_offset(int32_t offset);
-
 
     void set_h_sink_write(bool write);
 
-
-
     void set_h_sink_first_pos(llama_seq_id seq_id, llama_pos pos_first);
 
-
     bool h_sink_ubatch_skip(const llama_ubatch & ubatch) const;
-
-
 
     bool h_nextn_sink_capture(const int32_t * src_cols, size_t n_cols);
 
     bool h_nextn_sink_get(int32_t group, size_t token_offset, size_t n_tokens, float * dst);
 
     int32_t h_nextn_sink_col(llama_seq_id seq_id, llama_pos pos) const;
-
-
 
     bool synchronize_ubatch(int64_t ubatch_id);
 
@@ -246,12 +205,6 @@ struct llama_context {
                 int32_t   il_start,
                 int32_t   il_end);
 
-    // process a single ubatch with a specific graph type
-    // if memory_context is provided, it will be applied first to the context's memory
-    // ret contains the status of the graph computation
-    // returns nullptr only if ret != GGML_STATUS_SUCCESS
-    // pipeline: submit the ubatch to the prefill pipeline instead of computing it synchronously.
-    // ubatch_id orders the submission and is used later to wait for this ubatch's outputs
     llm_graph_result * process_ubatch(
                 const llama_ubatch & ubatch,
                     llm_graph_type   gtype,
@@ -264,13 +217,8 @@ struct llama_context {
     int encode(const llama_batch_ext & batch_inp);
     int decode(const llama_batch_ext & batch_inp);
 
-    // compat version
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
-
-    //
-    // state save/load
-    //
 
     size_t state_get_size();
     size_t state_get_data(      uint8_t * dst, size_t size);
@@ -305,10 +253,6 @@ struct llama_context {
      const llama_token * tokens,
                 size_t   n_token_count);
 
-    //
-    // perf
-    //
-
     llama_perf_context_data perf_get_data() const;
     void perf_reset();
 
@@ -316,17 +260,10 @@ struct llama_context {
 
     const std::vector<std::pair<std::string, ggml_tensor *>> & get_memory_tensors() const;
 
-
-
     void comm_connect();
-
-    //
-    // training
-    //
 
     void opt_init(struct llama_model * model, struct llama_opt_params lopt_params);
 
-    // TODO: more flexible combinations of logical/physical batch size and context size
     void opt_epoch(
             ggml_opt_dataset_t      dataset,
             ggml_opt_result_t       result_train,
@@ -348,38 +285,22 @@ struct llama_context {
             int64_t                          t_loop_start);
 
 private:
-    //
-    // output
-    //
 
-    // Make sure enough space is available for outputs.
-    // Returns max number of outputs for which space was reserved.
     uint32_t output_reserve(int32_t n_outputs);
 
     void output_reorder();
 
-    // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
-    // async-copy enabled layer-input tensors (per cparams.output_layer_inp)
-    // from backend into host-side embd_layer_inp buffers
     bool extract_layer_inputs(ggml_backend_sched_t sched, const llm_graph_result * res, size_t token_offset, size_t n_tokens);
-
-    //
-    // graph
-    //
 
 public:
     uint32_t graph_max_nodes(uint32_t n_tokens) const;
 
-    // can reuse the llm_graph_result instance of the context (for example to update a memory module)
     llm_graph_result * get_gf_res_reserve() const;
 
-    // returns the result of ggml_backend_sched_graph_compute_async execution
     ggml_status graph_compute(ggml_cgraph * gf, bool batched);
 
-    // reserve a graph with a dummy ubatch of the specified size
-    // n_embd > 0 reserves the graph of an embd ubatch with that row width (e.g. DFlash feature injection)
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr, uint32_t n_embd = 0,
         ggml_backend_sched_t sched_override = nullptr);
@@ -389,12 +310,9 @@ public:
 private:
     llm_graph_result * get_gf_res_prev(int slot);
 
-
     llm_graph_result * get_gf_res_pipe(int stage);
 
-
     int gf_res_slot(const llama_ubatch & ubatch) const;
-
 
     ggml_backend_sched_t sched_for_slot(int slot) const;
 
@@ -410,41 +328,30 @@ private:
 
     ggml_status graph_compute_impl(ggml_backend_sched_t sched, ggml_cgraph * gf, bool batched);
 
-
-
-
     void wait_submitted(ggml_backend_t backend);
-
 
     void graph_set_threads(bool batched);
 
-
-
     void perf_eval_update();
 
-    // create a new backend scheduler for a graph of the specified size and register the callbacks below
     void sched_new(size_t max_nodes, bool parallel);
 
-    // ggml_backend_sched copy callback, copies only the experts used by MUL_MAT_ID and updates the MoE cache
+    void borrow_arm(bool arm);
+    bool independent_draft_scratch = false;
+
+    void borrow_set_phase(bool decode, bool single_token = false);
+
     static bool sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data);
 
-    // ggml_backend_sched realloc callback, counts and traces the graph reallocations of this context
     static void sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph * gf, bool backend_ids_changed, bool graph_size_changed, void * user_data);
 
-    // disable auto fused ops (Flash Attention, Gated Delta Net) whose op lands on a device
-    // that differs from the layer it belongs to (usually due to missing backend support)
     void resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs);
 
-    // TODO: read/write lora adapters and cvec
     size_t state_write_data(llama_io_write_i & io);
     size_t state_read_data (llama_io_read_i  & io);
 
     size_t state_seq_write_data(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags);
     size_t state_seq_read_data (llama_io_read_i  & io, llama_seq_id seq_id, llama_state_seq_flags flags);
-
-    //
-    // members
-    //
 
     const llama_model & model;
 
@@ -453,109 +360,81 @@ private:
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
 
-    llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
+    llama_cross cross;
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
 
-
     std::vector<std::pair<std::string, ggml_tensor *>> memory_tensors;
 
-    // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
 
-    // embeddings output (2-dimensional array: [n_outputs][n_embd])
-    // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};
 
-    // hidden state required by the nextn layers (2-dimensional array: [n_outputs][n_embd])
-    // populated only when cparams.embeddings_nextn is enabled and the model graph
-    // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
 
-    // host buffers for output layer input embeddings, per layer
-    // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
-    std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
-
+    std::vector<int32_t> embd_batch_idxs;
 
     ggml_context_ptr        ctx_sink;
     ggml_backend_buffer_ptr buf_sink;
     ggml_tensor *           t_layer_inp_sink = nullptr;
     std::vector<uint32_t>   layer_inp_sink_layers;
 
-
     std::vector<std::pair<llama_seq_id, llama_pos>> sink_cols;
 
     std::unordered_map<llama_seq_id, std::vector<std::pair<llama_pos, int32_t>>> sink_cols_by_seq;
 
-
     ggml_context_ptr        ctx_embd_src;
     ggml_backend_buffer_ptr buf_embd_src;
     ggml_tensor *           t_embd_src_sink = nullptr;
-
-
-
 
     ggml_context_ptr        ctx_h_sink;
     ggml_backend_buffer_ptr buf_h_sink;
     ggml_tensor *           t_h_sink = nullptr;
     bool                    h_sink_is_target = false;
 
-
-
     ggml_backend_t          backend_h_sink = nullptr;
     uint32_t                h_sink_extra = 0;
-
 
     std::vector<std::pair<llama_seq_id, llama_pos>> h_sink_cols;
 
     std::unordered_map<llama_seq_id, std::vector<std::pair<llama_pos, int32_t>>> h_sink_cols_by_seq;
 
-
-
     bool                 h_src_enable = false;
     std::vector<int32_t> h_src_cols;
-
-
 
     int32_t h_sink_offset = 0;
 
     bool    h_sink_write = true;
 
-
     int32_t h_sink_group = 0;
 
-
     int32_t h_src_group = -1;
-
-
-
+public:
+    uint64_t mtp_sink_generation() const { return embd_link ? embd_link->h_generation : 0; }
+    bool mtp_defer_sink = false;
+    int32_t mtp_selected_sink = -1;
+    uint64_t mtp_selected_generation = 0;
+    bool mtp_can_defer_sink() const;
+    bool mtp_can_overlap_tail(uint32_t tokens, int32_t pending_group) const;
+private:
+    int32_t mtp_read_group() const;
+    void mtp_wait_sink(int32_t group);
 
     std::vector<llama_pos> h_sink_first_pos;
 
-
     int64_t pipeline_ubatch_last = -1;
-
 
     std::shared_ptr<llama_embd_link> embd_link;
     bool    embd_src_enable = false;
     int32_t embd_src_offset = 0;
 
-
-
-
     buffer_view<float>       topk_logits = {nullptr, 0};
     buffer_view<int32_t>     topk_ids    = {nullptr, 0};
     std::vector<llama_token> topk_ids_row;
 
-
     bool logits_full = true;
-
-
-
-
-
 
     ggml_context_ptr        ctx_draft_ring;
     ggml_context_ptr        ctx_draft_ring_host;
@@ -570,26 +449,16 @@ private:
     int32_t                 draft_ring_n_max   = 0;
     int32_t                 draft_ring_i       = 0;
 
-
-
-
-
     ggml_backend_event_t    ev_inputs_dec      = nullptr;
 
-
-
-
     bool outputs_ready = true;
-
-
-
 
     ggml_backend_event_t ev_outputs          = nullptr;
     ggml_backend_t       ev_outputs_backend  = nullptr;
     bool                 ev_outputs_recorded = false;
 
     struct sampling_info {
-        // !samplers.empty() to check if any samplers are active
+
         std::map<llama_seq_id, llama_sampler *> samplers;
 
         buffer_view<float>       logits     = {nullptr, 0};
@@ -601,23 +470,19 @@ private:
         std::vector<uint32_t> probs_count;
         std::vector<uint32_t> candidates_count;
 
-        // optimization
         std::vector<llama_token> token_ids_full_vocab;
     };
 
     sampling_info sampling;
 
-    // sequence embeddings output (map of [n_embd] vectors)
-    // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE
     std::map<llama_seq_id, std::vector<float>> embd_seq;
 
-    // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
 
-    uint32_t n_input_tensors = 0; // number of tensors marked as input during the last graph reserve
-    uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
+    uint32_t n_input_tensors = 0;
+    uint32_t n_outputs = 0;
 
-    std::vector<int32_t> output_ids; // map batch token positions to ids of the logits and embd buffers
+    std::vector<int32_t> output_ids;
 
     struct swap_info {
         uint32_t i0;
@@ -628,28 +493,18 @@ private:
 
     ggml_backend_sched_ptr sched;
 
-
-
     ggml_backend_sched_ptr sched_slot0;
-
-
 
     ggml_backend_sched_ptr sched_dec;
 
-
     uint32_t n_dec_max = 0;
-
-
 
     int64_t pipeline_ubatch_id = 0;
 
     bool sched_need_reserve = true;
 
-    // whether the reserve graph has a logits tensor, set in sched_reserve()
-    // true until then, because the first output_reserve() runs before any graph is reserved
     bool graph_has_logits = true;
 
-    // state of sched_copy_experts, reset before each graph compute
     struct copy_experts_info {
         const ggml_tensor *  ids = nullptr;
         std::vector<int32_t> ids_data;
@@ -664,15 +519,12 @@ private:
 
     copy_experts_info copy_experts;
 
-    // graph reallocations during inference where the backend assignments did not change, split by whether the
-    // graph size is the same as the previously scheduled one (unexpected) or different
     int32_t n_reallocs_same = 0;
     int32_t n_reallocs_diff = 0;
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
 
-    // training
     ggml_opt_context_t opt_ctx = nullptr;
 
     ggml_threadpool_t threadpool       = nullptr;
@@ -683,44 +535,33 @@ private:
 
     std::vector<std::pair<ggml_backend_t, ggml_backend_set_n_threads_t>> set_n_threads_fns;
 
-    // pointers and buffer types used for the compute buffer of each backend
     std::vector<ggml_backend_t>             backend_ptrs;
     std::vector<ggml_backend_buffer_type_t> backend_buft;
-    std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
+    std::vector<size_t>                     backend_buf_exp_size;
 
-
+    std::vector<size_t>                     backend_buf_decode_size;
 
     int64_t comm_ne_allreduce      = 0;
     int64_t comm_ne_reduce_scatter = 0;
 
-    // Separate arenas give batches with different graph layouts distinct CUDA graph cache keys:
-    // by outputs for regular contexts, by input kind (embd/token) for DFlash drafts,
-    // slot 2 for decode batches when sched_dec is enabled
     std::array<llm_graph_result_ptr, 3> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
-
-
-
     std::vector<llm_graph_result_ptr> gf_res_pipe;
+    llm_graph_result_ptr gf_res_pipe_pending;
 
     std::array<llm_graph_result *, 3> gf_res_prev_active = { nullptr, nullptr, nullptr };
 
-    // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
-    // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
 
     bool has_evaluated_once = false;
 
-    // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
-    // true after the prism.hadamard coverage check passes on a reserved graph
     bool hadamard_verified = false;
 
-    // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;
     mutable int64_t t_p_eval_us = 0;
@@ -729,8 +570,8 @@ private:
     mutable int64_t t_compute_start_us = 0;
     mutable int64_t n_queued_tokens    = 0;
 
-    mutable int32_t n_p_eval = 0; // number of tokens in eval calls for the prompt (with batch size > 1)
-    mutable int32_t n_eval   = 0; // number of eval calls
+    mutable int32_t n_p_eval = 0;
+    mutable int32_t n_eval   = 0;
 
-    mutable int32_t n_reused = 0; // number of times the previous graph was reused
+    mutable int32_t n_reused = 0;
 };

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { ArrowRight, Copy, Edit, GitBranch, RefreshCw, Trash2 } from '@lucide/svelte';
 	import {
 		ActionIcon,
@@ -77,29 +78,29 @@
 		<div
 			class="pointer-events-auto inset-0 flex items-center gap-1 opacity-100 transition-all duration-150"
 		>
-			<ActionIcon icon={Copy} onclick={messageActions.copy} tooltip="Copy" />
+			<ActionIcon icon={Copy} onclick={messageActions.copy} tooltip={tr("Copy")} />
 
-			<ActionIcon icon={Edit} onclick={editCtx.startEdit} tooltip="Edit" />
+			<ActionIcon icon={Edit} onclick={editCtx.startEdit} tooltip={tr("Edit")} />
 
 			{#if role === MessageRole.ASSISTANT && onRegenerate}
-				<ActionIcon icon={RefreshCw} onclick={() => onRegenerate()} tooltip="Regenerate" />
+				<ActionIcon icon={RefreshCw} onclick={() => onRegenerate()} tooltip={tr("Regenerate")} />
 			{/if}
 
 			{#if role === MessageRole.ASSISTANT && onContinue}
-				<ActionIcon icon={ArrowRight} onclick={onContinue} tooltip="Continue" />
+				<ActionIcon icon={ArrowRight} onclick={onContinue} tooltip={tr("Continue")} />
 			{/if}
 
 			{#if messageActions.forkConversation}
 				<ActionIcon icon={GitBranch} onclick={handleOpenForkDialog} tooltip="Fork conversation" />
 			{/if}
 
-			<ActionIcon icon={Trash2} onclick={messageActions.requestDelete} tooltip="Delete" />
+			<ActionIcon icon={Trash2} onclick={messageActions.requestDelete} tooltip={tr("Delete")} />
 		</div>
 	</div>
 
 	{#if showRawOutputSwitch}
 		<div class="flex items-center gap-2">
-			<span class="text-xs text-muted-foreground">Show raw output</span>
+			<span class="text-xs text-muted-foreground">{tr("Show raw output")}</span>
 
 			<Switch
 				checked={rawOutputEnabled}
@@ -158,7 +159,7 @@
 			/>
 
 			<Label class="cursor-pointer text-sm font-normal" for="fork-attachments">
-				Include all attachments
+				{tr("Include all attachments")}
 			</Label>
 		</div>
 	</div>

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { FileX } from '@lucide/svelte';
 	import * as AlertDialog from '$lib/components/ui/alert-dialog';
 
@@ -55,7 +56,7 @@
 		</div>
 
 		<AlertDialog.Footer>
-			<AlertDialog.Action onclick={() => handleOpenChange(false)}>Got it</AlertDialog.Action>
+			<AlertDialog.Action onclick={() => handleOpenChange(false)}>{tr("Got it")}</AlertDialog.Action>
 		</AlertDialog.Footer>
 	</AlertDialog.Content>
 </AlertDialog.Root>

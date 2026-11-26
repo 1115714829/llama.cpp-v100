@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Pencil } from '@lucide/svelte';
 	import * as AlertDialog from '$lib/components/ui/alert-dialog';
 	import { Button } from '$lib/components/ui/button';
@@ -55,15 +56,15 @@
 		<AlertDialog.Header>
 			<AlertDialog.Title class="flex items-center gap-2">
 				<Pencil class="h-5 w-5" />
-				Rename conversation
+				{tr("Rename conversation")}
 			</AlertDialog.Title>
 
-			<AlertDialog.Description>Choose a new title for this conversation.</AlertDialog.Description>
+			<AlertDialog.Description>{tr("Choose a new title for this conversation.")}</AlertDialog.Description>
 		</AlertDialog.Header>
 
 		<form class="space-y-2 pt-2 pb-4" onsubmit={handleSubmit}>
 			<label class="text-sm font-medium text-muted-foreground" for="conversation-rename-input">
-				Conversation title
+				{tr("Conversation title")}
 			</label>
 
 			<Input
@@ -73,15 +74,15 @@
 				autocorrect="off"
 				id="conversation-rename-input"
 				maxlength={200}
-				placeholder="Conversation title"
+				placeholder={tr("Conversation title")}
 				spellcheck={false}
 			/>
 		</form>
 
 		<AlertDialog.Footer>
-			<AlertDialog.Cancel>Cancel</AlertDialog.Cancel>
+			<AlertDialog.Cancel>{tr("Cancel")}</AlertDialog.Cancel>
 
-			<Button disabled={!canSubmit} onclick={handleSubmit} type="button">Save</Button>
+			<Button disabled={!canSubmit} onclick={handleSubmit} type="button">{tr("Save")}</Button>
 		</AlertDialog.Footer>
 	</AlertDialog.Content>
 </AlertDialog.Root>

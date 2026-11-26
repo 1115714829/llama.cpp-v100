@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Music } from '@lucide/svelte';
 
 	interface Props {
@@ -18,7 +19,7 @@
 				Your browser does not support the audio element.
 			</audio>
 		{:else}
-			<p class="mb-4 text-white/70">Audio preview not available</p>
+			<p class="mb-4 text-white/70">{tr("Audio preview not available")}</p>
 		{/if}
 
 		<p class="text-sm text-white/50">{currentItem?.name || 'Audio'}</p>

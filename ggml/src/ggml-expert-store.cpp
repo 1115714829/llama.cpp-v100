@@ -1,5 +1,6 @@
 #include "ggml-expert-store.h"
 #include "ggml-impl.h"
+#include "ggml-safe-io.h"
 
 #include <algorithm>
 #include <atomic>
@@ -16,9 +17,13 @@
 #include <tuple>
 #include <unordered_map>
 
-static bool ggml_expert_store_read_profile(const char * path, ggml_expert_store_profile & profile) {
-    FILE * f = fopen(path, "r");
-    if (f == nullptr) {
+#if defined(__linux__)
+#include <unistd.h>
+#endif
+
+bool ggml_expert_store_read_profile(const char * path, ggml_expert_store_profile & profile) {
+    ggml_safe_io::reader reader;
+    if (reader.open(path).code != ggml_safe_io::error::none) {
         return false;
     }
 
@@ -29,7 +34,26 @@ static bool ggml_expert_store_read_profile(const char * path, ggml_expert_store_
     bool any_launch = false;
 
     char line[256];
-    while (fgets(line, sizeof(line), f) != nullptr) {
+    char block[8192];
+    size_t used = 0, pos = 0, available = 0;
+    uint64_t offset = 0;
+    while (pos < available || offset < reader.size()) {
+        if (pos == available) {
+            const auto result = reader.read(block, sizeof(block), offset);
+            if (result.code != ggml_safe_io::error::none || result.written == 0) {
+                return false;
+            }
+            available = (size_t) result.written;
+            offset += available;
+            pos = 0;
+        }
+        const char byte = block[pos++];
+        line[used++] = byte;
+        if (byte != '\n' && used < sizeof(line) - 1 && (pos < available || offset < reader.size())) {
+            continue;
+        }
+        line[used] = '\0';
+        used = 0;
         if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') {
             continue;
         }
@@ -49,7 +73,7 @@ static bool ggml_expert_store_read_profile(const char * path, ggml_expert_store_
         n_expert = std::max(n_expert, expert + 1);
         rows.emplace_back(layer, expert, count, launches);
     }
-    fclose(f);
+    reader.close();
 
     profile.n_layer  = n_layer;
     profile.n_expert = n_expert;
@@ -62,7 +86,6 @@ static bool ggml_expert_store_read_profile(const char * path, ggml_expert_store_
         const size_t i = (size_t) (std::get<0>(row) * n_expert + std::get<1>(row));
         profile.count[i] = std::get<2>(row);
         if (any_launch) {
-
 
             profile.launch[i] = std::max<int64_t>(std::get<3>(row), 0);
         }
@@ -131,10 +154,58 @@ bool ggml_expert_store_trace_enabled() {
     return g_trace_enabled.load(std::memory_order_relaxed);
 }
 
-
-
 static int64_t g_adaptive_window = 0;
 static int64_t g_adaptive_min_host_per_pool = 0;
+
+static int64_t g_host_budget = -1;
+static int64_t g_disk_budget = -1;
+static std::mutex g_budget_mutex;
+
+void ggml_expert_store_set_budgets(int64_t host_budget, int64_t disk_budget) {
+    std::lock_guard<std::mutex> lock(g_budget_mutex);
+    g_host_budget = host_budget >= 0 ? host_budget : -1;
+    g_disk_budget = disk_budget >= 0 ? disk_budget : -1;
+}
+
+int64_t ggml_expert_store_host_budget(void) {
+    std::lock_guard<std::mutex> lock(g_budget_mutex);
+    return g_host_budget;
+}
+
+int64_t ggml_expert_store_disk_budget(void) {
+    std::lock_guard<std::mutex> lock(g_budget_mutex);
+    return g_disk_budget;
+}
+
+static std::string g_disk_dir;
+static std::string g_model_path;
+
+static int64_t g_plan_disk_bytes = 0;
+
+int64_t ggml_expert_store_disk_bytes(void) {
+    std::lock_guard<std::mutex> lock(g_budget_mutex);
+    return g_plan_disk_bytes;
+}
+
+void ggml_expert_store_set_disk_dir(const char * dir) {
+    std::lock_guard<std::mutex> lock(g_budget_mutex);
+    g_disk_dir = dir != nullptr ? dir : "";
+}
+
+void ggml_expert_store_set_model_path(const char * path) {
+    std::lock_guard<std::mutex> lock(g_budget_mutex);
+    g_model_path = path != nullptr ? path : "";
+}
+
+std::string ggml_expert_store_disk_dir(void) {
+    std::lock_guard<std::mutex> lock(g_budget_mutex);
+    return g_disk_dir;
+}
+
+std::string ggml_expert_store_model_path(void) {
+    std::lock_guard<std::mutex> lock(g_budget_mutex);
+    return g_model_path;
+}
 
 void ggml_expert_store_set_adaptive_window(int64_t window) {
     std::lock_guard<std::mutex> lock(g_profile_mutex);
@@ -181,15 +252,9 @@ void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_device) {
         return;
     }
 
-
-
     if (n_device > 1) {
         path += ".dev" + std::to_string(store->device);
     }
-
-
-
-
 
     int64_t n_layer = 0;
     for (const ggml_expert_store_tensor & t : store->tensors) {
@@ -228,28 +293,50 @@ void ggml_expert_store_dump_profile(ggml_expert_store * store, int n_device) {
     }
     if (!any) {
 
-
         return;
     }
 
-    FILE * f = fopen(path.c_str(), "w");
-    if (f == nullptr) {
-        GGML_LOG_ERROR("%s: cannot write expert routing profile '%s'\n", __func__, path.c_str());
-        return;
-    }
-    fprintf(f, "# expert routing profile: layer expert count launches\n");
-    fprintf(f, "# count: routing entries, launches: mul_mat_id launches that routed the expert (see ggml_expert_store_profile)\n");
-    fprintf(f, "# generated from runtime routing statistics, one run can feed the next one\n");
+    std::string text =
+        "# expert routing profile: layer expert count launches\n"
+        "# count: routing entries, launches: mul_mat_id launches that routed the expert (see ggml_expert_store_profile)\n"
+        "# generated from runtime routing statistics, one run can feed the next one\n";
     for (int64_t l = 0; l < n_layer; ++l) {
         const std::vector<int64_t> & row  = counts[(size_t) l];
         const std::vector<int64_t> & lrow = launches[(size_t) l];
         for (size_t e = 0; e < row.size(); ++e) {
             if (row[e] > 0) {
-                fprintf(f, "%" PRId64 " %zu %" PRId64 " %" PRId64 "\n", l, e, row[e], lrow[e]);
+                char line[128];
+                const int size = snprintf(line, sizeof(line), "%" PRId64 " %zu %" PRId64 " %" PRId64 "\n", l, e, row[e], lrow[e]);
+                if (size < 0 || (size_t) size >= sizeof(line)) {
+                    GGML_LOG_ERROR("%s: cannot format expert routing profile '%s'\n", __func__, path.c_str());
+                    return;
+                }
+                text.append(line, (size_t) size);
             }
         }
     }
-    fclose(f);
+    const size_t slash = path.rfind('/');
+    const std::string dir = slash == std::string::npos ? "." : path.substr(0, slash == 0 ? 1 : slash);
+    const char * name = path.c_str() + (slash == std::string::npos ? 0 : slash + 1);
+#if defined(__linux__)
+    const long page = sysconf(_SC_PAGESIZE);
+#else
+    const long page = 0;
+#endif
+    ggml_safe_io::writer writer;
+    auto result = writer.begin(dir.c_str(), name, text.size(), page > 0 ? (uint64_t) page : 0);
+    if (result.code == ggml_safe_io::error::none) {
+        result = writer.append(text.data(), text.size());
+    }
+    if (result.code == ggml_safe_io::error::none) {
+        result = writer.finish();
+    }
+    if (result.code != ggml_safe_io::error::none || !result.durability_confirmed) {
+        GGML_LOG_ERROR("%s: cannot durably write expert routing profile '%s': %s (stage %d, errno %d, published %d)\n",
+            __func__, path.c_str(), ggml_safe_io::error_name(result.code), (int) result.where,
+            result.sys_errno, (int) result.published);
+        return;
+    }
     GGML_LOG_DEBUG("%s: device %d: wrote expert routing profile '%s'\n", __func__, store->device, path.c_str());
 
     for (ggml_expert_store_tensor & t : store->tensors) {
@@ -298,10 +385,6 @@ void ggml_expert_store_free(ggml_expert_store * store) {
     delete store;
 }
 
-
-
-
-
 struct ggml_expert_store_source_hashes {
     std::vector<uint64_t> hash;
     std::vector<uint8_t>  present;
@@ -310,22 +393,6 @@ struct ggml_expert_store_source_hashes {
 
 static std::mutex g_source_hash_mutex;
 static std::map<std::string, ggml_expert_store_source_hashes> g_source_hash;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 struct ggml_expert_store_assignment {
     std::string          profile_path;
@@ -350,11 +417,50 @@ static std::mutex g_assign_mutex;
 static ggml_expert_store_assignment g_assign;
 static bool g_assign_valid = false;
 
+static std::mutex      g_devices_mutex;
+static std::vector<int> g_devices;
 
+void ggml_expert_store_set_devices(const int * devices, int n_devices) {
+    std::vector<int> list;
+    if (devices != nullptr && n_devices > 0) {
+        list.assign(devices, devices + n_devices);
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_devices_mutex);
+        if (list == g_devices) {
+            return;
+        }
+        g_devices = std::move(list);
+    }
+
+    std::lock_guard<std::mutex> lock(g_assign_mutex);
+    g_assign_valid = false;
+}
+
+int ggml_expert_store_n_devices(void) {
+    std::lock_guard<std::mutex> lock(g_devices_mutex);
+    return (int) g_devices.size();
+}
+
+int ggml_expert_store_device_id(int index) {
+    std::lock_guard<std::mutex> lock(g_devices_mutex);
+    if (index < 0 || index >= (int) g_devices.size()) {
+        return -1;
+    }
+    return g_devices[(size_t) index];
+}
+
+int ggml_expert_store_device_index(int id) {
+    std::lock_guard<std::mutex> lock(g_devices_mutex);
+    for (size_t i = 0; i < g_devices.size(); ++i) {
+        if (g_devices[i] == id) {
+            return (int) i;
+        }
+    }
+    return -1;
+}
 
 static int64_t g_assign_n_expert_seen = 0;
-
-
 
 static bool ggml_expert_store_assignment_matches(
         const char * path, const ggml_expert_store_profile * profile,
@@ -370,7 +476,6 @@ static bool ggml_expert_store_assignment_matches(
                     g_assign.profile_path == std::string(path != nullptr ? path : ""));
 }
 
-
 static double ggml_expert_store_imbalance(const std::vector<int64_t> & load, int n_dev) {
     int64_t total = 0;
     int64_t peak  = 0;
@@ -383,8 +488,6 @@ static double ggml_expert_store_imbalance(const std::vector<int64_t> & load, int
     }
     return (double) peak * n_dev / (double) total;
 }
-
-
 
 static void ggml_expert_store_assignment_init_caps(ggml_expert_store_assignment & a, int n_dev, int n_layer, int n_expert,
         const std::vector<int> & cap) {
@@ -407,9 +510,6 @@ static void ggml_expert_store_assignment_init_caps(ggml_expert_store_assignment 
     a.rev.assign((size_t) n_dev * (size_t) n_layer * (size_t) a.cap_max, -1);
 }
 
-
-
-
 static void ggml_expert_store_assignment_init(ggml_expert_store_assignment & a, int n_dev, int n_layer, int n_expert) {
     GGML_ASSERT(n_dev > 0);
     std::vector<int> cap((size_t) n_dev, 0);
@@ -421,8 +521,6 @@ static void ggml_expert_store_assignment_init(ggml_expert_store_assignment & a, 
     ggml_expert_store_assignment_init_caps(a, n_dev, n_layer, n_expert, cap);
 }
 
-
-
 static void ggml_expert_store_assignment_contiguous_layer(ggml_expert_store_assignment & a, int l) {
     int base = 0;
     for (int jj = 0; jj < a.n_dev; ++jj) {
@@ -433,8 +531,6 @@ static void ggml_expert_store_assignment_contiguous_layer(ggml_expert_store_assi
         base += a.cap[(size_t) jj];
     }
 }
-
-
 
 static void ggml_expert_store_assignment_number_layer(ggml_expert_store_assignment & a, int l) {
     std::vector<int> nxt((size_t) a.n_dev, 0);
@@ -449,21 +545,12 @@ static void ggml_expert_store_assignment_number_layer(ggml_expert_store_assignme
 
 static uint64_t ggml_expert_store_hash_range(uint64_t h, const uint8_t * p, size_t n);
 
-
-
 static uint64_t ggml_expert_store_assignment_fingerprint(const ggml_expert_store_assignment & a) {
     uint64_t h = 0x243F6A8885A308D3ULL ^ ((uint64_t) a.n_dev << 40) ^ ((uint64_t) a.n_layer << 20) ^ (uint64_t) a.n_expert;
     h = ggml_expert_store_hash_range(h, (const uint8_t *) a.owner.data(), a.owner.size() * sizeof(int32_t));
     h = ggml_expert_store_hash_range(h, (const uint8_t *) a.local.data(), a.local.size() * sizeof(int16_t));
     return h;
 }
-
-
-
-
-
-
-
 
 void ggml_expert_store_compute_assignment(
         const char * path, const ggml_expert_store_profile * profile,
@@ -473,8 +560,6 @@ void ggml_expert_store_compute_assignment(
     std::lock_guard<std::mutex> lock(g_assign_mutex);
 
     const bool has_profile = profile != nullptr && !profile->count.empty();
-
-
 
     if (has_profile) {
         g_assign_n_expert_seen = n_expert;
@@ -487,8 +572,6 @@ void ggml_expert_store_compute_assignment(
         ggml_expert_store_assignment_matches(path, profile, n_dev, n_layer, n_expert)) {
         return;
     }
-
-
 
     if ((int64_t) n_layer * n_expert > (int64_t) 1 << 22 || n_expert > INT16_MAX) {
         GGML_LOG_ERROR("%s: %d layers x %d experts is too large for an expert assignment\n",
@@ -611,8 +694,6 @@ static int ggml_expert_store_table_global_of(const ggml_expert_store_assignment 
     return a.rev[((size_t) dev * a.n_layer + layer) * a.cap_max + local];
 }
 
-
-
 static int ggml_expert_store_table_slice_device(const ggml_expert_store_assignment & a, int64_t expert_base, int64_t n_expert) {
     if (expert_base == 0 && n_expert == a.n_expert) {
         return -1;
@@ -665,8 +746,6 @@ bool ggml_expert_store_assignment_info_get(ggml_expert_store_assignment_info * i
     return true;
 }
 
-
-
 struct ggml_expert_assignment_table {
     uint32_t    id       = 0;
     bool        active   = false;
@@ -681,7 +760,6 @@ static uint32_t g_table_next_id = 1;
 
 static std::unordered_map<const ggml_tensor *, uint32_t> g_weight_tables;
 
-
 static const ggml_tensor * ggml_expert_assignment_weight_base(const ggml_tensor * w) {
     int depth = 0;
     while (w != nullptr && w->view_src != nullptr && depth++ < 16) {
@@ -689,9 +767,6 @@ static const ggml_tensor * ggml_expert_assignment_weight_base(const ggml_tensor 
     }
     return w;
 }
-
-
-
 
 static void ggml_expert_assignment_validate(const ggml_expert_store_assignment & a) {
     std::vector<uint8_t> seen((size_t) std::max(a.cap_max, 1));
@@ -740,7 +815,6 @@ static uint32_t ggml_expert_assignment_add(ggml_expert_store_assignment && a, co
     g_tables.emplace(id, std::move(t));
     return id;
 }
-
 
 static const ggml_expert_assignment_table * ggml_expert_assignment_find(uint32_t id) {
     const auto it = g_tables.find(id);
@@ -818,8 +892,6 @@ int ggml_expert_assignment_cap(uint32_t table, int dev) {
     return t->a.cap[(size_t) dev];
 }
 
-
-
 int64_t ggml_expert_assignment_load_position(uint32_t table, int layer, int expert) {
     std::lock_guard<std::mutex> lock(g_table_mutex);
     const ggml_expert_assignment_table * t = ggml_expert_assignment_find(table);
@@ -863,8 +935,6 @@ void ggml_expert_assignment_activate(uint32_t table, const ggml_tensor * const *
             __func__, table, t.what.c_str(), t.a.has_profile ? t.a.profile_path.c_str() : "none",
             t.a.n_dev, t.a.n_layer, t.a.n_expert, t.a.imbalance_permuted, t.fingerprint, n_weights);
     }
-
-
 
     std::lock_guard<std::mutex> lock(g_source_hash_mutex);
     for (const std::string & name : names) {
@@ -938,10 +1008,6 @@ size_t ggml_expert_assignment_count(void) {
     return g_tables.size();
 }
 
-
-
-
-
 static std::mutex g_segment_mutex;
 static std::unordered_map<uint64_t, std::vector<int16_t>> g_segment_rows;
 
@@ -965,7 +1031,6 @@ const int16_t * ggml_expert_store_node_lut(const ggml_tensor * node) {
     GGML_ASSERT(node != nullptr && node->op == GGML_OP_MUL_MAT_ID && node->src[0] != nullptr);
     const int n_local = (int) node->src[0]->ne[2];
 
-
     if (!ggml_mul_mat_id_is_expert_parallel(node)) {
         return ggml_expert_segment_row(0, n_local, n_local);
     }
@@ -983,7 +1048,6 @@ const int16_t * ggml_expert_store_node_lut(const ggml_tensor * node) {
             __func__, node->name, node->src[0]->name);
     }
     if (table == 0) {
-
 
         return ggml_expert_segment_row(offset, n_local, n_total);
     }
@@ -1007,7 +1071,6 @@ const int16_t * ggml_expert_store_node_lut(const ggml_tensor * node) {
             table, a.n_dev, a.n_layer, a.n_expert);
     }
 
-
     if (n_local != a.cap[(size_t) device] || offset != a.cap_prefix[(size_t) device]) {
         GGML_ABORT("%s: node %s: device %d holds experts [%d, %d) of the weight, expert assignment %d gives it the segment [%" PRId64 ", %" PRId64 ")\n",
             __func__, node->name, device, offset, offset + n_local, table,
@@ -1018,10 +1081,15 @@ const int16_t * ggml_expert_store_node_lut(const ggml_tensor * node) {
 
 void ggml_expert_store_plan(
         const ggml_expert_store_plan_tensor * tensors, size_t n_tensors,
-        int n_device,
-        int64_t slot_budget, const char * profile_path,
+        const int * devices, int n_devices,
+        int64_t slot_budget, int64_t borrow_budget, const char * profile_path,
         ggml_expert_store_placement * placement) {
     GGML_ASSERT(placement != nullptr);
+
+    if (n_devices > 0) {
+        ggml_expert_store_set_devices(devices, n_devices);
+    }
+    const int n_device = n_devices > 0 ? n_devices : 0;
 
     placement->n_slot.assign(n_tensors, 0);
     placement->host_used.assign(n_tensors, 0);
@@ -1029,9 +1097,11 @@ void ggml_expert_store_plan(
     placement->slot_used  = 0;
     placement->host_bytes = 0;
     placement->host_peak  = 0;
-
-
-
+    placement->disk_bytes = 0;
+    placement->n_tail.assign(n_tensors, 0);
+    placement->tail_experts.assign(n_tensors, {});
+    placement->next_rank.resize(n_tensors);
+    placement->tail_bytes = 0;
 
     std::vector<size_t> stride(n_tensors, 0);
     std::vector<size_t> tensor_bytes(n_tensors, 0);
@@ -1045,10 +1115,6 @@ void ggml_expert_store_plan(
         return;
     }
 
-
-
-
-
     std::vector<size_t> order_redist(n_tensors);
     for (size_t i = 0; i < n_tensors; ++i) {
         order_redist[i] = i;
@@ -1060,9 +1126,6 @@ void ggml_expert_store_plan(
         return tensor_bytes[a]   < tensor_bytes[b];
     });
 
-
-
-
     std::vector<int64_t> n_slots(n_tensors, 0);
     size_t slot_used = 0;
     if (slot_budget < 0) {
@@ -1072,8 +1135,6 @@ void ggml_expert_store_plan(
         }
     } else {
 
-
-
         for (size_t i = 0; i < n_tensors; ++i) {
             const uint64_t quota = ggml_expert_store_mul_div_floor(
                 (uint64_t) slot_budget, (uint64_t) tensor_bytes[i], (uint64_t) expert_bytes);
@@ -1082,17 +1143,12 @@ void ggml_expert_store_plan(
                 n = tensors[i].n_expert;
             }
 
-
             while (n > 0 && slot_used + (size_t) n * stride[i] > (size_t) slot_budget) {
                 --n;
             }
             n_slots[i] = n;
             slot_used += (size_t) n * stride[i];
         }
-
-
-
-
 
         while (true) {
             size_t  best = SIZE_MAX;
@@ -1104,11 +1160,6 @@ void ggml_expert_store_plan(
                 if (slot_used + stride[i] > (size_t) slot_budget) {
                     continue;
                 }
-
-
-
-
-
 
                 const int64_t gap = (int64_t) ggml_expert_store_mul_div_floor(
                     (uint64_t) slot_budget, (uint64_t) tensor_bytes[i], (uint64_t) expert_bytes)
@@ -1126,10 +1177,6 @@ void ggml_expert_store_plan(
         }
     }
 
-
-
-
-
     const std::string path = profile_path != nullptr ? profile_path : ggml_expert_store_get_profile();
     ggml_expert_store_profile profile;
     const bool have_profile = !path.empty() && ggml_expert_store_read_profile(path.c_str(), profile);
@@ -1137,8 +1184,6 @@ void ggml_expert_store_plan(
         GGML_ABORT("%s: cannot read expert profile '%s' (missing file or no entry)\n",
             __func__, path.c_str());
     }
-
-
 
     if (n_device > 0) {
         int64_t n_expert_total = 0;
@@ -1157,12 +1202,23 @@ void ggml_expert_store_plan(
         }
     }
 
-
-
-
     double routed_share_bytes = 0.0;
     double complement_bytes    = 0.0;
     bool   have_routed_share   = false;
+
+    const int64_t host_budget = ggml_expert_store_host_budget();
+    const int64_t disk_budget = ggml_expert_store_disk_budget();
+    if ((host_budget >= 0 || disk_budget >= 0) && !have_profile) {
+        GGML_ABORT("%s: a budget on the host or the disk tier needs the routing profile (the coldest "
+            "experts are the ones that go to the disk), but no profile was read\n", __func__);
+    }
+
+    int64_t total_bytes = 0;
+    for (size_t i = 0; i < n_tensors; ++i) {
+        total_bytes += tensors[i].n_expert * (int64_t) stride[i];
+    }
+    placement->n_disk.assign(n_tensors, 0);
+    placement->disk_experts.assign(n_tensors, {});
 
     for (size_t i = 0; i < n_tensors; ++i) {
         const ggml_expert_store_plan_tensor & in = tensors[i];
@@ -1176,8 +1232,6 @@ void ggml_expert_store_plan(
             order[(size_t) e] = e;
         }
         if (have_profile && in.layer >= 0 && profile.n_layer > in.layer && profile.n_expert > 0) {
-
-
 
             const int dev = ggml_expert_store_slice_device(in.expert_base, in.n_expert);
             if (dev == -2) {
@@ -1197,11 +1251,6 @@ void ggml_expert_store_plan(
                 return g < profile.n_expert ? profile.at(in.layer, g) : 0;
             };
 
-
-
-
-
-
             const auto launch_of = [&](int64_t local) -> int64_t {
                 const int64_t g = global_of(local);
                 return g < profile.n_expert ? profile.launch_at(in.layer, g) : 0;
@@ -1220,12 +1269,6 @@ void ggml_expert_store_plan(
                     return count_of(a) > count_of(b);
                 });
             }
-
-
-
-
-
-
 
             if (in.n_expert_used > 0) {
                 int64_t traffic = 0;
@@ -1257,28 +1300,60 @@ void ggml_expert_store_plan(
             }
         }
 
-        placement->n_slot[i]    = n_slot;
-        placement->host_used[i] = (in.n_expert - n_slot) * aligned;
-        placement->slot_experts[i].assign(order.begin(), order.begin() + (size_t) n_slot);
+        const int64_t total_i = in.n_expert * aligned;
+        int64_t n_disk_forced = 0;
+        if (disk_budget > 0 && total_bytes > 0) {
+            const int64_t share = (int64_t) ((double) disk_budget * (double) total_i / (double) total_bytes);
+            n_disk_forced = std::min<int64_t>(in.n_expert, share / aligned);
+        }
+        const int64_t n_slot_i = std::min<int64_t>(n_slot, in.n_expert - n_disk_forced);
+        int64_t n_host_i       = in.n_expert - n_slot_i - n_disk_forced;
+        if (host_budget >= 0) {
+            int64_t room = 0;
+            if (total_bytes > 0) {
+                room = (int64_t) ((double) host_budget * (double) total_i / (double) total_bytes) / aligned;
+            }
+            n_host_i = std::min(n_host_i, room);
+        }
+        const int64_t n_disk_i = in.n_expert - n_slot_i - n_host_i;
 
+        placement->n_slot[i]    = n_slot_i;
+        placement->host_used[i] = n_host_i * aligned;
+        placement->slot_experts[i].assign(order.begin(), order.begin() + (size_t) n_slot_i);
+        placement->n_disk[i]    = n_disk_i;
+        placement->disk_experts[i].assign(order.begin() + (size_t) (in.n_expert - n_disk_i), order.end());
 
-
+        int64_t n_tail_i = 0;
+        if (borrow_budget > 0 && n_host_i > 0) {
+            const uint64_t quota = ggml_expert_store_mul_div_floor(
+                    (uint64_t) borrow_budget, (uint64_t) tensor_bytes[i], (uint64_t) expert_bytes);
+            n_tail_i = (int64_t) (quota / (uint64_t) aligned);
+            if (n_tail_i > n_host_i) {
+                n_tail_i = n_host_i;
+            }
+            while (n_tail_i > 0 && placement->tail_bytes + n_tail_i * aligned > borrow_budget) {
+                --n_tail_i;
+            }
+        }
+        placement->n_tail[i] = n_tail_i;
+        placement->tail_experts[i].assign(order.begin() + (size_t) n_slot_i,
+                                          order.begin() + (size_t) (n_slot_i + n_tail_i));
+        placement->next_rank[i].assign(order.begin()+n_slot_i+placement->n_tail[i], order.begin()+n_slot_i+n_host_i);
+        std::sort(placement->tail_experts[i].begin(), placement->tail_experts[i].end());
+        placement->tail_bytes += n_tail_i * aligned;
 
         std::sort(placement->slot_experts[i].begin(), placement->slot_experts[i].end());
-        placement->slot_used += n_slot * aligned;
+        placement->slot_used += n_slot_i * aligned;
         placement->host_bytes += placement->host_used[i];
+        placement->disk_bytes += n_disk_i * aligned;
     }
-
-
-
-
-
 
     {
         std::map<int, int64_t> n_host_max;
         std::map<int, int64_t> stride_max;
         for (size_t i = 0; i < n_tensors; ++i) {
-            const int64_t n_host = tensors[i].n_expert - n_slots[i];
+
+            const int64_t n_host = stride[i] > 0 ? placement->host_used[i] / (int64_t) stride[i] : 0;
             int64_t & nh = n_host_max[tensors[i].kind];
             nh = std::max(nh, n_host);
             int64_t & st = stride_max[tensors[i].kind];
@@ -1286,14 +1361,6 @@ void ggml_expert_store_plan(
         }
         placement->host_peak = 0;
         for (const auto & kv : n_host_max) {
-
-
-
-
-
-
-
-
 
             if (kv.second <= 0) {
                 continue;
@@ -1305,10 +1372,48 @@ void ggml_expert_store_plan(
     placement->has_routed_share = have_routed_share;
     placement->routed_share = have_routed_share && complement_bytes > 0.0
         ? routed_share_bytes / complement_bytes : 0.0;
+    {
+        std::lock_guard<std::mutex> lock(g_budget_mutex);
+        g_plan_disk_bytes = placement->disk_bytes;
+    }
 
-    GGML_LOG_DEBUG("%s: %zu tensors, slot budget %.2f MiB: slots %.2f MiB, host %.2f MiB, staging %.2f MiB\n",
+    GGML_LOG_DEBUG("%s: %zu tensors, slot budget %.2f MiB: slots %.2f MiB, host %.2f MiB, staging %.2f MiB, tail %.2f MiB\n",
         __func__, n_tensors, slot_budget / 1024.0 / 1024.0, placement->slot_used / 1024.0 / 1024.0,
-        placement->host_bytes / 1024.0 / 1024.0, placement->host_peak / 1024.0 / 1024.0);
+        placement->host_bytes / 1024.0 / 1024.0, placement->host_peak / 1024.0 / 1024.0,
+        placement->tail_bytes / 1024.0 / 1024.0);
+}
+
+static char * file_ptr(const ggml_expert_store * store, const ggml_expert_store_tensor & t, int64_t e) {
+    if (store->backend == nullptr || store->backend->file_base == nullptr) {
+        return nullptr;
+    }
+    char * base = (char *) store->backend->file_base(store->backend->user, t.file_id);
+    if (base == nullptr) {
+        return nullptr;
+    }
+    return base + t.file_offset[(size_t) e];
+}
+
+bool ggml_expert_store_refresh_disk_pointers(ggml_expert_store * store) {
+    GGML_ASSERT(store != nullptr);
+    bool changed = false;
+    for (size_t i = 0; i < store->tensors.size(); ++i) {
+        ggml_expert_store_tensor & t = store->tensors[i];
+        if (t.n_disk <= 0 || t.table_host == nullptr) {
+            continue;
+        }
+        for (int64_t e = 0; e < t.n_expert; ++e) {
+            if (t.residency[(size_t) e] != GGML_EXPERT_STORE_DISK) {
+                continue;
+            }
+            char * ptr = file_ptr(store, t, e);
+            if (ptr != t.table_host[(size_t) e]) {
+                t.table_host[(size_t) e] = ptr;
+                changed = true;
+            }
+        }
+    }
+    return changed;
 }
 
 int ggml_expert_store_add_tensor(
@@ -1316,12 +1421,17 @@ int ggml_expert_store_add_tensor(
         int layer, int kind,
         int64_t expert_base, int64_t n_expert, size_t blob_bytes, size_t blob_pad, size_t type_size,
         const int64_t * slot_experts, int64_t n_slot,
-        int64_t host_budget) {
+        int64_t host_budget,
+        const int64_t * disk_experts, int64_t n_disk,
+        const int64_t * tail_experts, int64_t n_tail, char * tail_dev) {
     GGML_ASSERT(store != nullptr);
     GGML_ASSERT(n_expert > 0);
     GGML_ASSERT(blob_bytes > 0);
     GGML_ASSERT(n_slot >= 0 && n_slot <= n_expert);
+    GGML_ASSERT(n_disk >= 0 && n_slot + n_disk <= n_expert);
+    GGML_ASSERT(n_tail >= 0 && n_slot + n_disk + n_tail <= n_expert);
     GGML_ASSERT(n_slot == 0 || slot_experts != nullptr);
+    GGML_ASSERT(n_tail == 0 || (tail_experts != nullptr && tail_dev != nullptr));
 
     if (store->tensors.size() >= (size_t) GGML_EXPERT_STORE_MAX_TENSORS) {
         GGML_LOG_ERROR("%s: too many expert tensors (%zu)\n", __func__, store->tensors.size());
@@ -1329,11 +1439,9 @@ int ggml_expert_store_add_tensor(
     }
 
     const size_t stride = ggml_expert_store_stride(blob_bytes, blob_pad, type_size);
-    const int64_t n_host = n_expert - n_slot;
+    const int64_t n_host = n_expert - n_slot - n_disk;
 
-
-
-    if (host_budget >= 0 && n_host > 0 && host_budget < n_host * (int64_t) stride) {
+    if (host_budget >= 0 && n_host > 0 && host_budget < n_host * (int64_t) stride && n_disk == 0) {
         GGML_LOG_ERROR("%s: layer %d kind %d: %" PRId64 " host experts need %.2f MiB, budget is %.2f MiB\n",
             __func__, layer, kind, n_host, n_host * stride / 1024.0 / 1024.0, host_budget / 1024.0 / 1024.0);
         return -1;
@@ -1350,30 +1458,47 @@ int ggml_expert_store_add_tensor(
     t.stride     = stride;
     t.n_slot     = n_slot;
     t.n_host     = n_host;
+    t.n_disk     = n_disk;
+    t.n_tail     = n_tail;
+    t.tail_dev   = tail_dev;
+    for (int64_t s = 0; s < n_tail; ++s) {
+        const int64_t e = tail_experts[s];
+        GGML_ASSERT(e >= 0 && e < n_expert);
+        t.tail_experts.push_back(e);
+    }
+    t.file_id    = store->device;
     t.residency.assign((size_t) n_expert, GGML_EXPERT_STORE_INVALID);
     t.host_offset.assign((size_t) n_expert, GGML_EXPERT_STORE_INVALID);
+    t.file_offset.assign((size_t) n_expert, GGML_EXPERT_STORE_INVALID);
     t.write_hash.assign((size_t) n_expert, 0);
     t.write_hash_state.assign((size_t) n_expert, 0);
 
-
+    for (int64_t d = 0; d < n_disk; ++d) {
+        const int64_t e = disk_experts[d];
+        GGML_ASSERT(e >= 0 && e < n_expert);
+        t.residency[(size_t) e]  = GGML_EXPERT_STORE_DISK;
+        t.file_offset[(size_t) e] = store->pack_offset + (int64_t) d * (int64_t) stride;
+    }
+    store->pack_offset += n_disk * (int64_t) stride;
 
     for (int64_t s = 0; s < n_slot; ++s) {
         const int64_t e = slot_experts[s];
         GGML_ASSERT(e >= 0 && e < n_expert);
         t.residency[(size_t) e] = (int32_t) s;
     }
+
     int64_t host_next = 0;
     for (int64_t e = 0; e < n_expert; ++e) {
-        if (t.residency[(size_t) e] < 0) {
+        if (t.residency[(size_t) e] == GGML_EXPERT_STORE_INVALID) {
             t.host_offset[(size_t) e] = host_next;
             host_next += (int64_t) stride;
         }
     }
+    GGML_ASSERT(host_next == n_host * (int64_t) stride);
     t.host_used = host_next;
 
     GGML_LOG_DEBUG("%s: layer %d kind %d: %" PRId64 " experts, %.2f MiB data + %.2f MiB pad each, slots %" PRId64 ", host %" PRId64 "\n",
         __func__, layer, kind, n_expert, blob_bytes / 1024.0 / 1024.0, blob_pad / 1024.0 / 1024.0, n_slot, n_host);
-
 
     if (n_slot > 0) {
         const size_t slot_bytes = (size_t) n_slot * stride;
@@ -1398,24 +1523,25 @@ int ggml_expert_store_add_tensor(
         store->host_used += t.host_used;
     }
 
-
-
-    t.slot_addr.resize((size_t) n_slot);
+    t.slot_addr.resize((size_t) (n_slot + n_tail));
     for (int64_t s = 0; s < n_slot; ++s) {
         t.slot_addr[(size_t) s] = t.slots_dev + (size_t) s * stride;
     }
 
+    for (int64_t s = 0; s < n_tail; ++s) {
+        t.slot_addr[(size_t) (n_slot + s)] = tail_dev + (size_t) s * stride;
+    }
 
     t.table_host = new char *[(size_t) n_expert];
     for (int64_t e = 0; e < n_expert; ++e) {
         if (t.residency[(size_t) e] >= 0) {
             t.table_host[(size_t) e] = t.slot_addr[(size_t) t.residency[(size_t) e]];
+        } else if (t.residency[(size_t) e] == GGML_EXPERT_STORE_DISK) {
+            t.table_host[(size_t) e] = file_ptr(store, t, e);
         } else {
             t.table_host[(size_t) e] = t.host_dev + t.host_offset[(size_t) e];
         }
     }
-
-
 
     for (int64_t e = 0; e < n_expert && t.sample_expert[0] < 0; ++e) {
         if (t.residency[(size_t) e] >= 0) {
@@ -1424,16 +1550,18 @@ int ggml_expert_store_add_tensor(
         }
     }
     for (int64_t e = 0; e < n_expert && t.sample_expert[1] < 0; ++e) {
-        if (t.residency[(size_t) e] < 0) {
+        if (t.residency[(size_t) e] == GGML_EXPERT_STORE_INVALID) {
             t.sample_expert[1] = e;
             t.sample_src[1].resize(blob_bytes);
         }
     }
 
-    GGML_LOG_DEBUG("%s: layer %d kind %d: slots %" PRId64 " (%.2f MiB), host %" PRId64 " (%.2f MiB)\n",
+    GGML_LOG_DEBUG("%s: layer %d kind %d: slots %" PRId64 " (%.2f MiB), host %" PRId64 " (%.2f MiB), disk %" PRId64 " (%.2f MiB), tail %" PRId64 " (%.2f MiB)\n",
         __func__, layer, kind,
         n_slot, n_slot * (double) stride / 1024.0 / 1024.0,
-        n_host, host_next / 1024.0 / 1024.0);
+        n_host, host_next / 1024.0 / 1024.0,
+        n_disk, n_disk * (double) stride / 1024.0 / 1024.0,
+        n_tail, n_tail * (double) stride / 1024.0 / 1024.0);
 
     store->tensors.push_back(std::move(t));
 
@@ -1443,8 +1571,6 @@ int ggml_expert_store_add_tensor(
 static inline int64_t ggml_expert_store_expert_of(const ggml_expert_store_tensor & t, size_t offset) {
     return (int64_t) (offset / t.blob_bytes);
 }
-
-
 
 static void ggml_expert_store_write_impl(
         ggml_expert_store * store, int tensor_id,
@@ -1463,9 +1589,16 @@ static void ggml_expert_store_write_impl(
 
         if (t.residency[(size_t) expert] >= 0) {
 
-
             char * dst = t.slot_addr[(size_t) t.residency[(size_t) expert]] + in_expert;
             store->backend->copy_h2d(store->backend->user, dst, src + written, n);
+        } else if (t.residency[(size_t) expert] == GGML_EXPERT_STORE_DISK) {
+
+            if (store->backend->write_file == nullptr) {
+                GGML_ABORT("%s: layer %d kind %d: the disk tier has no backend to write the pack file\n",
+                    __func__, t.layer, t.kind);
+            }
+            store->backend->write_file(store->backend->user, t.file_id,
+                t.file_offset[(size_t) expert] + (int64_t) in_expert, src + written, n);
         } else {
             char * dst = t.host_host + t.host_offset[(size_t) expert] + in_expert;
             memcpy(dst, src + written, n);
@@ -1482,7 +1615,6 @@ static void ggml_expert_store_write_impl(
                 }
             }
         }
-
 
         if (record_hash) {
             if (in_expert == 0 && n == t.blob_bytes) {
@@ -1521,6 +1653,9 @@ void ggml_expert_store_read(
         if (t.residency[(size_t) expert] >= 0) {
             const char * src = t.slot_addr[(size_t) t.residency[(size_t) expert]] + in_expert;
             store->backend->copy_d2h(store->backend->user, dst + read, src, n);
+        } else if (t.residency[(size_t) expert] == GGML_EXPERT_STORE_DISK) {
+
+            memcpy(dst + read, t.table_host[(size_t) expert] + in_expert, n);
         } else {
             memcpy(dst + read, t.host_host + t.host_offset[(size_t) expert] + in_expert, n);
         }
@@ -1572,20 +1707,23 @@ bool ggml_expert_store_verify(
             continue;
         }
 
-        if (t.residency[(size_t) expert] >= 0) {
-            const char * dev = t.slot_addr[(size_t) t.residency[(size_t) expert]];
+        const int32_t residency = t.residency[(size_t) expert];
+        if (residency >= 0) {
+            const char * dev = t.slot_addr[(size_t) residency];
             store->backend->copy_d2h(store->backend->user, buf.data(), dev, t.blob_bytes);
+        } else if (residency == GGML_EXPERT_STORE_DISK) {
+            memcpy(buf.data(), t.table_host[(size_t) expert], t.blob_bytes);
         } else {
             memcpy(buf.data(), t.host_host + t.host_offset[(size_t) expert], t.blob_bytes);
         }
 
         if (memcmp(buf.data(), t.sample_src[s].data(), t.blob_bytes) != 0) {
             GGML_LOG_ERROR("%s: layer %d kind %d expert %" PRId64 " (%s tier) does not match the source bytes\n",
-                __func__, t.layer, t.kind, expert, t.residency[(size_t) expert] >= 0 ? "slot" : "host");
+                __func__, t.layer, t.kind, expert,
+                residency >= 0 ? "slot" : (residency == GGML_EXPERT_STORE_DISK ? "disk" : "host"));
             ok = false;
         }
     }
-
 
     for (int s = 0; s < 2; ++s) {
         t.sample_src[s].clear();
@@ -1597,8 +1735,6 @@ bool ggml_expert_store_verify(
     }
     return ok;
 }
-
-
 
 static uint64_t ggml_expert_store_hash_range(uint64_t h, const uint8_t * p, size_t n) {
     while (n >= 8) {
@@ -1671,11 +1807,8 @@ bool ggml_expert_store_verify_placement(
 
     if (!have_src) {
 
-
         skipped = t.n_expert;
     } else {
-
-
 
         std::vector<int64_t> global_of((size_t) t.n_expert, -1);
         int dev = -1;
@@ -1734,7 +1867,8 @@ bool ggml_expert_store_verify_placement(
             }
             if (src.hash[(size_t) g] != t.write_hash[(size_t) k]) {
                 GGML_LOG_ERROR("%s: %s: local expert %" PRId64 " of device segment %d holds other bytes than global expert %" PRId64 " of the file (layer %d, %s tier)\n",
-                    __func__, tensor_name, k, dev, g, t.layer, t.residency[(size_t) k] >= 0 ? "slot" : "host");
+                    __func__, tensor_name, k, dev, g, t.layer,
+                    t.residency[(size_t) k] >= 0 ? "slot" : (t.residency[(size_t) k] == GGML_EXPERT_STORE_DISK ? "disk" : "host"));
                 ok = false;
                 break;
             }
@@ -1770,14 +1904,17 @@ void ggml_expert_store_log_stats(const ggml_expert_store * store, const char * t
 void ggml_expert_store_print_plan(const ggml_expert_store * store) {
     int64_t n_slot = 0;
     int64_t n_host = 0;
+    int64_t n_disk = 0;
     for (const ggml_expert_store_tensor & t : store->tensors) {
         n_slot += t.n_slot;
         n_host += t.n_host;
+        n_disk += t.n_disk;
     }
-    GGML_LOG_DEBUG("%s: device %d: %d tensors, %" PRId64 " slots (%.2f MiB), %" PRId64 " host experts (%.2f MiB)\n",
+    GGML_LOG_DEBUG("%s: device %d: %d tensors, %" PRId64 " slots (%.2f MiB), %" PRId64 " host (%.2f MiB), %" PRId64 " disk (%.2f MiB)\n",
         __func__, store->device, (int) store->tensors.size(),
         n_slot, store->slot_used / 1024.0 / 1024.0,
-        n_host, store->host_used / 1024.0 / 1024.0);
+        n_host, store->host_used / 1024.0 / 1024.0,
+        n_disk, store->pack_offset / 1024.0 / 1024.0);
 }
 
 void ggml_expert_store_reset_stats(ggml_expert_store * store) {
@@ -1816,6 +1953,13 @@ bool ggml_expert_store_tensor_swap_to(ggml_expert_store_tensor * st, int64_t exp
 
     const int32_t slot   = st->residency[(size_t) expert_out];
     const int64_t offset = st->host_offset[(size_t) expert_in];
+
+    if (slot < 0 || (int64_t) slot >= st->n_slot || offset < 0 ||
+            st->residency[(size_t) expert_in] != GGML_EXPERT_STORE_INVALID ||
+            std::binary_search(st->tail_experts.begin(), st->tail_experts.end(), expert_in) ||
+            std::binary_search(st->tail_experts.begin(), st->tail_experts.end(), expert_out)) {
+        return false;
+    }
     char * const  old    = st->slot_addr[(size_t) slot];
 
     if (slot_dev != nullptr) {
@@ -1847,13 +1991,6 @@ bool ggml_expert_store_tensor_swap_to(ggml_expert_store_tensor * st, int64_t exp
 bool ggml_expert_store_tensor_swap(ggml_expert_store_tensor * st, int64_t expert_in, int64_t expert_out) {
     return ggml_expert_store_tensor_swap_to(st, expert_in, expert_out, nullptr, nullptr);
 }
-
-
-
-
-
-
-
 
 int64_t ggml_expert_store_swap_epoch(const ggml_expert_store * store) {
     if (store == nullptr) {
@@ -1895,18 +2032,17 @@ int64_t ggml_expert_store_tensor_n_host(const ggml_expert_store_tensor * st) {
 bool ggml_expert_store_tensor_check(const ggml_expert_store_tensor * st) {
     GGML_ASSERT(st != nullptr);
 
-    if (st->n_expert <= 0 || st->stride == 0 || st->n_slot < 0 || st->n_host < 0 ||
-            st->n_slot + st->n_host != st->n_expert ||
+    if (st->n_expert <= 0 || st->stride == 0 || st->n_slot < 0 || st->n_host < 0 || st->n_disk < 0 ||
+            st->n_slot + st->n_host + st->n_disk != st->n_expert ||
             (int64_t) st->residency.size() != st->n_expert ||
             (int64_t) st->host_offset.size() != st->n_expert ||
-            (int64_t) st->slot_addr.size() != st->n_slot ||
+            (int64_t) st->file_offset.size() != st->n_expert ||
+            (int64_t) st->slot_addr.size() != st->n_slot + st->n_tail ||
             st->table_host == nullptr ||
             st->host_used != st->n_host * (int64_t) st->stride) {
         GGML_LOG_ERROR("%s: layer %d kind %d: shape is inconsistent\n", __func__, st->layer, st->kind);
         return false;
     }
-
-
 
     {
         std::vector<char *> addr = st->slot_addr;
@@ -1921,19 +2057,19 @@ bool ggml_expert_store_tensor_check(const ggml_expert_store_tensor * st) {
         }
     }
 
-
-
-    std::vector<bool> slot_taken((size_t) st->n_slot, false);
+    std::vector<bool> slot_taken((size_t) (st->n_slot + st->n_tail), false);
     std::vector<bool> host_taken((size_t) (st->host_used > 0 ? st->host_used / (int64_t) st->stride : 0), false);
     int64_t n_slot_seen = 0;
     int64_t n_host_seen = 0;
+    int64_t n_disk_seen = 0;
 
     for (int64_t e = 0; e < st->n_expert; ++e) {
         const int32_t slot   = st->residency[(size_t) e];
         const int64_t offset = st->host_offset[(size_t) e];
+        const char * expect  = nullptr;
 
         if (slot >= 0) {
-            if (slot >= st->n_slot || slot_taken[(size_t) slot]) {
+            if (slot >= st->n_slot + st->n_tail || slot_taken[(size_t) slot]) {
                 GGML_LOG_ERROR("%s: layer %d kind %d: expert %" PRId64 " has slot %" PRId32 "\n",
                     __func__, st->layer, st->kind, e, slot);
                 return false;
@@ -1945,6 +2081,21 @@ bool ggml_expert_store_tensor_check(const ggml_expert_store_tensor * st) {
                     __func__, st->layer, st->kind, e);
                 return false;
             }
+            expect = st->slot_addr[(size_t) slot];
+        } else if (slot == GGML_EXPERT_STORE_DISK) {
+
+            if (st->file_offset[(size_t) e] < 0 || st->table_host[(size_t) e] == nullptr) {
+                GGML_LOG_ERROR("%s: layer %d kind %d: disk expert %" PRId64 " has no pack offset\n",
+                    __func__, st->layer, st->kind, e);
+                return false;
+            }
+            if (offset != GGML_EXPERT_STORE_INVALID) {
+                GGML_LOG_ERROR("%s: layer %d kind %d: disk expert %" PRId64 " is also on the host\n",
+                    __func__, st->layer, st->kind, e);
+                return false;
+            }
+            n_disk_seen++;
+            expect = st->table_host[(size_t) e];
         } else if (offset >= 0) {
             if (offset % (int64_t) st->stride != 0 || offset >= st->host_used ||
                     host_taken[(size_t) (offset / (int64_t) st->stride)]) {
@@ -1959,14 +2110,13 @@ bool ggml_expert_store_tensor_check(const ggml_expert_store_tensor * st) {
                     __func__, st->layer, st->kind, e);
                 return false;
             }
+            expect = st->host_dev + offset;
         } else {
             GGML_LOG_ERROR("%s: layer %d kind %d: expert %" PRId64 " is stored nowhere\n",
                 __func__, st->layer, st->kind, e);
             return false;
         }
 
-        const char * expect = slot >= 0 ? st->slot_addr[(size_t) slot]
-                                        : st->host_dev + offset;
         if (st->table_host[(size_t) e] != expect) {
             GGML_LOG_ERROR("%s: layer %d kind %d: the table entry of expert %" PRId64 " is wrong\n",
                 __func__, st->layer, st->kind, e);
@@ -1974,9 +2124,9 @@ bool ggml_expert_store_tensor_check(const ggml_expert_store_tensor * st) {
         }
     }
 
-    if (n_slot_seen != st->n_slot || n_host_seen != st->n_host) {
-        GGML_LOG_ERROR("%s: layer %d kind %d: %" PRId64 " slots / %" PRId64 " host experts, expected %" PRId64 " / %" PRId64 "\n",
-            __func__, st->layer, st->kind, n_slot_seen, n_host_seen, st->n_slot, st->n_host);
+    if (n_slot_seen != st->n_slot || n_host_seen != st->n_host || n_disk_seen != st->n_disk) {
+        GGML_LOG_ERROR("%s: layer %d kind %d: %" PRId64 " slots / %" PRId64 " host / %" PRId64 " disk experts, expected %" PRId64 " / %" PRId64 " / %" PRId64 "\n",
+            __func__, st->layer, st->kind, n_slot_seen, n_host_seen, n_disk_seen, st->n_slot, st->n_host, st->n_disk);
         return false;
     }
 

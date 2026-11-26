@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Loader2, Square, SquarePen, X } from '@lucide/svelte';
 	import * as Tooltip from '$lib/components/ui/tooltip';
 	import { cn } from '$lib/components/ui/utils';
@@ -81,7 +82,7 @@
 				{#snippet child({ props })}
 					<button
 						{...props}
-						aria-label="Stop generation"
+						aria-label={tr("Stop generation")}
 						class="stop-button relative z-10 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground"
 						onclick={(e) => handleActionClick(e, () => onStop?.(tab.id, e))}
 					>
@@ -97,7 +98,7 @@
 			</Tooltip.Trigger>
 
 			<Tooltip.Content>
-				<p>Stop generation</p>
+				<p>{tr("Stop generation")}</p>
 			</Tooltip.Content>
 		</Tooltip.Root>
 	{/if}
@@ -115,7 +116,7 @@
 			{#snippet child({ props })}
 				<button
 					{...props}
-					aria-label="Close tab"
+					aria-label={tr("Close tab")}
 					class={cn(
 						'relative z-10 flex h-5 w-5 shrink-0 cursor-pointer items-center justify-center rounded-sm text-muted-foreground transition-opacity hover:bg-foreground/10 hover:text-foreground',
 						contentOpacity
@@ -128,7 +129,7 @@
 		</Tooltip.Trigger>
 
 		<Tooltip.Content>
-			<p>Close tab</p>
+			<p>{tr("Close tab")}</p>
 		</Tooltip.Content>
 	</Tooltip.Root>
 </div>

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import * as Dialog from './index.js';
 	import XIcon from '@lucide/svelte/icons/x';
 	import { cn, type WithoutChildrenOrChild } from '$lib/components/ui/utils';
@@ -42,7 +43,7 @@
 			>
 				<XIcon />
 
-				<span class="sr-only">Close</span>
+				<span class="sr-only">{tr("Close")}</span>
 			</DialogPrimitive.Close>
 		{/if}
 	</DialogPrimitive.Content>

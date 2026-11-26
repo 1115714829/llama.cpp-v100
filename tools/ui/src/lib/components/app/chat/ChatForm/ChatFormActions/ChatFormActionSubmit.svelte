@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { ArrowUp } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import * as Tooltip from '$lib/components/ui/tooltip';
@@ -26,7 +27,7 @@
 		type="submit"
 		{...props}
 	>
-		<span class="sr-only">Send</span>
+		<span class="sr-only">{tr("Send")}</span>
 
 		<ArrowUp class="h-12 w-12" />
 	</Button>

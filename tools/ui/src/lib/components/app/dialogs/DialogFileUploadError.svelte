@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import * as AlertDialog from '$lib/components/ui/alert-dialog';
 
 	interface Props {
@@ -27,17 +28,17 @@
 
 		<AlertDialog.Content class="flex max-w-md flex-col">
 			<AlertDialog.Header>
-				<AlertDialog.Title>File Upload Error</AlertDialog.Title>
+				<AlertDialog.Title>{tr("File Upload Error")}</AlertDialog.Title>
 
 				<AlertDialog.Description class="text-sm text-muted-foreground">
-					Some files cannot be uploaded with the current model.
+					{tr("Some files cannot be uploaded with the current model.")}
 				</AlertDialog.Description>
 			</AlertDialog.Header>
 
 			<div class="!max-h-[50vh] min-h-0 flex-1 space-y-4 overflow-y-auto">
 				{#if fileErrorData.generallyUnsupported.length > 0}
 					<div class="space-y-2">
-						<h4 class="text-sm font-medium text-destructive">Unsupported File Types</h4>
+						<h4 class="text-sm font-medium text-destructive">{tr("Unsupported File Types")}</h4>
 
 						<div class="space-y-1">
 							{#each fileErrorData.generallyUnsupported as file (file.name)}
@@ -46,7 +47,7 @@
 										{file.name}
 									</p>
 
-									<p class="mt-1 text-xs text-muted-foreground">File type not supported</p>
+									<p class="mt-1 text-xs text-muted-foreground">{tr("File type not supported")}</p>
 								</div>
 							{/each}
 						</div>
@@ -73,7 +74,7 @@
 			</div>
 
 			<div class="rounded-md bg-muted/50 p-3">
-				<h4 class="mb-2 text-sm font-medium">This model supports:</h4>
+				<h4 class="mb-2 text-sm font-medium">{tr("This model supports:")}</h4>
 
 				<p class="text-sm text-muted-foreground">
 					{fileErrorData.supportedTypes.join(', ')}
@@ -81,7 +82,7 @@
 			</div>
 
 			<AlertDialog.Footer>
-				<AlertDialog.Action onclick={() => handleOpenChange(false)}>Got it</AlertDialog.Action>
+				<AlertDialog.Action onclick={() => handleOpenChange(false)}>{tr("Got it")}</AlertDialog.Action>
 			</AlertDialog.Footer>
 		</AlertDialog.Content>
 	</AlertDialog.Portal>

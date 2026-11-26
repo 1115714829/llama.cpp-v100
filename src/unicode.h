@@ -4,17 +4,16 @@
 #include <string>
 #include <vector>
 
-// TODO: reimplement this structure in endian-independent way
 struct unicode_cpt_flags {
     enum {
         UNDEFINED       = 0x0001,
-        NUMBER          = 0x0002,  // regex: \p{N}
-        LETTER          = 0x0004,  // regex: \p{L}
-        SEPARATOR       = 0x0008,  // regex: \p{Z}
-        ACCENT_MARK     = 0x0010,  // regex: \p{M}
-        PUNCTUATION     = 0x0020,  // regex: \p{P}
-        SYMBOL          = 0x0040,  // regex: \p{S}
-        CONTROL         = 0x0080,  // regex: \p{C}
+        NUMBER          = 0x0002,
+        LETTER          = 0x0004,
+        SEPARATOR       = 0x0008,
+        ACCENT_MARK     = 0x0010,
+        PUNCTUATION     = 0x0020,
+        SYMBOL          = 0x0040,
+        CONTROL         = 0x0080,
         MASK_CATEGORIES = 0x00FF,
         WHITESPACE      = 0x0100,
         LOWERCASE       = 0x0200,
@@ -22,22 +21,20 @@ struct unicode_cpt_flags {
         NFD             = 0x0800,
     };
 
-    // codepoint type
     uint16_t is_undefined   : 1;
-    uint16_t is_number      : 1;  // regex: \p{N}
-    uint16_t is_letter      : 1;  // regex: \p{L}
-    uint16_t is_separator   : 1;  // regex: \p{Z}
-    uint16_t is_accent_mark : 1;  // regex: \p{M}
-    uint16_t is_punctuation : 1;  // regex: \p{P}
-    uint16_t is_symbol      : 1;  // regex: \p{S}
-    uint16_t is_control     : 1;  // regex: \p{C}
-    // helper flags
-    uint16_t is_whitespace  : 1;  // regex: \s
+    uint16_t is_number      : 1;
+    uint16_t is_letter      : 1;
+    uint16_t is_separator   : 1;
+    uint16_t is_accent_mark : 1;
+    uint16_t is_punctuation : 1;
+    uint16_t is_symbol      : 1;
+    uint16_t is_control     : 1;
+
+    uint16_t is_whitespace  : 1;
     uint16_t is_lowercase   : 1;
     uint16_t is_uppercase   : 1;
     uint16_t is_nfd         : 1;
 
-    // decode from uint16
     inline unicode_cpt_flags(const uint16_t flags = 0) {
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
         *reinterpret_cast<uint16_t*>(this) = flags;
@@ -104,6 +101,7 @@ unicode_cpt_flags unicode_cpt_flags_from_utf8(const std::string & utf8);
 
 std::string unicode_byte_to_utf8(uint8_t byte);
 uint8_t     unicode_utf8_to_byte(const std::string & utf8);
+uint8_t     unicode_cpt_to_byte (uint32_t cpt);
 
 uint32_t unicode_tolower(uint32_t cpt);
 

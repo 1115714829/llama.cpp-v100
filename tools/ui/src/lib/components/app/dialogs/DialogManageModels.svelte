@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import ModelsManager from '$lib/components/app/models/ModelsManager/ModelsManager.svelte';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import { MODEL_ICON } from '$lib/constants';
@@ -25,7 +26,7 @@
 			<Dialog.Title class="flex min-h-7 items-center gap-2">
 				<MODEL_ICON class="h-5 w-5 shrink-0" />
 
-				<span>Models</span>
+				<span>{tr("Models")}</span>
 			</Dialog.Title>
 
 			<Dialog.Description class="sr-only">

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Check, ChevronDown, ChevronRight, Info, Loader2, PencilRuler } from '@lucide/svelte';
 	import { Checkbox } from '$lib/components/ui/checkbox';
 	import * as Collapsible from '$lib/components/ui/collapsible';
@@ -26,7 +27,7 @@
 				<div class="px-3 py-4 text-center text-sm text-muted-foreground">
 					<Loader2 class="mx-auto mb-1 {ICON_CLASS_DEFAULT} animate-spin" />
 
-					Loading tools...
+					{tr("Loading tools...")}
 				</div>
 			{:else if toolsStore.isToolsEndpointUnreachable}
 				<div class="grid gap-2.5 px-3 py-4 text-sm text-muted-foreground">
@@ -51,7 +52,7 @@
 					</span>
 				</div>
 			{:else if toolsStore.error}
-				<div class="px-3 py-4 text-center text-sm text-muted-foreground">Failed to load tools</div>
+				<div class="px-3 py-4 text-center text-sm text-muted-foreground">{tr("Failed to load tools")}</div>
 			{:else if toolsPanel.noToolsInfoMessage}
 				<div class="flex gap-2 px-3 py-4 text-sm text-muted-foreground">
 					<Info class="mt-0.5 {ICON_CLASS_DEFAULT} shrink-0" />
@@ -59,7 +60,7 @@
 					<span>{toolsPanel.noToolsInfoMessage}</span>
 				</div>
 			{:else}
-				<div class="px-3 py-4 text-center text-sm text-muted-foreground">No tools available</div>
+				<div class="px-3 py-4 text-center text-sm text-muted-foreground">{tr("No tools available")}</div>
 			{/if}
 		{:else}
 			<div class="max-h-80 overflow-y-auto p-2 pr-1">

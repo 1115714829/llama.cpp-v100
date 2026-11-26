@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Braces, FolderOpen, Loader2, Plus, X } from '@lucide/svelte';
 	import {
 		McpResourcePreview,
@@ -277,7 +278,7 @@
 			>
 				<X class="size-4" />
 
-				<span class="sr-only">Close</span>
+				<span class="sr-only">{tr("Close")}</span>
 			</Dialog.Close>
 		</Dialog.Header>
 
@@ -374,7 +375,7 @@
 		</div>
 
 		<Dialog.Footer class="border-t border-border/30 px-6 py-4">
-			<Button onclick={() => handleOpenChange(false)} variant="outline">Cancel</Button>
+			<Button onclick={() => handleOpenChange(false)} variant="outline">{tr("Cancel")}</Button>
 
 			{#if hasTemplateResult}
 				<Button disabled={isAttaching} onclick={handleAttachTemplateResource}>

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Plus } from '@lucide/svelte';
 	import { replaceState } from '$app/navigation';
 	import { page } from '$app/state';
@@ -62,7 +63,7 @@
 						<Plus />
 					</Empty.Media>
 
-					<Empty.Title>Add your first MCP server</Empty.Title>
+					<Empty.Title>{tr("Add your first MCP server")}</Empty.Title>
 
 					<Empty.Description>Connect a remote MCP server by URL.</Empty.Description>
 				</Empty.Header>
@@ -114,7 +115,7 @@
 							<Plus />
 						</Empty.Media>
 
-						<Empty.Title>Add another MCP server</Empty.Title>
+						<Empty.Title>{tr("Add another MCP server")}</Empty.Title>
 
 						<Empty.Description>Connect a remote MCP server by URL.</Empty.Description>
 					</Empty.Header>

@@ -4,13 +4,6 @@
 
 #include <cstdint>
 
-
-
-
-
-
-
-
 constexpr int gdn_cols_per_warp = 1;
 
 template <int S_v, bool KDA, bool keep_rs_t, bool Prologue, int cols_per_warp = gdn_cols_per_warp>
@@ -46,15 +39,14 @@ gated_delta_net_cuda(const float * q,
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
-    // the warp is split into cols_per_warp segments of lanes_per_col lanes; each segment owns
-    // one state column and reduces within itself
+
     constexpr int lanes_per_col = warp_size / cols_per_warp;
     constexpr int rows_per_lane = S_v / lanes_per_col;
     static_assert(S_v % lanes_per_col == 0, "S_v must be a multiple of lanes_per_col");
 
     const int lane        = threadIdx.x;
-    const int col_in_warp = lane / lanes_per_col;              // column slot within the warp
-    const int lane_in_col = lane - col_in_warp * lanes_per_col;  // lane within the column's reduction segment
+    const int col_in_warp = lane / lanes_per_col;
+    const int lane_in_col = lane - col_in_warp * lanes_per_col;
     const int col = (blockIdx.z * blockDim.y + threadIdx.y) * cols_per_warp + col_in_warp;
 
     const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
@@ -62,8 +54,6 @@ gated_delta_net_cuda(const float * q,
 
     float *       attn_data        = dst;
 
-    // input state holds s0 only: [S_v, S_v, H, n_seqs] — seq stride is D = H * S_v * S_v.
-    // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
     const int64_t state_in_offset      = sequence * H * S_v * S_v + h_idx * S_v * S_v;
     const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
     state += state_out_offset;
@@ -71,7 +61,6 @@ gated_delta_net_cuda(const float * q,
     attn_data += (sequence * n_tokens * H + h_idx) * S_v;
 
     float         s_shard[rows_per_lane];
-    // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
     ggml_cuda_pdl_sync();
 #pragma unroll
@@ -98,7 +87,6 @@ gated_delta_net_cuda(const float * q,
 
         const float beta_val = *beta_t;
 
-        // Cache k and q in registers
         float k_reg[rows_per_lane];
         float q_reg[rows_per_lane];
 #pragma unroll
@@ -109,32 +97,62 @@ gated_delta_net_cuda(const float * q,
         }
 
         if constexpr (Prologue) {
-
-            float q_ss = 0.0f;
-            float k_ss = 0.0f;
+            if (pro.standalone_rms_order) {
+                float q_ss = 0.0f;
+                float k_ss = 0.0f;
+                if constexpr (lanes_per_col == 32 && rows_per_lane <= 8) {
+                    float qw[8] = {}, kw[8] = {};
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                q_ss += q_reg[r] * q_reg[r];
-                k_ss += k_reg[r] * k_reg[r];
-            }
-
-
-            q_ss = warp_reduce_sum<lanes_per_col>(q_ss);
-            k_ss = warp_reduce_sum<lanes_per_col>(k_ss);
-
-            const float q_norm = rsqrtf(q_ss / S_v + pro.eps_q);
-            const float k_norm = rsqrtf(k_ss / S_v + pro.eps_k);
+                    for (int r = 0; r < rows_per_lane; r++) {
+                        qw[r] = warp_reduce_sum<32>(__fmul_rn(q_reg[r], q_reg[r]));
+                        kw[r] = warp_reduce_sum<32>(__fmul_rn(k_reg[r], k_reg[r]));
+                    }
+                    q_ss = __fadd_rn(__fadd_rn(__fadd_rn(qw[0], qw[4]), __fadd_rn(qw[2], qw[6])),
+                                     __fadd_rn(__fadd_rn(qw[1], qw[5]), __fadd_rn(qw[3], qw[7])));
+                    k_ss = __fadd_rn(__fadd_rn(__fadd_rn(kw[0], kw[4]), __fadd_rn(kw[2], kw[6])),
+                                     __fadd_rn(__fadd_rn(kw[1], kw[5]), __fadd_rn(kw[3], kw[7])));
+                } else {
 #pragma unroll
-            for (int r = 0; r < rows_per_lane; r++) {
-                q_reg[r] = q_reg[r] * q_norm * pro.scale_q;
-                k_reg[r] = k_reg[r] * k_norm * pro.scale_k;
+                    for (int r = 0; r < rows_per_lane; r++) {
+                        q_ss += q_reg[r] * q_reg[r];
+                        k_ss += k_reg[r] * k_reg[r];
+                    }
+                    q_ss = warp_reduce_sum<lanes_per_col>(q_ss);
+                    k_ss = warp_reduce_sum<lanes_per_col>(k_ss);
+                }
+
+                const float q_norm = rsqrtf(__fadd_rn(q_ss / S_v, pro.eps_q));
+                const float k_norm = rsqrtf(__fadd_rn(k_ss / S_v, pro.eps_k));
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    q_reg[r] = __fmul_rn(pro.scale_q, __fmul_rn(q_norm, q_reg[r]));
+                    k_reg[r] = __fmul_rn(pro.scale_k, __fmul_rn(k_norm, k_reg[r]));
+                }
+            } else {
+                float q_ss = 0.0f;
+                float k_ss = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    q_ss += q_reg[r] * q_reg[r];
+                    k_ss += k_reg[r] * k_reg[r];
+                }
+
+                q_ss = warp_reduce_sum<lanes_per_col>(q_ss);
+                k_ss = warp_reduce_sum<lanes_per_col>(k_ss);
+
+                const float q_norm = rsqrtf(q_ss / S_v + pro.eps_q);
+                const float k_norm = rsqrtf(k_ss / S_v + pro.eps_k);
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    q_reg[r] = q_reg[r] * q_norm * pro.scale_q;
+                    k_reg[r] = k_reg[r] * k_norm * pro.scale_k;
+                }
             }
         }
 
         if constexpr (!KDA) {
             const float g_val = expf(*g_t);
 
-            // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
@@ -142,11 +160,8 @@ gated_delta_net_cuda(const float * q,
             }
             float kv_col = warp_reduce_sum<lanes_per_col>(kv_shard);
 
-            // delta[col] = (v[col] - g * kv[col]) * beta
             float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
 
-            // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
-            // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
             float attn_partial = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
@@ -160,7 +175,7 @@ gated_delta_net_cuda(const float * q,
                 attn_data[col] = attn_col * scale;
             }
         } else {
-            // kv[col] = sum_i g[i] * S[i][col] * k[i]
+
             float kv_shard = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
@@ -170,11 +185,8 @@ gated_delta_net_cuda(const float * q,
 
             float kv_col = warp_reduce_sum<lanes_per_col>(kv_shard);
 
-            // delta[col] = (v[col] - kv[col]) * beta
             float delta_col = (v_t[col] - kv_col) * beta_val;
 
-            // fused: S[i][col] = g[i] * S[i][col] + k[i] * delta[col]
-            // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
             float attn_partial = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
@@ -193,8 +205,7 @@ gated_delta_net_cuda(const float * q,
         attn_data += S_v * H;
 
         if constexpr (keep_rs_t) {
-            // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
-            // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
+
             const int target_slot = (int) n_tokens - 1 - t;
             if (target_slot >= 0 && target_slot < K) {
                 float * curr_state = state + target_slot * state_slot_stride;
@@ -228,17 +239,16 @@ static void launch_gated_delta_net(
         int64_t neqk1, int64_t rq3,
         float scale, int64_t state_slot_stride, int K,
         const ggml_cuda_gdn_prologue pro, cudaStream_t stream) {
-    //TODO: Add chunked kernel for even faster pre-fill
+
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    // one column per warp (see the kernel); shrink the CTA when the wider CTA would leave
-    // SMs without a CTA, so small head counts keep the device filled
+
     const int nsm = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
     const int cols_per_warp = gdn_cols_per_warp;
     int num_warps = 4;
     while (num_warps > 1 && H*n_seqs*(S_v / (cols_per_warp * num_warps)) < nsm) {
         num_warps /= 2;
     }
-    // one CTA covers cols_per_warp*num_warps columns (see the kernel)
+
     dim3      grid_dims(H, n_seqs, (S_v + cols_per_warp * num_warps - 1) / (cols_per_warp * num_warps));
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
@@ -328,7 +338,6 @@ static void ggml_cuda_op_gated_delta_net_impl(
     GGML_ASSERT(ggml_is_contiguous(src_beta));
     GGML_ASSERT(ggml_is_contiguous(src_state));
 
-    // strides in floats (beta strides used for both g and beta offset computation)
     const int64_t sq1 = nbq1 / sizeof(float);
     const int64_t sq2 = nbq2 / sizeof(float);
     const int64_t sq3 = nbq3 / sizeof(float);
@@ -343,19 +352,15 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     cudaStream_t stream = ctx.stream();
 
-    // K (snapshot slot count) is an op param; state holds s0 only [S_v, S_v, H, n_seqs].
     const int K = ggml_get_op_params_i32(dst, 0);
     const bool keep_rs = K > 1;
 
-    // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
     int64_t state_slot_stride = S_v * S_v * H * n_seqs;
     if (cache != nullptr) {
         state_d           = cache->data;
         state_slot_stride = cache->slot_stride;
     }
-
-
 
     const float * q_rec   = q_d;
     const float * k_rec   = k_d;
@@ -384,6 +389,7 @@ static void ggml_cuda_op_gated_delta_net_impl(
                 args.sk1 = prologue->sk1;
                 args.sk2 = prologue->sk2;
                 args.l2norm  = true;
+                args.standalone_rms_order = prologue->standalone_rms_order;
                 args.eps_q   = prologue->eps_q;
                 args.scale_q = prologue->scale_q;
                 args.eps_k   = prologue->eps_k;

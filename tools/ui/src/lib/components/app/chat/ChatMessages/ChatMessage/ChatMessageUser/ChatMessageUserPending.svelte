@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { ArrowUp, Edit, Trash2 } from '@lucide/svelte';
 	import { ActionIcon, ChatMessageEditForm, ChatMessageUserBubble } from '$lib/components/app';
 	import { useChatMessageEditContext } from '$lib/hooks/use-chat-message-edit-context.svelte';
@@ -50,9 +51,9 @@
 					<div
 						class="pointer-events-auto inset-0 flex items-center gap-1 opacity-0 transition-all duration-150 group-hover:opacity-100"
 					>
-						<ActionIcon icon={Edit} onclick={editCtx.handleEdit} tooltip="Edit" />
+						<ActionIcon icon={Edit} onclick={editCtx.handleEdit} tooltip={tr("Edit")} />
 
-						<ActionIcon icon={Trash2} onclick={onDelete} tooltip="Delete" />
+						<ActionIcon icon={Trash2} onclick={onDelete} tooltip={tr("Delete")} />
 
 						<ActionIcon icon={ArrowUp} onclick={onSendImmediately} tooltip="Send immediately" />
 					</div>

@@ -18,7 +18,7 @@
 static constexpr uint32_t DSV4_CSA_RATIO = 4;
 static constexpr uint32_t DSV4_HCA_RATIO = 128;
 
-static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
+static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344;
 static constexpr uint32_t DSV4_STATE_VERSION       = 1;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
@@ -151,24 +151,24 @@ static llama_ubatch dsv4_build_raw_write_ubatch(const llama_ubatch & ubatch) {
     }
 
     llama_ubatch res {
-        /*.b_equal_seqs =*/ true,
-        /*.n_tokens     =*/ n_tokens,
-        /*.n_seq_tokens =*/ n_seq_tokens,
-        /*.n_seqs       =*/ ubatch.n_seqs_unq,
-        /*.n_seqs_unq   =*/ ubatch.n_seqs_unq,
-        /*.n_pos        =*/ ubatch.n_pos,
-        /*.token        =*/ data->token.empty() ? nullptr : data->token.data(),
-        /*.embd         =*/ nullptr,
-        /*.embd_state   =*/ nullptr,
-        /*.pos          =*/ data->pos.data(),
-        /*.n_seq_id     =*/ data->n_seq_id.data(),
-        /*.seq_id       =*/ data->seq_id.data(),
-        /*.seq_id_unq   =*/ data->seq_id_unq.data(),
-        /*.seq_idx      =*/ data->seq_idx.data(),
-        /*.output       =*/ data->output.data(),
-        /*.type         =*/ nullptr,
-        /*.decision_order =*/ nullptr,
-        /*.data         =*/ data,
+                            true,
+                            n_tokens,
+                            n_seq_tokens,
+                            ubatch.n_seqs_unq,
+                            ubatch.n_seqs_unq,
+                            ubatch.n_pos,
+                            data->token.empty() ? nullptr : data->token.data(),
+                            nullptr,
+                            nullptr,
+                            data->pos.data(),
+                            data->n_seq_id.data(),
+                            data->seq_id.data(),
+                            data->seq_id_unq.data(),
+                            data->seq_idx.data(),
+                            data->output.data(),
+                            nullptr,
+                              nullptr,
+                            data,
     };
 
     return res;
@@ -198,8 +198,7 @@ static bool dsv4_batch_has_coupled(const llama_batch & batch) {
 }
 
 static int64_t dsv4_comp_graph_n_stream(const llama_ubatch & ubatch, uint32_t n_stream) {
-    // Coupled sequence sets must stay in one graph stream because their
-    // compressed state is shared. Independent per-seq state can fan out.
+
     if (n_stream <= 1 || ubatch.n_seqs_unq <= 1 || dsv4_ubatch_has_coupled(ubatch)) {
         return 1;
     }
@@ -441,8 +440,6 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
     plan.n_visible.resize(ubatch.n_tokens);
     plan.n_stream = dsv4_comp_graph_n_stream(ubatch, n_stream);
 
-    // n_stream is the persistent cache/state layout; plan.n_stream is the
-    // graph view for this ubatch and can be a subset of those streams.
     if (n_stream <= 1 && ubatch.n_seqs_unq > 1) {
         throw std::runtime_error("DSV4 single compressed stream cannot serve multiple sequences");
     }
@@ -457,11 +454,6 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
 
     std::vector<persist_row> persist_rows;
 
-    // For the overlap compressor, build_overlap_compressed_kv_from_state() consumes
-    // state_read_idxs as two contiguous halves: the first ratio*n_blocks entries are
-    // the "previous-window" gather indices for every block, followed by the
-    // "current-window" indices for every block. Collect them separately here and
-    // append cur after prev once the loop has visited all completed blocks
     std::vector<int32_t> overlap_prev_reads;
     std::vector<int32_t> overlap_cur_reads;
 
@@ -476,9 +468,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
 
     const auto state_source_idx = [&](llama_seq_id seq_id, llama_pos pos) -> int32_t {
         if (pos < 0) {
-            // The overlap compressor needs a zero/-inf source for the first
-            // block's previous half. The graph appends that row after the
-            // current-ubatch scratch rows.
+
             return (int32_t) (state_rows + ubatch.n_tokens);
         }
 
@@ -551,7 +541,6 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
     if (ratio == DSV4_CSA_RATIO && !plan.state_pos.empty()) {
         assert(kv_size > 0);
 
-        // Pad each stream to the reserve plan's block count.
         const auto append_dummy_block = [&](llama_seq_id seq_id, uint32_t i) {
             const int64_t cache_off = dsv4_stream_offset(n_stream, seq_id, kv_size);
             const int32_t source_idx = state_source_idx(seq_id, ubatch.pos[i]);
@@ -605,13 +594,9 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
 
     if (ratio == DSV4_HCA_RATIO && !plan.state_pos.empty() && plan.state_write_idxs.empty()) {
         assert(kv_size > 0);
-        // the last slot must not be live, or the dummy write would corrupt it;
-        // a full stream implies a completed block, which implies real writes
+
         assert(plan.n_kv < (int64_t) kv_size);
 
-        // Keep the compress/write ops in the graph when no HCA block completes
-        // in this ubatch. The dummy block writes to the last cache slot and is
-        // masked out.
         uint32_t i = 0;
         while (i < ubatch.n_tokens && ubatch.pos[i] < 0) {
             ++i;
@@ -631,7 +616,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
     }
 
     if (overlap) {
-        // [ all blocks' prev-window indices | all blocks' cur-window indices ]
+
         plan.state_read_idxs.reserve(overlap_prev_reads.size() + overlap_cur_reads.size());
         plan.state_read_idxs.insert(plan.state_read_idxs.end(),
                 overlap_prev_reads.begin(), overlap_prev_reads.end());
@@ -639,9 +624,6 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                 overlap_cur_reads.begin(), overlap_cur_reads.end());
     }
 
-    // Keep the mask (and with it the compressed-attention branch) present even
-    // before the first block is visible, so the graph topology never changes.
-    // Padded slots are masked out; comp cache buffers are zero-initialized.
     plan.n_kv = std::max<int64_t>(GGML_PAD(plan.n_kv, 256u), 256);
 
     std::sort(persist_rows.begin(), persist_rows.end(),
@@ -655,13 +637,11 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
     }
 
     if (n_rs_seq > 0) {
-        // Emit restore/snapshot entries for all layout streams so that the
-        // graph tensor sizes do not depend on the ubatch's sequence count.
-        // Streams not present in the ubatch get no-op entries.
+
         for (uint32_t stream = 0; stream < n_stream; ++stream) {
             llama_seq_id seq_id = -1;
             if (n_stream == 1) {
-                // a unified stream serves any single sequence
+
                 seq_id = ubatch.n_seqs_unq > 0 ? ubatch.seq_id_unq[0] : -1;
             } else {
                 for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
@@ -674,7 +654,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
 
             const int64_t stream_off = (int64_t) stream*state_size;
             const uint32_t rollback = seq_id >= 0 && (uint32_t) seq_id < rs_idx.size() ? rs_idx[seq_id] : 0;
-            // Keep the restore graph fixed-width when no rollback is pending.
+
             const int64_t src_plane = rollback > 0 && rollback <= n_rs_seq ? (int64_t) rollback*state_rows : 0;
             for (uint32_t r = 0; r < state_size; ++r) {
                 plan.state_restore_src_idxs.push_back((int32_t) (src_plane + stream_off + r));
@@ -708,7 +688,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                     }
 
                     if (n_seq_tokens == 0) {
-                        // no-op: copy the snapshot plane onto itself
+
                         src = (int32_t) (dst_plane + stream_off + r);
                     }
 
@@ -752,7 +732,6 @@ static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans
     std::vector<llama_kv_cache_dsv4_context::comp_plan> plans;
     plans.reserve(ubatches.size());
 
-    // the first ubatch touching a seq consumes its rollback restore
     std::vector<uint32_t> rs(rs_idx);
     for (const llama_ubatch & ubatch : ubatches) {
         plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, rs));
@@ -860,8 +839,6 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
         return plan;
     }
 
-    // worst case over every seq split: sum of per-seq ceil(tokens/ratio) is at
-    // most floor(n_tokens/ratio) + n_seqs
     const uint32_t n_seqs = std::max<uint32_t>(1, ubatch.n_seqs);
     const size_t n_blocks = (size_t) ubatch.n_tokens/ratio + n_seqs;
 
@@ -885,14 +862,10 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
 }
 
 static void dsv4_make_k_only(llama_hparams & hparams) {
-    // llama_kv_cache uses hparams.is_mla() to allocate K-only storage.
+
     hparams.n_embd_head_k_mla_impl = hparams.n_embd_head_k();
     hparams.n_embd_head_v_mla_impl = hparams.n_embd_head_k();
 }
-
-//
-// llama_dsv4_comp_state
-//
 
 llama_dsv4_comp_state::llama_dsv4_comp_state(
         const llama_model & model,
@@ -924,9 +897,9 @@ llama_dsv4_comp_state::llama_dsv4_comp_state(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*hparams.n_layer()*ggml_tensor_overhead()),
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
+                                  size_t(2u*(1 + n_stream)*hparams.n_layer()*ggml_tensor_overhead()),
+                                  NULL,
+                                  true,
             };
 
             ggml_context * ctx = ggml_init(params);
@@ -1214,10 +1187,6 @@ size_t llama_dsv4_comp_state::total_size() const {
     return size;
 }
 
-//
-// llama_kv_cache_dsv4
-//
-
 llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         const llama_model & model,
                 ggml_type   type_k,
@@ -1239,7 +1208,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_lid(model.hparams),
     n_seq_max(n_seq_max),
     n_rs_seq(n_rs_seq),
-    rs_idx(n_seq_max, 0) {
+    rs_idx(n_seq_max, 0),
+    rs_max(n_seq_max, 0) {
 
     const layer_filter_cb filter_raw = [&](int32_t il) {
         if (filter && !filter(il)) {
@@ -1251,7 +1221,6 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
 
     GGML_UNUSED(unified);
 
-    // Keep DSV4 KV/state streams per sequence even when public KV mode is unified.
     const bool unified_raw = false;
 
     hparams_raw.n_layer_nextn = 0;
@@ -1339,10 +1308,6 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
             model, offload, unified_compressed, n_seq_max, DSV4_CSA_RATIO, 2*DSV4_CSA_RATIO,
             2*model.hparams.indexer_head_size, n_rs_seq, "lid", filter_csa);
 
-    // DSV4 attention reads compressed-K / compressor-state rows that the current
-    // graph does not necessarily overwrite; uninitialized buffer contents would
-    // otherwise leak in (instance-specific garbage) and corrupt recall. Zero all
-    // compressed buffers up front so reads of un-written rows are deterministic.
     clear_compressed(-1, true);
 }
 
@@ -1380,8 +1345,6 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
                 std::move(ubatches_raw));
     };
 
-    // Match llama_kv_cache_iswa splitting when DSV4 compressed state does not
-    // require per-sequence graph layout.
     do {
         if (raw_per_seq || comp_per_seq) {
             break;
@@ -1407,9 +1370,6 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
         }
     } while (false);
 
-    // When raw or compressed state is per-sequence, independent sequences can
-    // share an equal-length ubatch. Coupled sequence sets still serialize until
-    // DSV4 has explicit shared-state handling for compressed streams.
     do {
         balloc.split_reset();
 
@@ -1419,8 +1379,7 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
             if (has_coupled) {
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
-                // [TAG_RECURRENT_ROLLBACK_SPLITS]
-                // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
+
                 ubatch = balloc.split_equal(n_ubatch, raw_per_seq || comp_per_seq, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
             }
 
@@ -1457,14 +1416,13 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_update(llama_context * lctx, 
 }
 
 bool llama_kv_cache_dsv4::get_can_shift() const {
-    // Compressed row metadata uses block-derived positions. Keep shifting
-    // disabled until DSV4 compressed-cache shift semantics are wired.
+
     return false;
 }
 
 void llama_kv_cache_dsv4::clear(bool data) {
     kv_raw->clear(data);
-    clear_compressed(-1, true); // DSV4 compressed buffers must never expose stale/uninit rows
+    clear_compressed(-1, true);
 }
 
 bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -1489,16 +1447,11 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return res;
         }
 
-        if (n_rs_seq == 0) {
-            return false;
-        }
-
         const llama_pos rollback = pos_max - (p0 - 1);
-        if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
+        if (rollback < 1 || rollback > (llama_pos) rs_max[seq_id]) {
             return false;
         }
 
-        // pending rollback is single-use: stacked partial removals don't compose
         if (rs_idx[seq_id] != 0) {
             return false;
         }
@@ -1534,6 +1487,7 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
 
     if (seq_id_src != seq_id_dst) {
         rs_idx[seq_id_dst] = 0;
+        rs_max[seq_id_dst] = 0;
     }
 }
 
@@ -1565,9 +1519,6 @@ llama_pos llama_kv_cache_dsv4::seq_pos_min(llama_seq_id seq_id) const {
         return -1;
     }
 
-    // The raw SWA cache may contain a wider window, but the compressed DSV4
-    // state cannot be rolled back within that window. Report only the current
-    // boundary so server-context uses checkpoints for rollback.
     return kv_raw->seq_pos_max(seq_id);
 }
 
@@ -1628,7 +1579,6 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     if (!partial_only) {
         const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
 
-        //FIXME : note that we conflate token positions with rows, which is not true for multi-modal case.
         const uint32_t n_rows_csa = seq_id >= 0 ?
             dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_csa->get_size()) : kv_csa->get_size();
         const uint32_t n_rows_hca = seq_id >= 0 ?
@@ -1688,8 +1638,10 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
         rs_idx[seq_id] = 0;
+        rs_max[seq_id] = 0;
     } else {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        std::fill(rs_max.begin(), rs_max.end(), 0);
     }
 }
 
@@ -1729,18 +1681,29 @@ const std::vector<uint32_t> & llama_kv_cache_dsv4::get_rs_idx() const {
     return rs_idx;
 }
 
-void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches) {
+void llama_kv_cache_dsv4::update_rs_for_ubatches(const std::vector<llama_ubatch> & ubatches) {
     if (n_rs_seq == 0) {
         return;
     }
 
+    std::vector<uint32_t> n_seq_tokens(n_seq_max);
+
     for (const llama_ubatch & ubatch : ubatches) {
+        std::fill(n_seq_tokens.begin(), n_seq_tokens.end(), 0);
+
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
                 const llama_seq_id seq_id = ubatch.seq_id[i][s];
                 if (seq_id >= 0 && (uint32_t) seq_id < n_seq_max) {
-                    rs_idx[seq_id] = 0;
+                    n_seq_tokens[seq_id]++;
                 }
+            }
+        }
+
+        for (uint32_t seq_id = 0; seq_id < n_seq_max; ++seq_id) {
+            if (n_seq_tokens[seq_id] > 0) {
+                rs_idx[seq_id] = 0;
+                rs_max[seq_id] = std::min(n_seq_tokens[seq_id], n_rs_seq);
             }
         }
     }
@@ -1780,10 +1743,6 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
     }
 }
-
-//
-// llama_kv_cache_dsv4_raw_context
-//
 
 static llama_kv_cache::slot_info dsv4_build_full_sinfo(const llama_kv_cache * kv) {
     const uint32_t n_stream = kv->get_n_stream();
@@ -1906,8 +1865,6 @@ ggml_tensor * llama_kv_cache_dsv4_raw_context::cpy_k(ggml_context * ctx, ggml_te
         return kv_swa->cpy_k(ctx, k_cur, k_idxs, il, sinfo);
     }
 
-    // k_idxs may be expanded to one block per stream while k_cur is only
-    // the token block. Keep zero deps on all copies so each write executes.
     const int64_t n_fanout = (int64_t) sinfo.size()*sinfo.n_stream();
 
     GGML_ASSERT(sinfo.n_stream() > 1);
@@ -1948,10 +1905,6 @@ void llama_kv_cache_dsv4_raw_context::set_input_k_idxs(ggml_tensor * dst) const 
 void llama_kv_cache_dsv4_raw_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv_swa->set_input_kq_mask(dst, ubatch, causal_attn);
 }
-
-//
-// llama_kv_cache_dsv4_comp_context
-//
 
 llama_kv_cache_dsv4_comp_context::llama_kv_cache_dsv4_comp_context(llama_kv_cache * kv) : kv(kv), n_kv(kv->get_size()) {
     const uint32_t n_stream = kv->get_n_stream();
@@ -2003,10 +1956,6 @@ ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k(ggml_context * ctx, ggml_t
 ggml_tensor * llama_kv_cache_dsv4_comp_context::build_input_k_rot(int32_t il) const {
     return kv->build_input_k_rot(il);
 }
-
-//
-// llama_kv_cache_dsv4_context
-//
 
 llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(llama_memory_status status) : status(status) {}
 
@@ -2096,7 +2045,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     hca_state(kv->get_hca_state()),
     lid_state(kv->get_lid_state()),
     status(ctx_raw->get_status()) {
-    kv->reset_rs_idx_for_ubatches(this->ubatches);
+    kv->update_rs_for_ubatches(this->ubatches);
 }
 
 llama_kv_cache_dsv4_context::~llama_kv_cache_dsv4_context() = default;

@@ -127,23 +127,14 @@ if (CUDAToolkit_FOUND)
     ggml_cuda_fattn_vec_instances(${CMAKE_CURRENT_SOURCE_DIR} SRCS)
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
 
-
-
-
     list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/fattn-sm70-d256.cu")
     list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/gdn-chunk-sm70.cu")
+    list(REMOVE_ITEM GGML_SOURCES_CUDA "${CMAKE_CURRENT_SOURCE_DIR}/fp8-sm70.cu")
 
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
                             )
-
-
-
-
-
-
-
 
     set(GGML_CUDA_SM70_D256_ENABLE OFF)
     foreach(ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
@@ -153,6 +144,19 @@ if (CUDAToolkit_FOUND)
     endforeach()
 
     if (GGML_CUDA_SM70_D256_ENABLE)
+        # OCP E4M3 conversion keeps signed-zero/NaN semantics (no fast math).
+        # The production wrapper moved into this translation unit too, so it
+        # needs the same include/link setup as the D256 object beside it.
+        add_library(ggml-cuda-fp8-sm70 OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/fp8-sm70.cu")
+        target_link_libraries(ggml-cuda-fp8-sm70 PRIVATE ggml-base CUDA::cudart CUDA::cublas)
+        target_include_directories(ggml-cuda-fp8-sm70 PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/.."
+            "${CMAKE_CURRENT_SOURCE_DIR}/sm70-vendor")
+        set_target_properties(ggml-cuda-fp8-sm70 PROPERTIES
+            CUDA_ARCHITECTURES "70" CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON POSITION_INDEPENDENT_CODE ON)
+        target_link_libraries(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-fp8-sm70>)
+
         add_library(ggml-cuda-sm70d256 OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/fattn-sm70-d256.cu")
         target_link_libraries(ggml-cuda-sm70d256 PRIVATE ggml-base)
         target_include_directories(ggml-cuda-sm70d256 PRIVATE
@@ -164,10 +168,6 @@ if (CUDAToolkit_FOUND)
 
         set_target_properties(ggml-cuda-sm70d256 PROPERTIES CUDA_ARCHITECTURES "70" POSITION_INDEPENDENT_CODE ON)
         target_link_libraries(ggml-cuda PRIVATE $<TARGET_OBJECTS:ggml-cuda-sm70d256>)
-
-
-
-
 
         add_library(ggml-cuda-gdnchunk OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/gdn-chunk-sm70.cu")
         target_link_libraries(ggml-cuda-gdnchunk PRIVATE ggml-base)
@@ -236,6 +236,9 @@ if (CUDAToolkit_FOUND)
         if (NCCL_FOUND)
             add_compile_definitions(GGML_USE_NCCL)
             target_link_libraries(ggml-cuda PRIVATE NCCL::NCCL)
+            if (TARGET ggml-cuda-fp8-sm70)
+                target_link_libraries(ggml-cuda-fp8-sm70 PRIVATE NCCL::NCCL)
+            endif()
             if (TARGET ggml-cuda-sm70d256)
 
                 target_link_libraries(ggml-cuda-sm70d256 PRIVATE NCCL::NCCL)

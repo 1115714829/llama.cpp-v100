@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from "$lib/stores/locale.svelte";
 	import { KeyboardShortcutInfo } from '$lib/components/app';
 	import * as Drawer from '$lib/components/ui/drawer';
 	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
@@ -88,7 +89,7 @@
 					>
 						{@render iconComponent(action.icon, 'h-4 w-4 shrink-0')}
 
-						<span class="flex-1">{action.label}</span>
+						<span class="flex-1">{tr(action.label)}</span>
 
 						{#if action.shortcut}
 							<KeyboardShortcutInfo keys={action.shortcut} variant={action.variant} />
@@ -142,7 +143,7 @@
 							action.icon,
 							`h-4 w-4 ${action.variant === 'destructive' ? 'text-destructive' : ''}`
 						)}
-						{action.label}
+						{tr(action.label)}
 					</div>
 
 					{#if action.shortcut}

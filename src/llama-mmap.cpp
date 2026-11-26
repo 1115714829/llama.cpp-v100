@@ -3,10 +3,12 @@
 #include "llama-impl.h"
 
 #include "ggml.h"
+#include "../ggml/src/ggml-safe-io.h"
 
 #include <cstring>
 #include <climits>
 #include <cstdlib>
+#include <cstdio>
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
@@ -49,7 +51,6 @@
 #    define llama_mmap_fseek fseeko
 #endif
 
-// TODO: consider moving to llama-impl.h if needed in more places
 #if defined(_WIN32)
 static std::string llama_format_win_err(DWORD err) {
     LPSTR buf;
@@ -64,7 +65,19 @@ static std::string llama_format_win_err(DWORD err) {
 }
 #endif
 
-// llama_file
+static size_t llama_mmap_prefetch_limit() {
+    static const size_t limit = [] {
+        const char * v = getenv("LLAMA_V100_MMAP_PREFETCH_MIB");
+        if (v != nullptr && *v != '\0') {
+            const long mib = strtol(v, nullptr, 10);
+            if (mib >= 0) {
+                return (size_t) mib << 20;
+            }
+        }
+        return (size_t) 1024 << 20;
+    }();
+    return limit;
+}
 
 struct llama_file::impl {
 #if defined(_WIN32)
@@ -183,38 +196,41 @@ struct llama_file::impl {
 #else
     impl(const char * fname, const char * mode, [[maybe_unused]] const bool use_direct_io = false) : fname(fname) {
 #ifdef __linux__
-        // Try unbuffered I/O for read only
-        if (use_direct_io && std::strcmp(mode, "rb") == 0) {
-            if (init_fd()) {
-                return;
+
+        if (std::strcmp(mode, "rb") == 0) {
+            gate = std::make_shared<ggml_safe_io::reader>();
+
+            const uint64_t resident = use_direct_io
+                ? static_cast<uint64_t>(LLAMA_DIRECT_IO_BUFFER_SIZE)
+                : static_cast<uint64_t>(llama_mmap_prefetch_limit());
+            const auto s = gate->open(fname, resident, use_direct_io);
+            if (s.code != ggml_safe_io::error::none) {
+                throw std::runtime_error(format(
+                    "refused to read '%s' under the safe-IO contract: %s (stage %u)",
+                    fname, ggml_safe_io::error_name(s.code), unsigned(s.where)));
             }
-            LLAMA_LOG_WARN("Failed to open file '%s' with error: %s. Falling back to buffered I/O",
-                           fname, strerror(errno));
+            via_gate = true;
+            size = gate->size();
+            if (gate->alignment() > 1) {
+
+                fd = gate->fd();
+                alignment = gate->alignment();
+            } else {
+
+                const int gfd = gate->detach_fd();
+                fp = ::fdopen(gfd, mode);
+                if (fp == nullptr) {
+                    const int e = errno;
+                    ::close(gfd);
+                    throw std::runtime_error(format("failed to open %s: %s", fname, strerror(e)));
+                }
+                owns_fp = true;
+            }
+            return;
         }
 #endif
         init_fp(mode);
     }
-
-#ifdef __linux__
-    bool init_fd() {
-        fd = open(fname.c_str(), O_RDONLY | O_DIRECT);
-
-        if (fd != -1) {
-            struct stat file_stats{};
-            fstat(fd, &file_stats);
-
-            size = file_stats.st_size;
-            alignment = file_stats.st_blksize;
-
-            off_t ret = lseek(fd, 0, SEEK_SET);
-            if (ret == -1) {
-                throw std::runtime_error(format("seek error: %s", strerror(errno)));
-            }
-            return true;
-        }
-        return false;
-    }
-#endif
 
     void init_fp(const char * mode) {
         fp = ggml_fopen(fname.c_str(), mode);
@@ -286,12 +302,34 @@ struct llama_file::impl {
 
                 if (ret == -1) {
                     if (errno == EINTR) {
-                        continue;  // Interrupted by signal, retry
+                        continue;
                     }
-                    // Fallback to std::fread in case the DMA controller cannot access the buffer
+
                     if (errno == EFAULT || errno == EINVAL) {
                         LLAMA_LOG_WARN("%s: Falling back to buffered IO due to %s\n", __func__, strerror(errno));
-                        auto curr_off = tell();
+                        const auto curr_off = tell();
+                        if (via_gate) {
+
+                            const auto rs = gate->reopen_buffered();
+                            if (rs.code != ggml_safe_io::error::none) {
+                                throw std::runtime_error(format(
+                                    "failed to fall back to buffered IO for %s: %s",
+                                    fname.c_str(), ggml_safe_io::error_name(rs.code)));
+                            }
+                            const int gfd = gate->detach_fd();
+                            fp = ::fdopen(gfd, "rb");
+                            if (fp == nullptr) {
+                                const int e = errno;
+                                ::close(gfd);
+                                throw std::runtime_error(format("failed to open %s: %s", fname.c_str(), strerror(e)));
+                            }
+                            owns_fp = true;
+                            fd = -1;
+                            alignment = 1;
+                            seek(curr_off, SEEK_SET);
+                            read_raw_unsafe(ptr, len);
+                            return;
+                        }
                         close(fd);
                         fd = -1;
                         alignment = 1;
@@ -303,7 +341,7 @@ struct llama_file::impl {
                     throw std::runtime_error(format("read error: %s", strerror(errno)));
                 }
                 if (ret == 0) {
-                    // EOF: allow if this read was only pulling alignment padding past file end
+
                     off_t pos = lseek(fd, 0, SEEK_CUR);
                     if (pos != -1 && (size_t) pos == size) {
                         std::memset(reinterpret_cast<char *>(ptr) + bytes_read, 0, len - bytes_read);
@@ -323,7 +361,6 @@ struct llama_file::impl {
         off_t offset_from_alignment = offset - aligned_offset;
         size_t bytes_to_read = (offset_from_alignment + size + alignment - 1) & ~(alignment - 1);
 
-        // stage through a bounded buffer, so that a large tensor is not held in memory twice while it loads
         const size_t buffer_size = std::min<size_t>(bytes_to_read, LLAMA_DIRECT_IO_BUFFER_SIZE);
 
         void * raw_buffer = nullptr;
@@ -388,12 +425,21 @@ struct llama_file::impl {
     }
 
     ~impl() {
+        if (via_gate) {
+
+            if (owns_fp) { std::fclose(fp); }
+            fd = -1;
+            return;
+        }
         if (fd != -1) {
             close(fd);
         } else if (owns_fp) {
             std::fclose(fp);
         }
     }
+
+    std::shared_ptr<ggml_safe_io::reader> gate;
+    bool via_gate = false;
     int fd = -1;
     std::string fname;
 #endif
@@ -415,6 +461,15 @@ llama_file::llama_file(const char * fname, const char * mode, const bool use_dir
 llama_file::llama_file(FILE * file) : pimpl(std::make_unique<impl>(file)) {}
 
 llama_file::~llama_file() = default;
+
+std::shared_ptr<ggml_safe_io::reader> llama_file::read_gate() const {
+#if defined(_WIN32)
+
+    return nullptr;
+#else
+    return pimpl->gate;
+#endif
+}
 
 size_t llama_file::tell() const { return pimpl->tell(); }
 size_t llama_file::size() const { return pimpl->size; }
@@ -450,9 +505,6 @@ uint32_t llama_file::read_u32() { return pimpl->read_u32(); }
 void llama_file::write_raw(const void * ptr, size_t len) const { pimpl->write_raw(ptr, len); }
 void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 
-
-
-
 size_t llama_file::drop_page_cache(size_t first, size_t last) {
 #ifdef __linux__
     const int fd = file_id();
@@ -476,10 +528,8 @@ size_t llama_file::drop_page_cache(size_t first, size_t last) {
 #endif
 }
 
-// llama_mmap
-
 #if defined(_POSIX_MAPPED_FILES) || defined(_WIN32)
-// merge `ranges` and return their complement within [0, limit)
+
 static llama_mmap::ranges ranges_complement(llama_mmap::ranges ranges, size_t limit) {
     llama_mmap::ranges res;
     std::sort(ranges.begin(), ranges.end());
@@ -509,34 +559,29 @@ struct llama_mmap::impl {
     int fd_own = -1;
 #endif
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges,
+         std::shared_ptr<ggml_safe_io::reader> gate_in) : gate(std::move(gate_in)) {
         size = file->size();
         int fd = file->file_id();
         int flags = MAP_SHARED;
 
-
-
-
-
-
-
-
-
         (void) numa;
+
+        const size_t prefetch_max = llama_mmap_prefetch_limit();
+        const size_t prefetch_eff = std::min(prefetch, prefetch_max);
 #ifdef __linux__
         if (posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL)) {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
-        // MAP_POPULATE would fault in the lazy ranges too
-        if (prefetch && lazy_ranges.empty()) { flags |= MAP_POPULATE; }
+
+        if (prefetch_eff && lazy_ranges.empty() && file->size() <= prefetch_max) { flags |= MAP_POPULATE; }
 #endif
         addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
 
-        // page-aligned madvise over [beg, end), clamped to the file
         auto advise = [&](size_t beg, size_t end, int advice, const char * name) {
             const size_t page_size = sysconf(_SC_PAGESIZE);
             beg = beg & ~(page_size - 1);
@@ -549,16 +594,12 @@ struct llama_mmap::impl {
             }
         };
 
-        if (prefetch > 0) {
-            for (const auto & range : ranges_complement(lazy_ranges, std::min(file->size(), prefetch))) {
+        if (prefetch_eff > 0) {
+            for (const auto & range : ranges_complement(lazy_ranges, std::min(file->size(), prefetch_eff))) {
                 advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
             }
         }
         if (numa) {
-
-
-
-
 
             if (posix_madvise(addr, file->size(), POSIX_MADV_SEQUENTIAL)) {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_SEQUENTIAL) failed: %s\n",
@@ -574,6 +615,7 @@ struct llama_mmap::impl {
 #ifdef __linux__
         fd_own = dup(fd);
         if (fd_own == -1) {
+
             LLAMA_LOG_DEBUG("warning: dup failed: %s, page cache of unmapped fragments will not be released\n", strerror(errno));
         }
 #endif
@@ -608,11 +650,14 @@ struct llama_mmap::impl {
 
         const int munmap_ret = munmap(next_page_start, len);
         if (munmap_ret) {
-            LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
+
+            LLAMA_LOG_WARN("warning: munmap failed: %s (range kept in the fragment list)\n",
+                    strerror(errno));
+            return;
         }
 #ifdef __linux__
 
-        if (munmap_ret == 0 && fd_own != -1 && posix_fadvise(fd_own, first, len, POSIX_FADV_DONTNEED)) {
+        if (fd_own != -1 && posix_fadvise(fd_own, first, len, POSIX_FADV_DONTNEED)) {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_DONTNEED) failed: %s\n", strerror(errno));
         }
 #endif
@@ -634,7 +679,6 @@ struct llama_mmap::impl {
         mapped_fragments = std::move(new_mapped_fragments);
     }
 
-
     void drop_page_cache(size_t first, size_t last) {
 #ifdef __linux__
         if (fd_own == -1) {
@@ -655,10 +699,6 @@ struct llama_mmap::impl {
 #endif
     }
 
-
-
-
-
     size_t release_page_cache(size_t first, size_t last) {
 #ifdef __linux__
         if (fd_own == -1) {
@@ -670,7 +710,6 @@ struct llama_mmap::impl {
         if (first >= last) {
             return 0;
         }
-
 
         bool mapped_ok = true;
         if (madvise((uint8_t *) addr + first, last - first, MADV_DONTNEED)) {
@@ -705,7 +744,8 @@ struct llama_mmap::impl {
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges,
+         std::shared_ptr<ggml_safe_io::reader> gate_in) : gate(std::move(gate_in)) {
         GGML_UNUSED(numa);
 
         size = file->size();
@@ -785,7 +825,8 @@ struct llama_mmap::impl {
         }
     }
 #else
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges,
+         std::shared_ptr<ggml_safe_io::reader> gate_in) : gate(std::move(gate_in)) {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
@@ -813,12 +854,14 @@ struct llama_mmap::impl {
     }
 #endif
 
+    std::shared_ptr<ggml_safe_io::reader> gate;
     void * addr;
     size_t size;
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
-        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
+        const ranges & lazy_ranges, std::shared_ptr<ggml_safe_io::reader> gate)
+    : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges, std::move(gate))) {}
 llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }
@@ -835,8 +878,6 @@ const bool llama_mmap::SUPPORTED  = true;
 #else
 const bool llama_mmap::SUPPORTED  = false;
 #endif
-
-// llama_mlock
 
 struct llama_mlock::impl {
 #ifdef _POSIX_MEMLOCK_RANGE
@@ -861,8 +902,7 @@ struct llama_mlock::impl {
         char* errmsg = std::strerror(errno);
         bool suggest = (errno == ENOMEM);
 #if defined(TARGET_OS_VISION) || defined(TARGET_OS_TV) || defined(_AIX) || defined(__HAIKU__)
-        // visionOS/tvOS/Haiku don't support RLIMIT_MEMLOCK
-        // Skip resource limit checks on these platforms
+
         suggest = false;
 #else
         struct rlimit lock_limit;
@@ -1032,7 +1072,7 @@ void llama_prefetch(llama_memory_ranges mr) {
     }
     mr.resize(n_ranges);
 #if defined(_WIN32)
-    // prefetch the merged ranges in one call, so the reads can be issued concurrently
+
     std::vector<WIN32_MEMORY_RANGE_ENTRY> entries;
     entries.reserve(mr.size());
     for (const auto & range : mr) {
@@ -1044,7 +1084,7 @@ void llama_prefetch(llama_memory_ranges mr) {
     }
 #else
     for (const auto & range : mr) {
-        // TODO: in a follow-up, use posix_madvise(.., POSIX_MADV_WILLNEED) to match the rest of this file
+
         if (madvise(const_cast<void *>(range.addr), range.size, MADV_WILLNEED) != 0) {
             LLAMA_LOG_WARN("llama_prefetch: madvise(MADV_WILLNEED) failed: %s\n", strerror(errno));
             return;

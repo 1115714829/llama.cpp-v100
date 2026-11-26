@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import ModelLoadHighlight from '../ModelLoadHighlight.svelte';
 	import { ChevronDown, Loader2 } from '@lucide/svelte';
 	import {
@@ -206,7 +207,7 @@
 				modelId={selectedOption.model}
 			/>
 		{:else}
-			<span class="min-w-0 font-medium">Select model</span>
+			<span class="min-w-0 font-medium">{tr("Select model")}</span>
 		{/if}
 	</span>
 
@@ -289,7 +290,7 @@
 	<div class="flex items-center gap-2 text-xs text-muted-foreground">
 		<Loader2 class="h-3.5 w-3.5 animate-spin" />
 
-		Loading models...
+		{tr("Loading models...")}
 	</div>
 {:else if ms.options.length === 0 && ms.isMultiModel}
 	{#if displayModel}
@@ -300,7 +301,7 @@
 			<MODEL_ICON class="h-3.5 w-3.5 shrink-0" />
 		</span>
 	{:else}
-		<span class="text-xs text-muted-foreground">No models yet.</span>
+		<span class="text-xs text-muted-foreground">{tr("No models yet.")}</span>
 	{/if}
 {:else if ms.isMultiModel}
 	{#if isMobile}

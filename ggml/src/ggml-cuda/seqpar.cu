@@ -1,13 +1,8 @@
 
 
-
-
-
-
 #include "common.cuh"
 #include "cpy.cuh"
 #include "seqpar.cuh"
-
 
 void ggml_cuda_op_seq_scatter(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];

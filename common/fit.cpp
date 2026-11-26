@@ -1,4 +1,8 @@
+#include "../src/llama-layer-split.h"
 #include "fit.h"
+
+#include "admission_gate.h"
+#include "fit-host-account.h"
 
 #include "json.h"
 #include "log.h"
@@ -9,6 +13,7 @@
 #include <array>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <cinttypes>
@@ -16,37 +21,24 @@
 #include <string>
 #include <vector>
 
-// this enum is only used in llama_params_fit_impl but needs to be defined outside of it to fix a Windows compilation issue
-// enum to identify part of a layer for distributing its tensors:
 enum common_layer_fraction_t {
-    LAYER_FRACTION_NONE = 0, // nothing
-    LAYER_FRACTION_ATTN = 1, // attention
-    LAYER_FRACTION_UP   = 2, // attention + up
-    LAYER_FRACTION_GATE = 3, // attention + up + gate
-    LAYER_FRACTION_MOE  = 4, // everything but sparse MoE weights
+    LAYER_FRACTION_NONE = 0,
+    LAYER_FRACTION_ATTN = 1,
+    LAYER_FRACTION_UP   = 2,
+    LAYER_FRACTION_GATE = 3,
+    LAYER_FRACTION_MOE  = 4,
 };
 
 class common_params_fit_exception : public std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
-
-
-
-
 static constexpr int64_t COMMON_FIT_GPU_PAGE = 4096;
 static constexpr int64_t COMMON_FIT_GPU_PTE  = 8;
-
-
-
-
-
-
 
 static bool common_buft_is_host_memory(ggml_backend_buffer_type_t buft) {
     return ggml_backend_buft_is_host(buft) || ggml_backend_buft_is_device_mapped(buft);
 }
-
 
 static ggml_backend_buffer_type_t common_dev_mapped_buft(ggml_backend_dev_t dev) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -69,8 +61,6 @@ static ggml_backend_buffer_type_t common_dev_mapped_buft(ggml_backend_dev_t dev)
     return nullptr;
 }
 
-
-
 static bool common_buft_is_device_expert(ggml_backend_buffer_type_t buft) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
     if (dev == nullptr) {
@@ -85,9 +75,6 @@ static bool common_buft_is_device_expert(ggml_backend_buffer_type_t buft) {
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_buft_is_device_expert");
     return is_expert != nullptr && is_expert(buft);
 }
-
-
-
 
 static ggml_backend_buffer_type_t common_dev_expert_buft(ggml_backend_dev_t dev) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -110,8 +97,6 @@ static ggml_backend_buffer_type_t common_dev_expert_buft(ggml_backend_dev_t dev)
     return nullptr;
 }
 
-
-
 static void common_expert_reset_allocation(ggml_backend_buffer_type_t buft) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
     if (dev == nullptr) {
@@ -128,10 +113,6 @@ static void common_expert_reset_allocation(ggml_backend_buffer_type_t buft) {
         reset(buft);
     }
 }
-
-
-
-
 
 static void common_comm_memory_reset(ggml_backend_dev_t dev) {
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -155,10 +136,6 @@ static int64_t common_comm_memory(ggml_backend_dev_t dev) {
     return mem != nullptr ? (int64_t) mem(dev) : 0;
 }
 
-
-
-
-
 static void common_expert_device_ready(ggml_backend_buffer_type_t buft) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
     if (dev == nullptr) {
@@ -176,8 +153,28 @@ static void common_expert_device_ready(ggml_backend_buffer_type_t buft) {
     }
 }
 
+static bool allow_extra(void) {
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_EXPERT_BORROW");
+        return v == nullptr || v[0] == '\0' || atoi(v) != 0;
+    }();
+    return enabled;
+}
 
-static void common_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t stage_bytes) {
+static size_t spare_bytes(size_t borrow_bytes) {
+    const size_t pct = (size_t) ((double) borrow_bytes * 0.005);
+    const size_t floor_bytes = (size_t) (8 * 1024 * 1024);
+    return std::max(pct, floor_bytes);
+}
+
+static size_t spare_region(size_t borrow_bytes, size_t borrow_margin) {
+    const size_t align = 4096;
+    const size_t bytes = borrow_bytes + borrow_margin;
+    return (bytes + align - 1) / align * align;
+}
+
+static void set_limit(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t stage_bytes,
+        size_t borrow_bytes) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
     if (dev == nullptr) {
         return;
@@ -186,15 +183,13 @@ static void common_expert_set_budget(ggml_backend_buffer_type_t buft, size_t slo
     if (reg == nullptr) {
         return;
     }
-    typedef void (*ggml_backend_expert_set_budget_t)(ggml_backend_buffer_type_t, size_t, size_t);
+    typedef void (*ggml_backend_expert_set_budget_t)(ggml_backend_buffer_type_t, size_t, size_t, size_t);
     auto set_budget = (ggml_backend_expert_set_budget_t)
         ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_expert_set_budget");
     if (set_budget != nullptr) {
-        set_budget(buft, slot_bytes, stage_bytes);
+        set_budget(buft, slot_bytes, stage_bytes, borrow_bytes);
     }
 }
-
-
 
 static bool common_expert_get_allocation(ggml_backend_buffer_type_t buft, size_t * slot_bytes, size_t * host_bytes, size_t * stage_bytes) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
@@ -211,8 +206,6 @@ static bool common_expert_get_allocation(ggml_backend_buffer_type_t buft, size_t
     return get_alloc != nullptr && get_alloc(buft, slot_bytes, host_bytes, stage_bytes);
 }
 
-
-
 struct common_expert_tensor {
     int        layer      = -1;
     int64_t    expert_base = 0;
@@ -221,14 +214,8 @@ struct common_expert_tensor {
     ggml_type  type       = GGML_TYPE_COUNT;
     int64_t    ne0        = 0;
 
-
-
     int        kind       = -1;
 };
-
-
-
-
 
 static int common_expert_tensor_layer(const std::string & name) {
     const size_t pos = name.find("blk.");
@@ -246,10 +233,6 @@ static int common_expert_tensor_layer(const std::string & name) {
     }
     return layer;
 }
-
-
-
-
 
 static bool common_expert_plan(ggml_backend_buffer_type_t buft,
         const std::vector<common_expert_tensor> & tensors, size_t slot_budget,
@@ -305,23 +288,11 @@ static bool common_expert_plan(ggml_backend_buffer_type_t buft,
     return true;
 }
 
-
-
-
-
-
-
-
-
-
-
-
 static const double COMMON_EXPERT_STATIC_STAGING_MIN_SHARE = 0.9;
 
 static bool common_expert_static_staging_enabled(double routed_share) {
     return routed_share < 0.0 || routed_share >= COMMON_EXPERT_STATIC_STAGING_MIN_SHARE;
 }
-
 
 static void common_expert_log_static_staging(const char * func, double routed_share) {
     const bool on = common_expert_static_staging_enabled(routed_share);
@@ -329,9 +300,6 @@ static void common_expert_log_static_staging(const char * func, double routed_sh
             func, routed_share < 0.0 ? 1.0 : routed_share, on ? ">=" : "<",
             COMMON_EXPERT_STATIC_STAGING_MIN_SHARE);
 }
-
-
-
 
 static void common_expert_record_plan(ggml_backend_buffer_type_t buft, size_t slot_bytes, size_t host_bytes) {
     ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
@@ -350,14 +318,34 @@ static void common_expert_record_plan(ggml_backend_buffer_type_t buft, size_t sl
     }
 }
 
+struct common_fit_fixed_tensor {
+    std::string name;
+    std::string buft;
+    int64_t     bytes = 0;
+    int         layer = -1;
+};
 
+static bool show_detail() {
+    static const bool on = getenv("GGML_FIT_HOST_BREAKDOWN") != nullptr;
+    return on;
+}
 
+static int layer_index(const std::string & name) {
+    int layer = -1;
+    if (sscanf(name.c_str(), "blk.%d.", &layer) == 1) {
+        return layer;
+    }
+    return -1;
+}
 
 static void common_fit_host_fixed(ggml_backend_dev_t dev, const llama_model * model,
         const llama_context * ctx, const llama_context * ctx_dft,
-        int64_t * mapped, int64_t * pinned) {
+        int64_t * mapped, int64_t * pinned,
+        std::vector<common_fit_fixed_tensor> * breakdown = nullptr) {
     *mapped = 0;
     *pinned = 0;
+
+    const bool breakdown_on = breakdown != nullptr && show_detail();
 
     if (model != nullptr) {
         for (const auto & kv : llama_internal_get_tensor_map(model)) {
@@ -369,7 +357,18 @@ static void common_fit_host_fixed(ggml_backend_dev_t dev, const llama_model * mo
                 continue;
             }
             if (t->buffer != nullptr && ggml_backend_buft_is_device_mapped(ggml_backend_buffer_get_type(t->buffer))) {
-                *mapped += (int64_t) ggml_nbytes(t);
+                const int64_t nbytes = (int64_t) ggml_nbytes(t);
+                *mapped += nbytes;
+                if (breakdown_on) {
+                    common_fit_fixed_tensor item;
+                    item.name  = kv.first;
+                    item.buft  = ggml_backend_buft_name(ggml_backend_buffer_get_type(t->buffer));
+                    item.bytes = nbytes;
+                    item.layer = layer_index(kv.first);
+                    breakdown->push_back(item);
+                    LOG_DBG("%s: map %s %d %.1f %s\n",
+                            __func__, item.name.c_str(), item.layer, (double) nbytes/1048576.0, item.buft.c_str());
+                }
             }
         }
     }
@@ -384,17 +383,59 @@ static void common_fit_host_fixed(ggml_backend_dev_t dev, const llama_model * mo
         }
         for (const auto & [buft, data] : llama_get_memory_breakdown(c)) {
             if (buft == pinned_buft) {
+
                 *pinned += (int64_t) (data.context + data.compute);
+                if (breakdown_on) {
+                    common_fit_fixed_tensor item;
+                    item.name  = c == ctx ? "<ctx main>" : "<ctx dft>";
+                    item.buft  = ggml_backend_buft_name(buft);
+                    item.bytes = (int64_t) (data.context + data.compute);
+                    breakdown->push_back(item);
+                    LOG_DBG("%s: pin %s %.1f %.1f %s\n",
+                            __func__, item.name.c_str(), (double) data.context/1048576.0,
+                            (double) data.compute/1048576.0, item.buft.c_str());
+                }
             }
         }
     }
+    if (breakdown_on) {
+        LOG_DBG("%s: sum %.1f %.1f %zu\n",
+                __func__, (double) *mapped/1048576.0, (double) *pinned/1048576.0, breakdown->size());
+    }
 }
 
+static int64_t extra_bytes(const llama_model * model, const llama_model * model_extra) {
+    if (model_extra == nullptr) {
+        return 0;
+    }
+    const int n_layer = (int) llama_model_n_layer(model_extra);
+    const auto & map_main = llama_internal_get_tensor_map(model);
+    const auto & map_extra = llama_internal_get_tensor_map(model_extra);
 
-
-
-
-
+    int64_t bytes = 0;
+    for (const auto & kv : map_extra) {
+        const ggml_tensor * t = kv.second;
+        if (t == nullptr || t->view_src != nullptr || ggml_nelements(t) == 0) {
+            continue;
+        }
+        bool borrowed = false;
+        for (const auto & kv_main : map_main) {
+            if (kv_main.first == kv.first && kv_main.second == t) {
+                borrowed = true;
+                break;
+            }
+        }
+        if (borrowed) {
+            continue;
+        }
+        int layer = -1;
+        if (sscanf(kv.first.c_str(), "blk.%d.", &layer) == 1 && layer < n_layer) {
+            continue;
+        }
+        bytes += (int64_t) ggml_nbytes(t);
+    }
+    return bytes;
+}
 
 static void common_fit_ple_bytes(const llama_model * model, int64_t * ple_bytes, int64_t * embd_bytes) {
     *ple_bytes  = 0;
@@ -414,8 +455,6 @@ static void common_fit_ple_bytes(const llama_model * model, int64_t * ple_bytes,
     }
 }
 
-
-
 static std::string common_fit_host_nodes_per_node(const int64_t * node_bytes, const int64_t * node_avail,
         const int * node_ids, size_t n_nodes, int64_t MiB) {
     std::string per_node;
@@ -432,21 +471,6 @@ static std::string common_fit_host_nodes_per_node(const int64_t * node_bytes, co
     }
     return per_node;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 static int common_expert_check_host_nodes(
         const std::vector<ggml_backend_dev_t> & devs,
@@ -480,13 +504,6 @@ static int common_expert_check_host_nodes(
     return check(seq_dev.data(), seq_size.data(), seq_dev.size(), fixed_mapped, fixed_pinned,
         node_bytes, node_avail, node_ids, n_nodes, fail_node, fail_bytes, fail_avail, ple_host_read ? 1 : 0);
 }
-
-
-
-
-
-
-
 
 static int common_expert_host_nodes_fit_query(
         const std::vector<ggml_backend_dev_t> & devs,
@@ -528,9 +545,6 @@ static int common_expert_host_nodes_fit_query(
         node_need, node_avail, node_free, node_ids, n_nodes);
 }
 
-
-
-
 static int64_t common_fit_process_anon_bytes() {
 #if defined(__linux__)
     FILE * f = fopen("/proc/self/status", "r");
@@ -553,21 +567,60 @@ static int64_t common_fit_process_anon_bytes() {
 #endif
 }
 
+static void check_limit(
+        const char * func,
+        int64_t arena_total, int64_t mapped, int64_t pinned,
+        const char * what) {
+    constexpr int64_t MiB = 1024*1024;
 
+    const common_admission_paths paths;
+    const common_admission_supply supply = common_admission_probe(paths);
+    const common_admission_config   config = common_admission_config_from_env();
 
+    common_admission_demand demand;
+    demand.committed_bytes = (uint64_t) (arena_total + mapped + pinned);
+
+    demand.resident_bytes   = (uint64_t) (mapped > 0 ? mapped : 0);
+    demand.transient        = 0;
+
+    const common_admission_result result = common_admission_check(supply, demand, config);
+
+    LOG_DBG("%s: check %s %s\n", func, what,
+        common_admission_detail(supply, result).c_str());
+
+    if (result.verdict == COMMON_ADMISSION_ADMIT) {
+        return;
+    }
+
+    std::string msg = "the host memory gate refuses " + std::string(what) + ": ";
+    msg += result.detail;
+    msg += "; ";
+    msg += common_admission_detail(supply, result);
+    if (result.verdict == COMMON_ADMISSION_DEGRADE) {
+        msg += "; " + std::to_string((result.shed_bytes + MiB - 1)/MiB) +
+            " MiB have to move to the disk tier (use --expert-disk-gib with a routing profile)";
+    }
+    msg += "; reduce the context size, use more devices, use a lower quantization"
+           " or free the memory of the machine";
+    throw std::runtime_error(msg);
+}
 
 static bool common_fit_ple_host_read(
         llama_model_params * mparams,
         const std::vector<ggml_backend_dev_t> & devs,
         const std::vector<int> & seq_dev,
         const std::vector<size_t> & seq_size,
+        int64_t arena_total,
         int64_t * fixed_mapped, int64_t fixed_pinned,
-        int64_t ple_bytes, int64_t embd_bytes, int32_t cache_ram_mib) {
+        int64_t ple_bytes, int64_t embd_bytes, int32_t cache_ram_mib,
+        bool decide_only = false) {
     constexpr int64_t MiB = 1024*1024;
 
     if (ple_bytes <= 0) {
         return false;
     }
+
+    const int64_t fixed_mapped_in = *fixed_mapped;
 
     constexpr size_t max_nodes = 64;
     int64_t node_need [max_nodes] = {};
@@ -575,7 +628,6 @@ static bool common_fit_ple_host_read(
     int64_t node_free [max_nodes] = {};
     int     node_ids [max_nodes] = {};
     size_t  n_nodes = max_nodes;
-
 
     const int fits = common_expert_host_nodes_fit_query(devs, seq_dev, seq_size,
         *fixed_mapped + embd_bytes, fixed_pinned, node_need, node_avail, node_free, node_ids, &n_nodes);
@@ -586,8 +638,6 @@ static bool common_fit_ple_host_read(
 
     mparams->ple_host_read = true;
     *fixed_mapped = *fixed_mapped - ple_bytes + embd_bytes;
-
-
 
     std::string per_node;
     for (size_t n = 0; n < n_nodes; n++) {
@@ -603,24 +653,41 @@ static bool common_fit_ple_host_read(
     LOG_INF("%s: the n-gram table (%.0f MiB) does not fit into the pinned host memory: the placement of one node per device needs %s; the table stays in the model file and is read row by row\n",
         __func__, (double) ple_bytes/MiB, per_node.c_str());
 
-
-
-
-
-
-
-
-
-
     int64_t need_total = 0;
     int64_t free_total = 0;
     for (size_t n = 0; n < n_nodes; n++) {
         need_total += node_need[n];
 
-
         free_total += node_free[n] >= 0 ? node_free[n] : node_avail[n];
     }
     need_total -= ple_bytes;
+
+    {
+        int64_t node_sum = 0;
+        for (size_t n = 0; n < n_nodes; n++) {
+            node_sum += node_need[n];
+        }
+        const int64_t expected = common_fit_host_demand(arena_total, fixed_mapped_in + embd_bytes - ple_bytes, fixed_pinned);
+        if (node_sum <= 0) {
+
+            LOG_WRN("%s: the NUMA nodes could not take the expert arenas (%s MiB), the host memory of the placement is not accounted for\n",
+                __func__, std::to_string(arena_total/MiB).c_str());
+        } else if (need_total != expected) {
+            throw std::runtime_error(
+                "expert store host complement: the host memory accounting does not add up: the nodes need " +
+                std::to_string(need_total/MiB) + " MiB, but the expert arenas (" + std::to_string(arena_total/MiB) +
+                " MiB), the mapped weights (" + std::to_string(fixed_mapped_in/MiB) + " MiB), the embedding (" +
+                std::to_string(embd_bytes/MiB) + " MiB), the pinned buffers (" + std::to_string(fixed_pinned/MiB) +
+                " MiB) and the n-gram table (" + std::to_string(ple_bytes/MiB) + " MiB) add up to " +
+                std::to_string(expected/MiB) + " MiB; abort");
+        }
+    }
+
+    if (decide_only) {
+
+        return true;
+    }
+
     const int64_t anon      = common_fit_process_anon_bytes();
     const int64_t cache_ram = cache_ram_mib > 0 ? (int64_t) cache_ram_mib * MiB : 0;
     const int64_t row_cache = 0;
@@ -633,16 +700,12 @@ static bool common_fit_ple_host_read(
         LOG_WRN("%s: the prompt cache has no limit, it can take the memory the nodes have left\n", __func__);
     } else if (slack >= 0 && cache_ram > slack) {
 
-
-
-
         LOG_WRN("%s: the prompt cache of the server can take %.0f MiB, but the nodes have only %.0f MiB left for it: lower --cache-ram\n",
             __func__, (double) cache_ram/MiB, (double) slack/MiB);
     }
     if (slack < 0) {
         LOG_WRN("%s: the host memory of the nodes is %.0f MiB short of what the model needs on top of the pinned host memory\n",
             __func__, (double) (-slack)/MiB);
-
 
         if (slack < -(int64_t) (4*1024*1024*1024ll)) {
             throw std::runtime_error(
@@ -657,8 +720,6 @@ static bool common_fit_ple_host_read(
     return true;
 }
 
-
-
 static void collect_device_memory_breakdown(
         const llama_model * model, const llama_context * ctx, std::vector<llama_device_memory_data> & ret) {
     const size_t nd = llama_model_n_devices(model);
@@ -668,9 +729,6 @@ static void collect_device_memory_breakdown(
 
     for (const auto & [buft, mb] : memory_breakdown) {
         if (common_buft_is_device_expert(buft)) {
-
-
-
 
             size_t slot_bytes = 0;
             size_t host_bytes = 0;
@@ -690,6 +748,8 @@ static void collect_device_memory_breakdown(
                 ret.back().mb.model   += mb.model;
                 ret.back().mb.context += mb.context;
                 ret.back().mb.compute += mb.compute;
+                ret.back().mb.compute_prefill += mb.compute_prefill;
+                ret.back().mb.compute_decode  += mb.compute_decode;
             }
             continue;
         }
@@ -698,6 +758,8 @@ static void collect_device_memory_breakdown(
             ret.back().mb.model   += mb.model;
             ret.back().mb.context += mb.context;
             ret.back().mb.compute += mb.compute;
+            ret.back().mb.compute_prefill += mb.compute_prefill;
+            ret.back().mb.compute_decode  += mb.compute_decode;
             continue;
         }
 
@@ -710,9 +772,59 @@ static void collect_device_memory_breakdown(
                 ret[i].mb.model   += mb.model;
                 ret[i].mb.context += mb.context;
                 ret[i].mb.compute += mb.compute;
+
+                ret[i].mb.compute_prefill += mb.compute_prefill;
+                ret[i].mb.compute_decode  += mb.compute_decode;
                 break;
             }
         }
+    }
+}
+
+static void log_detail(const char * func, uint64_t id, const std::string & placement,
+        const std::vector<common_fit_fixed_tensor> & items, int64_t mapped, int64_t pinned) {
+    if (!show_detail()) {
+        return;
+    }
+    LOG_DBG("%s: plan %llu %s %.1f %.1f %zu\n",
+            func, (unsigned long long) id, placement.empty() ? "no placement" : placement.c_str(),
+            (double) mapped/1048576.0, (double) pinned/1048576.0, items.size());
+
+    std::vector<common_fit_fixed_tensor> sorted = items;
+    std::sort(sorted.begin(), sorted.end(), [](const common_fit_fixed_tensor & a, const common_fit_fixed_tensor & b) {
+        return a.bytes > b.bytes;
+    });
+    const size_t n_top = std::min<size_t>(sorted.size(), 16);
+    for (size_t i = 0; i < n_top; i++) {
+        LOG_DBG("%s: item %zu %s %d %.1f %s\n",
+                func, i, sorted[i].name.c_str(), sorted[i].layer,
+                (double) sorted[i].bytes/1048576.0, sorted[i].buft.c_str());
+    }
+
+    std::vector<std::pair<int, int64_t> > per_layer;
+    for (const common_fit_fixed_tensor & item : items) {
+        if (item.layer < 0) {
+            continue;
+        }
+        bool found = false;
+        for (auto & pl : per_layer) {
+            if (pl.first == item.layer) {
+                pl.second += item.bytes;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            per_layer.push_back({ item.layer, item.bytes });
+        }
+    }
+    std::sort(per_layer.begin(), per_layer.end(),
+        [](const std::pair<int, int64_t> & a, const std::pair<int, int64_t> & b) {
+            return a.second > b.second;
+        });
+    const size_t n_layers = std::min<size_t>(per_layer.size(), 12);
+    for (size_t i = 0; i < n_layers; i++) {
+        LOG_DBG("%s: layer %d %.1f\n", func, per_layer[i].first, (double) per_layer[i].second/1048576.0);
     }
 }
 
@@ -730,14 +842,13 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         const common_fit_extra_model * extra = nullptr,
         std::vector<llama_device_memory_data> * extra_mem = nullptr,
         std::vector<ggml_backend_dev_t> * extra_devs = nullptr,
-        int64_t * host_fixed_mapped = nullptr, int64_t * host_fixed_pinned = nullptr,
-        int64_t * ple_bytes = nullptr, int64_t * embd_bytes = nullptr) {
+        common_fit_host_account * account = nullptr) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
             void * user_data;
         } original_logger;
-        ggml_log_level min_level; // prints below this log level go to debug log
+        ggml_log_level min_level;
     };
     user_data_t ud;
     llama_log_get(&ud.original_logger.callback, &ud.original_logger.user_data);
@@ -771,22 +882,17 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     collect_device_memory_breakdown(model, ctx, ret);
 
-
-
     int64_t fixed_mapped = 0;
     int64_t fixed_pinned = 0;
-    if (host_fixed_mapped != nullptr && host_fixed_pinned != nullptr) {
+    std::vector<common_fit_fixed_tensor> breakdown;
+    if (account != nullptr) {
         common_fit_host_fixed(llama_model_get_device(model, 0), model, ctx, nullptr,
-            &fixed_mapped, &fixed_pinned);
+            &fixed_mapped, &fixed_pinned, &breakdown);
     }
 
-
-
-
-
-    if (ple_bytes != nullptr && embd_bytes != nullptr) {
-        common_fit_ple_bytes(model, ple_bytes, embd_bytes);
-    }
+    int64_t ple_bytes  = 0;
+    int64_t embd_bytes = 0;
+    common_fit_ple_bytes(model, &ple_bytes, &embd_bytes);
 
     {
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -806,9 +912,6 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         size_t total;
         ggml_backend_dev_memory(dev, &free, &total);
 
-        // Some non-GPU accelerator backends, such as BLAS, report 0/0 and rely on
-        // the host-memory fallback. For GPU-like backends, keep 0/0 so --fit does
-        // not assign anything to a device with an unknown memory budget.
         if (free == 0 && total == 0) {
             const enum ggml_backend_dev_type type = ggml_backend_dev_type(dev);
             if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
@@ -840,10 +943,6 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
     if (expert_tensors != nullptr) {
 
-
-
-
-
         expert_tensors->clear();
         for (const auto & [name, t] : llama_internal_get_tensor_map(model)) {
             if (t == nullptr || (t->flags & GGML_TENSOR_FLAG_EXPERT) == 0) {
@@ -863,14 +962,6 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
     }
 
-
-
-
-
-
-
-
-
     if (extra != nullptr && extra_mem != nullptr) {
         llama_model_params mparams_extra = *extra->mparams;
         mparams_extra.no_alloc      = true;
@@ -884,13 +975,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
             throw std::runtime_error(std::string("failed to load the extra model '") + extra->path_model + "'");
         }
 
-
-
-
         extra->cparams->ctx_other = ctx;
-
-
-
 
         if (extra->h_sink_rows > 0) {
             extra->cparams->n_h_sink_rows = extra->h_sink_rows;
@@ -909,39 +994,60 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
         collect_device_memory_breakdown(model_extra, ctx_extra, ret_extra);
 
-
-
-        if (host_fixed_pinned != nullptr) {
+        if (account != nullptr) {
             int64_t draft_mapped = 0;
             int64_t draft_pinned = 0;
             common_fit_host_fixed(llama_model_get_device(model_extra, 0), model_extra, ctx_extra,
                 nullptr, &draft_mapped, &draft_pinned);
             fixed_pinned += draft_pinned;
+            if (extra->mtp_host) {
+                fixed_pinned += extra_bytes(model, model_extra);
+            }
         }
-
-
 
         {
             const size_t sink_row = (size_t) llama_model_n_embd(model) * sizeof(float);
 
             if (extra->dflash_sink) {
                 const uint32_t n_lids = llama_model_target_layer_ids_n(model_extra);
-                if (n_lids > 0) {
-
-
-
-
-                    ret      [0].mb.context += sink_row * n_lids * cparams->n_batch;
-                    ret_extra[0].mb.context += sink_row * n_lids * extra->cparams->n_ubatch;
+                const bool layer_moe = hp_n_expert > 0 && mparams->split_mode == LLAMA_SPLIT_MODE_LAYER;
+                if (layer_moe) {
+                    try {
+                        const auto * ids = llama_model_target_layer_ids(model_extra);
+                        if (ids == nullptr || n_lids == 0 || std::any_of(ids, ids + n_lids, [&](int32_t id) {
+                                return id < 0 || id >= llama_model_n_layer(model);
+                            })) {
+                            throw std::runtime_error("DFlash: invalid target layer IDs for memory fit");
+                        }
+                        std::vector<uint32_t> layers(ids, ids + n_lids);
+                        for (auto layer : layers) {
+                            llama_set_embeddings_layer_inp(ctx, layer, true);
+                        }
+                        if (!llama_enable_layer_inp_sink(ctx, layers.data(), n_lids)) {
+                            throw std::runtime_error("DFlash: could not model target layer input sink");
+                        }
+                        llama_reserve(ctx);
+                        std::vector<llama_device_memory_data> with_sink(nd + 1);
+                        collect_device_memory_breakdown(model, ctx, with_sink);
+                        for (size_t i = 0; i < ret.size(); ++i) {
+                            ret[i].mb = with_sink[i].mb;
+                        }
+                    } catch (...) {
+                        llama_free(ctx_extra);
+                        llama_model_free(model_extra);
+                        llama_free(ctx);
+                        llama_model_free(model);
+                        extra->cparams->ctx_other = nullptr;
+                        llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+                        throw;
+                    }
+                } else {
+                    ret[0].mb.context += sink_row * n_lids * cparams->n_batch;
                 }
+                ret_extra[0].mb.context += sink_row * n_lids * extra->cparams->n_ubatch;
             }
 
             if (extra->h_sink_rows > 0) {
-
-
-
-
-
 
                 const size_t row = (size_t) llama_model_n_embd_out(model) * sizeof(float);
                 ret[nd > 0 ? nd - 1 : 0].mb.context +=
@@ -965,9 +1071,19 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
 
         extra->cparams->ctx_other = nullptr;
     }
-    if (host_fixed_mapped != nullptr && host_fixed_pinned != nullptr) {
-        *host_fixed_mapped = fixed_mapped;
-        *host_fixed_pinned = fixed_pinned;
+    if (account != nullptr) {
+        account->mapped = fixed_mapped;
+        account->pinned = fixed_pinned;
+        account->ple    = ple_bytes;
+        account->embd   = embd_bytes;
+        account->valid  = true;
+
+        LOG_TRC("%s: host fixed measurement #%llu: the plan has n_gpu_layers %d, split_mode %d, placement %s, mapped %.1f MiB, pinned %.1f MiB, n-gram table %.1f MiB, embedding %.1f MiB\n",
+                __func__, (unsigned long long) account->id, mparams_copy.n_gpu_layers, (int) mparams_copy.split_mode,
+                account->placement.empty() ? "none" : account->placement.c_str(),
+                (double) fixed_mapped/1048576.0, (double) fixed_pinned/1048576.0,
+                (double) ple_bytes/1048576.0, (double) embd_bytes/1048576.0);
+        log_detail(__func__, account->id, account->placement, breakdown, fixed_mapped, fixed_pinned);
     }
     llama_free(ctx);
     llama_model_free(model);
@@ -1000,12 +1116,6 @@ common_device_memory_data_vec common_get_device_memory_data(
     return ret;
 }
 
-
-
-
-
-
-
 void common_fit_log_memory_stage(const struct llama_model * model, const char * stage) {
     if (model == nullptr || stage == nullptr) {
         common_fit_log_memory_stage_devs(nullptr, 0, nullptr);
@@ -1016,8 +1126,6 @@ void common_fit_log_memory_stage(const struct llama_model * model, const char * 
     if (nd <= 0) {
         return;
     }
-
-
 
     std::vector<ggml_backend_dev_t> devs;
     for (int i = 0; i < nd; i++) {
@@ -1033,20 +1141,10 @@ void common_fit_log_memory_stage(const struct llama_model * model, const char * 
     common_fit_log_memory_stage_devs(devs.data(), (int) devs.size(), stage);
 }
 
-
-
-
-
-
-
-
-
 void common_fit_log_host_resident_pools(const struct llama_model * model) {
     if (model == nullptr) {
         return;
     }
-
-
 
     std::vector<ggml_backend_dev_t> devs;
     const int nd = llama_model_n_devices(model);
@@ -1095,7 +1193,6 @@ void common_fit_log_memory_stage_devs(struct ggml_backend_device ** devs, int nd
         return;
     }
 
-
     if (nd <= 0 || common_log_get_verbosity_thold() < LOG_LEVEL_TRACE) {
         return;
     }
@@ -1128,11 +1225,11 @@ void common_fit_log_memory_stage_devs(struct ggml_backend_device ** devs, int nd
     prev_free = std::move(cur_free);
 }
 
+static size_t stage_count(const common_fit_extra_model * extra) {
 
-
-
-
-
+    (void) extra;
+    return 1;
+}
 
 static void common_fit_ep(
         const char * path_model, struct llama_model_params * mparams, struct llama_context_params * cparams,
@@ -1149,10 +1246,7 @@ static void common_fit_ep(
         throw common_params_fit_exception("failed to load model");
     }
 
-
-
     const int hp_neu = llama_model_n_expert_used(model);
-
 
     std::vector<ggml_backend_dev_t> simple_devs;
     if (llama_model_n_devices(model) == 1 && ggml_backend_dev_is_meta(llama_model_get_device(model, 0))) {
@@ -1168,8 +1262,6 @@ static void common_fit_ep(
         throw common_params_fit_exception("expert parallel fit needs a meta device with at least one simple device, abort");
     }
 
-
-
     common_comm_memory_reset(simple_devs[0]);
 
     llama_context * ctx = llama_init_from_model(model, *cparams);
@@ -1178,12 +1270,7 @@ static void common_fit_ep(
         throw common_params_fit_exception("failed to create llama_context from model");
     }
 
-
-
-
     llama_internal_comm_connect(ctx);
-
-
 
     std::vector<ggml_backend_buffer_type_t> expert_bufts(nd, nullptr);
     for (size_t j = 0; j < nd; j++) {
@@ -1196,18 +1283,7 @@ static void common_fit_ep(
         }
     }
 
-
-
-
-
-
-
-
-
     std::vector<int64_t> dev_model(nd, 0);
-
-
-
 
     int64_t mapped_host = 0;
     for (const auto & kv : llama_internal_get_tensor_map(model)) {
@@ -1244,12 +1320,6 @@ static void common_fit_ep(
             dev_model[j] += (int64_t) ggml_nbytes(t) * ne_j / ne_axis;
         }
     }
-
-
-
-
-
-
 
     struct ep_tensor { int layer; std::vector<int64_t> expert_base; std::vector<int64_t> n_expert; size_t blob_bytes; ggml_type type; int64_t ne0; int kind; };
     std::vector<ep_tensor> expert_tensors;
@@ -1289,15 +1359,6 @@ static void common_fit_ep(
             ggml_expert_kind_of_name(kv.first.c_str()) });
     }
 
-
-
-
-
-
-
-
-
-
     std::set<const ggml_tensor *> counted;
     std::vector<int64_t> ctx_dev(nd, 0);
     for (const auto & kv : llama_internal_get_memory_tensors(ctx)) {
@@ -1332,11 +1393,8 @@ static void common_fit_ep(
         }
     }
 
-
-
-
-
     int64_t compute_total = 0;
+    int64_t compute_prefill_total = 0;
     {
         const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx);
         for (const auto & [buft, data] : mb) {
@@ -1344,15 +1402,19 @@ static void common_fit_ep(
 
                 continue;
             }
-            compute_total += (int64_t) data.compute;
+            compute_total         += (int64_t) data.compute;
+            compute_prefill_total += (int64_t) data.compute_prefill;
         }
     }
 
-
-
-
-
-
+    size_t borrow_bytes = allow_extra() ? (size_t) compute_prefill_total : 0;
+    size_t borrow_margin = borrow_bytes > 0 ? spare_bytes(borrow_bytes) : 0;
+    size_t borrow_total  = borrow_bytes + borrow_margin;
+    if (borrow_bytes > 0) {
+        LOG_TRC("%s: A-1 tail borrow: the prefill compute buffer (%.2f MiB per device) goes into the slot block"
+                " (+%.2f MiB margin, region %.2f MiB)\n",
+            __func__, (double) borrow_bytes/MiB, (double) borrow_margin/MiB, (double) borrow_total/MiB);
+    }
 
     std::vector<int64_t> dev_draft(nd, 0);
     std::vector<int64_t> draft_ctx_dev(nd, 0);
@@ -1361,7 +1423,6 @@ static void common_fit_ep(
     int64_t pinned_host          = 0;
     bool    host_fixed_counted   = false;
     if (extra != nullptr) {
-
 
         extra->cparams->n_ctx = cparams->n_ctx;
 
@@ -1378,8 +1439,39 @@ static void common_fit_ep(
             throw common_params_fit_exception(std::string("failed to load the extra model '") + extra->path_model + "'");
         }
 
+        if (extra->dflash_sink) {
+            const int32_t * lids = llama_model_target_layer_ids(model_extra);
+            const uint32_t  n_lids = llama_model_target_layer_ids_n(model_extra);
+            if (lids != nullptr && n_lids > 0) {
+                const int64_t compute_before = compute_total;
 
+                for (uint32_t i = 0; i < n_lids; i++) {
+                    llama_set_embeddings_layer_inp(ctx, (uint32_t) lids[i], true);
+                }
+                llama_reserve(ctx);
 
+                compute_total = 0;
+                compute_prefill_total = 0;
+                {
+                    const llama_memory_breakdown mb = llama_get_memory_breakdown(ctx);
+                    for (const auto & [buft, data] : mb) {
+                        if (common_buft_is_host_memory(buft)) {
+                            continue;
+                        }
+                        compute_total         += (int64_t) data.compute;
+                        compute_prefill_total += (int64_t) data.compute_prefill;
+                    }
+                }
+
+                borrow_bytes  = allow_extra() ? (size_t) compute_prefill_total : 0;
+                borrow_margin = borrow_bytes > 0 ? spare_bytes(borrow_bytes) : 0;
+                borrow_total  = borrow_bytes + borrow_margin;
+
+                LOG_TRC("%s: DFlash layer-input extraction: target compute %.2f -> %.2f MiB (%.2f MiB more)\n",
+                        __func__, (double) compute_before/MiB, (double) compute_total/MiB,
+                        (double) (compute_total - compute_before)/MiB);
+            }
+        }
 
         extra->cparams->ctx_other = ctx;
         if (extra->h_sink_rows > 0) {
@@ -1394,7 +1486,6 @@ static void common_fit_ep(
             llama_model_free(model);
             throw common_params_fit_exception(std::string("failed to create llama_context from the extra model '") + extra->path_model + "'");
         }
-
 
         const auto & map_main = llama_internal_get_tensor_map(model);
         for (const auto & kv : llama_internal_get_tensor_map(model_extra)) {
@@ -1434,8 +1525,6 @@ static void common_fit_ep(
                 dev_draft[j] += (int64_t) ggml_nbytes(t) * ne_j / ne_axis;
             }
         }
-
-
 
         for (const auto & kv : llama_internal_get_memory_tensors(ctx_extra)) {
             const ggml_tensor * t = kv.second;
@@ -1478,15 +1567,12 @@ static void common_fit_ep(
             }
         }
 
-
-
         {
             const size_t sink_row = (size_t) llama_model_n_embd(model) * sizeof(float);
 
             if (extra->dflash_sink) {
                 const uint32_t n_lids = llama_model_target_layer_ids_n(model_extra);
                 if (n_lids > 0) {
-
 
                     sinks_total += (int64_t) (sink_row * n_lids * cparams->n_batch +
                                               sink_row * n_lids * extra->cparams->n_ubatch);
@@ -1495,15 +1581,16 @@ static void common_fit_ep(
 
             if (extra->h_sink_rows > 0) {
 
-
                 const size_t row = (size_t) llama_model_n_embd_out(model) * sizeof(float);
                 sinks_total += (int64_t) (row * ((size_t) cparams->n_batch + extra->h_sink_rows));
             }
         }
 
-
-
         common_fit_host_fixed(simple_devs[0], model, ctx, ctx_extra, &mapped_host, &pinned_host);
+        if (extra->mtp_host) {
+
+            pinned_host += extra_bytes(model, model_extra);
+        }
         host_fixed_counted = true;
 
         llama_free(ctx_extra);
@@ -1513,19 +1600,12 @@ static void common_fit_ep(
 
     if (!host_fixed_counted) {
 
-
         common_fit_host_fixed(simple_devs[0], model, ctx, nullptr, &mapped_host, &pinned_host);
     }
-
-
-
-
 
     int64_t ple_bytes  = 0;
     int64_t embd_bytes = 0;
     common_fit_ple_bytes(model, &ple_bytes, &embd_bytes);
-
-
 
     std::vector<int64_t> comm_dev(nd, 0);
     for (size_t j = 0; j < nd; j++) {
@@ -1538,9 +1618,6 @@ static void common_fit_ep(
     if (expert_tensors.empty()) {
         throw common_params_fit_exception("tensor split with experts: the model carries no expert tensor, abort");
     }
-
-
-
 
     for (size_t j = 0; j < nd; j++) {
         common_expert_reset_allocation(expert_bufts[j]);
@@ -1558,30 +1635,18 @@ static void common_fit_ep(
     common_fit_log_memory_stage_devs(nullptr, 0, nullptr);
     common_fit_log_memory_stage_devs(simple_devs.data(), (int) nd, "fit");
 
-
     std::vector<std::vector<common_expert_tensor>> dev_tensors(nd);
     int64_t host_complement = 0;
     std::vector<std::vector<size_t>> host_each(nd);
     std::vector<size_t> slot_budgets(nd, 0);
     bool has_experts = false;
 
-
-
-
     if (extra != nullptr) {
         LOG_TRC("%s: expert parallel draft: compute %.0f MiB per rank, sinks %.0f MiB per device\n",
             __func__, draft_compute_total/(1024.0*1024.0), sinks_total/(1024.0*1024.0));
     }
 
-
-
-
-
-
-
-
-
-
+    const size_t n_stage = stage_count(extra);
 
     std::vector<int64_t> margin_dev(nd, 0);
     for (size_t j = 0; j < nd; j++) {
@@ -1597,19 +1662,22 @@ static void common_fit_ep(
         }
     }
 
-
-
-
-
-
     struct ep_plan { int64_t surplus; size_t slot_budget; size_t stage_bytes; size_t slot_used; size_t host_bytes; size_t stage_peak;
         double routed_share = -1.0; };
-
 
     const auto plan_device = [&](size_t j, int64_t reserve, std::vector<size_t> * host_each_j, size_t slot_cap) -> ep_plan {
         ep_plan pl = {};
         pl.surplus = free_mem[j] - dev_model[j] - ctx_dev[j] - compute_total
                    - dev_draft[j] - draft_ctx_dev[j] - draft_compute_total - sinks_total - reserve;
+
+        const int64_t margin_taken = std::min((int64_t) borrow_margin, std::max<int64_t>(pl.surplus, 0));
+        if (margin_taken < (int64_t) borrow_margin) {
+            LOG_WRN("%s: device %zu: the surplus (%.2f MiB) cannot pay the borrow margin (%.2f MiB);"
+                    " the slot block grows by %.2f MiB\n",
+                __func__, j, (double) pl.surplus/MiB, (double) borrow_margin/MiB,
+                (double) ((int64_t) borrow_margin - margin_taken)/MiB);
+        }
+        pl.surplus -= margin_taken;
         if (pl.surplus <= 0) {
 
             size_t slot_used_none = 0;
@@ -1632,12 +1700,12 @@ static void common_fit_ep(
                 throw common_params_fit_exception("expert store: the buffer type of device " + std::to_string(j) +
                     " has no placement plan, abort");
             }
-            const size_t next = std::min(pl.stage_peak, (size_t) pl.surplus);
+            const size_t next = std::min(pl.stage_peak, (size_t) pl.surplus / n_stage);
             if (next == pl.stage_bytes) {
                 break;
             }
             pl.stage_bytes = next;
-            pl.slot_budget = std::min((size_t) pl.surplus - pl.stage_bytes, slot_cap);
+            pl.slot_budget = std::min((size_t) pl.surplus - pl.stage_bytes * n_stage, slot_cap);
         }
         if (!common_expert_plan(expert_bufts[j], dev_tensors[j], pl.slot_budget, &pl.slot_used, &pl.host_bytes, &pl.stage_peak,
                 host_each_j, hp_neu, &pl.routed_share)) {
@@ -1645,27 +1713,18 @@ static void common_fit_ep(
                 " has no placement plan, abort");
         }
 
-
-
         common_expert_log_static_staging(__func__, pl.routed_share);
         if (pl.stage_peak > pl.stage_bytes) {
             throw common_params_fit_exception(
                 "expert store: device " + std::to_string(j) + " needs " +
-                std::to_string((pl.stage_peak + MiB - 1)/MiB) + " MiB of staging for the host experts of one prefill batch (one region per expert tensor kind), but only " +
-                std::to_string(pl.stage_bytes/MiB) + " MiB fit (short by " +
+                std::to_string((pl.stage_peak + MiB - 1)/MiB) + " MiB of staging for the host experts of one prefill batch (one region per expert tensor kind)"
+                " and " + std::to_string(n_stage) + " CUDA streams stage on these weights, but only " +
+                std::to_string(pl.stage_bytes/MiB) + " MiB per stream fit (short by " +
                 std::to_string((pl.stage_peak - pl.stage_bytes + MiB - 1)/MiB) +
-                " MiB); reduce the context size, use more devices or a lower quantization");
+                " MiB per stream); reduce the context size, use more devices or a lower quantization");
         }
         return pl;
     };
-
-
-
-
-
-
-
-
 
     const auto plan_devices = [&](const int64_t & pt_fixed_in, std::vector<std::vector<size_t>> & host_each_out, int64_t & pt_hc_out) {
         int64_t host_first = 0;
@@ -1688,10 +1747,6 @@ static void common_fit_ep(
     int64_t pt_hc    = 0;
     std::vector<ep_plan> plans = plan_devices(pt_fixed, host_each, pt_hc);
 
-
-
-
-
     if (ple_bytes > 0) {
         std::vector<int>    seq_dev;
         std::vector<size_t> seq_size;
@@ -1701,20 +1756,19 @@ static void common_fit_ep(
                 seq_size.push_back(bytes);
             }
         }
-        if (common_fit_ple_host_read(mparams, simple_devs, seq_dev, seq_size, &mapped_host,
-                pinned_host, ple_bytes, embd_bytes, cache_ram_mib)) {
 
+        int64_t arena_total = 0;
+        for (const size_t bytes : seq_size) {
+            arena_total += (int64_t) bytes;
+        }
+        if (common_fit_ple_host_read(mparams, simple_devs, seq_dev, seq_size, arena_total, &mapped_host,
+                pinned_host, ple_bytes, embd_bytes, cache_ram_mib)) {
 
             pt_fixed = page_table(mapped_host + pinned_host);
             pt_hc    = 0;
             plans = plan_devices(pt_fixed, host_each, pt_hc);
         }
     }
-
-
-
-
-
 
     std::vector<size_t> slot_budgets_own(nd, 0);
     size_t slot_equal = SIZE_MAX;
@@ -1741,16 +1795,18 @@ static void common_fit_ep(
             (double) draft_compute_total/MiB, (double) sinks_total/MiB, (double) comm_dev[j]/MiB,
             (double) pt_j/MiB, (double) margin_dev[j]/MiB, (double) pl.surplus/MiB);
 
-        common_expert_set_budget(expert_bufts[j], pl.slot_budget, pl.stage_bytes);
+        set_limit(expert_bufts[j], pl.slot_budget, pl.stage_bytes, borrow_total);
         common_expert_record_plan(expert_bufts[j], pl.slot_used, pl.host_bytes);
 
         const double hit = pl.slot_used + pl.host_bytes > 0
             ? 100.0 * (double) pl.slot_used / (double) (pl.slot_used + pl.host_bytes) : 0.0;
-        LOG_TRC("%s: device %zu: dense %.0f MiB, context %.0f MiB, compute %.0f MiB, expert slots %.0f MiB (budget %.0f MiB), staging %.0f MiB, host complement %.0f MiB, decode hit %.0f%% (uniform)\n",
+        LOG_TRC("%s: device %zu: dense %.0f MiB, context %.0f MiB, compute %.0f MiB, expert slots %.0f MiB (budget %.0f MiB), staging %.0f MiB, host complement %.0f MiB, decode hit %.0f%% (uniform), borrow %.0f MiB (margin %.0f MiB)\n",
             __func__, j,
             (double) dev_model[j]/MiB, (double) ctx_dev[j]/MiB, (double) compute_total/MiB,
             pl.slot_used/1024.0/1024.0, pl.slot_budget/1024.0/1024.0, pl.stage_bytes/1024.0/1024.0,
-            pl.host_bytes/1024.0/1024.0, hit);
+            pl.host_bytes/1024.0/1024.0, hit, (double) borrow_total/MiB, (double) borrow_margin/MiB);
+        LOG_TRC("%s: device %zu: staging reserved for %zu CUDA stream(s): %.0f MiB each, %.0f MiB in total\n",
+            __func__, j, n_stage, pl.stage_bytes/1024.0/1024.0, (double) n_stage * pl.stage_bytes/1024.0/1024.0);
         slot_budgets[j] = slot_budgets_own[j];
         host_complement += (int64_t) pl.host_bytes;
         has_experts = true;
@@ -1790,7 +1846,6 @@ static void common_fit_ep(
         }
     }
 
-
     {
         std::vector<int>    seq_dev;
         std::vector<size_t> seq_size;
@@ -1808,6 +1863,16 @@ static void common_fit_ep(
         int     fail_node  = -1;
         size_t  fail_bytes = 0;
         int64_t fail_avail = 0;
+        {
+
+            int64_t arena_total = 0;
+            for (const size_t bytes : seq_size) {
+                arena_total += (int64_t) bytes;
+            }
+
+            check_limit(__func__, arena_total, mapped_host, pinned_host,
+                "the expert parallel placement");
+        }
         const int check = common_expert_check_host_nodes(simple_devs, seq_dev, seq_size,
             mapped_host, pinned_host, mparams->ple_host_read,
             node_bytes, node_avail, node_ids, &n_nodes, &fail_node, &fail_bytes, &fail_avail);
@@ -1837,6 +1902,22 @@ static void common_fit_ep(
             }
             LOG_TRC("%s: expert store host complement %" PRId64 " MiB fits, per NUMA node:%s\n",
                 __func__, total/MiB, per_node.c_str());
+
+            const int64_t disk_bytes = ggml_expert_store_disk_bytes();
+            if (disk_bytes > 0) {
+                int64_t avail_total = 0;
+                for (size_t n = 0; n < n_nodes; n++) {
+                    avail_total += node_avail[n];
+                }
+                if (disk_bytes > avail_total) {
+                    throw std::runtime_error(
+                        "expert store disk tier: the pack file needs " + std::to_string(disk_bytes/MiB) +
+                        " MiB of page cache but the NUMA nodes hold " + std::to_string(avail_total/MiB) +
+                        " MiB; use a smaller --expert-disk-gib or free the nodes");
+                }
+                LOG_TRC("%s: expert store disk tier %" PRId64 " MiB, page cache budget %" PRId64 " MiB\n",
+                    __func__, disk_bytes/MiB, disk_bytes/MiB);
+            }
         }
     }
     GGML_UNUSED(host_complement);
@@ -1853,23 +1934,17 @@ static void common_params_fit_impl(
     const llama_model_params default_mparams = llama_model_default_params();
 
     std::vector<ggml_backend_dev_t> devs;
-    uint32_t hp_ngl = 0; // hparams.n_gpu_layers
-    uint32_t hp_nct = 0; // hparams.n_ctx_train
-    uint32_t hp_nex = 0; // hparams.n_expert
+    uint32_t hp_ngl = 0;
+    uint32_t hp_nct = 0;
+    uint32_t hp_nex = 0;
     uint32_t hp_neu = 0;
 
-    // with non-unified kv, we need to take into account n_streams
-    // for example, if memory can hold more than model's trained context size, we must extend the n_ctx to hold enough n_streams
     const uint32_t n_streams  = cparams->kv_unified ? 1 : std::max<uint32_t>(1, cparams->n_seq_max);
     const bool     n_ctx_auto = cparams->n_ctx == 0;
 
-    dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
-    uint32_t n_ctx_extra = 0;  // context that memory was measured at
+    dmds_t   dmds_extra;
+    uint32_t n_ctx_extra = 0;
 
-    // the extra model competes for the same memory as the main model, add it to every
-    // measurement. The fresh measurement comes from the same common_get_device_memory_data_impl
-    // call that measured the main model (with the main model still alive, so the extra model
-    // can borrow its shared tensors); it is empty when the cached values are still valid.
     auto add_extra_memory = [&](dmds_t & dmds, const dmds_t & measured_extra, const std::vector<ggml_backend_dev_t> & devs_extra) {
         if (extra == nullptr) {
             return;
@@ -1894,9 +1969,6 @@ static void common_params_fit_impl(
                 }
             }
 
-
-
-
             std::string per_dev;
             for (size_t id = 0; id < devs.size(); id++) {
                 const llama_memory_breakdown_data & mb = dmds_extra[id].mb;
@@ -1920,24 +1992,14 @@ static void common_params_fit_impl(
         }
     };
 
-
-
-
-    int64_t host_fixed_mapped = 0;
-    int64_t host_fixed_pinned = 0;
-
-
-
-    int64_t ple_bytes  = 0;
-    int64_t embd_bytes = 0;
-
-
-
-
+    uint64_t fit_measurement_seq = 0;
 
     auto measure_main = [&](dmds_t & dmds, std::vector<common_expert_tensor> * expert_tensors = nullptr,
-            const llama_model_params * mparams_over = nullptr) {
-        const bool need_extra = extra != nullptr && (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx);
+            const llama_model_params * mparams_over = nullptr,
+            const std::string & placement = std::string()) -> common_fit_host_account {
+
+        const bool need_extra = extra != nullptr && (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx ||
+                (hp_nex > 0 && extra->dflash_sink && mparams->split_mode == LLAMA_SPLIT_MODE_LAYER));
         dmds_t measured_extra;
         std::vector<ggml_backend_dev_t> devs_extra;
         if (need_extra) {
@@ -1947,25 +2009,27 @@ static void common_params_fit_impl(
                 __func__, cparams->n_ctx);
         }
 
+        common_fit_host_account account;
+        account.id        = ++fit_measurement_seq;
+        account.placement = placement;
+
         dmds = common_get_device_memory_data_impl(
             path_model, mparams_over != nullptr ? mparams_over : mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, hp_neu, log_level,
             expert_tensors, extra, need_extra ? &measured_extra : nullptr, need_extra ? &devs_extra : nullptr,
-            &host_fixed_mapped, &host_fixed_pinned, &ple_bytes, &embd_bytes);
+            &account);
 
         add_extra_memory(dmds, measured_extra, devs_extra);
-    };
 
-    // step 1: get data for default parameters and check whether any changes are necessary in the first place
+        return account;
+    };
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
     dmds_t dmds_full;
     measure_main(dmds_full);
 
-    // saturate instead of overflowing, this also preserves the UINT32_MAX sentinel of n_ctx_min:
     const uint32_t n_ctx_max       = (uint32_t) std::min<uint64_t>(uint64_t(hp_nct)    * n_streams, UINT32_MAX);
     const uint32_t n_ctx_min_total = (uint32_t) std::min<uint64_t>(uint64_t(n_ctx_min) * n_streams, UINT32_MAX);
 
-    // llama_context would use only hp_nct in total for n_ctx == 0, resolve the context before measuring anything else:
     if (n_ctx_auto) {
         cparams->n_ctx = n_ctx_max;
         if (n_streams > 1) {
@@ -1975,14 +2039,7 @@ static void common_params_fit_impl(
         }
     }
 
-    const size_t nd = devs.size(); // number of devices
-
-
-
-
-
-
-
+    const size_t nd = devs.size();
 
     if (mparams->split_mode == LLAMA_SPLIT_MODE_TENSOR) {
         if (hp_nex == 0) {
@@ -1992,12 +2049,9 @@ static void common_params_fit_impl(
         return;
     }
 
-
-
-
     common_fit_log_memory_stage_devs(devs.data(), (int) nd, "fit");
 
-    std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
+    std::vector<int64_t> margins;
     margins.reserve(nd);
     if (nd == 0) {
         margins.push_back(margins_s[0]);
@@ -2030,6 +2084,14 @@ static void common_params_fit_impl(
     int64_t sum_projected_model = 0;
     std::vector<int64_t> projected_free_per_device;
     projected_free_per_device.reserve(nd);
+
+    const bool expert_tiers_explicit = hp_nex > 0 && nd > 0 &&
+        (ggml_expert_store_host_budget() >= 0 || ggml_expert_store_disk_budget() >= 0);
+    if (expert_tiers_explicit) {
+        LOG_INF("%s: the expert tiers were sized by the operator (host %" PRId64 " MiB, disk %" PRId64
+            " MiB): the expert store is planned for the placement, the memory fit does not shortcut it\n",
+            __func__, ggml_expert_store_host_budget()/MiB, ggml_expert_store_disk_budget()/MiB);
+    }
 
     if (nd == 0) {
         sum_projected_used = dmds_full.back().mb.total();
@@ -2067,13 +2129,13 @@ static void common_params_fit_impl(
         LOG_TRC("%s: projected to use %" PRId64 " MiB of device memory vs. %" PRId64 " MiB of free device memory\n",
             __func__, sum_projected_used/MiB, sum_free/MiB);
         if (nd == 1) {
-            if (projected_free_per_device[0] >= margins[0]) {
+            if (projected_free_per_device[0] >= margins[0] && !expert_tiers_explicit) {
                 LOG_TRC("%s: will leave %" PRId64 " >= %" PRId64 " MiB of free device memory, no changes needed\n",
                     __func__, projected_free_per_device[0]/MiB, margins[0]/MiB);
                 return;
             }
         } else {
-            bool changes_needed = false;
+            bool changes_needed = expert_tiers_explicit;
             for (size_t id = 0; id < nd; id++) {
                 if (projected_free_per_device[id] < margins[id]) {
                     changes_needed = true;
@@ -2086,8 +2148,6 @@ static void common_params_fit_impl(
             }
         }
     }
-
-    // step 2: try reducing memory use by reducing the context size
 
     {
         int64_t global_surplus = sum_projected_free;
@@ -2118,11 +2178,7 @@ static void common_params_fit_impl(
                         }
                     }
                     if (nd > 1) {
-                        // for multiple devices we need to be more conservative in terms of how much context we think can fit:
-                        //   - for dense models only whole layers can be assigned to devices
-                        //   - for MoE models only whole tensors can be assigned to devices, which we estimate to be <= 1/3 of a layer
-                        //   - on average we expect a waste of 0.5 layers/tensors per device
-                        //   - use slightly more than the expected average for nd devices to be safe
+
                         const int64_t model_per_layer = sum_projected_model / std::min(uint32_t(mparams->n_gpu_layers), hp_ngl);
                         sum_used_target -= (nd + 1) * model_per_layer / (hp_nex == 0 ? 2 : 6);
                     }
@@ -2139,10 +2195,10 @@ static void common_params_fit_impl(
                         }
                     }
                     if (sum_used_target > sum_projected_used_min_ctx) {
-                        // linear interpolation between minimum and maximum context size:
+
                         cparams->n_ctx += (n_ctx_max - n_ctx_min_total) * (sum_used_target - sum_projected_used_min_ctx)
                             / (sum_projected_used - sum_projected_used_min_ctx);
-                        // round down context for CUDA backend, keep it divisible by the number of streams:
+
                         const uint32_t align = 256 * n_streams;
                         cparams->n_ctx = std::max(cparams->n_ctx - cparams->n_ctx % align, n_ctx_min_total);
 
@@ -2152,7 +2208,9 @@ static void common_params_fit_impl(
                             __func__, n_ctx_max, cparams->n_ctx, memory_reduction/MiB);
                         if (nd <= 1) {
                             LOG_TRC("%s: entire model can be fit by reducing context\n", __func__);
-                            return;
+                            if (!expert_tiers_explicit) {
+                                return;
+                            }
                         }
                         LOG_TRC("%s: entire model should be fit across devices by reducing context\n", __func__);
                     } else {
@@ -2176,9 +2234,6 @@ static void common_params_fit_impl(
     if (nd == 0) {
         throw common_params_fit_exception("was unable to fit model into system memory by reducing context, abort");
     }
-
-
-
 
     const bool user_ngl = mparams->n_gpu_layers != default_mparams.n_gpu_layers;
     bool user_ts = false;
@@ -2205,11 +2260,6 @@ static void common_params_fit_impl(
         throw common_params_fit_exception("model_params::tensor_buft_overrides already set by user, abort");
     }
 
-    // step 3: iteratively fill the back to front with "dense" layers
-    //   - for a dense model simply fill full layers, giving each device a contiguous slice of the model
-    //   - for a MoE model, same as dense model but with all MoE tensors in system memory
-
-    // utility function that returns a static C string matching the tensors for a specific layer index and layer fraction:
     auto get_overflow_pattern = [&](const size_t il, const common_layer_fraction_t lf) -> const char * {
         constexpr size_t n_strings = 1000;
         if (il >= n_strings) {
@@ -2241,7 +2291,6 @@ static void common_params_fit_impl(
                 static std::array<std::string, n_strings> patterns;
                 if (patterns[il].empty()) {
 
-
                     patterns[il] = "blk\\." + std::to_string(il) + "\\.ffn_(up|down|gate_up|gate)_(ch|)exps\\.weight";
                 }
                 return patterns[il].c_str();
@@ -2252,10 +2301,9 @@ static void common_params_fit_impl(
     };
 
     struct ngl_t {
-        uint32_t n_layer = 0; // number of total layers
-        uint32_t n_part  = 0; // number of partial layers, <= n_layer
+        uint32_t n_layer = 0;
+        uint32_t n_part  = 0;
 
-        // for the first partial layer varying parts can overflow, all further layers use LAYER_FRACTION_MOE:
         common_layer_fraction_t overflow_type = LAYER_FRACTION_MOE;
 
         uint32_t n_full() const {
@@ -2265,8 +2313,6 @@ static void common_params_fit_impl(
     };
 
     const size_t ntbo = llama_max_tensor_buft_overrides();
-
-
 
     std::vector<ggml_backend_buffer_type_t> moe_bufts;
     moe_bufts.reserve(nd);
@@ -2280,32 +2326,17 @@ static void common_params_fit_impl(
         moe_bufts.push_back(mapped != nullptr ? mapped : ggml_backend_cpu_buffer_type());
     }
 
-
-
     for (size_t id = 0; id < nd; id++) {
         common_expert_reset_allocation(moe_bufts[id]);
     }
-
-
-
-
 
     for (size_t id = 0; id < nd; id++) {
         common_expert_device_ready(moe_bufts[id]);
     }
 
-
-
-
     measure_main(dmds_full);
     common_fit_log_memory_stage_devs(nullptr, 0, nullptr);
     common_fit_log_memory_stage_devs(devs.data(), (int) nd, "fit_ready");
-
-
-
-
-
-
 
     bool all_expert_store = hp_nex > 0;
     for (size_t id = 0; id < nd; id++) {
@@ -2324,13 +2355,9 @@ static void common_params_fit_impl(
         throw common_params_fit_exception("model_params::tensor_split already set by user, abort");
     }
 
-
-
-
     std::vector<float> ts_work(nd > 0 ? nd : 1, 0.0f);
     std::vector<llama_model_tensor_buft_override> tbo_work(ntbo);
 
-    // utility function to set n_gpu_layers and tensor_split
     auto set_ngl_tensor_split_tbo = [&](
             const std::vector<ngl_t> & ngl_per_device,
             const std::vector<ggml_backend_buffer_type_t> & overflow_bufts,
@@ -2339,10 +2366,7 @@ static void common_params_fit_impl(
             llama_model_tensor_buft_override * tbo_out,
             bool keep_split = false) {
 
-
         std::fill(tbo_out, tbo_out + ntbo, llama_model_tensor_buft_override{nullptr, nullptr});
-
-
 
         if (!keep_split) {
             mparams.n_gpu_layers = 0;
@@ -2354,9 +2378,6 @@ static void common_params_fit_impl(
             }
         }
         assert(uint32_t(mparams.n_gpu_layers) <= hp_ngl + 1);
-
-
-
 
         const uint32_t n_gpu       = uint32_t(mparams.n_gpu_layers);
         const uint32_t i_gpu_start = hp_ngl + 1 > n_gpu ? hp_ngl + 1 - n_gpu : 0;
@@ -2374,9 +2395,6 @@ static void common_params_fit_impl(
             }
         }
 
-
-
-
         auto is_gpu_layer = [&](uint32_t il) {
             return act_gpu > 0 && il >= i_gpu_start && il - i_gpu_start < act_gpu;
         };
@@ -2384,17 +2402,15 @@ static void common_params_fit_impl(
         auto get_layer_dev = [&](uint32_t il) -> size_t {
             GGML_ASSERT(is_gpu_layer(il));
             return nd == 1 ? 0 :
-                std::upper_bound(split_points.begin(), split_points.end(), float(il - i_gpu_start)/act_gpu) - split_points.begin();
+                std::upper_bound(split_points.begin(), split_points.end(), llama_layer_split_fraction(il, i_gpu_start, act_gpu, hp_ngl)) - split_points.begin();
         };
 
-        uint32_t il0 = i_gpu_start; // start index for tensor buft overrides
+        uint32_t il0 = i_gpu_start;
 
         mparams.tensor_split = ts_out;
 
         size_t itbo = 0;
         for (size_t id = 0; id < nd; id++) {
-
-
 
             if (all_expert_store) {
                 for (uint32_t il = il0; il < il0 + ngl_per_device[id].n_full(); il++) {
@@ -2453,8 +2469,6 @@ static void common_params_fit_impl(
 
                 const common_layer_fraction_t lf = il == il0 ? ngl_per_device[id].overflow_type : LAYER_FRACTION_MOE;
 
-
-
                 tbo_out[itbo].pattern = get_overflow_pattern(il, LAYER_FRACTION_MOE);
                 tbo_out[itbo].buft    = moe_bufts[id_dev];
                 itbo++;
@@ -2465,7 +2479,6 @@ static void common_params_fit_impl(
                         ggml_backend_buft_name(moe_bufts[id_dev]),
                         ggml_backend_dev_name(ggml_backend_buft_get_device(moe_bufts[id_dev])));
                 }
-
 
                 if (lf != LAYER_FRACTION_MOE) {
                     tbo_out[itbo].pattern = get_overflow_pattern(il, lf);
@@ -2481,18 +2494,32 @@ static void common_params_fit_impl(
         mparams.tensor_buft_overrides = tbo_out;
     };
 
-    // utility function that returns the memory use per device for given numbers of layers per device
     int64_t host_used = 0;
     dmds_t  dmds_last;
     auto get_memory_for_layers = [&](
             const char * func_name,
             const std::vector<ngl_t> & ngl_per_device,
-            const std::vector<ggml_backend_buffer_type_t> & overflow_bufts) -> std::vector<int64_t> {
+            const std::vector<ggml_backend_buffer_type_t> & overflow_bufts) -> common_fit_layer_measurement {
         llama_model_params mparams_copy = *mparams;
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy, ts_work.data(), tbo_work.data());
 
+        std::string placement;
+        for (size_t id = 0; id < nd; id++) {
+            const ngl_t & n = ngl_per_device[id];
+            if (!placement.empty()) {
+                placement += ", ";
+            }
+            placement += "device " + std::to_string(id) + ": " + std::to_string(n.n_layer) + " layers";
+            if (n.n_part > 0) {
+                placement += " + " + std::to_string(n.n_part) + " partial";
+            }
+        }
+        if (placement.empty()) {
+            placement = "no layers";
+        }
+
         dmds_t dmd_nl;
-        measure_main(dmd_nl, nullptr, &mparams_copy);
+        const common_fit_host_account account = measure_main(dmd_nl, nullptr, &mparams_copy, placement);
 
         host_used = dmd_nl.back().mb.total();
 
@@ -2503,18 +2530,20 @@ static void common_params_fit_impl(
                 "%s: id=%zu, n_layer=%2" PRIu32 ", n_part=%2" PRIu32 ", overflow_type=%d, mem=%6" PRId64 " MiB\n",
                 func_name, id, n.n_layer, n.n_part, int(n.overflow_type), dmd_nl[id].mb.total()/MiB);
         }
+        LOG_TRC("%s: host fixed of measurement #%llu (%s): mapped %.1f MiB, pinned %.1f MiB\n",
+                func_name, (unsigned long long) account.id, placement.c_str(),
+                (double) account.mapped/1048576.0, (double) account.pinned/1048576.0);
 
-        std::vector<int64_t> ret;
-        ret.reserve(nd);
+        common_fit_layer_measurement ret;
+        ret.account = account;
+        ret.mem.reserve(nd);
         for (size_t id = 0; id < nd; id++) {
-            ret.push_back(dmd_nl[id].mb.total());
+            ret.mem.push_back(dmd_nl[id].mb.total());
         }
 
         dmds_last = std::move(dmd_nl);
         return ret;
     };
-
-
 
     auto check_host_memory = [&](
             const std::vector<ngl_t> & ngl_per_device,
@@ -2526,8 +2555,6 @@ static void common_params_fit_impl(
         bool uses_mapped = false;
         for (size_t id = 0; id < nd; id++) {
 
-
-
             if (ngl_per_device[id].n_part > 0 && ggml_backend_buft_is_device_mapped(moe_bufts[id]) &&
                     !common_buft_is_device_expert(moe_bufts[id])) {
                 uses_mapped = true;
@@ -2537,7 +2564,7 @@ static void common_params_fit_impl(
         if (!uses_mapped) {
             return;
         }
-        get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
+        (void) get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
 
         const int64_t host_free   = dmds_full.back().free;
         const int64_t host_margin = nd < llama_max_devices() ? (int64_t) margins_s[nd] : 0;
@@ -2555,7 +2582,7 @@ static void common_params_fit_impl(
     dmds_t dmds_cpu_moe;
     std::vector<common_expert_tensor> moe_expert_tensors;
     if (hp_nex > 0) {
-        const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps"; // matches all MoE tensors
+        const static std::string pattern_moe_all = "blk\\.\\d+\\.ffn_(up|down|gate_up|gate)_(ch|)exps";
         ggml_backend_buffer_type_t cpu_buft = ggml_backend_cpu_buffer_type();
         tbo_work[0] = {pattern_moe_all.c_str(), cpu_buft};
         tbo_work[1] = {nullptr, nullptr};
@@ -2579,42 +2606,30 @@ static void common_params_fit_impl(
                 __func__, -global_surplus_cpu_moe/MiB);
         }
 
-
         std::fill(tbo_work.begin(), tbo_work.end(), llama_model_tensor_buft_override{nullptr, nullptr});
     }
 
-    std::vector<int64_t> targets; // maximum acceptable memory use per device
+    std::vector<int64_t> targets;
     targets.reserve(nd);
     for (size_t id = 0; id < nd; id++) {
         targets.push_back(dmds_full[id].free - margins[id]);
         LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
     }
 
-    std::vector<ggml_backend_buffer_type_t> overflow_bufts; // which bufts the first partial layer of a device overflows to:
+    std::vector<ggml_backend_buffer_type_t> overflow_bufts;
     overflow_bufts.reserve(nd);
     for (size_t id = 0; id < nd; id++) {
         overflow_bufts.push_back(ggml_backend_cpu_buffer_type());
     }
 
     std::vector<ngl_t> ngl_per_device(nd);
-    std::vector<int64_t> mem = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
+    std::vector<int64_t> mem = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts).mem;
 
-
-
-
-
-
-
-
-
-
-    auto apply_expert_budgets = [&]() {
+    auto apply_expert_budgets = [&](const std::vector<ngl_t> & ngl_cur) {
         if (hp_nex == 0) {
             return;
         }
 
-        // layer -> device of the MoE placement, the same mapping that set_ngl_tensor_split_tbo
-        // wrote into the tensor buft overrides
         std::vector<int> layer_dev((size_t) hp_ngl + 2, -1);
         std::vector<int> dev_first(nd, -1);
         std::vector<int> dev_last(nd, -1);
@@ -2637,13 +2652,12 @@ static void common_params_fit_impl(
                 }
             }
 
-
             auto get_layer_dev = [&](uint32_t il) -> size_t {
                 if (act_gpu == 0 || il < i_gpu_start || il - i_gpu_start >= act_gpu) {
                     return (size_t) -1;
                 }
                 return nd == 1 ? 0 :
-                    std::upper_bound(split_points.begin(), split_points.end(), float(il - i_gpu_start)/act_gpu) - split_points.begin();
+                    std::upper_bound(split_points.begin(), split_points.end(), llama_layer_split_fraction(il, i_gpu_start, act_gpu, hp_ngl)) - split_points.begin();
             };
 
             for (uint32_t il = i_gpu_start; il < i_gpu_start + act_gpu && (size_t) il < layer_dev.size(); il++) {
@@ -2656,8 +2670,6 @@ static void common_params_fit_impl(
                     dev_last[id_dev] = (int) il;
                 }
             }
-
-
 
             std::string ranges = i_gpu_start > 0 ? "CPU 0.." + std::to_string(i_gpu_start - 1) : "CPU none";
             for (size_t id = 0; id < nd; id++) {
@@ -2674,21 +2686,18 @@ static void common_params_fit_impl(
             LOG_TRC("%s: layer ranges: %s\n", __func__, ranges.c_str());
         }
 
-
-
-
         std::vector<int> tensor_dev = layer_dev;
         if (!all_expert_store) {
             std::fill(tensor_dev.begin(), tensor_dev.end(), -1);
             uint32_t il0 = i_gpu_start;
             for (size_t id = 0; id < nd; id++) {
-                il0 += ngl_per_device[id].n_full();
-                for (uint32_t il = il0; il < il0 + ngl_per_device[id].n_part && (size_t) il < tensor_dev.size(); il++) {
+                il0 += ngl_cur[id].n_full();
+                for (uint32_t il = il0; il < il0 + ngl_cur[id].n_part && (size_t) il < tensor_dev.size(); il++) {
                     if (layer_dev[il] == (int) id) {
                         tensor_dev[il] = (int) id;
                     }
                 }
-                il0 += ngl_per_device[id].n_part;
+                il0 += ngl_cur[id].n_part;
             }
         }
 
@@ -2699,20 +2708,21 @@ static void common_params_fit_impl(
             }
         }
 
-
-
-
-
         std::vector<int64_t> mem_final;
+
+        common_fit_host_account gate_account;
         if (all_expert_store) {
-            mem_final = get_memory_for_layers(__func__, ngl_per_device, overflow_bufts);
+            const common_fit_layer_measurement final_measurement = get_memory_for_layers(__func__, ngl_cur, overflow_bufts);
+            mem_final    = final_measurement.mem;
+            gate_account = final_measurement.account;
         }
 
         int64_t host_complement = 0;
 
+        const size_t n_stage = stage_count(extra);
+
         std::vector<size_t> slot_budgets(nd, 0);
         bool has_experts = false;
-
 
         std::vector<std::vector<size_t>> host_each(nd);
         for (size_t id = 0; id < nd; id++) {
@@ -2723,15 +2733,29 @@ static void common_params_fit_impl(
             int64_t surplus;
             if (all_expert_store) {
 
-
-
-
                 surplus = dmds_last[id].free - mem_final[id] - margins[id];
             } else {
                 surplus = dmds_cpu_moe[id].free - int64_t(dmds_cpu_moe[id].mb.total()) - margins[id];
             }
-            if (surplus <= 0) {
 
+            const llama_memory_breakdown_data & mb_dev = all_expert_store ? dmds_last[id].mb : dmds_cpu_moe[id].mb;
+            const size_t borrow_bytes = allow_extra() ? mb_dev.compute_prefill : 0;
+            const size_t borrow_margin = borrow_bytes > 0 ? spare_bytes(borrow_bytes) : 0;
+            size_t borrow_total = borrow_bytes + borrow_margin;
+            if (borrow_total > 0) {
+                const size_t borrow_region = spare_region(borrow_bytes, borrow_margin);
+                const int64_t region_cost  = (int64_t) (borrow_region - borrow_bytes);
+                if (surplus < region_cost) {
+
+                    borrow_total = 0;
+                } else {
+                    surplus -= region_cost;
+                }
+                LOG_TRC("%s: device %zu: A-1 tail borrow: pp=%zu bytes borrow=%zu bytes region=%zu bytes surplus=%" PRId64 " bytes\n",
+                    __func__, id, borrow_bytes, borrow_total, borrow_total ? borrow_region : 0, surplus);
+            }
+
+            if (surplus <= 0) {
 
                 size_t slot_used_none = 0;
                 size_t host_bytes_none = 0;
@@ -2749,12 +2773,12 @@ static void common_params_fit_impl(
                         " use more devices or a lower quantization");
                 }
 
-                common_expert_set_budget(moe_bufts[id], 0, 0);
+                set_limit(moe_bufts[id], 0, 0, 0);
                 continue;
             }
             if (dev_tensors[id].empty()) {
 
-                common_expert_set_budget(moe_bufts[id], 0, 0);
+                set_limit(moe_bufts[id], 0, 0, 0);
                 continue;
             }
 
@@ -2768,12 +2792,12 @@ static void common_params_fit_impl(
                     throw common_params_fit_exception("expert store: the buffer type of device " + std::to_string(id) +
                         " has no placement plan, abort");
                 }
-                const size_t next = std::min(stage_peak, (size_t) surplus);
+                const size_t next = std::min(stage_peak, (size_t) surplus / n_stage);
                 if (next == stage_bytes) {
                     break;
                 }
                 stage_bytes = next;
-                slot_budget = (size_t) surplus - stage_bytes;
+                slot_budget = (size_t) surplus - stage_bytes * n_stage;
             }
             double routed_share = -1.0;
             if (!common_expert_plan(moe_bufts[id], dev_tensors[id], slot_budget, &slot_used, &host_bytes, &stage_peak,
@@ -2782,44 +2806,34 @@ static void common_params_fit_impl(
                     " has no placement plan, abort");
             }
 
-
-
             common_expert_log_static_staging(__func__, routed_share);
             if (stage_peak > stage_bytes) {
 
-
                 throw common_params_fit_exception(
                     "expert store: device " + std::to_string(id) + " needs " +
-                    std::to_string((stage_peak + MiB - 1)/MiB) + " MiB of staging for the host experts of one prefill batch (one region per expert tensor kind), but only " +
-                    std::to_string(stage_bytes/MiB) + " MiB fit (short by " +
+                    std::to_string((stage_peak + MiB - 1)/MiB) + " MiB of staging for the host experts of one prefill batch (one region per expert tensor kind)"
+                    " and " + std::to_string(n_stage) + " CUDA streams stage on these weights, but only " +
+                    std::to_string(stage_bytes/MiB) + " MiB per stream fit (short by " +
                     std::to_string((stage_peak - stage_bytes + MiB - 1)/MiB) +
-                    " MiB); reduce the context size, use more devices or a lower quantization");
+                    " MiB per stream); reduce the context size, use more devices or a lower quantization");
             }
-            common_expert_set_budget(moe_bufts[id], slot_budget, stage_bytes);
-
+            set_limit(moe_bufts[id], slot_budget, stage_bytes, borrow_total);
 
             common_expert_record_plan(moe_bufts[id], slot_used, host_bytes);
 
-
-
-
-
-
-            const llama_memory_breakdown_data & mb = all_expert_store ? dmds_last[id].mb : dmds_cpu_moe[id].mb;
+            const llama_memory_breakdown_data & mb = mb_dev;
             const double hit = slot_used + host_bytes > 0
                 ? 100.0 * (double) slot_used / (double) (slot_used + host_bytes) : 0.0;
             const std::string range = dev_first[id] < 0 ? "none" :
                 std::to_string(dev_first[id]) + ".." + std::to_string(dev_last[id]) +
                 (dev_last[id] == (int) hp_ngl ? " (out)" : "");
-            LOG_INF("%s: device %zu (layers %s): dense %.0f MiB, context %.0f MiB, compute %.0f MiB, expert slots %.0f MiB (budget %.0f MiB), staging %.0f MiB, host complement %.0f MiB, decode hit %.0f%% (uniform)\n",
+            LOG_DBG("%s: dev %zu %s %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f%% %.0f\n",
                 __func__, id, range.c_str(),
                 (double) mb.model/MiB, (double) mb.context/MiB, (double) mb.compute/MiB,
                 slot_used/1024.0/1024.0, slot_budget/1024.0/1024.0, stage_bytes/1024.0/1024.0,
-                host_bytes/1024.0/1024.0, hit);
-
-
-
-
+                host_bytes/1024.0/1024.0, hit, (double) borrow_total/1024.0/1024.0);
+            LOG_TRC("%s: device %zu: staging reserved for %zu CUDA stream(s): %.0f MiB each, %.0f MiB in total\n",
+                __func__, id, n_stage, stage_bytes/1024.0/1024.0, (double) n_stage * stage_bytes/1024.0/1024.0);
 
             const size_t slot_slack    = slot_budget > slot_used  ? slot_budget - slot_used  : 0;
             const size_t staging_slack = stage_bytes > stage_peak ? stage_bytes - stage_peak : 0;
@@ -2831,7 +2845,6 @@ static void common_params_fit_impl(
             has_experts = true;
             host_complement += (int64_t) host_bytes;
         }
-
 
         if (has_experts) {
             size_t min_slot = SIZE_MAX;
@@ -2853,14 +2866,7 @@ static void common_params_fit_impl(
                 (max_slot - min_slot)/1024.0/1024.0);
         }
 
-
-
-
-
         if (all_expert_store) {
-
-
-
 
             std::vector<int> order(nd);
             for (size_t id = 0; id < nd; id++) {
@@ -2882,6 +2888,17 @@ static void common_params_fit_impl(
                 }
             }
 
+            int64_t arena_total = 0;
+            for (const size_t bytes : seq_size) {
+                arena_total += (int64_t) bytes;
+            }
+            if (arena_total != host_complement) {
+                throw std::runtime_error(
+                    "expert store host complement: the expert plan does not add up: the per tensor breakdown of the "
+                    "host arenas is " + std::to_string(arena_total/MiB) + " MiB, the plan says " +
+                    std::to_string(host_complement/MiB) + " MiB; abort");
+            }
+
             constexpr size_t max_nodes = 64;
             int64_t node_bytes[max_nodes] = {};
             int64_t node_avail[max_nodes] = {};
@@ -2891,24 +2908,69 @@ static void common_params_fit_impl(
             size_t  fail_bytes = 0;
             int64_t fail_avail = 0;
 
+            if (!gate_account.valid) {
+                throw std::runtime_error(
+                    "expert store host complement: the final placement has no host memory accounting, abort");
+            }
+            int64_t gate_mapped = gate_account.mapped;
+            const int64_t gate_pinned = gate_account.pinned;
+            const int64_t gate_ple    = gate_account.ple;
+            const int64_t gate_embd   = gate_account.embd;
 
+            const bool ple_read_before = mparams->ple_host_read;
+            if (ple_read_before) {
+                gate_mapped += gate_embd - gate_ple;
+            }
 
+            if (!ple_read_before) {
+                common_fit_ple_host_read(mparams, devs, seq_dev, seq_size, arena_total, &gate_mapped,
+                    gate_pinned, gate_ple, gate_embd, cache_ram_mib,                 true);
+                if (mparams->ple_host_read) {
 
+                    return;
+                }
+            }
 
-            common_fit_ple_host_read(mparams, devs, seq_dev, seq_size, &host_fixed_mapped,
-                host_fixed_pinned, ple_bytes, embd_bytes, cache_ram_mib);
+            LOG_DBG("%s: state %llu %s %.1f %.1f %.1f %.1f %.1f\n",
+                __func__, (unsigned long long) gate_account.id,
+                gate_account.placement.empty() ? "no placement" : gate_account.placement.c_str(),
+                (double) gate_mapped/MiB, (double) gate_pinned/MiB,
+                (double) gate_ple/MiB, (double) gate_embd/MiB, (double) arena_total/MiB);
+
+            check_limit(__func__, arena_total, gate_mapped, gate_pinned,
+                "the layer placement");
 
             const int check = common_expert_check_host_nodes(devs, seq_dev, seq_size,
-                host_fixed_mapped, host_fixed_pinned, mparams->ple_host_read,
+                gate_mapped, gate_pinned, mparams->ple_host_read,
                 node_bytes, node_avail, node_ids, &n_nodes, &fail_node, &fail_bytes, &fail_avail);
+
+            if (check != 0 && n_nodes > 0) {
+                int64_t node_total = 0;
+                for (size_t n = 0; n < n_nodes; n++) {
+                    node_total += node_bytes[n];
+                }
+                const int64_t expected = common_fit_host_demand(arena_total, gate_mapped, gate_pinned);
+                if (node_total == arena_total) {
+
+                    LOG_TRC("%s: the nodes carry the expert arenas per tensor, the fixed terms are accounted per node in the plan\n",
+                        __func__);
+                } else if (node_total != expected) {
+                    throw std::runtime_error(
+                        "expert store host complement: the host memory accounting does not add up: the nodes need " +
+                        std::to_string(node_total/MiB) + " MiB, but the expert arenas (" + std::to_string(arena_total/MiB) +
+                        " MiB), the mapped weights (" + std::to_string(gate_mapped/MiB) + " MiB) and the pinned buffers (" +
+                        std::to_string(gate_pinned/MiB) + " MiB) add up to " + std::to_string(expected/MiB) + " MiB; abort");
+                }
+            }
+
             if (check < 0) {
 
                 const int64_t deficit = (int64_t) fail_bytes - fail_avail;
                 throw std::runtime_error(
                     "expert store host complement: the host arenas need " + std::to_string(fail_bytes/MiB) +
                     " MiB of NUMA node memory, the nodes hold " + std::to_string(fail_avail/MiB) +
-                    " MiB (including " + std::to_string(host_fixed_mapped/MiB) + " MiB mapped weights and " +
-                    std::to_string(host_fixed_pinned/MiB) + " MiB pinned buffers; short by " +
+                    " MiB (including " + std::to_string(gate_mapped/MiB) + " MiB mapped weights and " +
+                    std::to_string(gate_pinned/MiB) + " MiB pinned buffers; short by " +
                     std::to_string((deficit > 0 ? deficit : 0)/MiB) +
                     " MiB); per node: " + common_fit_host_nodes_per_node(node_bytes, node_avail, node_ids, n_nodes, MiB) +
                     "; reduce the context size, use more devices or a lower quantization");
@@ -2947,21 +3009,17 @@ static void common_params_fit_impl(
         }
     };
 
-
-
-
-
-
-
-
-
-
-
+    auto apply_expert_budgets_fixed = [&](const std::vector<ngl_t> & ngl_cur) {
+        const bool ple_read_before = mparams->ple_host_read;
+        apply_expert_budgets(ngl_cur);
+        if (mparams->ple_host_read && !ple_read_before) {
+            LOG_INF("%s: the n-gram table is read row by row: re-measuring the final placement with that graph\n", __func__);
+            apply_expert_budgets(ngl_cur);
+        }
+    };
 
     auto balanced_expert_split = [&](std::vector<ngl_t> & ngl_out, std::vector<int64_t> & mem_out) {
         const uint32_t n_gpu_layers = hp_ngl + 1;
-
-
 
         auto split_layers = [&](const std::vector<int64_t> & weight, std::vector<uint32_t> & out) -> bool {
 
@@ -3024,8 +3082,6 @@ static void common_params_fit_impl(
         int64_t best_min = INT64_MIN;
         bool measured = false;
 
-
-
         std::vector<int64_t> fail_mem;
         int64_t fail_deficit = INT64_MAX;
 
@@ -3034,7 +3090,7 @@ static void common_params_fit_impl(
                 ngl_out[id].n_layer = layers[id];
                 ngl_out[id].n_part  = 0;
             }
-            mem_out = get_memory_for_layers(__func__, ngl_out, overflow_bufts);
+            mem_out = get_memory_for_layers(__func__, ngl_out, overflow_bufts).mem;
 
             bool fits = true;
             int64_t deficit = 0;
@@ -3049,7 +3105,6 @@ static void common_params_fit_impl(
                 fail_mem     = mem_out;
             }
             if (fits) {
-
 
                 int64_t worst = INT64_MAX;
                 for (size_t id = 0; id < nd; id++) {
@@ -3076,7 +3131,6 @@ static void common_params_fit_impl(
 
         if (!measured) {
 
-
             const std::vector<int64_t> & need = fail_mem.empty() ? mem_out : fail_mem;
             std::string detail;
             for (size_t id = 0; id < nd; id++) {
@@ -3096,8 +3150,6 @@ static void common_params_fit_impl(
         }
         mem_out = best_mem;
     };
-
-
 
     if (user_ngl || user_ts) {
         int64_t n_gpu = mparams->n_gpu_layers;
@@ -3119,8 +3171,6 @@ static void common_params_fit_impl(
             }
         }
 
-
-
         std::vector<ngl_t> ngl_user(nd);
         {
             const uint32_t n_all       = hp_ngl + 1;
@@ -3139,36 +3189,25 @@ static void common_params_fit_impl(
             }
             for (uint32_t il = i_gpu_start; il < i_gpu_start + act_gpu; il++) {
                 const size_t id_dev = nd == 1 ? 0 :
-                    std::upper_bound(split.begin(), split.end(), float(il - i_gpu_start)/act_gpu) - split.begin();
+                    std::upper_bound(split.begin(), split.end(), llama_layer_split_fraction(il, i_gpu_start, act_gpu, hp_ngl)) - split.begin();
                 ngl_user[id_dev].n_layer++;
             }
         }
 
         check_host_memory(ngl_user, overflow_bufts);
         set_ngl_tensor_split_tbo(ngl_user, overflow_bufts, *mparams, tensor_split, tensor_buft_overrides, true);
-        apply_expert_budgets();
+        apply_expert_budgets_fixed(ngl_user);
         return;
     }
-
-
-
-
 
     if (all_expert_store) {
         balanced_expert_split(ngl_per_device, mem);
         check_host_memory(ngl_per_device, overflow_bufts);
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams, tensor_split, tensor_buft_overrides);
-        apply_expert_budgets();
+        apply_expert_budgets_fixed(ngl_per_device);
         return;
     }
 
-    // optimize the number of layers per device using the method of false position:
-    //   - ngl_per_device has 0 layers for each device, lower bound
-    //   - try a "high" configuration where a device is given all unassigned layers
-    //   - interpolate the memory use / layer between low and high linearly to get a guess where it meets our target
-    //   - check memory use of our guess, replace either the low or high bound
-    //   - once we only have a difference of a single layer, stop and return the lower bound that just barely still fits
-    //   - the last device has the output layer, which cannot be a partial layer
     if (hp_nex == 0) {
         LOG_TRC("%s: filling dense layers back-to-front:\n", __func__);
     } else {
@@ -3187,7 +3226,7 @@ static void common_params_fit_impl(
             ngl_per_device_high[id].n_part = size_t(id) < nd - 1 ? ngl_per_device_high[id].n_layer : ngl_per_device_high[id].n_layer - 1;
         }
         if (ngl_per_device_high[id].n_layer > 0) {
-            std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
+            std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts).mem;
             if (mem_high[id] > targets[id]) {
                 assert(ngl_per_device_high[id].n_layer > ngl_per_device[id].n_layer);
                 uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
@@ -3201,9 +3240,9 @@ static void common_params_fit_impl(
                     ngl_per_device_test[id].n_layer += step_size;
                     if (hp_nex) {
                         ngl_per_device_test[id].n_part += size_t(id) == nd - 1 && ngl_per_device_test[id].n_part == 0 ?
-                            step_size - 1 : step_size; // the first layer is the output layer which must always be full
+                            step_size - 1 : step_size;
                     }
-                    const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
+                    const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts).mem;
 
                     if (mem_test[id] <= targets[id]) {
                         ngl_per_device = ngl_per_device_test;
@@ -3232,14 +3271,9 @@ static void common_params_fit_impl(
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
         check_host_memory(ngl_per_device, overflow_bufts);
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams, tensor_split, tensor_buft_overrides);
-        apply_expert_budgets();
+        apply_expert_budgets_fixed(ngl_per_device);
         return;
     }
-
-    // step 4: for a MoE model where all dense tensors fit,
-    //     convert the dense-only layers in the back to full layers in the front until all devices are full
-    // essentially the same procedure as for the dense-only layers except front-to-back
-    // also, try fitting at least part of one more layer to reduce waste for "small" GPUs with e.g. 24 GiB VRAM
 
     size_t id_dense_start = nd;
     for (int id = nd - 1; id >= 0; id--) {
@@ -3261,7 +3295,7 @@ static void common_params_fit_impl(
             ngl_per_device_high[jd].n_part = 0;
         }
         size_t id_dense_start_high = nd - 1;
-        std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
+        std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts).mem;
 
         if (mem_high[id] > targets[id]) {
             assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
@@ -3286,7 +3320,7 @@ static void common_params_fit_impl(
                         break;
                     }
                 }
-                const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
+                const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts).mem;
 
                 if (mem_test[id] <= targets[id]) {
                     ngl_per_device = ngl_per_device_test;
@@ -3312,9 +3346,6 @@ static void common_params_fit_impl(
                 __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
         }
 
-
-
-
         if (id_dense_start < nd && ngl_per_device[id_dense_start].n_part > 0 &&
                 ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
             std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
@@ -3332,7 +3363,7 @@ static void common_params_fit_impl(
                 overflow_bufts_test[id] = ggml_backend_dev_buffer_type(devs[id + 1]);
             }
             LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_UP\n", __func__);
-            std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
+            std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test).mem;
             if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
                 ngl_per_device = ngl_per_device_test;
                 overflow_bufts = overflow_bufts_test;
@@ -3343,7 +3374,7 @@ static void common_params_fit_impl(
 
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_GATE;
                 LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_GATE\n", __func__);
-                mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
+                mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test).mem;
                 if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
@@ -3355,7 +3386,7 @@ static void common_params_fit_impl(
             } else {
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_ATTN;
                 LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_ATTN\n", __func__);
-                mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test);
+                mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts_test).mem;
                 if (mem_test[id] < targets[id] && (id + 1 == nd || mem_test[id + 1] < targets[id + 1])) {
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
@@ -3373,7 +3404,6 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
     }
 
-    // print info for devices that were not changed during the conversion from dense only to full layers:
     for (size_t id = id_dense_start + 1; id < nd; id++) {
         const int64_t projected_margin = dmds_full[id].free - mem[id];
         LOG_TRC(
@@ -3383,7 +3413,7 @@ static void common_params_fit_impl(
 
     check_host_memory(ngl_per_device, overflow_bufts);
     set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams, tensor_split, tensor_buft_overrides);
-    apply_expert_budgets();
+    apply_expert_budgets_fixed(ngl_per_device);
 }
 
 enum common_params_fit_status common_fit_params(
@@ -3400,12 +3430,7 @@ enum common_params_fit_status common_fit_params(
         ggml_log_level log_level) {
     const int64_t t0_us = llama_time_us();
 
-
-
     common_fit_log_memory_stage(nullptr, nullptr);
-
-
-
 
     std::vector<size_t> margins_layer(llama_max_devices());
     for (size_t i = 0; i < margins_layer.size(); i++) {
@@ -3430,7 +3455,7 @@ enum common_params_fit_status common_fit_params(
 }
 
 void common_memory_breakdown_print(const struct llama_context * ctx) {
-    //const auto & devices = ctx->get_model().devices;
+
     const auto * model = llama_get_model(ctx);
 
     std::vector<ggml_backend_dev_t> devices;
@@ -3443,7 +3468,6 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
     std::vector<std::array<std::string, 9>> table_data;
     table_data.reserve(devices.size());
 
-    // same data as the table below, for --log-jsonl consumers
     common_json rows = common_json::array();
     const std::string template_header = "%s: | %s | %s   %s    %s   %s   %s   %s    %s |\n";
     const std::string template_gpu    = "%s: | %s | %s = %s + (%s = %s + %s + %s) + %s |\n";
@@ -3454,10 +3478,8 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
     constexpr size_t MiB = 1024 * 1024;
     const std::vector<std::string> desc_prefixes_strip = {"NVIDIA ", "GeForce ", "Tesla ", "AMD ", "Radeon ", "Instinct "};
 
-    // track seen buffer types to avoid double counting:
     std::set<ggml_backend_buffer_type_t> seen_buffer_types;
 
-    // accumulative memory breakdown for each device and for host:
     std::vector<llama_memory_breakdown_data> mb_dev(devices.size());
     llama_memory_breakdown_data              mb_host;
 
@@ -3513,7 +3535,6 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
         }
     }
 
-    // print memory breakdown for each device:
     for (size_t i = 0; i < devices.size(); i++) {
         ggml_backend_dev_t dev = devices[i];
         llama_memory_breakdown_data mb = mb_dev[i];
@@ -3557,19 +3578,18 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
         });
     }
 
-    // print memory breakdown for host:
     {
         const size_t self = mb_host.model + mb_host.context + mb_host.compute;
         table_data.push_back({
             template_other,
             "  - Host",
-            "", // total
-            "", // free
+            "",
+            "",
             std::to_string(self / MiB),
             std::to_string(mb_host.model / MiB),
             std::to_string(mb_host.context / MiB),
             std::to_string(mb_host.compute / MiB),
-            ""}); // unaccounted
+            ""});
 
         rows.push_back({
             {"kind",    "host"},
@@ -3581,7 +3601,6 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
         });
     }
 
-    // print memory breakdown for all remaining buffer types:
     for (const auto & buft_mb : memory_breakdown) {
         ggml_backend_buffer_type_t          buft = buft_mb.first;
         const llama_memory_breakdown_data & mb   = buft_mb.second;
@@ -3593,13 +3612,13 @@ void common_memory_breakdown_print(const struct llama_context * ctx) {
         table_data.push_back({
             template_other,
             "  - " + name,
-            "", // total
-            "", // free
+            "",
+            "",
             std::to_string(self / MiB),
             std::to_string(mb.model / MiB),
             std::to_string(mb.context / MiB),
             std::to_string(mb.compute / MiB),
-            ""}); // unaccounted
+            ""});
 
         rows.push_back({
             {"kind",    "buffer_type"},
@@ -3639,10 +3658,10 @@ void common_fit_print(
         llama_model_params * mparams,
         llama_context_params * cparams) {
     std::vector<ggml_backend_dev_t> devs;
-    uint32_t hp_ngl = 0; // hparams.n_gpu_layers
-    uint32_t hp_nct = 0; // hparams.n_ctx_train
-    uint32_t hp_nex = 0; // hparams.n_expert
-    uint32_t hp_neu = 0; // hparams.n_expert_used
+    uint32_t hp_ngl = 0;
+    uint32_t hp_nct = 0;
+    uint32_t hp_nex = 0;
+    uint32_t hp_neu = 0;
 
     auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, hp_neu, GGML_LOG_LEVEL_ERROR);
     GGML_ASSERT(dmd.size() == devs.size() + 1);

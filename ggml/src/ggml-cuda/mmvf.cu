@@ -48,8 +48,6 @@ static __global__ void mul_mat_vec_f(
 
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
 
-
-
     const int expert_local = ids != nullptr ? ggml_cuda_expert_local(lut, channel_x) : channel_x;
     if (expert_local < 0) {
         if (tid < ncols_dst) {
@@ -62,10 +60,7 @@ static __global__ void mul_mat_vec_f(
         return;
     }
 
-
     const int channel_x_local = expert_local;
-
-
 
     if (ids != nullptr && fusion.expert_ptrs != nullptr) {
         x = (const T *) (fusion.expert_ptrs[channel_x_local]) + int64_t(sample_x) *stride_sample_x + row*stride_row;
@@ -662,25 +657,6 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, lut, stream);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 template <typename T, int ncols_dst>
 static __global__ void __launch_bounds__(WARP_SIZE) mul_mat_vec_f_split(
         const T * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
@@ -693,10 +669,6 @@ static __global__ void __launch_bounds__(WARP_SIZE) mul_mat_vec_f_split(
                                            dst + row, stride_col_dst, scratch + (int64_t) row*n_warps*ncols_dst,
                                            counters + row, warp, threadIdx.x);
 }
-
-
-
-
 
 struct mmvf_narrow_multi_seg {
     const void * x;
@@ -798,7 +770,6 @@ static __global__ void __launch_bounds__(mmvf_narrow_block_size) mul_mat_vec_f_r
         }
     }
 
-
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
@@ -850,7 +821,6 @@ static void mul_mat_vec_f_narrow_launch(ggml_backend_cuda_context & ctx, const T
     CUDA_CHECK(cudaGetLastError());
 }
 
-
 static bool ggml_cuda_mul_mat_vec_f_narrow(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                                            const ggml_tensor * src1, ggml_tensor * dst) {
     const int64_t ncols     = src0->ne[0];
@@ -894,9 +864,6 @@ static bool ggml_cuda_mul_mat_vec_f_narrow(ggml_backend_cuda_context & ctx, cons
 #undef MMVF_NARROW_CASE
     return true;
 }
-
-
-
 
 bool ggml_cuda_mul_mat_vec_f_split_covers(const ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                                           const ggml_tensor * src1, const ggml_tensor * dst) {
@@ -1037,8 +1004,6 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
         fusion_local.glu_limit = fusion->glu_limit;
     }
 
-
-
     ggml_cuda_expert_table ex_table;
     bool is_expert_store = false;
     if (ids != nullptr && ggml_cuda_expert_table_get(src0, &ex_table)) {
@@ -1076,11 +1041,6 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
-
-
-
-
-
 
     ggml_cuda_expert_lut lut;
     if (ids != nullptr) {
@@ -1196,7 +1156,6 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
                 if (ampere_mma_available(cc)) {
                     return ne11 <= 3;
                 }
-
 
                 if (cc >= GGML_CUDA_CC_VOLTA) {
                     return ne11 <= 4;

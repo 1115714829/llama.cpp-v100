@@ -1,27 +1,5 @@
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -227,8 +205,6 @@ static run_result run(ggml_backend_t backend, const std::string & what, int64_t 
     ggml_backend_synchronize(backend);
     const auto t1 = std::chrono::steady_clock::now();
     const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / iters / layers;
-
-
 
     std::vector<int32_t> ids_h(N_USED * n);
     for (int64_t t = 0; t < n; ++t) {

@@ -1,18 +1,5 @@
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -94,13 +81,10 @@ int main() {
         return 1;
     }
 
-
     std::vector<uint16_t> rows((size_t) (n_embd * n_rows));
     for (size_t i = 0; i < rows.size(); ++i) {
         rows[i] = (uint16_t) ((((i % 7) + 1) << 10) | (i & 0x3ff));
     }
-
-
 
     ggml_backend_tensor_set(table, rows.data(), 0, rows.size() * sizeof(uint16_t));
     std::vector<uint16_t> readback(rows.size(), 0);
@@ -108,8 +92,6 @@ int main() {
     if (!check_bytes("host round trip", (const uint8_t *) readback.data(), (const uint8_t *) rows.data(), rows.size() * sizeof(uint16_t))) {
         return 1;
     }
-
-
 
     ggml_tensor * ids = ggml_new_tensor_1d(ctx_g, GGML_TYPE_I32, n_tokens);
     ggml_set_name(ids, "ids");
@@ -148,7 +130,6 @@ int main() {
             return 1;
         }
     }
-
 
     ggml_backend_buffer_free(table_buffer);
     ggml_backend_buffer_free(graph_buffer);

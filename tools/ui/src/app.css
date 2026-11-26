@@ -252,3 +252,22 @@
 .mermaidTooltip {
 	display: none !important;
 }
+
+:root {
+ --background:#edf2f8; --foreground:#14253e; --card:#fff; --card-foreground:var(--foreground);
+ --popover:#fff; --popover-foreground:var(--foreground); --primary:#1958b5; --primary-foreground:#fff;
+ --secondary:#eff3f9; --secondary-foreground:var(--foreground); --muted:#e6edf6; --muted-foreground:#475e7b;
+ --accent:#dce9f8; --accent-foreground:#14253e; --border:#d4e0ef; --input:#d4e0ef; --ring:#2860b7;
+ --sidebar:#fff; --sidebar-foreground:var(--foreground); --sidebar-primary:var(--primary); --sidebar-primary-foreground:var(--primary-foreground);
+ --sidebar-accent:#eaf0f9; --sidebar-accent-foreground:var(--foreground); --sidebar-border:var(--border); --sidebar-ring:var(--ring);
+ --code-background:#f5f8fc; --code-foreground:var(--foreground); --live-prefill:#2459a8; --live-decode:#007266;
+}
+.dark {
+ --background:#0e1522; --foreground:#ebf2ff; --card:#121e2d; --card-foreground:var(--foreground);
+ --popover:#152233; --popover-foreground:var(--foreground); --primary:#8dc9f5; --primary-foreground:#102339;
+ --secondary:#18283c; --secondary-foreground:var(--foreground); --muted:#182639; --muted-foreground:#a5b7ce;
+ --accent:#21394f; --accent-foreground:#edf5ff; --border:#283b52; --input:#283b52; --ring:#8fbbff;
+ --sidebar:#121e2d; --sidebar-foreground:var(--foreground); --sidebar-primary:var(--primary); --sidebar-primary-foreground:var(--primary-foreground);
+ --sidebar-accent:#19293c; --sidebar-accent-foreground:var(--foreground); --sidebar-border:var(--border); --sidebar-ring:var(--ring);
+ --code-background:#121e2d; --code-foreground:var(--foreground); --live-prefill:#95baff; --live-decode:#62e3cc;
+}

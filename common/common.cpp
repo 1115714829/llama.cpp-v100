@@ -63,7 +63,7 @@
 #endif
 
 #if defined(_MSC_VER)
-#pragma warning(disable: 4244 4267) // possible loss of data
+#pragma warning(disable: 4244 4267)
 #endif
 
 common_time_meas::common_time_meas(int64_t & t_acc, bool disable) : t_start_us(disable ? -1 : ggml_time_us()), t_acc(t_acc) {}
@@ -73,10 +73,6 @@ common_time_meas::~common_time_meas() {
         t_acc += ggml_time_us() - t_start_us;
     }
 }
-
-//
-// CPU utils
-//
 
 int32_t common_cpu_get_num_physical_cores() {
 #if defined(_AIX)
@@ -89,13 +85,13 @@ int32_t common_cpu_get_num_physical_cores() {
         return static_cast<int32_t>(logical_cpus);
     }
 #elif defined(__linux__)
-    // enumerate the set of thread siblings, num entries is num cores
+
     std::unordered_set<std::string> siblings;
     for (uint32_t cpu=0; cpu < UINT32_MAX; ++cpu) {
         std::ifstream thread_siblings("/sys/devices/system/cpu/cpu"
             + std::to_string(cpu) + "/topology/thread_siblings");
         if (!thread_siblings.is_open()) {
-            break; // no more cpus
+            break;
         }
         std::string line;
         if (std::getline(thread_siblings, line)) {
@@ -116,8 +112,8 @@ int32_t common_cpu_get_num_physical_cores() {
     if (result == 0) {
         return num_physical_cores;
     }
-#elif defined(_WIN32) && (_WIN32_WINNT >= 0x0601) && !defined(__MINGW64__) // windows 7 and later
-    // TODO: windows + arm64 + mingw64
+#elif defined(_WIN32) && (_WIN32_WINNT >= 0x0601) && !defined(__MINGW64__)
+
     unsigned int n_threads_win = std::thread::hardware_concurrency();
     unsigned int default_threads = n_threads_win > 0 ? (n_threads_win <= 4 ? n_threads_win : n_threads_win / 2) : 4;
 
@@ -189,19 +185,16 @@ static int cpu_count_math_cpus(int n_cpu) {
             return -1;
         }
         if (is_running_on_efficiency_core()) {
-            continue; // efficiency cores harm lockstep threading
+            continue;
         }
-        ++cpu; // hyperthreading isn't useful for linear algebra
+        ++cpu;
         ++result;
     }
     return result;
 }
 
-#endif // __x86_64__ && __linux__
+#endif
 
-/**
- * Returns number of CPUs on system that are useful for math.
- */
 int32_t common_cpu_get_num_math() {
 #if defined(__x86_64__) && defined(__linux__) && !defined(__ANDROID__)
     int n_cpu = sysconf(_SC_NPROCESSORS_ONLN);
@@ -230,8 +223,6 @@ int32_t common_cpu_get_num_math() {
     return common_cpu_get_num_physical_cores();
 }
 
-// Helper for setting process priority
-
 #if defined(_WIN32)
 
 bool set_process_priority(enum ggml_sched_priority prio) {
@@ -256,7 +247,7 @@ bool set_process_priority(enum ggml_sched_priority prio) {
     return true;
 }
 
-#else // MacOS and POSIX
+#else
 #include <sys/types.h>
 #include <sys/resource.h>
 
@@ -283,16 +274,11 @@ bool set_process_priority(enum ggml_sched_priority prio) {
 
 #endif
 
-//
-// CLI argument parsing
-//
-
-
 void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_params * role_model) {
     int32_t n_set = 0;
 
     if (cpuparams.n_threads < 0) {
-        // Assuming everything about cpuparams is invalid
+
         if (role_model != nullptr) {
             cpuparams = *role_model;
         } else {
@@ -307,7 +293,7 @@ void postprocess_cpu_params(common_cpu_params & cpuparams, const common_cpu_para
     }
 
     if (n_set && n_set < cpuparams.n_threads) {
-        // Not enough set bits, may experience performance issues.
+
         COM_WRN("Not enough set bits in CPU mask (%d) to satisfy requested thread count: %d\n", n_set, cpuparams.n_threads);
     }
 }
@@ -350,7 +336,7 @@ bool parse_cpu_range(const std::string & range, bool (&boolmask)[GGML_MAX_N_THRE
 }
 
 bool parse_cpu_mask(const std::string & mask, bool (&boolmask)[GGML_MAX_N_THREADS]) {
-    // Discard potential 0x prefix
+
     size_t start_i = 0;
     if (mask.length() >= 2 && mask.substr(0, 2) == "0x") {
         start_i = 2;
@@ -408,7 +394,6 @@ void common_params_print_info(const common_params & params, bool print_devices) 
     const int verbosity = common_log_get_verbosity_thold();
     COM_INF("%s: verbosity = %d (adjust with the `-lv N` CLI arg)\n", __func__, verbosity);
 
-    // device enumeration creates a primary context on CUDA backends, skip it when the caller does not own any device
     if (print_devices && verbosity >= LOG_LEVEL_TRACE) {
         COM_TRC("%s", "device_info:\n");
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
@@ -428,8 +413,8 @@ std::string common_params_get_system_info(const common_params & params) {
     if (params.cpuparams_batch.n_threads != -1) {
         os << " (n_threads_batch = " << params.cpuparams_batch.n_threads << ")";
     }
-#if defined(_WIN32) && (_WIN32_WINNT >= 0x0601) && !defined(__MINGW64__) // windows 7 and later
-    // TODO: windows + arm64 + mingw64
+#if defined(_WIN32) && (_WIN32_WINNT >= 0x0601) && !defined(__MINGW64__)
+
     DWORD logicalProcessorCount = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     os << " / " << logicalProcessorCount << " | " << llama_print_system_info();
 #else
@@ -438,10 +423,6 @@ std::string common_params_get_system_info(const common_params & params) {
 
     return os.str();
 }
-
-//
-// String utils
-//
 
 std::string string_format(const char * fmt, ...) {
     va_list ap;
@@ -631,7 +612,7 @@ void string_process_escapes(std::string & input) {
                 case '\"': input[output_idx++] = '\"'; break;
                 case '\\': input[output_idx++] = '\\'; break;
                 case 'x':
-                    // Handle \x12, etc
+
                     if (input_idx + 2 < input_len) {
                         const char x[3] = { input[input_idx + 1], input[input_idx + 2], 0 };
                         char *err_p = nullptr;
@@ -709,7 +690,6 @@ static inline bool glob_class_match(const char c, const char * pattern, const ch
         class_start++;
     }
 
-    // If first character after negation is ']' or '-', treat it as literal
     if (*class_start == ']' || *class_start == '-') {
         if (class_start < class_end && *class_start == c) {
             return !negated;
@@ -740,7 +720,6 @@ static inline bool glob_class_match(const char c, const char * pattern, const ch
     return negated ? !matched : matched;
 }
 
-// simple glob: * matches non-/ chars, ** matches anything including /, [] matches character class
 static inline bool glob_match(const char * pattern, const char * str) {
     if (*pattern == '\0') {
         return *str == '\0';
@@ -763,7 +742,7 @@ static inline bool glob_match(const char * pattern, const char * str) {
     }
     if (*pattern == '[') {
         const char * class_end = pattern + 1;
-        // If first character after '[' is ']' or '-', treat it as literal
+
         if (*class_end == ']' || *class_end == '-') {
             class_end++;
         }
@@ -791,21 +770,13 @@ bool glob_match(const std::string & pattern, const std::string & str) {
     return glob_match(pattern.c_str(), str.c_str());
 }
 
-//
-// Filesystem utils
-//
-
-// Validate if a filename is safe to use
-// To validate a full path, split the path by the OS-specific path separator, and validate each part with this function
 bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
     if (!filename.length()) {
-        // Empty filename invalid
+
         return false;
     }
     if (filename.length() > 255) {
-        // Limit at common largest possible filename on Linux filesystems
-        // to avoid unnecessary further validation
-        // (On systems with smaller limits it will be caught by the OS)
+
         return false;
     }
 
@@ -824,46 +795,35 @@ bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
             return false;
         }
 
-        // Check for forbidden codepoints:
-        // - Control characters
-        // - Unicode equivalents of illegal characters
-        // - UTF-16 surrogate pairs
-        // - UTF-8 replacement character
-        // - Byte order mark (BOM)
-        // - Illegal characters: / \ : * ? " < > |
-        if (c <= 0x1F // Control characters (C0)
-            || c == 0x7F // Control characters (DEL)
-            || (c >= 0x80 && c <= 0x9F) // Control characters (C1)
-            || c == 0xFF0E // Fullwidth Full Stop (period equivalent)
-            || c == 0x2215 // Division Slash (forward slash equivalent)
-            || c == 0x2216 // Set Minus (backslash equivalent)
-            || (c >= 0xD800 && c <= 0xDFFF) // UTF-16 surrogate pairs
-            || c > 0x10FFFF // Max Unicode limit
-            || c == 0xFFFD // Replacement Character (UTF-8)
-            || c == 0xFEFF // Byte Order Mark (BOM)
-            || c == ':' || c == '*' // Illegal characters
+        if (c <= 0x1F
+            || c == 0x7F
+            || (c >= 0x80 && c <= 0x9F)
+            || c == 0xFF0E
+            || c == 0x2215
+            || c == 0x2216
+            || (c >= 0xD800 && c <= 0xDFFF)
+            || c > 0x10FFFF
+            || c == 0xFFFD
+            || c == 0xFEFF
+            || c == ':' || c == '*'
             || c == '?' || c == '"' || c == '<' || c == '>' || c == '|') {
             return false;
         }
         if (!allow_subdirs && (c == '/' || c == '\\')) {
-            // Subdirectories not allowed, reject path separators
+
             return false;
         }
         offset += result.bytes_consumed;
     }
 
-    // Reject any leading or trailing ' ', or any trailing '.', these are stripped on Windows and will cause a different filename
-    // Unicode and other whitespace is not affected, only 0x20 space
     if (filename.front() == ' ' || filename.back() == ' ' || filename.back() == '.') {
         return false;
     }
 
-    // Reject any ".." (currently stricter than necessary, it should be fine to just check for == ".." instead)
     if (filename.find("..") != std::string::npos) {
         return false;
     }
 
-    // Reject "."
     if (filename == ".") {
         return false;
     }
@@ -872,7 +832,6 @@ bool fs_validate_filename(const std::string & filename, bool allow_subdirs) {
 }
 
 #include <iostream>
-
 
 #ifdef _WIN32
 std::wstring utf8_to_wstring(const std::string & str) {
@@ -910,7 +869,6 @@ std::string wstring_to_utf8(const std::wstring & str) {
 }
 #endif
 
-// returns the path as a UTF-8 string, preserving its separators
 std::string fs_path_to_utf8(const std::filesystem::path & path) {
     const auto value = path.u8string();
     return std::string(value.begin(), value.end());
@@ -1034,10 +992,6 @@ std::filesystem::path fs_get_cache_file(const std::string & filename) {
     return cache_directory / std::filesystem::u8path(filename);
 }
 
-//
-// TTY utils
-//
-
 bool common_is_tty(FILE * file) {
 #if defined(_WIN32)
     return _isatty(_fileno(file));
@@ -1054,21 +1008,18 @@ bool tty_can_use_colors() {
         }
     }
 
-    // Check TERM environment variable
     if (const char * term = std::getenv("TERM")) {
         if (std::strcmp(term, "dumb") == 0) {
             return false;
         }
     }
 
-    // Check if stdout and stderr are connected to a terminal
-    // We check both because log messages can go to either
     return common_is_tty(stdout) || common_is_tty(stderr);
 }
 
 bool tty_enable_ansi() {
 #if defined(_WIN32)
-    // a Windows console renders ANSI sequences only in virtual terminal mode, pipes and files take them as is
+
     for (DWORD id : { STD_OUTPUT_HANDLE, STD_ERROR_HANDLE }) {
         HANDLE h    = GetStdHandle(id);
         DWORD  mode = 0;
@@ -1080,11 +1031,6 @@ bool tty_enable_ansi() {
     return true;
 }
 
-//
-// Model utils
-//
-
-// TODO: move to common/sampling
 static void common_init_sampler_from_model(
     const llama_model * model,
     common_params_sampling & sparams) {
@@ -1121,7 +1067,6 @@ static void common_init_sampler_from_model(
         }
     };
 
-    // Sampling sequence
     if (!(config & common_params_sampling_config::COMMON_PARAMS_SAMPLING_CONFIG_SAMPLERS)) {
         char buf[512] = {0};
         if (llama_model_meta_val_str(model, llama_model_meta_key_str(LLAMA_MODEL_META_KEY_SAMPLING_SEQUENCE), buf, sizeof(buf)) > 0) {
@@ -1149,8 +1094,6 @@ struct common_init_result::impl {
     impl() = default;
     ~impl() = default;
 
-    // note: the order in which model, context, etc. are declared matters because their destructors will be called bottom-to-top
-
     common_threadpools threadpools;
 
     llama_model_ptr   model;
@@ -1174,7 +1117,7 @@ static const std::map<common_decision_type, std::string> COMMON_DECISION_TYPE_NA
     { COMMON_DECISION_TYPE_VLLM_D3,        "vllm-d3"        },
     { COMMON_DECISION_TYPE_LFM2_D1,        "lfm2-d1"       },
     { COMMON_DECISION_TYPE_LFM2_D1_OMNI,   "lfm2-d1-omni"  },
-    // for future models, ALWAYS add org name prefix to avoid name collisions, e.g. "orgname-modelname"
+
 };
 
 static common_decision_type common_decision_type_from_string(const std::string & str) {
@@ -1202,18 +1145,18 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
     common_gguf_info info;
 
     struct gguf_init_params gguf_params = {
-        /* .no_alloc = */ true,
-        /* .ctx      = */ nullptr,
+                          true,
+                          nullptr,
     };
 
     gguf_context_ptr gguf_ctx(gguf_init_from_file(fname.c_str(), gguf_params));
     if (!gguf_ctx) {
-        return info; // missing or unreadable file
+        return info;
     }
 
     const int64_t arch_id = gguf_find_key(gguf_ctx.get(), "general.architecture");
     if (arch_id < 0 || gguf_get_kv_type(gguf_ctx.get(), arch_id) != GGUF_TYPE_STRING) {
-        return info; // no architecture in the metadata
+        return info;
     }
     const std::string arch = gguf_get_val_str(gguf_ctx.get(), arch_id);
     if (arch.empty()) {
@@ -1227,7 +1170,6 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
         info.decision_type = common_decision_type_from_string(gguf_get_val_str(gguf_ctx.get(), type_id));
     }
 
-    // same key and type as the model loader
     const int64_t ctx_id = gguf_find_key(gguf_ctx.get(), (arch + ".context_length").c_str());
     if (ctx_id >= 0 && gguf_get_kv_type(gguf_ctx.get(), ctx_id) == GGUF_TYPE_UINT32) {
         info.n_ctx_train = gguf_get_val_u32(gguf_ctx.get(), ctx_id);
@@ -1238,6 +1180,20 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+
+    {
+        const bool spec_mtp_tgt = std::find(params.speculative.types.begin(), params.speculative.types.end(),
+                COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+        if (spec_mtp_tgt && params.cpu_mtp) {
+            params.speculative.draft.mtp_host = true;
+            const int32_t window = params.cpu_mtp_context > 0 ? params.cpu_mtp_context : 2048;
+            if (params.speculative.draft.window > window) {
+                params.speculative.draft.window = window;
+            }
+            COM_INF("%s: native MTP block -> host memory (CPU compute), draft window %d\n", __func__,
+                    params.speculative.draft.window);
+        }
+    }
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
@@ -1245,7 +1201,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
-        // the draft context is created from the same base params and follows the main context, fit both together
         const bool has_draft  = params.speculative.has_dft();
         const bool spec_mtp   = std::find(params.speculative.types.begin(), params.speculative.types.end(),
             COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
@@ -1262,23 +1217,23 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         }
         cparams_dft.n_rs_seq = 0;
+        if (params_dft.speculative.draft.mtp_host) {
 
-
-
+            cparams_dft.offload_kqv = false;
+        }
 
         const uint32_t h_sink_rows = spec_mtp
             ? (uint32_t) params.n_batch + (uint32_t) (params.n_parallel * (params.speculative.draft.n_max + 2)) : 0;
 
         const common_fit_extra_model extra = {
-            /*.path_model   =*/ params_dft.model.path.c_str(),
-            /*.mparams      =*/ &mparams_dft,
-            /*.cparams      =*/ &cparams_dft,
-            /*.shares_model =*/ !has_draft, // an MTP context runs on the weights of the main model
+                                params_dft.model.path.c_str(),
+                                &mparams_dft,
+                                &cparams_dft,
+                                !has_draft,
             spec_dflash,
             h_sink_rows,
+            params_dft.speculative.draft.mtp_host,
         };
-
-
 
         std::vector<size_t> fit_margins = params.fit_params_target;
         if (!params.fit_params_target_set) {
@@ -1297,8 +1252,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
                 has_draft || spec_mtp ? &extra : nullptr,
                 params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR)
                 == COMMON_PARAMS_FIT_STATUS_ERROR) {
-
-
 
             return;
         }
@@ -1319,8 +1272,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    // these decision models return a score for each token via the embeddings output
-    // TODO: maybe improve this in the future
     const auto decision_type = common_get_decision_type(model);
     if (decision_type == COMMON_DECISION_TYPE_LAYA || decision_type == COMMON_DECISION_TYPE_KEV || decision_type == COMMON_DECISION_TYPE_CLEF ||
         decision_type == COMMON_DECISION_TYPE_LFM2_D1_OMNI || decision_type == COMMON_DECISION_TYPE_VLLM_DECISION2) {
@@ -1335,15 +1286,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         LOG_INF("%s", "decision model reads the embeddings output, enabling embedding mode\n");
     }
 
-    // embeddings need the whole batch in one ubatch, so n_batch must not be larger than n_ubatch
-    // (server.cpp does this check for --embedding, but before the model is loaded)
     if (cparams.embeddings && cparams.n_batch > cparams.n_ubatch) {
         LOG_WRN("embeddings enabled: setting n_batch = n_ubatch = %u\n", cparams.n_ubatch);
         cparams.n_batch = cparams.n_ubatch;
         params.n_batch  = params.n_ubatch;
     }
 
-    // load and optionally apply lora adapters
     for (auto & la : params.lora_adapters) {
         llama_adapter_lora_ptr lora;
         lora.reset(llama_adapter_lora_init(model, la.path.c_str()));
@@ -1358,11 +1306,9 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         la.task_name = buf;
         llama_adapter_meta_val_str(la.ptr, "adapter.lora.prompt_prefix", buf, sizeof(buf));
         la.prompt_prefix = buf;
-        pimpl->lora.emplace_back(std::move(lora)); // copy to list of loaded adapters
+        pimpl->lora.emplace_back(std::move(lora));
     }
 
-    // updates params.sampling
-    // TODO: fix naming
     common_init_sampler_from_model(model, params.sampling);
 
     if (params.sampling.ignore_eos && llama_vocab_eos(vocab) == LLAMA_TOKEN_NULL) {
@@ -1370,7 +1316,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         params.sampling.ignore_eos = false;
     }
 
-    // initialize once
     for (llama_token i = 0; i < llama_vocab_n_tokens(vocab); i++) {
         if (llama_vocab_is_eog(vocab, i)) {
             COM_TRC("added %s logit bias = %f\n", common_token_to_piece(vocab, i).c_str(), -INFINITY);
@@ -1379,13 +1324,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     if (params.sampling.ignore_eos) {
-        // add EOG biases to the active set of logit biases
+
         params.sampling.logit_bias.insert(
                 params.sampling.logit_bias.end(),
                 params.sampling.logit_bias_eog.begin(), params.sampling.logit_bias_eog.end());
     }
 
-    // init the backend samplers as part of the context creation
     pimpl->samplers.resize(cparams.n_seq_max);
     pimpl->samplers_seq_config.resize(cparams.n_seq_max);
 
@@ -1406,8 +1350,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     common_fit_log_memory_stage(model, "sched_reserve");
-
-
 
     common_fit_log_host_resident_pools(model);
 
@@ -1443,7 +1385,6 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
     return pimpl->lora;
 }
 
-// only for warmup and probe decodes, fill zeros as dummy input
 static void common_batch_set_zero_state(common_batch & batch, const llama_model * model, std::vector<float> & zeros) {
     zeros.assign(llama_model_n_embd_out(model), 0.0f);
     for (int32_t i = 0; i < batch.size(); ++i) {
@@ -1533,7 +1474,6 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         llama_token bos = llama_vocab_bos(vocab);
         llama_token eos = llama_vocab_eos(vocab);
 
-        // some models (e.g. T5) don't have a BOS token
         if (bos != LLAMA_TOKEN_NULL) {
             tmp.push_back(bos);
         }
@@ -1565,7 +1505,6 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);
 
-        // reset samplers to reset RNG state after warmup to the seeded state
         res->reset_samplers();
     }
 
@@ -1579,7 +1518,7 @@ common_init_result::~common_init_result() = default;
 std::string common_get_model_endpoint() {
     std::string endpoint = common_get_env("MODEL_ENDPOINT");
     if (endpoint.empty()) {
-        // the HF_ENDPOINT variable is respected for backward compatibility
+
         endpoint = common_get_env("HF_ENDPOINT");
     }
     if (endpoint.empty()) {
@@ -1620,7 +1559,6 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
 
     llama_memory_clear(mem, true);
 
-    // eval 2 tokens to check if the context is compatible
     std::vector<llama_token> tmp;
     tmp.push_back(0);
     tmp.push_back(0);
@@ -1638,7 +1576,6 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
         goto done;
     }
 
-    // try to remove the last tokens
     if (!llama_memory_seq_rm(mem, 0, 1, -1)) {
         COM_TRC("%s", "the context does not support partial sequence removal\n");
         res = COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -1742,6 +1679,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
     mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    mparams.mtp_host                    = params.cpu_mtp && params.speculative.draft.mtp_host;
 
     return mparams;
 }
@@ -1788,14 +1726,10 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     return cparams;
 }
 
-//
-// Threadpool utils
-//
-
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params) {
     struct ggml_threadpool_params tpp;
 
-    ggml_threadpool_params_init(&tpp, params.n_threads); // setup the defaults
+    ggml_threadpool_params_init(&tpp, params.n_threads);
 
     if (params.mask_valid) {
         std::memcpy(&tpp.cpumask, &params.cpumask, GGML_MAX_N_THREADS);
@@ -1845,7 +1779,6 @@ void common_threadpools::init(llama_context * ctx, const common_params & params)
             return;
         }
 
-        // start the non-batch threadpool in the paused state
         tpp.paused = true;
     }
 
@@ -1859,10 +1792,6 @@ void common_threadpools::init(llama_context * ctx, const common_params & params)
 
     llama_attach_threadpool(ctx, threadpool, threadpool_batch);
 }
-
-//
-// Vocab utils
-//
 
 std::vector<llama_token> common_tokenize(
   const struct llama_context * ctx,
@@ -1879,7 +1808,7 @@ std::vector<llama_token> common_tokenize(
            const std::string & text,
                         bool   add_special,
                         bool   parse_special) {
-    // upper limit for the number of tokens
+
     int n_tokens = text.length() + 2 * add_special;
     std::vector<llama_token> result(n_tokens);
     n_tokens = llama_tokenize(vocab, text.data(), text.length(), result.data(), result.size(), add_special, parse_special);
@@ -1904,7 +1833,7 @@ std::string common_token_to_piece(const struct llama_context * ctx, llama_token 
 
 std::string common_token_to_piece(const struct llama_vocab * vocab, llama_token token, bool special) {
     std::string piece;
-    piece.resize(piece.capacity());  // using string internal cache, 15 bytes + '\n'
+    piece.resize(piece.capacity());
     const int n_chars = llama_token_to_piece(vocab, token, &piece[0], piece.size(), 0, special);
     if (n_chars < 0) {
         piece.resize(-n_chars);
@@ -1931,41 +1860,36 @@ std::string common_detokenize(const struct llama_vocab * vocab, const std::vecto
     if (n_chars < 0) {
         text.resize(-n_chars);
         n_chars = llama_detokenize(vocab, tokens.data(), (int32_t)tokens.size(), &text[0], (int32_t)text.size(), false, special);
-        GGML_ASSERT(n_chars <= (int32_t)text.size());  // whitespace trimming is performed after per-token detokenization
+        GGML_ASSERT(n_chars <= (int32_t)text.size());
     }
 
     text.resize(n_chars);
 
-    // NOTE: the original tokenizer decodes bytes after collecting the pieces.
     return text;
 }
-
-//
-// Embedding utils
-//
 
 void common_embd_normalize(const float * inp, float * out, int n, int embd_norm) {
     double sum = 0.0;
 
     switch (embd_norm) {
-        case -1: // no normalisation
+        case -1:
             sum = 1.0;
             break;
-        case 0: // max absolute
+        case 0:
             for (int i = 0; i < n; i++) {
                 if (sum < std::abs(inp[i])) {
                     sum = std::abs(inp[i]);
                 }
             }
-            sum /= 32760.0; // make an int16 range
+            sum /= 32760.0;
             break;
-        case 2: // euclidean
+        case 2:
             for (int i = 0; i < n; i++) {
                 sum += inp[i] * inp[i];
             }
             sum = std::sqrt(sum);
             break;
-        default: // p-norm (euclidean is p-norm p=2)
+        default:
             for (int i = 0; i < n; i++) {
                 sum += std::pow(std::abs(inp[i]), embd_norm);
             }
@@ -1991,10 +1915,9 @@ float common_embd_similarity_cos(const float * embd1, const float * embd2, int n
         sum2 += embd2[i] * embd2[i];
     }
 
-    // Handle the case where one or both vectors are zero vectors
     if (sum1 == 0.0 || sum2 == 0.0) {
         if (sum1 == 0.0 && sum2 == 0.0) {
-            return 1.0f; // two zero vectors are similar
+            return 1.0f;
         }
         return 0.0f;
     }
@@ -2002,17 +1925,13 @@ float common_embd_similarity_cos(const float * embd1, const float * embd2, int n
     return sum / (sqrt(sum1) * sqrt(sum2));
 }
 
-//
-// Control vector utils
-//
-
 static common_control_vector_data common_control_vector_load_one(const common_control_vector_load_info & load_info) {
     common_control_vector_data result = { -1, {} };
 
     ggml_context * ctx = nullptr;
     struct gguf_init_params meta_gguf_params = {
-        /* .no_alloc = */ false,
-        /* .ctx      = */ &ctx,
+                          false,
+                          &ctx,
     };
     struct gguf_context * ctx_gguf = gguf_init_from_file(load_info.fname.c_str(), meta_gguf_params);
     if (!ctx_gguf) {
@@ -2030,7 +1949,6 @@ static common_control_vector_data common_control_vector_load_one(const common_co
 
         int layer_idx = -1;
 
-        // split on '.'
         size_t dotpos = name.find('.');
         if (dotpos != std::string::npos && name.substr(0, dotpos) == "direction") {
             try {
@@ -2069,13 +1987,12 @@ static common_control_vector_data common_control_vector_load_one(const common_co
             break;
         }
 
-        // extend if necessary - do not store data for layer 0 (it's not used)
         result.data.resize(std::max(result.data.size(), static_cast<size_t>(result.n_embd * layer_idx)), 0.0f);
 
         const float * src = (const float *) tensor->data;
-        float * dst = result.data.data() + result.n_embd * (layer_idx - 1);  // layer 1 at [0]
+        float * dst = result.data.data() + result.n_embd * (layer_idx - 1);
         for (int j = 0; j < result.n_embd; j++) {
-            dst[j] += src[j] * load_info.strength;  // allows multiple directions for same layer in same file
+            dst[j] += src[j] * load_info.strength;
         }
 
     }
@@ -2110,7 +2027,7 @@ common_control_vector_data common_control_vector_load(const std::vector<common_c
         if (result.n_embd == -1) {
             result = std::move(cur);
         } else {
-            result.data.resize(std::max(result.data.size(), cur.data.size()), 0.0f);  // extend if necessary
+            result.data.resize(std::max(result.data.size(), cur.data.size()), 0.0f);
             for (size_t i = 0; i < cur.data.size(); i++) {
                 result.data[i] += cur.data[i];
             }
@@ -2129,7 +2046,7 @@ ggml_opt_dataset_t common_opt_dataset_init(struct llama_context * ctx, const std
     const int64_t ne_datapoint = llama_n_ctx(ctx);
     const int64_t ndata        = (tokens.size() - ne_datapoint - 1) / stride;
     ggml_opt_dataset_t result = ggml_opt_dataset_init(
-        GGML_TYPE_I32, GGML_TYPE_I32, ne_datapoint, ne_datapoint, ndata, /*ndata_shard =*/ 1);
+        GGML_TYPE_I32, GGML_TYPE_I32, ne_datapoint, ne_datapoint, ndata,                   1);
 
     llama_token * data   = (llama_token *) ggml_opt_dataset_data(result)->data;
     llama_token * labels = (llama_token *) ggml_opt_dataset_labels(result)->data;
@@ -2150,14 +2067,13 @@ ggml_opt_optimizer_params common_opt_lr_pars(void * userdata) {
     return result;
 }
 
-// TODO make all command line args case-insensitive
 static inline bool eq_case_insensitive(char const* a, char const* b) {
     return !
 #if defined(_MSC_VER)
         _stricmp
 #else
         strcasecmp
-#endif // defined(_MSC_VER)
+#endif
         (a, b);
 }
 
@@ -2171,7 +2087,6 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char * n) {
     return GGML_OPT_OPTIMIZER_TYPE_COUNT;
 }
 
-// TODO simplify to use just log and exp
 static float const k_log_2 = std::log(2.f);
 
 void lr_opt::init() {
@@ -2309,7 +2224,7 @@ llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
             llama_batch_ext_set_output_logits(res, idx, true);
         }
         if (t.state.data) {
-            llama_batch_ext_set_embd_state(res, idx, t.state); // contexts without a state input ignore it
+            llama_batch_ext_set_embd_state(res, idx, t.state);
         }
         if (t.decision_order != 0) {
             llama_batch_ext_set_decision_order(res, idx, (llama_decision_order) t.decision_order);
@@ -2323,7 +2238,7 @@ common_batch common_batch_get_one(llama_context * ctx, const llama_token * token
     common_batch batch(ctx);
 
     auto mem = llama_get_memory(ctx);
-    llama_pos pos = llama_memory_seq_pos_max(mem, 0) + 1; // -1 + 1 == 0 when the memory is empty
+    llama_pos pos = llama_memory_seq_pos_max(mem, 0) + 1;
 
     for (int32_t i = 0; i < n_tokens; ++i) {
         const bool output = i == n_tokens - 1;
@@ -2356,11 +2271,6 @@ bool common_prompt_batch_decode(
 
         GGML_ASSERT(n_new <= n_batch);
 
-        // Decode all but the last token so we can save the memory state before decoding the last token.
-        // This is done so we can restore the session state later and replay the last token.
-        // Memory implementations in recurrent/hybrid models don't support removing tokens from their
-        // memory, so we can't just remove the last token from the memory and replay the last token which
-        // is the reason for this logic.
         llama_tokens prefix_tokens(all_tokens.begin() + offset, all_tokens.begin() + offset + n_tokens_before_last);
         common_batch batch_prefix = common_batch_get_one(ctx, prefix_tokens);
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch_prefix.get())) {

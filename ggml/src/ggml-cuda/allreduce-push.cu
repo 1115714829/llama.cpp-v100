@@ -1,3 +1,4 @@
+// Portions from 1Cat-vLLM and SGLang-V100; see licenses/LICENSE-1Cat-vLLM (Apache-2.0).
 #include "allreduce-push.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
@@ -6,41 +7,6 @@
 
 #include <climits>
 #include <cstdint>
-
-// One-shot push AllReduce.
-//
-// Every rank writes its own payload directly into the receive slot of every
-// rank (including itself). Slots are pre-filled with an all-ones sentinel, so
-// a poller can tell a filled slot from an empty one without any extra flag or
-// barrier. After summing the slots and restoring the sentinel, each block
-// flips its own epoch word; two epochs alternate so a block never touches the
-// slots another in-flight call of the same stream is still using.
-//
-// Two payload formats share the same buffers and slot layout:
-// ggml_cuda_ar_push_f32 sends the raw f32 words (exact), while
-// ggml_cuda_ar_push_f32_via_f16 sends them as f16 to halve the P2P traffic
-// (approximate, as in 1Cat's sm70 push AllReduce). The f16 kernel only uses
-// the first half of each slot. The two kernels can be interleaved freely:
-// every call restores the slots it touched to all-0xFF bytes, which both
-// formats read as an empty slot.
-//
-// For 4 ranks that split into two cliques of two (e.g. two GPU pairs on
-// different CPU sockets), ggml_cuda_ar_push_f32_via_f16_hier halves the
-// traffic on the expensive cross-clique links: each rank first pushes its f16
-// payload to itself and to its clique peer only (slots 0/1), both clique
-// members reduce those two slots in the same order and round the partial sum
-// to f16, and each rank sends that rounded partial sum to its counterpart in
-// the other clique (slot 2). Both sides of the final sum are f16-rounded and
-// the sum is always "clique 0 + clique 1", so all ranks get bitwise identical
-// results. Protocol from 1Cat-vLLM `csrc/custom_all_reduce.cuh`
-// (`sm70_tp8_hierarchical_reduce_push`, Apache-2.0), except that the
-// cross-clique exchange carries f16 partial sums instead of f32.
-//
-// The grid size is fixed at GGML_CUDA_AR_PUSH_BLOCKS for every call: the epoch
-// words are indexed by block, so a different grid would make blocks disagree
-// about which slot set is current. For the same reason two epochs are only
-// safe as long as calls on all ranks stay in lockstep, which the collective
-// itself guarantees (a call cannot finish before every rank has pushed).
 
 static constexpr int    GGML_CUDA_AR_PUSH_MAX_RANKS    = 8;
 static constexpr int    GGML_CUDA_AR_PUSH_BLOCKS       = 80;
@@ -60,7 +26,6 @@ struct ggml_cuda_ar_push {
     int    devices[GGML_CUDA_AR_PUSH_MAX_RANKS];
     char * bufs[GGML_CUDA_AR_PUSH_MAX_RANKS];
 
-
     bool   hier;
     int    clique_slot[GGML_CUDA_AR_PUSH_MAX_RANKS];
     int    clique_peer[GGML_CUDA_AR_PUSH_MAX_RANKS];
@@ -72,7 +37,6 @@ struct ggml_cuda_ar_push {
 struct ggml_cuda_ar_push_ptrs {
     char * ptrs[GGML_CUDA_AR_PUSH_MAX_RANKS];
 };
-
 
 union ggml_cuda_ar_push_pack {
     uint4  bits;
@@ -96,13 +60,10 @@ static __device__ __forceinline__ void ggml_cuda_ar_push_st_volatile(uint4 * p, 
                  : "memory");
 }
 
-
-
 static __device__ __forceinline__ uint16_t ggml_cuda_ar_push_to_half(const float x) {
     const uint16_t h = __half_as_ushort(__float2half_rn(x));
     return h == GGML_CUDA_AR_PUSH_SENTINEL_H ? GGML_CUDA_AR_PUSH_ESCAPE_H : h;
 }
-
 
 template <int nranks>
 static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda_ar_push_f32(
@@ -114,10 +75,8 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
                         (size_t) epoch * nranks * GGML_CUDA_AR_PUSH_MAX_BYTES;
     const int stride = gridDim.x * blockDim.x;
 
-
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         uint4 v = reinterpret_cast<const uint4 *>(input)[i];
-
 
         if (v.x == GGML_CUDA_AR_PUSH_SENTINEL) { v.x = GGML_CUDA_AR_PUSH_ESCAPE; }
         if (v.y == GGML_CUDA_AR_PUSH_SENTINEL) { v.y = GGML_CUDA_AR_PUSH_ESCAPE; }
@@ -131,9 +90,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
             ggml_cuda_ar_push_st_volatile(slot + i, v);
         }
     }
-
-
-
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         ggml_cuda_ar_push_pack packs[nranks];
@@ -180,9 +136,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     }
 }
 
-
-
-
 template <int nranks>
 static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda_ar_push_f32_via_f16(
         const ggml_cuda_ar_push_ptrs bufs, const float * input, float * output, const int rank, const int n_packs) {
@@ -192,7 +145,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     const size_t base = GGML_CUDA_AR_PUSH_SIGNAL_BYTES +
                         (size_t) epoch * nranks * GGML_CUDA_AR_PUSH_MAX_BYTES;
     const int stride = gridDim.x * blockDim.x;
-
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         const float4 lo = reinterpret_cast<const float4 *>(input)[2 * i];
@@ -210,9 +162,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
             ggml_cuda_ar_push_st_volatile(slot + i, v);
         }
     }
-
-
-
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         ggml_cuda_ar_push_pack packs[nranks];
@@ -262,12 +211,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     }
 }
 
-
-
-
-
-
-
 static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda_ar_push_f32_via_f16_hier(
         const ggml_cuda_ar_push_ptrs bufs, const float * input, float * output, const int rank, const int n_packs,
         const int clique_slot, const int clique_peer, const int pair, const int clique_id) {
@@ -278,8 +221,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     const size_t base = GGML_CUDA_AR_PUSH_SIGNAL_BYTES +
                         (size_t) epoch * nranks * GGML_CUDA_AR_PUSH_MAX_BYTES;
     const int stride = gridDim.x * blockDim.x;
-
-
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         const float4 lo = reinterpret_cast<const float4 *>(input)[2 * i];
@@ -297,9 +238,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
         ggml_cuda_ar_push_st_volatile(own + i, v);
         ggml_cuda_ar_push_st_volatile(peer + i, v);
     }
-
-
-
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         ggml_cuda_ar_push_pack packs[2];
@@ -330,8 +268,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
             (uint32_t) ggml_cuda_ar_push_to_half(partial[4]) | ((uint32_t) ggml_cuda_ar_push_to_half(partial[5]) << 16),
             (uint32_t) ggml_cuda_ar_push_to_half(partial[6]) | ((uint32_t) ggml_cuda_ar_push_to_half(partial[7]) << 16));
 
-
-
         uint4 * cross = reinterpret_cast<uint4 *>(
             bufs.ptrs[pair] + base + 2 * GGML_CUDA_AR_PUSH_MAX_BYTES);
         ggml_cuda_ar_push_st_volatile(cross + i, rounded.bits);
@@ -348,8 +284,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
                 other_ready = other_ready && __half_as_ushort(other.halves[k]) != GGML_CUDA_AR_PUSH_SENTINEL_H;
             }
         }
-
-
 
         float total[8];
         #pragma unroll
@@ -377,17 +311,9 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     }
 }
 
-
 struct ggml_cuda_ar_push_clique3 {
     int rank[3];
 };
-
-
-
-
-
-
-
 
 static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda_ar_push_f32_via_f16_hier3(
         const ggml_cuda_ar_push_ptrs bufs, const float * input, float * output, const int rank, const int n_packs,
@@ -399,8 +325,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     const size_t base = GGML_CUDA_AR_PUSH_SIGNAL_BYTES +
                         (size_t) epoch * nranks * GGML_CUDA_AR_PUSH_MAX_BYTES;
     const int stride = gridDim.x * blockDim.x;
-
-
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         const float4 lo = reinterpret_cast<const float4 *>(input)[2 * i];
@@ -418,9 +342,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
             ggml_cuda_ar_push_st_volatile(slot + i, v);
         }
     }
-
-
-
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         ggml_cuda_ar_push_pack packs[3];
@@ -452,8 +373,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
             (uint32_t) ggml_cuda_ar_push_to_half(partial[4]) | ((uint32_t) ggml_cuda_ar_push_to_half(partial[5]) << 16),
             (uint32_t) ggml_cuda_ar_push_to_half(partial[6]) | ((uint32_t) ggml_cuda_ar_push_to_half(partial[7]) << 16));
 
-
-
         uint4 * cross = reinterpret_cast<uint4 *>(
             bufs.ptrs[pair] + base + 3 * GGML_CUDA_AR_PUSH_MAX_BYTES);
         ggml_cuda_ar_push_st_volatile(cross + i, rounded.bits);
@@ -470,8 +389,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
                 other_ready = other_ready && __half_as_ushort(other.halves[k]) != GGML_CUDA_AR_PUSH_SENTINEL_H;
             }
         }
-
-
 
         float total[8];
         #pragma unroll
@@ -499,24 +416,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     }
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda_ar_push_f32_via_f16_hier5(
         const ggml_cuda_ar_push_ptrs bufs, const float * input, float * output, const int rank, const int n_packs,
         const int clique_slot, const int pair, const int clique_id, const ggml_cuda_ar_push_clique3 members) {
@@ -529,8 +428,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     const int stride = gridDim.x * blockDim.x;
     const int clique_size = clique_id == 0 ? 3 : 2;
     const int seg_split = n_packs / 2;
-
-
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
         const float4 lo = reinterpret_cast<const float4 *>(input)[2 * i];
@@ -549,7 +446,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
     }
 
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_packs; i += stride) {
-
 
         ggml_cuda_ar_push_pack packs[3];
         bool ready = false;
@@ -588,9 +484,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
             (uint32_t) ggml_cuda_ar_push_to_half(partial[4]) | ((uint32_t) ggml_cuda_ar_push_to_half(partial[5]) << 16),
             (uint32_t) ggml_cuda_ar_push_to_half(partial[6]) | ((uint32_t) ggml_cuda_ar_push_to_half(partial[7]) << 16));
 
-
-
-
         const int seg = i < seg_split ? 0 : 1;
         const bool cross = clique_slot < 2 && seg == clique_slot;
         ggml_cuda_ar_push_pack other;
@@ -614,8 +507,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
 
         int recv_slot = -1;
         if (clique_id == 0) {
-
-
 
             if (clique_slot == 0) {
                 if (seg == 0) {
@@ -643,7 +534,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
                 recv_slot = seg == 0 ? 3 : 4;
             }
         } else {
-
 
             if (clique_slot == 0) {
                 if (seg == 0) {
@@ -676,8 +566,6 @@ static __global__ void __launch_bounds__(GGML_CUDA_AR_PUSH_THREADS, 1) ggml_cuda
                 }
             }
         }
-
-
 
         float total[8];
         #pragma unroll
@@ -751,8 +639,6 @@ ggml_cuda_ar_push * ggml_cuda_ar_push_init(const int * devices, size_t n) {
         return nullptr;
     }
 
-
-
     const ggml_cuda_device_info & info = ggml_cuda_info();
     if (info.device_count != info.physical_device_count) {
         GGML_LOG_DEBUG("%s: virtual devices in use; push AllReduce disabled\n", __func__);
@@ -782,10 +668,6 @@ ggml_cuda_ar_push * ggml_cuda_ar_push_init(const int * devices, size_t n) {
     for (size_t i = 0; i < n; ++i) {
         ar->devices[i] = devices[i];
     }
-
-
-
-
 
     int cl0[2] = { -1, -1 };
     int cl1[2] = { -1, -1 };
@@ -848,9 +730,6 @@ ggml_cuda_ar_push * ggml_cuda_ar_push_init(const int * devices, size_t n) {
             }
         }
     } else if (n == 5) {
-
-
-
 
         int perf[5][5] = {};
         bool perf_ok = true;
@@ -927,10 +806,7 @@ ggml_cuda_ar_push * ggml_cuda_ar_push_init(const int * devices, size_t n) {
             }
         }
     } else if (n == 6) {
-        // Same idea for six ranks in two cliques of three, e.g. three GPUs on
-        // each of two CPU sockets. Rank 0 anchors one clique; try all ten
-        // choices for its two partners. Without such a split the flat kernel
-        // is used.
+
         int perf[6][6] = {};
         bool perf_ok = true;
         for (int i = 0; i < 6 && perf_ok; ++i) {
@@ -1076,8 +952,6 @@ void ggml_cuda_ar_push_free(ggml_cuda_ar_push * ar) {
     delete ar;
 }
 
-
-
 static bool ggml_cuda_ar_push_can_impl(const ggml_tensor * t, bool exact, int & n_packs) {
     if (t == nullptr ||
         t->type != GGML_TYPE_F32 ||
@@ -1113,9 +987,6 @@ bool ggml_cuda_ar_push_can(const ggml_cuda_ar_push * ar, const ggml_tensor * t, 
     int n_packs;
     return ggml_cuda_ar_push_can_impl(t, exact, n_packs);
 }
-
-
-
 
 static void ggml_cuda_ar_push_launch_rank(
         ggml_cuda_ar_push * ar, ggml_backend_t backend, size_t rank, ggml_tensor * t, bool exact, int n_packs) {
@@ -1184,8 +1055,6 @@ bool ggml_cuda_ar_push_allreduce(
         return true;
     }
 
-
-
     int n_packs = 0;
     for (size_t i = 0; i < n; ++i) {
         if (tensors[i] == nullptr ||
@@ -1195,8 +1064,6 @@ bool ggml_cuda_ar_push_allreduce(
         }
     }
 
-
-
     for (size_t i = 0; i < n; ++i) {
         ggml_cuda_ar_push_launch_rank(ar, backends[i], i, tensors[i], exact, n_packs);
     }
@@ -1204,7 +1071,7 @@ bool ggml_cuda_ar_push_allreduce(
     return true;
 }
 
-#else // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+#else
 
 ggml_cuda_ar_push * ggml_cuda_ar_push_init(const int * devices, size_t n) {
     GGML_UNUSED(devices);
@@ -1252,4 +1119,4 @@ bool ggml_cuda_ar_push_allreduce_rank(
     return false;
 }
 
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif

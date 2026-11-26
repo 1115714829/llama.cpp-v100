@@ -1,35 +1,13 @@
 import { IMAGE } from '$lib/constants';
 import { MimeTypeImage } from '$lib/enums';
 
-// heic requires a relatively large decoder, in order to reduce primary bundle size
-// we lazily load this decoder from a CDN when needed, and cache it for future conversions
-const HEIC_TO_CDN_URL = 'https://cdn.jsdelivr.net/npm/heic-to@1.5.2/dist/heic-to.js';
-
-interface HeicToModule {
-	heicTo(args: { blob: Blob; type: string; quality?: number }): Promise<Blob>;
-}
-
-let modulePromise: Promise<HeicToModule> | null = null;
-
-/**
- * Lazily load the heic-to decoder from the CDN and cache it
- * @returns Promise resolving to the heic-to module
- */
-function getHeicTo(): Promise<HeicToModule> {
-	if (!modulePromise) {
-		modulePromise = import(/* @vite-ignore */ HEIC_TO_CDN_URL) as Promise<HeicToModule>;
-	}
-
-	return modulePromise;
-}
-
 /**
  * Convert a HEIC/HEIF file to a compressed JPEG data URL
  * @param file - The HEIC/HEIF file to convert
  * @returns Promise resolving to JPEG data URL
  */
 export async function heicFileToJpegDataURL(file: File | Blob): Promise<string> {
-	const { heicTo } = await getHeicTo();
+	const { heicTo } = await import('heic-to');
 	const jpegBlob = await heicTo({
 		blob: file,
 		quality: IMAGE.HEIC_JPEG_QUALITY,

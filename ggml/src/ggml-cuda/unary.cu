@@ -1,5 +1,5 @@
-// The scale+silu fusion ports the scaled activation epilogue of Strata's fused_gr kernels
-// (MIT, https://github.com/Niko1221/Strata src/kernels/cuda/fused_gr.cu, see licenses/LICENSE-strata).
+// Portions from Strata and its AC922 fork; Copyright (c) 2026 Niko1221 and the Strata contributors (MIT); see licenses/LICENSE-strata.
+
 #include "unary.cuh"
 #include "convert.cuh"
 
@@ -303,7 +303,6 @@ void ggml_cuda_op_expm1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_op_unary<op_softplus>(ctx, dst);
 }
-/* gated ops */
 
 template <float (*op)(float), typename T>
 static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
@@ -314,7 +313,6 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
         return;
     }
 
-    // perform base op and multiply with gate (either offset in same tensor or a separate one)
     const int64_t j0 = (i / n) * o0 + (i % n);
     const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
 
@@ -412,8 +410,6 @@ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     ggml_cuda_op_unary_gated<op_gelu_quick>(ctx, dst);
 }
 
-// swiglu_oai
-
 template <typename T>
 static __global__ void swiglu_oai_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, float alpha, float limit) {
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
@@ -422,7 +418,6 @@ static __global__ void swiglu_oai_kernel(const T * x, const T * g, T * dst, cons
         return;
     }
 
-    // perform base op and multiply with gate (either offset in same tensor or a separate one)
     const int64_t j0 = (i / n) * o0 + (i % n);
     const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
 
@@ -466,7 +461,6 @@ void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
         GGML_ASSERT(src0->type == src1->type);
     }
 
-    //const int32_t swapped = ((const int32_t *) dst->op_params)[1];
     const int32_t swapped = ggml_get_op_params_i32(dst, 1);
     const float alpha = ggml_get_op_params_f32(dst, 2);
     const float limit = ggml_get_op_params_f32(dst, 3);
@@ -481,8 +475,6 @@ void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
 
     swiglu_oai_cuda(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), alpha, limit, stream);
 }
-
-// swiglu_clamp
 
 template <typename T>
 static __global__ void swiglu_clamp_kernel(const T * gate, const T * up, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, float limit) {
@@ -557,8 +549,6 @@ void ggml_cuda_op_swiglu_clamp(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     }
 }
 
-/* CUDA kernel + launcher for xIELU */
-
 template <typename T>
 static __global__ void xielu_kernel(const T * x, T * dst, const int k, float alpha_n, float alpha_p, float beta, float eps) {
     const int i = blockDim.x*blockIdx.x + threadIdx.x;
@@ -610,10 +600,6 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
 }
 
-
-
-/* silu_back */
-
 static __device__ __forceinline__ float op_silu_back(float grad, float x) {
     const float s = 1.0f / (1.0f + expf(-x));
     return grad * s * (1.0f + x * (1.0f - s));
@@ -637,8 +623,8 @@ static void silu_back_cuda(const T * grad, const T * x, T * dst, const int k, cu
 }
 
 void ggml_cuda_op_silu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0]; // input from forward pass
-    const ggml_tensor * src1 = dst->src[1]; // grads of forward pass output
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
 
     const float * src0_d = (const float *) src0->data;
     const float * src1_d = (const float *) src1->data;
@@ -658,8 +644,6 @@ void ggml_cuda_op_silu_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
         silu_back_cuda((const float*)src0_d, (const float*)src1_d, (float *)dst_d, ggml_nelements(src0), stream);
     }
 }
-
-/* leaky relu */
 
 static __device__ __forceinline__ float op_leaky_relu(float x, const float negative_slope) {
     return fmaxf(x, 0) + fminf(x, 0.0f) * negative_slope;
@@ -704,15 +688,10 @@ void ggml_cuda_op_leaky_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     }
 }
 
-/* fused unary + mul */
-
 template <float (*op)(float)>
 static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
-    // unary_node: UNARY op applied to unary_node->src[0]
-    // mul_node:   MUL(a, b) where one of a/b is unary_node
-    // Output goes to mul_node->data
 
-    const ggml_tensor * unary_src = unary_node->src[0];  // input to the unary op
+    const ggml_tensor * unary_src = unary_node->src[0];
     const ggml_tensor * other_src = (mul_node->src[0] == unary_node) ? mul_node->src[1] : mul_node->src[0];
 
     GGML_ASSERT(ggml_is_contiguous_1(unary_src));
@@ -747,11 +726,6 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
     }
 }
 
-
-
-
-
-
 static __global__ void scale_silu_kernel(const float * x, float * dst, const float scale, const int64_t k) {
     ggml_cuda_pdl_lc();
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
@@ -766,8 +740,6 @@ static __global__ void scale_silu_kernel(const float * x, float * dst, const flo
 }
 
 void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * scale_node, ggml_tensor * silu_node) {
-
-
 
     const ggml_tensor * x = scale_node->src[0];
 
@@ -802,11 +774,6 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
-
-
-
-
-
 static __global__ void sigmoid_mul_add_rows_kernel(const float * x, const float * g, const float * a, float * dst,
                                                    const int64_t ncols, const int64_t k) {
     ggml_cuda_pdl_lc();
@@ -838,10 +805,6 @@ void ggml_cuda_op_sigmoid_mul_add_rows(ggml_backend_cuda_context & ctx, ggml_ten
     ggml_cuda_kernel_launch(sigmoid_mul_add_rows_kernel, launch_params,
         (const float *) x->data, (const float *) g->data, (const float *) a->data, (float *) add->data, x->ne[0], k);
 }
-
-
-
-
 
 template <float (*op)(float), bool write_f16>
 static __global__ void unary_gated_view_kernel(
@@ -882,7 +845,6 @@ static void unary_gated_view_cuda(
     ggml_cuda_kernel_launch(kernel, launch_params, x, g, dst, dst_f16, k, nc, ne0, ne2, nb1, nb2, nb3);
 }
 
-
 void ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor * cont, ggml_tensor * sigmoid, ggml_tensor * mul,
                                    half * dst_f16) {
     const ggml_tensor * gate = cont->src[0];
@@ -901,12 +863,6 @@ void ggml_cuda_op_cont_sigmoid_mul(ggml_backend_cuda_context & ctx, ggml_tensor 
         k, nc, gate->ne[0], gate->ne[2],
         gate->nb[1] / sizeof(float), gate->nb[2] / sizeof(float), gate->nb[3] / sizeof(float), stream);
 }
-
-
-
-
-
-
 
 static __global__ void gdn_gating_kernel(
         const float * beta, float * beta_out, const int64_t n_beta,
@@ -973,8 +929,6 @@ void ggml_cuda_op_gdn_gating(
                     (const float *) alpha_in->data, (float *) gate_out->data, ggml_nelements(gate_out),
                     (const float *) dt->data, (const float *) a->data, alpha_in->ne[0], stream);
 }
-
-/* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {
     const ggml_tensor * src = relu_node->src[0];

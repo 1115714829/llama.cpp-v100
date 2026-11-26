@@ -1,13 +1,16 @@
 #pragma once
 
-#include "mma.cuh"
 #include "common.cuh"
+#include "mma.cuh"
 #include "convert.cuh"
+#include "mmid.cuh"
 
 using namespace ggml_cuda_mma;
 
 #define MMF_ROWS_PER_BLOCK 32
 #define MMF_ROWS_PER_BLOCK_CDNA 64
+
+#define MMF_COLS_PER_BLOCK 16
 
 static __forceinline__ int64_t mmf_get_max_block_size(int cc) {
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -30,14 +33,15 @@ static constexpr __device__ int mmf_get_padding() {
     return 2;
 #else
     return 4;
-#endif // defined(AMD_MFMA_AVAILABLE)
+#endif
 }
 
 struct mmf_ids_data {
     const int32_t * ids_src_compact = nullptr;
     const int32_t * ids_dst_compact = nullptr;
-    const int32_t * expert_bounds_dev = nullptr;
+    const ggml_cuda_mm_id_tile_spec * tile_spec_dev = nullptr;
     int n_experts = 0;
+    int max_tiles = 0;
     int sis1 = 0;
 };
 
@@ -54,7 +58,7 @@ static __global__ void mul_mat_f(
         const int channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const char * const * __restrict__ expert_ptrs) {
-// TODO: handle this in a consistent and simpler way after AMD MFMA support has been added
+
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 #if defined(AMD_WMMA_AVAILABLE)
     if constexpr (!(std::is_same_v<T, half2> || std::is_same_v<T, nv_bfloat162>) || rows_per_block != MMF_ROWS_PER_BLOCK) {NO_DEVICE_CODE;} else {
@@ -77,8 +81,8 @@ static __global__ void mul_mat_f(
     typedef tile<16, 8, T>     tile_A;
     typedef tile<8,  8, T>     tile_B;
     typedef tile<16, 8, float> tile_C;
-#endif // VOLTA_MMA_AVAILABLE
-#endif // defined(AMD_WMMA_AVAILABLE)
+#endif
+#endif
     if constexpr (!tile_A::supported() || !tile_B::supported() || !tile_C::supported()) {
         NO_DEVICE_CODE;
         return;
@@ -97,7 +101,7 @@ static __global__ void mul_mat_f(
     const int channel_dst = has_ids ? 0 : blockIdx.y;
 
     if constexpr (has_ids) {
-        // experts + tiles of ncols_dst are packed in the y dimension
+
         int col_tiles = (ncols_dst_total + cols_per_block - 1) / cols_per_block;
         const int nchannels_x = gridDim.y / col_tiles;
         const int tile_idx = blockIdx.y / nchannels_x;
@@ -110,8 +114,6 @@ static __global__ void mul_mat_f(
     const int sample_dst  = blockIdx.z;
     const int sample_x    = sample_dst / sample_ratio;
     const int sample_y    = sample_dst;
-
-
 
     if (has_ids && expert_ptrs != nullptr) {
         x = (const T *) expert_ptrs[channel_x] + int64_t(sample_x) *stride_sample_x + row0*stride_row;
@@ -173,7 +175,6 @@ static __global__ void mul_mat_f(
             return;
         }
     }
-
 
     for (int col = threadIdx.y*warp_size + threadIdx.x; col < ncols; col += nwarps*warp_size) {
         tile_A A[ntA][warp_size / tile_A::J];
@@ -306,21 +307,20 @@ static __global__ void mul_mat_f(
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst);
     NO_DEVICE_CODE;
-#endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+#endif
 }
 
-//This kernel is for larger batch sizes of mul_mat_id
 template <typename T, int rows_per_block, int cols_per_block, int nwarps>
 __launch_bounds__(ggml_cuda_get_physical_warp_size()*nwarps, 1)
 static __global__ void mul_mat_f_ids(
         const T * __restrict__ x, const float * __restrict__ y,
         const int32_t * __restrict__ ids_src_compact, const int32_t * __restrict__ ids_dst_compact,
-        const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
+        const ggml_cuda_mm_id_tile_spec * __restrict__ tile_spec, float * __restrict__ dst,
         const int ncols, const int ncols_dst_total, const int nchannels_dst, const int stride_row, const int stride_col_y, const int stride_col_dst,
         const int channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
         const int sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
         const uint3 sis1_fd, const uint3 nch_fd, const char * const * __restrict__ expert_ptrs) {
-// TODO: handle this in a consistent and simpler way after AMD MFMA support has been added
+
 #if defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
 #if defined(AMD_WMMA_AVAILABLE)
     if constexpr (!(std::is_same_v<T, half2> || std::is_same_v<T, nv_bfloat162>) || rows_per_block != MMF_ROWS_PER_BLOCK) {NO_DEVICE_CODE;} else {
@@ -343,33 +343,31 @@ static __global__ void mul_mat_f_ids(
     typedef tile<16, 8, T>     tile_A;
     typedef tile<8,  8, T>     tile_B;
     typedef tile<16, 8, float> tile_C;
-#endif // VOLTA_MMA_AVAILABLE
-#endif // defined(AMD_WMMA_AVAILABLE)
+#endif
+#endif
     if constexpr (!tile_A::supported() || !tile_B::supported() || !tile_C::supported()) {
         NO_DEVICE_CODE;
         return;
     }
-
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int tile_k_padded = warp_size + mmf_get_padding();
     constexpr int ntA = rows_per_block / tile_A::I;
     constexpr int ntB = (cols_per_block + tile_B::I - 1) / tile_B::I;
 
-    const int row0        = blockIdx.x * rows_per_block;
+    const int row0     = blockIdx.x * rows_per_block;
+    const int tile_idx = blockIdx.y;
 
-    const int expert_idx = blockIdx.y;
-    const int expert_start = expert_bounds[expert_idx];
-    const int expert_end   = expert_bounds[expert_idx + 1];
+    const ggml_cuda_mm_id_tile_spec ts = tile_spec[tile_idx];
+
+    const int expert_idx   = ts.expert;
+    const int expert_start = ts.col_low;
+    const int expert_end   = ts.col_high;
     const int ncols_expert = expert_end - expert_start;
 
-    const int tiles_for_expert = (ncols_expert + cols_per_block - 1) / cols_per_block;
-    const int tile_idx = blockIdx.z;
-    if (tile_idx >= tiles_for_expert) {
+    if (ncols_expert == 0) {
         return;
     }
-
-    const int col_base = tile_idx * cols_per_block;
 
     GGML_UNUSED(channel_ratio);
 
@@ -377,8 +375,6 @@ static __global__ void mul_mat_f_ids(
     const int sample_dst  = 0;
     const int sample_x    = sample_dst / sample_ratio;
     const int sample_y    = sample_dst;
-
-
 
     if (expert_ptrs != nullptr) {
         x = (const T *) expert_ptrs[channel_x] + int64_t(sample_x) *stride_sample_x + row0*stride_row;
@@ -393,8 +389,6 @@ static __global__ void mul_mat_f_ids(
 
     extern __shared__ char data_mmv[];
     char * compute_base = data_mmv;
-
-    //const float2 * y2 = (const float2 *) y;
 
     tile_C C[ntA][ntB];
 
@@ -422,10 +416,9 @@ static __global__ void mul_mat_f_ids(
 #pragma unroll
                 for (int j0 = 0; j0 < tile_B::I; ++j0) {
                     const int j = j0 + tile_idx_local*tile_B::I;
-                    const int global_j = col_base + j;
                     float val = 0.0f;
-                    if (j < cols_per_block && global_j < ncols_expert) {
-                        const int src_entry = ids_src_expert[global_j];
+                    if (j < cols_per_block && j < ncols_expert) {
+                        const int src_entry = ids_src_expert[j];
                         const uint2 qrm = fast_div_modulo((uint32_t) src_entry, sis1_fd);
                         const int token   = (int) qrm.x;
                         const int channel = (int) qrm.y;
@@ -475,10 +468,9 @@ static __global__ void mul_mat_f_ids(
 #pragma unroll
                 for (int j0 = 0; j0 < tile_B::I; ++j0) {
                     const int j = j0 + tile_idx_local*tile_B::I;
-                    const int global_j = col_base + j;
                     float2 tmp = make_float2(0.0f, 0.0f);
-                    if (j < cols_per_block && global_j < ncols_expert) {
-                        const int src_entry = ids_src_expert[global_j];
+                    if (j < cols_per_block && j < ncols_expert) {
+                        const int src_entry = ids_src_expert[j];
                         const uint2 qrm = fast_div_modulo((uint32_t) src_entry, sis1_fd);
                         const int token   = (int) qrm.x;
                         const int channel = (int) qrm.y;
@@ -577,9 +569,8 @@ static __global__ void mul_mat_f_ids(
             }
         }
 
-        const int global_j = col_base + j;
-        if (j < cols_per_block && global_j < ncols_expert && nchannels_dst > 0) {
-            const int dst_entry = ids_dst_expert[global_j];
+        if (j < cols_per_block && j < ncols_expert && nchannels_dst > 0) {
+            const int dst_entry = ids_dst_expert[j];
             const uint2 qrm = fast_div_modulo((uint32_t) dst_entry, nch_fd);
             const int token = (int) qrm.x;
             if (token < ncols_dst_total) {
@@ -593,12 +584,12 @@ static __global__ void mul_mat_f_ids(
     }
     }
 #else
-    GGML_UNUSED_VARS(x, y, ids_src_compact, ids_dst_compact, expert_bounds, dst,
+    GGML_UNUSED_VARS(x, y, ids_src_compact, ids_dst_compact, tile_spec, dst,
         ncols, ncols_dst_total, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, sis1_fd, nch_fd);
     NO_DEVICE_CODE;
-#endif // defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE)
+#endif
 }
 
 template<typename T, int rows_per_block, int cols_per_block, int nwarps>
@@ -613,20 +604,17 @@ static inline void mul_mat_f_switch_ids(
         const mmf_ids_data * ids_data, const char * const * expert_ptrs) {
     const bool has_ids_data = ids_data && ids_data->ids_src_compact;
 
-    // Use the compact-ids kernel only for larger tiles; for small ncols_dst (< 16)
-    // we prefer the normal mul_mat_f path with has_ids=true.
     if (has_ids_data && ncols_dst > 16) {
-        const int max_tiles = (int) ((ncols_dst + cols_per_block - 1) / cols_per_block);
-        if (max_tiles == 0) {
+        if (ids_data->max_tiles == 0) {
             return;
         }
-        dim3 block_nums_ids(block_nums.x, ids_data->n_experts, max_tiles);
+        dim3 block_nums_ids(block_nums.x, ids_data->max_tiles, 1);
 
         const uint3 sis1_fd = ids_data->sis1 > 0 ? init_fastdiv_values((uint32_t) ids_data->sis1) : make_uint3(0, 0, 1);
         const uint3 nch_fd  = init_fastdiv_values((uint32_t) nchannels_dst);
 
         mul_mat_f_ids<T, rows_per_block, cols_per_block, nwarps><<<block_nums_ids, block_dims, nbytes_shared_total, stream>>>
-            (x, y, ids_data->ids_src_compact, ids_data->ids_dst_compact, ids_data->expert_bounds_dev, dst,
+            (x, y, ids_data->ids_src_compact, ids_data->ids_dst_compact, ids_data->tile_spec_dev, dst,
             ncols_x, ncols_dst, nchannels_dst, stride_row, stride_col_y, stride_col_dst,
             channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
             sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst,

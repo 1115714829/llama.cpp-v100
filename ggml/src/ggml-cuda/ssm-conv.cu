@@ -1,4 +1,5 @@
 #include "common.cuh"
+#include "convert.cuh"
 #include "ssm-conv.cuh"
 #include "unary.cuh"
 
@@ -102,7 +103,6 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
     }
     __syncthreads();
 
-    // Load weights into registers (done once, small)
     float w[d_conv] = { 0.0f };
 #pragma unroll
     for (size_t j = 0; j < d_conv; j++) {
@@ -111,7 +111,6 @@ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, 
 
     float b = bias != nullptr ? bias[bidy * split_d_inner + tid] : 0.0f;
 
-    // Compute from shared memory
     for (int64_t i = 0; i < local_n_t; i++) {
         float sumf = 0.0f;
 #pragma unroll
@@ -157,12 +156,7 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
     }
 }
 
-
-
 static constexpr size_t d_conv_fused = 4;
-
-
-
 
 static __global__ void ssm_conv_rollback_fused_f32(const ggml_cuda_ssm_conv_rollback_params p) {
     ggml_cuda_pdl_lc();
@@ -181,8 +175,6 @@ static __global__ void ssm_conv_rollback_fused_f32(const ggml_cuda_ssm_conv_roll
     for (size_t j = 0; j < d_conv_fused - 1; ++j) {
         x[j] = state_c[j];
     }
-
-
 
     for (int k = 0; k < p.n_snap; ++k) {
         float * snap_c = p.snap_dst[k] + c * (d_conv_fused - 1);
@@ -225,25 +217,182 @@ void ggml_cuda_op_ssm_conv_rollback_fused(ggml_backend_cuda_context & ctx, const
     CUDA_CHECK(cudaGetLastError());
 }
 
+static __global__ void ssm_conv_rollback_halo_f32(const ggml_cuda_ssm_conv_rollback_params p,
+                                                 const float * history, float * halo) {
+    const int64_t c = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const float * q = p.qkv + c * p.qkv_nb1;
+    const int64_t tile_idx = blockIdx.y;
+    if (tile_idx != 0) {
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            halo[((tile_idx - 1) * 3 + j) * p.n_channels + c] = q[(tile_idx * 32 - 3 + j) * p.qkv_nb0];
+        }
+    } else {
+        for (int k = 0; k < p.n_snap; ++k) {
+#pragma unroll
+            for (int j = 0; j < 3; ++j) {
+                const int64_t t = p.snap_off[k] + j - 3;
+                p.snap_dst[k][c * 3 + j] = t < 0 ? history[c * 3 + t + 3] : q[t * p.qkv_nb0];
+            }
+        }
+    }
+}
+
+static __global__ void ssm_conv_rollback_long_f32(const ggml_cuda_ssm_conv_rollback_params p,
+                                                  const float * history, const float * halo) {
+    constexpr int tile = 32;
+    const int64_t c = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t begin = (int64_t) blockIdx.y * tile;
+    const int64_t remaining = p.n_tok - begin;
+    const int count = remaining < tile ? (int) remaining : tile;
+    const float * q = p.qkv + c * p.qkv_nb1;
+    const float * w = p.w + c * p.w_nb1;
+    const int64_t h = ((int64_t) blockIdx.y - 1) * 3 * p.n_channels + c;
+    float x0 = begin == 0 ? history[c * 3 + 0] : (halo ? halo[h] : q[(begin - 3) * p.qkv_nb0]);
+    float x1 = begin == 0 ? history[c * 3 + 1] : (halo ? halo[h + p.n_channels] : q[(begin - 2) * p.qkv_nb0]);
+    float x2 = begin == 0 ? history[c * 3 + 2] : (halo ? halo[h + 2 * p.n_channels] : q[(begin - 1) * p.qkv_nb0]);
+    for (int i = 0; i < count; ++i) {
+        const float x3 = q[(begin + i) * p.qkv_nb0];
+        float sumf = 0.0f;
+        sumf += x0 * w[0];
+        sumf += x1 * w[1];
+        sumf += x2 * w[2];
+        sumf += x3 * w[3];
+        sumf += 0.0f;
+        p.dst[(begin + i) * p.dst_nb1 + c] = ggml_cuda_op_silu_single(sumf);
+        x0 = x1;
+        x1 = x2;
+        x2 = x3;
+    }
+    if (halo == nullptr && blockIdx.y == 0) {
+        for (int k = 0; k < p.n_snap; ++k) {
+#pragma unroll
+            for (int j = 0; j < 3; ++j) {
+                const int64_t t = p.snap_off[k] + j - 3;
+                p.snap_dst[k][c * 3 + j] = t < 0 ? history[c * 3 + p.snap_off[k] + j] : q[t * p.qkv_nb0];
+            }
+        }
+    }
+}
+
+void ggml_cuda_op_ssm_conv_rollback_long(ggml_backend_cuda_context & ctx,
+                                        const ggml_cuda_ssm_conv_rollback_params & params, const float * history, float * halo) {
+    constexpr int threads = 128;
+    const dim3 blocks(params.n_channels / threads, (params.n_tok + 31) / 32);
+    if (halo != nullptr) {
+        ssm_conv_rollback_halo_f32<<<blocks, threads, 0, ctx.stream()>>>(params, history, halo);
+        CUDA_CHECK(cudaGetLastError());
+    }
+    ssm_conv_rollback_long_f32<<<blocks, threads, 0, ctx.stream()>>>(params, history, halo);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template<typename W>
+static __global__ void ple_conv4_f32(const ggml_cuda_ssm_conv_rollback_params p, const float * history, const W * weights, const float * hidden, const float * gated) {
+    const int64_t c = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t t = blockIdx.y;
+    const float * q = p.qkv + c;
+    const float * h = history + c * 9;
+    float sum = 0.0f;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const int64_t j = t - 9 + 3 * k;
+        const float x = j < 0 ? h[j + 9] : q[j * p.qkv_nb0];
+        const float term = __fmul_rn(x, ggml_cuda_cast<float>(weights[c * p.w_nb1 + k]));
+        sum = k == 0 ? term : __fadd_rn(sum, term);
+    }
+    const int64_t idx = t * p.dst_nb1 + c;
+    const float activation = ggml_cuda_op_silu_single(sum);
+    p.dst[idx] = hidden ? __fadd_rn(hidden[idx], __fadd_rn(gated[idx], activation)) : activation;
+    if (t == 0) {
+        for (int k = 0; k < p.n_snap; ++k) {
+#pragma unroll
+            for (int j = 0; j < 9; ++j) {
+                const int64_t off = p.snap_off[k] + j;
+                p.snap_dst[k][c * 9 + j] = off < 9 ? h[off] : q[(off - 9) * p.qkv_nb0];
+            }
+        }
+    }
+}
+
+void ggml_cuda_op_ple_conv4(ggml_backend_cuda_context & ctx, const ggml_cuda_ssm_conv_rollback_params & p,
+                           const float * history, const ggml_tensor * weights, const float * hidden, const float * gated) {
+    const dim3 blocks(p.n_channels / 128, p.n_tok);
+    if (weights->type == GGML_TYPE_F16) {
+        ple_conv4_f32<<<blocks, 128, 0, ctx.stream()>>>(p, history, (const half *) weights->data, hidden, gated);
+    } else if (weights->type == GGML_TYPE_BF16) {
+        ple_conv4_f32<<<blocks, 128, 0, ctx.stream()>>>(p, history, (const nv_bfloat16 *) weights->data, hidden, gated);
+    } else {
+        ple_conv4_f32<<<blocks, 128, 0, ctx.stream()>>>(p, history, (const float *) weights->data, hidden, gated);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static __global__ void ple_gate_f32(const float * key, const float * query, float * dst, int width, float scale) {
+    const int64_t row = blockIdx.x;
+    key += row * width;
+    query += row * width;
+    float partial[8] = {};
+    for (int col = threadIdx.x; col < width;) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j, col += blockDim.x) {
+            partial[j] += col < width ? __fmul_rn(key[col], query[col]) : 0.0f;
+        }
+    }
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) sum += partial[j];
+    __shared__ float shared[32];
+    sum = block_reduce<block_reduce_method::SUM>(sum, shared);
+    if (threadIdx.x == 0) {
+        const float x = __fmaf_rn(scale, sum, 0.0f);
+        const float mag = sqrtf(fmaxf(fabsf(x), 1e-6f));
+        dst[row] = ggml_cuda_op_sigmoid_single(__fmul_rn(float((x > 0.0f) - (x < 0.0f)), mag));
+    }
+}
+
+void ggml_cuda_op_ple_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * key,
+                          const ggml_tensor * query, float * dst, float scale) {
+    const int rows = ggml_nrows(key);
+    const int threads = rows / ggml_cuda_info().devices[ctx.device].nsm < 2 ? 512 : (key->ne[0] < 1024 ? 32 : 128);
+    ple_gate_f32<<<rows, threads, 0, ctx.stream()>>>((const float *) key->data, (const float *) query->data,
+                                                   dst, key->ne[0], scale);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static __global__ void ple_broadcast_f32(const float * value, const float * gate, float * dst,
+                                         int64_t width, int64_t streams, int64_t count) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) {
+        const int64_t row = i / width;
+        dst[i] = __fmul_rn(value[(row / streams) * width + i % width], gate[row]);
+    }
+}
+
+void ggml_cuda_op_ple_broadcast(ggml_backend_cuda_context & ctx, const ggml_tensor * value,
+                               const ggml_tensor * gate, ggml_tensor * dst) {
+    const int64_t count = ggml_nelements(dst);
+    ple_broadcast_f32<<<(count + 255) / 256, 256, 0, ctx.stream()>>>(
+        (const float *) value->data, (const float *) gate->data, (float *) dst->data, dst->ne[0], dst->ne[1], count);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
-    const struct ggml_tensor * src0 = dst->src[0];  // conv_x
-    const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
     const bool fuse_bias = bias_add_node != nullptr;
     const bool fuse_silu = silu_dst != nullptr;
 
-    // bias always comes with silu.
     GGML_ASSERT(!fuse_bias || fuse_silu);
 
-    // The bias (when fused) is the non-conv operand of the ADD node.
     const struct ggml_tensor * bias = fuse_bias ? (bias_add_node->src[0] == dst ? bias_add_node->src[1] : bias_add_node->src[0]) : nullptr;
 
-    // When fusing, write to silu_dst (the node downstream references).
     const struct ggml_tensor * out = fuse_silu ? silu_dst : dst;
 
-    const int64_t nc  = src1->ne[0];                // d_conv
-    const int64_t nr  = src0->ne[1];                // d_inner
-    const int64_t n_t = out->ne[1];                 // tokens per sequence
-    const int64_t n_s = out->ne[2];                 // number of sequences in the batch
+    const int64_t nc  = src1->ne[0];
+    const int64_t nr  = src0->ne[1];
+    const int64_t n_t = out->ne[1];
+    const int64_t n_s = out->ne[2];
 
     GGML_ASSERT(out->ne[0] == nr);
     GGML_ASSERT(src0->nb[0] == sizeof(float));

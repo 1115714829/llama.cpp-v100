@@ -1,26 +1,5 @@
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -43,7 +22,6 @@ struct ar_test {
     ggml_backend_comm_allreduce_tensor_t comm_allreduce = nullptr;
     ggml_backend_comm_allreduce_tensor_t comm_allreduce_exact = nullptr; // optional
 
-
     ggml_backend_comm_allreduce_rank_t            comm_allreduce_rank = nullptr;
     ggml_backend_comm_allreduce_rank_capturable_t comm_allreduce_rank_capturable = nullptr;
     ggml_backend_capture_begin_t  capture_begin  = nullptr;
@@ -51,13 +29,11 @@ struct ar_test {
     ggml_backend_capture_launch_t capture_launch = nullptr;
     ggml_backend_capture_free_t   capture_free   = nullptr;
 
-
     ggml_backend_comm_reduce_scatter_rank_can_t comm_reduce_scatter_rank_can = nullptr;
     ggml_backend_comm_reduce_scatter_rank_t     comm_reduce_scatter_rank     = nullptr;
     ggml_backend_comm_allgather_rank_can_t      comm_allgather_rank_can      = nullptr;
     ggml_backend_comm_allgather_rank_t          comm_allgather_rank          = nullptr;
 };
-
 
 struct ar_case {
     std::vector<ggml_context *>        ctxs;
@@ -116,7 +92,6 @@ static bool run_case(const ar_test & t, ggml_backend_comm_allreduce_tensor_t all
         ggml_backend_tensor_set(tensor, host[i].data(), 0, ne * sizeof(float));
     }
 
-
     std::vector<double> expected(ne, 0.0);
     for (size_t i = 0; i < n; ++i) {
         if (!compute[i]) {
@@ -147,10 +122,6 @@ static bool run_case(const ar_test & t, ggml_backend_comm_allreduce_tensor_t all
         for (int64_t j = 0; j < ne; ++j) {
             const double diff = std::fabs((double) result[j] - expected[j]);
 
-
-
-
-
             const double tol_bf16 = 2e-2 * std::max(1.0, (double) n / 4.0);
             const bool good = exact ? diff < 1e-5 :
                 (f16_push ? diff < 4e-3 :
@@ -173,10 +144,6 @@ static bool run_case(const ar_test & t, ggml_backend_comm_allreduce_tensor_t all
 
     return true;
 }
-
-
-
-
 
 static bool run_case_exact_ids(const ar_test & t) {
     const size_t n = t.n;
@@ -210,7 +177,6 @@ static bool run_case_exact_ids(const ar_test & t) {
 
             std::fill(host.begin(), host.end(), 0.0f);
             if (i == 0) {
-
 
                 const int64_t base = ne == 131072 ? 100000 : 0;
                 for (int64_t j = 0; j < ne; ++j) {
@@ -303,7 +269,6 @@ static void run_timing(const ar_test & t, ggml_backend_comm_allreduce_tensor_t a
     }
 }
 
-
 static double ar_median_us(const ar_test & t, void * comm,
                            ggml_backend_comm_allreduce_tensor_t allreduce, int64_t ne) {
     const size_t n = t.n;
@@ -356,10 +321,6 @@ static double ar_median_us(const ar_test & t, void * comm,
     return samples[samples.size() / 2];
 }
 
-
-
-
-
 static bool run_hier_rank_default(ar_test & t, const char * phase) {
     const int64_t sizes[] = { 5120 * 8, 5120 };
     const char * labels[] = { "5120x8", "5120x1" };
@@ -385,10 +346,6 @@ static bool run_hier_rank_default(ar_test & t, const char * phase) {
     printf("%s: %s\n", phase, ok ? "OK" : "FAILED");
     return ok;
 }
-
-
-
-
 
 static bool run_chain_timing(const ar_test & t, bool exact) {
     if (t.comm_allreduce_rank == nullptr || t.comm_allreduce_rank_capturable == nullptr ||
@@ -508,8 +465,6 @@ static bool run_chain_timing(const ar_test & t, bool exact) {
             t.capture_free(exec);
         }
 
-
-
         std::vector<void *> singles(n, nullptr);
         bool single_captured = true;
         for (size_t i = 0; i < n; ++i) {
@@ -546,8 +501,6 @@ static bool run_chain_timing(const ar_test & t, bool exact) {
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
         printf("single ne=%lld exact=%d us/call=%.2f\n", (long long) ne, (int) exact, single_us / n_single);
-
-
 
         for (size_t i = 0; i < n; ++i) {
             ggml_backend_tensor_set(c.tensors[i], host[i].data(), 0, nbytes);
@@ -610,12 +563,6 @@ static bool run_chain_timing(const ar_test & t, bool exact) {
     return ok;
 }
 
-
-
-
-
-
-
 static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, ggml_type ag_type, uint32_t seed,
                           const char * phase, int64_t zero_rank = -1) {
     const size_t n = t.n;
@@ -625,7 +572,6 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
     for (size_t i = 0; i < n; ++i) {
         ggml_seq_token_share(T, (int64_t) n, (int64_t) i, &t0[i], &Tj[i]);
     }
-
 
     {
         ar_case c;
@@ -702,7 +648,6 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
         }
     }
 
-
     {
         ar_case c;
         std::vector<std::vector<float>> host_slice(n);
@@ -715,8 +660,6 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
 
             ggml_tensor * slice = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d0, d1, Tj[i]);
             ggml_tensor * full  = ggml_new_tensor_3d(ctx, ag_type, d0, d1, T);
-
-
 
             full->op = GGML_OP_SEQ_GATHER;
             full->op_params[0] = axis;
@@ -753,7 +696,6 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
 
         for (size_t i = 0; i < n; ++i) {
 
-
             std::vector<float> got((size_t) d0*d1*T);
             if (ag_type == GGML_TYPE_F32) {
                 ggml_backend_tensor_get(dsts[i], got.data(), 0, got.size()*sizeof(float));
@@ -789,7 +731,6 @@ static bool run_case_rsag(const ar_test & t, int64_t d0, int64_t d1, int64_t T, 
 
     return true;
 }
-
 
 static bool run_case_rsag_i32(const ar_test & t, int64_t d0, int64_t d1, int64_t T, uint32_t seed, const char * phase) {
     const size_t n = t.n;
@@ -865,10 +806,6 @@ static bool run_case_rsag_i32(const ar_test & t, int64_t d0, int64_t d1, int64_t
 
     return true;
 }
-
-
-
-
 
 static bool run_case_ag_axis1(const ar_test & t, int64_t d0, int64_t d1, int64_t T, ggml_type ag_type,
                               uint32_t seed, const char * phase) {
@@ -980,10 +917,8 @@ int main() {
         return 0;
     }
 
-
     ggml_backend_comm_allreduce_tensor_t comm_allreduce_exact =
         (ggml_backend_comm_allreduce_tensor_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_tensor_exact");
-
 
     ggml_backend_comm_allreduce_rank_t comm_allreduce_rank =
         (ggml_backend_comm_allreduce_rank_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_allreduce_rank");
@@ -997,7 +932,6 @@ int main() {
         (ggml_backend_capture_launch_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_launch");
     ggml_backend_capture_free_t capture_free =
         (ggml_backend_capture_free_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_capture_free");
-
 
     ggml_backend_comm_reduce_scatter_rank_can_t comm_reduce_scatter_rank_can =
         (ggml_backend_comm_reduce_scatter_rank_can_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_comm_reduce_scatter_rank_can");
@@ -1079,8 +1013,6 @@ int main() {
 
     if (backends_ok && n_failed == 0) {
 
-
-
         const int64_t stress_sizes[] = { 4, 1280, 5120, 40960, 81920, 131072 };
         std::mt19937 rng(1234567u);
         std::uniform_int_distribution<size_t> pick(0, sizeof(stress_sizes) / sizeof(stress_sizes[0]) - 1);
@@ -1114,14 +1046,10 @@ int main() {
         printf("exact ids: %s\n", ok ? "OK" : "FAILED");
     }
 
-
     if (backends_ok && n_failed == 0 &&
         t.comm_reduce_scatter_rank != nullptr && t.comm_allgather_rank != nullptr &&
         t.comm_reduce_scatter_rank_can != nullptr && t.comm_allgather_rank_can != nullptr) {
         printf("testing reduce-scatter/all-gather on %zu CUDA devices\n", n);
-
-
-
 
         const int64_t d0 = 2560;
         const struct { int64_t d1, T; } rsag_cases[] = {
@@ -1151,7 +1079,6 @@ int main() {
         if (!run_case_rsag_i32(t, 512, 1, 2048, 0x62u, "rsag-i32")) {
             ok = false;
         }
-
 
         if (!run_case_ag_axis1(t, 2560, 1, 2047, GGML_TYPE_F16, 0x71u, "ag1-f16")) {
             ok = false;

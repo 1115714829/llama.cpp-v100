@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { browser } from '$app/environment';
 	import { McpServerCardCompact, McpServerForm } from '$lib/components/app/mcp';
 	import { Button } from '$lib/components/ui/button';
@@ -295,10 +296,10 @@
 
 			<Dialog.Footer>
 				<Button onclick={() => handleOpenChange(false)} size="sm" variant="secondary">
-					Cancel
+					{tr("Cancel")}
 				</Button>
 
-				<Button aria-label="Save" disabled={!canSave} size="sm" type="submit" variant="default">
+				<Button aria-label={tr("Save")} disabled={!canSave} size="sm" type="submit" variant="default">
 					Add
 				</Button>
 			</Dialog.Footer>

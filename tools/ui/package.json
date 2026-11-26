@@ -110,5 +110,8 @@
 		"cookie": "1.1.1",
 		"sharp": "0.35.3",
 		"valibot": "1.4.2"
+	},
+	"dependencies": {
+		"heic-to": "1.5.2"
 	}
 }

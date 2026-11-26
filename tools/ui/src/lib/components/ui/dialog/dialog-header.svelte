@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import XIcon from '@lucide/svelte/icons/x';
 	import { cn, type WithElementRef } from '$lib/components/ui/utils';
 	import { PANEL_CLOSE_MOBILE_CLASS } from '$lib/constants';
@@ -38,7 +39,7 @@
 		>
 			<XIcon />
 
-			<span class="sr-only">Close</span>
+			<span class="sr-only">{tr("Close")}</span>
 		</DialogPrimitive.Close>
 	{/if}
 </div>

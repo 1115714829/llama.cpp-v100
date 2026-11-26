@@ -6,12 +6,13 @@
 #include <vector>
 #include <cstdio>
 
-// staging buffer size for direct I/O reads, 64MB works well for NVMe drives
 #define LLAMA_DIRECT_IO_BUFFER_SIZE (64 * 1024 * 1024)
 
 struct llama_file;
 struct llama_mmap;
 struct llama_mlock;
+
+namespace ggml_safe_io { class reader; }
 
 using llama_files  = std::vector<std::unique_ptr<llama_file>>;
 using llama_mmaps  = std::vector<std::unique_ptr<llama_mmap>>;
@@ -25,7 +26,9 @@ struct llama_file {
     size_t tell() const;
     size_t size() const;
 
-    int file_id() const; // fileno overload
+    std::shared_ptr<ggml_safe_io::reader> read_gate() const;
+
+    int file_id() const;
 
     void seek(size_t offset, int whence) const;
 
@@ -33,8 +36,6 @@ struct llama_file {
     void read_raw_unsafe(void * ptr, size_t len);
     void read_aligned_chunk(void * dest, size_t size);
     uint32_t read_u32();
-
-
 
     size_t drop_page_cache(size_t first, size_t last);
 
@@ -49,12 +50,14 @@ private:
 };
 
 struct llama_mmap {
-    // list of [first, last) byte ranges within a file
+
     using ranges = std::vector<std::pair<size_t, size_t>>;
 
     llama_mmap(const llama_mmap &) = delete;
+
     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
-               const ranges & lazy_ranges = {});
+               const ranges & lazy_ranges = {},
+               std::shared_ptr<ggml_safe_io::reader> gate = nullptr);
     ~llama_mmap();
 
     size_t size() const;
@@ -62,11 +65,7 @@ struct llama_mmap {
 
     void unmap_fragment(size_t first, size_t last);
 
-
     void drop_page_cache(size_t first, size_t last);
-
-
-
 
     size_t release_page_cache(size_t first, size_t last);
 
@@ -98,7 +97,6 @@ struct llama_memory_range {
 
 using llama_memory_ranges = std::vector<llama_memory_range>;
 
-// Prefetch the host pages covering these memory ranges.
 void llama_prefetch(llama_memory_ranges mr);
 
 size_t llama_path_max();

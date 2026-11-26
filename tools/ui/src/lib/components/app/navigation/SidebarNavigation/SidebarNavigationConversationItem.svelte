@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import {
 		Download,
 		GitBranch,
@@ -218,7 +219,7 @@
 			<Tooltip.Root>
 				<Tooltip.Trigger>
 					<div
-						aria-label="Stop generation"
+						aria-label={tr("Stop generation")}
 						class="stop-button flex {ICON_CLASS_DEFAULT} shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground transition-colors hover:text-foreground"
 						onclick={handleStop}
 						onkeydown={(e) => e.key === 'Enter' && handleStop(e)}
@@ -232,7 +233,7 @@
 				</Tooltip.Trigger>
 
 				<Tooltip.Content>
-					<p>Stop generation</p>
+					<p>{tr("Stop generation")}</p>
 				</Tooltip.Content>
 			</Tooltip.Root>
 		{/if}

@@ -1,23 +1,5 @@
 #pragma once
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -25,13 +7,7 @@
 
 namespace ggml_cuda_numa_plan {
 
-
-
-
-
 static constexpr double TIE = 1.02;
-
-
 
 static constexpr uint64_t EXHAUSTIVE = 256;
 
@@ -44,7 +20,6 @@ struct result {
     bool                 have_local = false;
 };
 
-
 static double cost_of(const int * a, size_t n_dev, size_t n_nodes, const size_t * dev_bytes, const double * t_ms) {
     double worst = 0.0;
     for (size_t d = 0; d < n_dev; d++) {
@@ -56,7 +31,6 @@ static double cost_of(const int * a, size_t n_dev, size_t n_nodes, const size_t 
     }
     return worst;
 }
-
 
 static bool fits_of(const int * a, size_t n_dev, size_t n_nodes, const size_t * dev_bytes,
                     const int64_t * node_cap, std::vector<int64_t> & used) {
@@ -79,10 +53,6 @@ static bool lex_less(const std::vector<int> & a, const std::vector<int> & b) {
     return std::lexicographical_compare(a.begin(), a.end(), b.begin(), b.end());
 }
 
-
-
-
-
 static int nodes_used(const std::vector<int> & a, const std::vector<size_t> & part, size_t n_nodes,
         std::vector<char> & seen) {
     seen.assign(n_nodes, 0);
@@ -97,8 +67,6 @@ static int nodes_used(const std::vector<int> & a, const std::vector<size_t> & pa
     }
     return n;
 }
-
-
 
 static int fastest_of(size_t device, size_t n_nodes, const double * t_ms) {
     int    best = -1;
@@ -116,24 +84,6 @@ static int fastest_of(size_t device, size_t n_nodes, const double * t_ms) {
     return best;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 static int plan(size_t n_dev, size_t n_nodes,
                 const size_t * dev_bytes, const int64_t * node_cap, const double * t_ms,
                 const int * topo_node, result * out) {
@@ -146,8 +96,6 @@ static int plan(size_t n_dev, size_t n_nodes,
         return 0;
     }
 
-
-
     std::vector<int> base(n_dev, -1);
     for (size_t d = 0; d < n_dev; d++) {
         base[d] = fastest_of(d, n_nodes, t_ms);
@@ -156,15 +104,12 @@ static int plan(size_t n_dev, size_t n_nodes,
         }
     }
 
-
     std::vector<size_t> part;
     for (size_t d = 0; d < n_dev; d++) {
         if (dev_bytes[d] > 0) {
             part.push_back(d);
         }
     }
-
-
 
     out->cost_fast = cost_of(base.data(), n_dev, n_nodes, dev_bytes, t_ms);
     {
@@ -185,7 +130,6 @@ static int plan(size_t n_dev, size_t n_nodes,
         out->cost_local = cost_of(local.data(), n_dev, n_nodes, dev_bytes, t_ms);
         out->have_local = all_local;
     }
-
 
     uint64_t count = 1;
     bool     exhaustive = true;
@@ -224,12 +168,6 @@ static int plan(size_t n_dev, size_t n_nodes,
             }
         }
 
-
-
-
-
-
-
         if (best_cost >= 0.0) {
             const double limit = best_cost*TIE;
             std::vector<char> seen;
@@ -257,11 +195,8 @@ static int plan(size_t n_dev, size_t n_nodes,
         }
     } else {
 
-
         std::vector<int> a = base;
         if (!fits_of(a.data(), n_dev, n_nodes, dev_bytes, node_cap, used)) {
-
-
 
             std::vector<size_t> by_bytes;
             for (;;) {
@@ -354,7 +289,6 @@ static int plan(size_t n_dev, size_t n_nodes,
                         continue;
                     }
 
-
                     if (c < best_c) {
                         best_c = c;
                         best_a = trial;
@@ -378,9 +312,6 @@ static int plan(size_t n_dev, size_t n_nodes,
     }
 
     if (!exhaustive) {
-
-
-
 
         std::vector<int> lex = best;
         if (fits_of(lex.data(), n_dev, n_nodes, dev_bytes, node_cap, used)) {
@@ -453,31 +384,11 @@ static std::vector<int64_t> slot_occupancy(size_t n_dev, const size_t * dev_byte
     return used;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 static int table_node_of(const std::vector<int64_t> & node_bytes, size_t n_nodes,
         const int64_t * node_cap, int64_t fixed_w) {
     if (n_nodes == 0) {
         return -1;
     }
-
-
 
     int best = -1;
     for (size_t n = 0; n < n_nodes && n < node_bytes.size(); n++) {
@@ -492,7 +403,6 @@ static int table_node_of(const std::vector<int64_t> & node_bytes, size_t n_nodes
         return best;
     }
 
-
     best = 0;
     for (size_t n = 1; n < n_nodes; n++) {
         const int64_t used_n = n < node_bytes.size() ? node_bytes[n] : 0;
@@ -503,9 +413,6 @@ static int table_node_of(const std::vector<int64_t> & node_bytes, size_t n_nodes
     }
     return best;
 }
-
-
-
 
 static int pinned_node_of(const std::vector<int64_t> & node_bytes, size_t n_nodes,
         const int64_t * node_cap, int64_t fixed_w) {
@@ -530,9 +437,6 @@ static int pinned_node_of(const std::vector<int64_t> & node_bytes, size_t n_node
     return best;
 }
 
-
-
-
 static int table_node(size_t n_dev, const size_t * dev_bytes, const int * local_node,
         size_t n_nodes, const int64_t * node_cap, int64_t fixed_w) {
     if (n_nodes == 0) {
@@ -541,8 +445,6 @@ static int table_node(size_t n_dev, const size_t * dev_bytes, const int * local_
     std::vector<int64_t> node_bytes = slot_occupancy(n_dev, dev_bytes, local_node, n_nodes, node_cap);
     return table_node_of(node_bytes, n_nodes, node_cap, fixed_w);
 }
-
-
 
 static int pinned_node(size_t n_dev, const size_t * dev_bytes, const int * local_node,
         size_t n_nodes, const int64_t * node_cap, int64_t fixed_w) {
@@ -559,7 +461,6 @@ static bool fixed_fits(size_t n_dev, const size_t * dev_bytes, const int * local
     if (n_nodes == 0) {
         return false;
     }
-
 
     std::vector<int64_t> used(n_nodes, 0);
     for (size_t d = 0; d < n_dev; d++) {
@@ -608,12 +509,6 @@ static bool fixed_fits(size_t n_dev, const size_t * dev_bytes, const int * local
     return true;
 }
 
-
-
-
-
-
-
 struct segment_entry {
     int     node;
     int64_t bytes;
@@ -623,32 +518,6 @@ struct segment_entry {
     }
 };
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 static int segment(size_t n_dev, const size_t * dev_bytes, const int * alloc_dev,
         const size_t * alloc_size, size_t n_alloc, const int * local_node,
         size_t n_nodes, const int64_t * node_cap, int64_t fixed_w, int64_t fixed_p,
@@ -657,9 +526,6 @@ static int segment(size_t n_dev, const size_t * dev_bytes, const int * alloc_dev
     if (n_dev == 0 || n_nodes == 0) {
         return 0;
     }
-
-
-
 
     std::vector<int64_t> room(n_nodes);
     for (size_t n = 0; n < n_nodes; n++) {
@@ -679,7 +545,6 @@ static int segment(size_t n_dev, const size_t * dev_bytes, const int * alloc_dev
         }
     }
     room[node_p] -= fixed_p;
-
 
     std::vector<std::vector<int>> quota_node(n_dev);
     std::vector<std::vector<int64_t>> quota_left(n_dev);
@@ -726,8 +591,6 @@ static int segment(size_t n_dev, const size_t * dev_bytes, const int * alloc_dev
         }
     }
 
-
-
     std::vector<size_t> at(n_dev, 0);
     for (size_t i = 0; i < n_alloc; i++) {
         const int     d    = alloc_dev != nullptr ? alloc_dev[i] : 0;
@@ -758,7 +621,6 @@ static int segment(size_t n_dev, const size_t * dev_bytes, const int * alloc_dev
         }
     }
 
-
     if (n_alloc == 0) {
         for (size_t d : order) {
             if (quota_node[d].empty()) {
@@ -783,47 +645,9 @@ static int segment(size_t n_dev, const size_t * dev_bytes, const int * alloc_dev
     return 1;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 static int64_t pinned_room(int64_t cap, int64_t zone_high, int64_t margin_proc) {
     return cap - margin_proc - (zone_high > 0 ? zone_high : 0);
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 static int balanced(size_t n_dev, const size_t * dev_bytes, const int * alloc_dev,
         const size_t * alloc_size, size_t n_alloc, const int * local_node,
@@ -835,7 +659,6 @@ static int balanced(size_t n_dev, const size_t * dev_bytes, const int * alloc_de
         return 0;
     }
 
-
     std::vector<int64_t> room(n_nodes);
     for (size_t n = 0; n < n_nodes; n++) {
         room[n] = node_cap[n] - slack;
@@ -845,7 +668,6 @@ static int balanced(size_t n_dev, const size_t * dev_bytes, const int * alloc_de
     }
     room[(size_t) node_w] -= fixed_w;
     room[(size_t) node_p] -= fixed_p;
-
 
     std::vector<std::vector<int>>    quota_node(n_dev);
     std::vector<std::vector<int64_t>> quota_left(n_dev);
@@ -860,19 +682,11 @@ static int balanced(size_t n_dev, const size_t * dev_bytes, const int * alloc_de
         return x < y;
     });
 
-
-
-
-
-
-
-
     const auto fill_quota = [&](bool balance) {
         std::vector<int64_t> left = room;
         std::vector<int64_t> take_up(n_nodes, 0);
         take_up[(size_t) node_w] += fixed_w;
         take_up[(size_t) node_p] += fixed_p;
-
 
         int64_t total = fixed_w + fixed_p;
         for (size_t d = 0; d < n_dev; d++) {
@@ -889,7 +703,6 @@ static int balanced(size_t n_dev, const size_t * dev_bytes, const int * alloc_de
             if (local >= 0 && (size_t) local < n_nodes) {
                 int64_t take = std::min(rest, left[(size_t) local]);
                 if (balance) {
-
 
                     const int64_t share = target > take_up[(size_t) local] ? target - take_up[(size_t) local] : 0;
                     take = std::min(rest, std::min(share, left[(size_t) local]));
@@ -941,8 +754,6 @@ static int balanced(size_t n_dev, const size_t * dev_bytes, const int * alloc_de
         return 0;
     }
 
-
-
     std::vector<size_t> at(n_dev, 0);
     for (size_t i = 0; i < n_alloc; i++) {
         const int     d    = alloc_dev != nullptr ? alloc_dev[i] : 0;
@@ -973,7 +784,6 @@ static int balanced(size_t n_dev, const size_t * dev_bytes, const int * alloc_de
         }
     }
 
-
     if (n_alloc == 0) {
         for (size_t d : order) {
             if (quota_node[d].empty()) {
@@ -998,10 +808,6 @@ static int balanced(size_t n_dev, const size_t * dev_bytes, const int * alloc_de
     return 1;
 }
 
-
-
-
-
 static constexpr size_t BYTES_TOLERANCE = 1ull << 20;
 
 struct committed {
@@ -1011,16 +817,12 @@ struct committed {
     std::vector<size_t> bytes;
 };
 
-
 static void commit_plan(committed * c, const std::vector<int> & node, const std::vector<size_t> & bytes, bool from_fit) {
     c->valid    = true;
     c->from_fit = from_fit;
     c->node     = node;
     c->bytes    = bytes;
 }
-
-
-
 
 static int committed_node(const committed & c, size_t device, size_t have_bytes, bool * bytes_match) {
     if (!c.valid || device >= c.node.size() || c.node[device] < 0) {

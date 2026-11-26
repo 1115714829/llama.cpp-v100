@@ -1,45 +1,6 @@
 // SPDX-License-Identifier: BSD-3-Clause
-// ============================================================================
-// fattn-sm70-d256-kernel.cuh
-//
-// SM70 (Volta) D256 FlashAttention "Split-D N32" kernel.
-//
-// ORIGIN: core adapted from the 1CatAI D256 Split-D kernel
-//   repo : 1CatAI/1Cat-vLLM
-//   path : csrc/attention/sm70_v37/tail.cu   (HEAD fcf59f8e9)
-//   (c) 1CatAI, BSD-3-Clause compatible.
-// The support layer (Mask, sm70_* helpers, gemm) is vendored from
-//   zhinianqin/flash-attention-v100 @ c2eda5e (BSD-3-Clause);
-//   see licenses/LICENSE-flash-attention-sm70.
-// CuTe/CUTLASS: see sm70-vendor/ (licenses/LICENSE-cute-cutlass).
-//
-// This file contains ONLY the device-side kernel + traits + helpers. The
-// upstream torch host wrapper (onecat_v37_dense_state_float_raw) is NOT
-// included -- the llama.cpp launcher in fattn-sm70-d256.cu drives the kernel
-// directly.
-//
-// Only the staged-f16 dense path is kept: no paged KV, no in-kernel q4/q8
-// dequant, no per-warp register P. SplitKV3 remains behind the template flag;
-// the llama.cpp launcher does not select it yet.
-//
-// The verified compute core is UNMODIFIED: SmemLayout (pitch-68 K / TT swizzled
-// V), HMMA.884 QK+PV atoms, the K ping-pong double buffer (V is staged in two
-// rounds per block), online softmax with row_scale_exchange and the
-// __launch_bounds__(256,1) smem budget (kSmemBytes==45568; the ~253-255
-// registers still cap the kernel at 1 CTA/SM).
-// Deviations from upstream, all required for llama.cpp semantics:
-//  * the causal Mask is replaced by a range mask (col >= kv_len -> -inf): the
-//    llama.cpp mask carries the causal/padding semantics and test masks are
-//    arbitrary;
-//  * one explicit mask add after the range mask: an f16 mask is added, an I32
-//    range mask sets every column outside its two [lo, hi) windows to -inf;
-//  * a mask pre-scan (sm70_d256_mask_bounds_kernel) gives, per (batch, q
-//    block), the first non-zero and the last above -inf column: the explicit
-//    mask add skips the all-zero prefix and the KV walk stops at the last
-//    block that can contribute. Without mask_bounds every block in
-//    [0, ceil(kv_len/kBlockN)) is visited (no causal bound);
-//  * a 0/0 guard for fully masked rows in the dense output and the merge.
-// ============================================================================
+// Portions (c) 1CatAI; zhinianqin/flash-attention-v100 and NVIDIA CUTLASS. See licenses/LICENSE-flash-attention-sm70 and licenses/LICENSE-cute-cutlass.
+
 #pragma once
 
 #include <cstdint>
@@ -61,7 +22,6 @@ namespace FLASH_NAMESPACE {
 
 using namespace cute;
 
-// DChunk: 64 = stock Path A Split-D (HMMA tiles over 64-wide K/V chunks).
 template <int DChunk = 64>
 struct Sm70D256SplitDTraitsT {
     using Element = cutlass::half_t;
@@ -84,9 +44,6 @@ struct Sm70D256SplitDTraitsT {
     static constexpr int kQkRowsPerThread = kQkWarpRows / 4;
     static constexpr int kOutputRowsPerThread = kGroupRows / 4;
 
-    // Each warp in a pair owns eight distinct Q rows for QK, then the pair
-    // shares the resulting P tile and each warp owns D/2 for PV. This keeps
-    // the standard FA2 N32 online-softmax order without duplicating QK work.
     using QkTiledMma = TiledMMA<
         MmaAtom,
         Layout<Shape<_1, _4, _1>>,
@@ -105,16 +62,12 @@ struct Sm70D256SplitDTraitsT {
         SmemLayoutAtom{}, Shape<Int<kBlockM>, Int<kHeadDim>>{}));
     using SmemLayoutKV = decltype(tile_to_shape(
         SmemLayoutAtom{}, Shape<Int<kBlockN>, Int<kDChunk>>{}));
-    // Volta HMMA.884 assigns one warp to four 8-thread quadpairs and services
-    // the 64-bit operand loads as two half-warps. Pitch 68 advances each row
-    // by one bank pair; the extra 16-half phase every 16 rows folds row bit 4
-    // into bank-pair bit 2 so every half-warp covers all 16 bank pairs once.
+
     using SmemLayoutK = Layout<
         Shape<Shape<Int<16>, Int<2>>, Int<kDChunk>>,
         Stride<Stride<Int<kDChunk + 4>, Int<16 * (kDChunk + 4) + 16>>,
                _1>>;
-    // TT PV consumes V as KxD. Row bit 1 is folded into D-address bit 2;
-    // the producer applies the inverse 64-bit-half swap before STS.128.
+
     using SmemLayoutV = Layout<
         Shape<Shape<_2, Int<kBlockN / 2>>,
               Shape<_32, Int<kDChunk / 32>>>,
@@ -154,10 +107,7 @@ struct Sm70D256SplitDTraitsT {
     static constexpr int kQElements = size(SmemLayoutQ{});
     static constexpr int kKVElements = size(SmemLayoutKV{});
     static_assert(size(SmemLayoutV{}) == kKVElements);
-    // The second K stage is live only before P is materialized, so it may
-    // alias the beginning of the later P region. Keep the K stages disjoint
-    // and on the same 128-byte bank phase without moving the V/P regions.
-    // 2240 elements = 4480 B = 35 x 128 B.
+
     static constexpr int kKStageElements = 2240;
     static_assert(kKStageElements >= cosize(SmemLayoutK{}));
     static_assert(kKStageElements + cosize(SmemLayoutK{}) <=
@@ -292,7 +242,7 @@ __device__ __forceinline__ void splitd_pv_gemm_tt(
     auto b1 = make_tensor<Element>(BLayout{});
     auto b0_words = recast<uint32_t>(b0);
     auto b1_words = recast<uint32_t>(b1);
-    // PV K-steps along P's N (= BlockN) are 4-wide; count is BlockN/4.
+
     static_assert(decltype(size<2>(tPrP))::value
                   == Sm70D256SplitDTraitsT<64>::kBlockN / 4);
     static_assert(decltype(size(b0))::value == 8);
@@ -304,10 +254,6 @@ __device__ __forceinline__ void splitd_pv_gemm_tt(
         tiled_mma, lane);
 }
 
-// kRows: number of rows in this warp's o accumulator (kGroupRows=16 for the
-// stock pair-shared path). kPerWarp: when true the warp's o accumulator covers
-// only its own kRows rows; when false it covers the whole kGroupRows group (no
-// offset). kOChunks/kOElements are deduced from the o_storage array shape.
 template <int kRows, bool kPerWarp, typename TensorScores, typename OLayout,
           int kOChunks, int kOElements>
 __device__ __forceinline__ void splitd_n32_online_softmax(
@@ -405,12 +351,6 @@ __device__ __forceinline__ void splitd_n32_online_softmax(
     }
 }
 
-// Additive f16 mask applied before the online softmax. Row and column indices
-// follow the same lane layout as Mask::apply_mask in mask.h. Entries outside
-// [0, q_len_real) x [0, kv_len) read as zero: Q pad rows and the tail of the
-// last KV tile. llama.cpp adds the mask to the scaled logits (QK*scale + mask)
-// while this kernel folds scale into exp2, so the launcher passes
-// mask_scale = 1/scale and the mask enters the raw-QK domain as mask/scale.
 template <typename TensorScores>
 __device__ __forceinline__ void splitd_add_explicit_mask(
     TensorScores &acc_s,
@@ -472,10 +412,6 @@ __device__ __forceinline__ void splitd_add_explicit_mask(
     }
 }
 
-// Range mask: the row's visible KV columns are the union of two [lo, hi) windows, every other
-// column is -inf. The second window is empty when hi1 <= lo1. Row and column traversal are
-// identical to splitd_add_explicit_mask; the four ints are read once per row (16-byte load)
-// before the column loop.
 template <typename TensorScores>
 __device__ __forceinline__ void splitd_apply_range_mask(
     TensorScores &acc_s,
@@ -547,12 +483,6 @@ __device__ __forceinline__ void splitd_apply_range_mask(
     }
 }
 
-// Block range of one windowed (Partial) CTA: the caller's KV block window
-// [win_block_lo, win_block_hi) clamped to the blocks the mask can visit, then
-// optionally split into kv_splits equal segments (SplitKV2). Segment s owns
-// [block_min + s*seg_len, block_min + (s+1)*seg_len - 1]; a segment past the
-// window end comes back empty (n_block_max < n_block_min). With kv_splits == 1
-// this is exactly the old clamp.
 __device__ __forceinline__ void sm70_d256_partial_block_range(
     int n_visited_blocks, int win_block_lo, int win_block_hi,
     int kv_split, int kv_splits, int & n_block_min, int & n_block_max) {
@@ -572,9 +502,6 @@ __device__ __forceinline__ void sm70_d256_partial_block_range(
     }
 }
 
-// Intersect a block range with the device-side row range [*visit_lo, *visit_hi): the owner caps
-// its share at the assist split point, the idle restricts its share to the rows past it. Either
-// pointer may be null. An empty intersection comes back as n_block_max < n_block_min.
 __device__ __forceinline__ void sm70_d256_clamp_visit_rows(
     const int * visit_lo, const int * visit_hi, int kBlockN,
     int & n_block_min, int & n_block_max) {
@@ -592,25 +519,6 @@ __device__ __forceinline__ void sm70_d256_clamp_visit_rows(
     }
 }
 
-// ElementOut (default = Element): output element type. The llama.cpp launcher
-// instantiates ElementOut=float so the attention output is written as f32
-// directly (the f16 output staging was a per-layer rounding source). Q/K/V
-// must stay f16 (HMMA operand constraint).
-//
-// SplitKV3: 3-way KV split for long-prefix prefill. Not selected by the
-// llama.cpp launcher yet; the dense and merge code paths are kept.
-//
-// Partial: windowed mode for a fixed-size KV mirror. Like SplitKV3 the kernel
-// writes only the per-row raw max/sum and the unnormalized numerator, but at
-// split 0 with gridDim.y = kv_splits * batch and one flat [row][D] partial
-// buffer per KV segment (row = (batch*query_len + query_row)*heads_q + head_q,
-// slice s at s * (gridDim.y/kv_splits)*query_len*heads_q rows). KV_SPLITS is a
-// template parameter (1 or 2): the launcher splits one KV window in two when
-// the window alone cannot fill the device. KV_SPLITS == 1 keeps the unsplit
-// kernel unchanged. The caller merges the segment slices (and then the
-// windows) with sm70_d256_window_merge_kernel; the output scatter applies the
-// row normalization. A row that sees no KV block in its segment writes max
-// -inf, sum 0 and leaves O unread (the merge skips -inf rows of p_max).
 template <typename TraitsT, typename Element, typename ElementOut = Element,
           bool SplitKV3 = false, bool Partial = false, int KV_SPLITS = 1>
 __global__ __launch_bounds__(256, 1)
@@ -679,14 +587,6 @@ void sm70_d256_splitd_dense_kernel(
     typename Traits::GmemKTiledCopy gmem_k_copy;
     auto gmem_k_thread = gmem_k_copy.get_thread_slice(tid);
 
-    // A windowed Partial CTA can get an empty window or, with kv_splits > 1, an
-    // empty KV segment (no visible KV block in its share of the window).
-    // Resolve the block range before the Q smem copy so the empty case returns
-    // without staging Q. Rows get max -inf and sum 0, O is not written: the
-    // merge kernel skips -inf rows of p_max without reading p_out, and a row
-    // that no window wrote (sum 0) becomes 0 in the scatter. The range is
-    // computed again below for the non-empty case; the integer result is the
-    // same.
     if constexpr (Partial) {
         const int visible_n_blocks = cute::ceil_div(kv_len, kBlockN);
         int n_visited_blocks = visible_n_blocks;
@@ -704,8 +604,7 @@ void sm70_d256_splitd_dense_kernel(
             block_min, block_max);
         sm70_d256_clamp_visit_rows(visit_lo, visit_hi, kBlockN, block_min, block_max);
         if (block_max < block_min) {
-            // Flat partial buffers: slice s starts at s * (grid.y/kv_splits)
-            // rows, so a segment writes its own slice.
+
             const int64_t partial_row_base = kv_splits > 1
                 ? (int64_t) split * (gridDim.y / kv_splits) * query_len * heads_q
                 : 0;
@@ -762,23 +661,11 @@ void sm70_d256_splitd_dense_kernel(
     float row_sum[Traits::kQkRowsPerThread];
 #pragma unroll
     for (int row = 0; row < Traits::kQkRowsPerThread; ++row) {
-        // SplitKV3: a row's causal window may not overlap this segment at all
-        // (fully-masked row) - keep row_max finite so exp2 never sees
-        // (-inf) - (-inf) = NaN. -1e30 behaves as -inf under exp2 (flushes to
-        // zero) and the merge kernel's scale stays 0. The dense path keeps
-        // -INFINITY (every row always sees causal block 0 there).
+
         row_max[row] = SplitKV3 ? -1.0e30f : -INFINITY;
         row_sum[row] = 0.0f;
     }
 
-    // Without mask_bounds every KV block [0, ceil(kv_len/kBlockN)) is
-    // processed: llama.cpp masks are arbitrary (tests) and carry the
-    // causal/padding semantics, so the kernel must not apply a causal bound or
-    // a causal mask of its own. mask_bounds (sm70_d256_mask_bounds_kernel)
-    // describes the mask shape instead: first_nz = kv_len - b.x is the first
-    // column with a non-zero entry and b.y - 1 the last column above -inf.
-    // Blocks past b.y-1 cannot contribute, and the explicit mask add is a
-    // no-op for blocks entirely below first_nz.
     const int visible_n_blocks = cute::ceil_div(kv_len, kBlockN);
     int mask_z_end = 0;
     int n_visited_blocks = visible_n_blocks;
@@ -799,23 +686,17 @@ void sm70_d256_splitd_dense_kernel(
         n_block_max = visible_n_blocks * (split + 1) / 3 - 1;
     }
     if constexpr (Partial) {
-        // Window clamp plus the optional SplitKV2 segment split, then the device-side row range.
+
         sm70_d256_partial_block_range(
             n_visited_blocks, win_block_lo, win_block_hi, split, kv_splits,
             n_block_min, n_block_max);
         sm70_d256_clamp_visit_rows(visit_lo, visit_hi, kBlockN, n_block_min, n_block_max);
     } else {
-        // Restrict the walk to the caller's KV block window [win_block_lo, win_block_hi).
-        // The windowed path passes the window bounds; every other call passes 0 and
-        // INT_MAX, for which both clamps are no-ops and the walk is bit-identical to
-        // the unwindowed one. The K/V pointers already map the window's rows, so no
-        // index below changes.
+
         n_block_min = n_block_min > win_block_lo ? n_block_min : win_block_lo;
         n_block_max = n_block_max < win_block_hi - 1 ? n_block_max : win_block_hi - 1;
     }
-    // SplitKV3 guard: an empty split segment (n_block_max < n_block_min) must
-    // still load a valid first tile to keep the gmem addresses in range; use
-    // n_block_min (always < visible_n_blocks) for that degenerate case.
+
     const int n_block_first = n_block_max >= n_block_min ? n_block_max : n_block_min;
 
     const int64_t k_batch_offset = static_cast<int64_t>(batch)
@@ -885,9 +766,7 @@ void sm70_d256_splitd_dense_kernel(
                 acc_s, tSrQ, tSrK, tSsQ, tSsK, qk_tiled_mma,
                 smem_copy_q, smem_copy_k, smem_thread_q, smem_thread_k);
             if (d_chunk + 1 < Traits::kDChunks) {
-                // Write the next chunk into the other stage: it does not
-                // conflict with the gemm that just read this one, so a single
-                // barrier makes the copy visible to the next gemm.
+
                 auto sKNext = make_tensor(
                     make_smem_ptr(
                         kv_smem_ptr
@@ -931,9 +810,6 @@ void sm70_d256_splitd_dense_kernel(
         copy_even_tile(gmem_v_copy, tVgV0, tVrV0);
         copy_even_tile(gmem_v_copy, tVgV2, tVrV1);
 
-        // Mask the tail columns of the last KV tile (col >= kv_len) to -inf.
-        // Causal_mask stays false: the explicit mask already carries the
-        // causal/padding semantics and is added below.
         FLASH_NAMESPACE::Mask<false, false, false> range_mask(
             kv_len, kv_len - kv_offset, -1, 0, 0.0f);
         range_mask.template apply_mask<false, false>(
@@ -941,7 +817,7 @@ void sm70_d256_splitd_dense_kernel(
             n_block * kBlockN,
             query_row_base + qk_row_base,
             0);
-        // Skip the explicit mask add where the mask is identically zero.
+
         if (mask != nullptr && n_block >= mask_z_end) {
             if (mask_is_range) {
                 splitd_apply_range_mask(
@@ -971,10 +847,6 @@ void sm70_d256_splitd_dense_kernel(
         store_v_fragment_128_swizzled(tVrV0, tVsV0, tVcV);
         store_v_fragment_128_swizzled(tVrV1, tVsV1, tVcV);
 
-        // The pair's 16-row P tile is staged into shared memory (each warp
-        // writes its own 8 rows) and loaded back as the pair MMA's A
-        // fragment. The barrier makes the P stores - and the V smem stores
-        // above - visible before the PV gemms read them.
         auto sP = make_tensor(
             make_smem_ptr(p_smem_ptr), typename Traits::SmemLayoutP{});
         auto sPGroup = local_tile(
@@ -1067,10 +939,7 @@ void sm70_d256_splitd_dense_kernel(
             row_sum[slot], sum_op);
     }
     if constexpr (SplitKV3) {
-        // 3-way partial output: unnormalized numerator + raw max/sum per row.
-        // The merge kernel (below) combines the three segments with the
-        // standard flash-decode scale formula. Layout: [split][row][D] where
-        // row = (batch * query_len + query_row) * heads_q + head_q.
+
         const int64_t partial_row_base =
             (int64_t) split * (gridDim.y / 3) * query_len * heads_q;
         if ((lane & 0x0e) == 0) {
@@ -1114,9 +983,7 @@ void sm70_d256_splitd_dense_kernel(
             }
         }
     } else if constexpr (Partial) {
-        // Window partial output: same stores as SplitKV3 at split 0 and a
-        // plain [row][D] slice per KV segment. An empty window or segment
-        // returned early, so every row here saw a KV block.
+
         const int64_t partial_row_base = kv_splits > 1
             ? (int64_t) split * (gridDim.y / kv_splits) * query_len * heads_q
             : 0;
@@ -1188,7 +1055,7 @@ void sm70_d256_splitd_dense_kernel(
                     Traits::kGroupRows>(row, lane);
                 const float sum = row_sum_exchange[
                     mma_group * Traits::kGroupRows + logical_row];
-                // A fully masked row has sum 0; llama.cpp expects 0 there.
+
                 const float inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
 #pragma unroll
                 for (int col = 0; col < size<1>(acc_o_rc); ++col) {
@@ -1216,10 +1083,6 @@ void sm70_d256_splitd_dense_kernel(
     }
 }
 
-// SplitKV3 merge kernel (from the upstream sm70_flash_attn_d256_splitkv3
-// patch): combines the three partial segments per output row. Writes into the
-// f32 Os staging buffer (same [row][D] layout the dense path produces and the
-// scatter kernel consumes).
 __global__ __launch_bounds__(256, 1)
 void sm70_d256_splitkv3_merge_kernel(
         const float *__restrict__ partial_out,
@@ -1246,7 +1109,7 @@ void sm70_d256_splitkv3_merge_kernel(
         merge[0] = scale0;
         merge[1] = scale1;
         merge[2] = scale2;
-        // Fully masked rows have denominator 0; llama.cpp expects 0 there.
+
         merge[3] = denominator > 0.0f ? 1.0f / denominator : 0.0f;
     }
     __syncthreads();
@@ -1260,18 +1123,6 @@ void sm70_d256_splitkv3_merge_kernel(
     out[element] = numerator * merge[3];
 }
 
-// Window merge: folds one window's (or one KV split segment's) partials p_*
-// into the running accumulator acc_* (first = true copies the first partial
-// into the accumulator). Two-way online-softmax merge: m = max(ma, mp) and
-// each side is scaled by exp2((max - m) * softmax_scale_log2), the same
-// exponent base and factor as sm70_d256_splitkv3_merge_kernel. Both sides -inf
-// (no KV row in either) keeps max -inf, sum 0, O 0 so later merges and the
-// scatter stay empty. One CTA covers kWindowMergeRowsPerCta rows, 256 threads
-// cover D=256 per row; an empty partial row reads p_max only. The caller
-// launches it once per partial slice with p_* pointing at the slice's
-// [row][D] block; the first window's first KV split segment must pass
-// first = true so that the accumulator is initialized even when that segment
-// is empty (all rows -inf).
 constexpr int kWindowMergeRowsPerCta = 8;
 
 __global__ __launch_bounds__(256, 1)
@@ -1294,9 +1145,7 @@ void sm70_d256_window_merge_kernel(
         }
 
         if (p_max[row] == -INFINITY) {
-            // Empty partial: the accumulator is unchanged, except on the first
-            // merge, which must still leave it initialized (max -inf, sum 0,
-            // O 0) for the later splits/windows of this row.
+
             if (first) {
                 if (d == 0) {
                     acc_max[row] = -INFINITY;
@@ -1308,10 +1157,7 @@ void sm70_d256_window_merge_kernel(
         }
 
         const int64_t element = row * Sm70D256SplitDTraitsT<64>::kHeadDim + d;
-        // An accumulator that has seen no KV row yet (its window 0 was empty
-        // for this row, so its O was never written) takes the window as is.
-        // Every thread reads acc_max before any thread writes it, so the
-        // branch is uniform across the row's threads.
+
         const bool acc_empty = acc_max[row] == -INFINITY;
         __syncthreads();
         if (first || acc_empty) {
@@ -1342,4 +1188,4 @@ void sm70_d256_window_merge_kernel(
     }
 }
 
-}  // namespace FLASH_NAMESPACE
+}

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { SkipForward, Square } from '@lucide/svelte';
 	import { page } from '$app/state';
 	import {
@@ -181,11 +182,11 @@
 			class="group h-8 w-8 rounded-full p-0 max-md:h-9 max-md:w-9"
 			onclick={() =>
 				ChatService.stopReasoning(activeMessage?.completionId ?? '', activeMessage?.model)}
-			title="Skip reasoning"
+			title={tr("Skip reasoning")}
 			type="button"
 			variant="secondary"
 		>
-			<span class="sr-only">Skip reasoning</span>
+			<span class="sr-only">{tr("Skip reasoning")}</span>
 
 			<SkipForward
 				class="{ICON_CLASS_DEFAULT} stroke-muted-foreground group-hover:stroke-foreground"
@@ -200,7 +201,7 @@
 			type="button"
 			variant="secondary"
 		>
-			<span class="sr-only">Stop</span>
+			<span class="sr-only">{tr("Stop")}</span>
 
 			<Square
 				class="h-8 w-8 fill-muted-foreground stroke-muted-foreground group-hover:fill-destructive group-hover:stroke-destructive hover:fill-destructive hover:stroke-destructive"

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { ICON_CLASS_DEFAULT } from '$lib/constants';
 	import type { SettingsSection, SettingsSectionTitle } from '$lib/types';
 
@@ -24,7 +25,7 @@
 			>
 				<section.icon class={ICON_CLASS_DEFAULT} />
 
-				<span class="ml-2">{section.title}</span>
+				<span class="ml-2">{tr(section.title)}</span>
 			</button>
 		{/each}
 	</nav>

@@ -1,16 +1,4 @@
-// Reader for the raw rows of the PLE n-gram table.
-//
-// The table stays in the GGUF shard on disk: the rows an ubatch needs are read with O_DIRECT and
-// copied into a small host buffer, which the graph uploads as a plain input tensor. The GPU then
-// runs the same GET_ROWS kernel on the same bytes as in the pinned path, so the output is bit for
-// bit the same.
-//
-// Adapted from Strata (https://github.com/Niko1221/Strata @ 011c9e600, MIT, see licenses/LICENSE-strata):
-//   src/ngram/ple_reader.cpp             - block level dedup, offset ordering, row copy-out
-//   src/platform/direct_file.cpp:263-366 - blocking pread pool, the thread count is the queue depth
-// and from Strata-AC922 (https://github.com/eelgaev/Strata-AC922 @ 8eef05e18, MIT, see licenses/LICENSE-strata):
-//   include/strata/platform/thread_affinity.hpp - release_inherited_pin (the helper threads must not
-//   inherit the single CPU pin of the host thread)
+// Portions from Strata and its AC922 fork; Copyright (c) 2026 Niko1221 and the Strata contributors (MIT); see licenses/LICENSE-strata.
 
 #include "llama-ple-reader.h"
 #include "llama-impl.h"
@@ -30,9 +18,6 @@
 #include <utility>
 #include <vector>
 
-// the reader needs a POSIX file descriptor: it works on Linux, macOS and the other unices. The
-// NUMA aware placement of the read threads uses the Linux procfs and sysfs, on the other systems
-// the threads are not pinned.
 #if defined(_WIN32)
 #  define LLAMA_PLE_POSIX 0
 #else
@@ -50,40 +35,34 @@
 
 namespace {
 
-// the read threads block in pread, so the thread count is the queue depth of the reader
 constexpr int PLE_READER_THREADS = 64;
 
-// the logical block sizes the reader probes, smallest first
 constexpr size_t PLE_BLOCK_SIZES[] = { 512, 4096 };
 
-// a copy of one row from a slot buffer into the destination buffer
 struct ple_copy {
-    uint32_t src_rel;  // offset inside the slot buffer
-    uint32_t dst_rel;  // offset inside the destination buffer
-    uint32_t len;      // bytes to copy
+    uint32_t src_rel;
+    uint32_t dst_rel;
+    uint32_t len;
 };
 
-// one read: a block aligned range of the file, plus the rows to copy out of it
 struct ple_task {
-    uint64_t off;      // file offset of the read
-    size_t   len;      // bytes to read
-    uint8_t * buf;     // slot buffer
-    uint32_t slot;     // index of the slot
+    uint64_t off;
+    size_t   len;
+    uint8_t * buf;
+    uint32_t slot;
     uint32_t first_copy;
     uint32_t n_copies;
 };
 
-// one group of rows that share the first block of their file range
 struct ple_group {
-    uint64_t off;      // file offset of the first block
-    size_t   len;      // bytes to read
+    uint64_t off;
+    size_t   len;
     uint32_t first_copy;
     uint32_t n_copies;
 };
 
 #if defined(__linux__)
 
-// parse a list of CPU numbers ("0-3,8,12-15")
 static std::vector<int> ple_parse_cpu_list(const char * p) {
     std::vector<int> cpus;
 
@@ -116,8 +95,6 @@ static std::vector<int> ple_parse_cpu_list(const char * p) {
     return cpus;
 }
 
-// the CPUs of the cpuset this process may run on: the list of /proc/self/status, not the affinity
-// of the thread that opens the reader (that one may be pinned to a single CPU)
 static std::vector<int> ple_cpuset_cpus() {
     std::vector<int> cpus;
 
@@ -133,7 +110,7 @@ static std::vector<int> ple_cpuset_cpus() {
     }
 
     if (cpus.empty()) {
-        // no procfs: the affinity of the calling thread is the best that is left
+
         cpu_set_t set;
         CPU_ZERO(&set);
         if (sched_getaffinity(0, sizeof(set), &set) == 0) {
@@ -148,7 +125,6 @@ static std::vector<int> ple_cpuset_cpus() {
     return cpus;
 }
 
-// the CPUs of every NUMA node of the cpuset, from /sys/devices/system/node/nodeN/cpulist
 static std::vector<std::vector<int>> ple_cpus_by_node(const std::vector<int> & allowed) {
     std::vector<std::pair<int, std::vector<int>>> nodes;
 
@@ -200,8 +176,6 @@ static std::vector<std::vector<int>> ple_cpus_by_node(const std::vector<int> & a
     return res;
 }
 
-// the CPU of every read thread: the threads are spread over the NUMA nodes of the cpuset, half of
-// them on each node, so that the reads of the two sockets do not queue up on one of them
 static std::vector<int> ple_thread_cpus(const std::vector<int> & allowed, int n_threads, std::vector<int> & threads_per_node) {
     std::vector<int> cpus(n_threads, -1);
     threads_per_node.clear();
@@ -213,7 +187,7 @@ static std::vector<int> ple_thread_cpus(const std::vector<int> & allowed, int n_
     const std::vector<std::vector<int>> by_node = ple_cpus_by_node(allowed);
 
     if (by_node.empty()) {
-        // no NUMA information: spread the threads over the allowed CPUs
+
         for (int i = 0; i < n_threads; ++i) {
             cpus[i] = allowed[i % allowed.size()];
         }
@@ -233,7 +207,6 @@ static std::vector<int> ple_thread_cpus(const std::vector<int> & allowed, int n_
     return cpus;
 }
 
-// set the affinity of the calling thread
 static void ple_set_affinity(const std::vector<int> & cpus) {
     if (cpus.empty()) {
         return;
@@ -246,11 +219,8 @@ static void ple_set_affinity(const std::vector<int> & cpus) {
     pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
-#endif // __linux__
+#endif
 
-// read the whole range: a signal (EINTR) is retried, a short read is continued. A short read at
-//   the end of the file is the end of the data: an unaligned read would fail with O_DIRECT, so the
-//   rest is not read there and the caller sees the bytes that are there.
 static ssize_t ple_read_range(int fd, uint8_t * buf, size_t len, uint64_t off, uint64_t file_size, bool direct, size_t block_size, int & err) {
     size_t done = 0;
 
@@ -258,23 +228,21 @@ static ssize_t ple_read_range(int fd, uint8_t * buf, size_t len, uint64_t off, u
         const ssize_t n = pread(fd, buf + done, len - done, (off_t) (off + done));
         if (n < 0) {
             if (errno == EINTR) {
-                continue; // interrupted by a signal: read the rest
+                continue;
             }
             err = errno;
             return -1;
         }
         if (n == 0) {
-            break; // end of the file
+            break;
         }
         done += (size_t) n;
         if (done < len) {
             if (off + done >= file_size) {
-                break; // the file ends here
+                break;
             }
             if (direct) {
-                // O_DIRECT reads whole blocks: a short read that is still block aligned is read
-                // on, the rest of the range, a partial block means the device stopped in the
-                // middle of a block and the range can not be read
+
                 if (block_size == 0 || done % block_size != 0) {
                     break;
                 }
@@ -290,7 +258,7 @@ class ple_reader_impl {
 public:
     ~ple_reader_impl() {
         {
-            // no batch may run while the reader goes away
+
             std::lock_guard<std::mutex> batch_lock(mtx_batch);
             closed = true;
         }
@@ -312,7 +280,6 @@ public:
         }
     }
 
-    // open the table file, probe the logical block size and start the read threads
     bool init(const llama_ple_reader & spec) {
         file      = spec.file;
         offset    = spec.offset;
@@ -336,7 +303,7 @@ public:
         ok = true;
 
         {
-            // the threads per NUMA node, so that the placement can be checked in the log
+
             std::string nodes;
             for (size_t i = 0; i < threads_per_node.size(); ++i) {
                 nodes += (i ? ", " : "") + std::to_string(threads_per_node[i]);
@@ -351,7 +318,6 @@ public:
         return true;
     }
 
-    // true when the reader still describes the same table
     bool matches(const llama_ple_reader & spec) const {
         return file      == spec.file &&
                offset    == spec.offset &&
@@ -364,7 +330,7 @@ public:
     }
 
     bool read_rows(const int32_t * rows, size_t n, uint8_t * dst) {
-        // one batch at a time: several contexts share one model and one reader
+
         std::lock_guard<std::mutex> batch_lock(mtx_batch);
 
         if (!ok || closed) {
@@ -400,7 +366,7 @@ public:
         }
 
         if (!direct) {
-            // the capability branch: the pages of the table must not stay in the page cache
+
 #ifdef POSIX_FADV_DONTNEED
             for (const auto & g : groups) {
                 posix_fadvise(fd, (off_t) g.off, (off_t) g.len, POSIX_FADV_DONTNEED);
@@ -445,7 +411,7 @@ private:
                 direct     = true;
                 block_size = bs;
             } else {
-                // the file opened with O_DIRECT but no aligned read worked: fall back to the page cache
+
                 close(fd_try);
                 fd_try = open(file.c_str(), O_RDONLY);
                 if (fd_try < 0) {
@@ -467,11 +433,11 @@ private:
                         __func__, file.c_str(), strerror(err));
                 return false;
             }
-            // capability branch: the file system has no O_DIRECT (tmpfs, some overlay mounts)
+
             LLAMA_LOG_WARN("%s: '%s' does not support O_DIRECT (%s), reading through the page cache and dropping the pages of every batch\n",
                     __func__, file.c_str(), strerror(err));
 #else
-            // the platform has no O_DIRECT at all: the reader reads through the page cache
+
             LLAMA_LOG_WARN("%s: '%s' is read through the page cache, the platform has no O_DIRECT\n",
                     __func__, file.c_str());
 #endif
@@ -505,7 +471,6 @@ private:
         return true;
     }
 
-    // the logical block size of the device: the smallest aligned read that the kernel accepts
     static bool probe_block_size(int fd, size_t & block) {
         for (size_t bs : PLE_BLOCK_SIZES) {
             void * buf = nullptr;
@@ -527,7 +492,7 @@ private:
     }
 
     bool start_workers() {
-        // a row that starts at the end of a block spans one more block than its length needs
+
         const size_t span       = (row_bytes + block_size - 1) / block_size;
         const size_t slot_bytes = (span + 1)*block_size;
 
@@ -549,12 +514,11 @@ private:
         }
 
 #if defined(__linux__)
-        // the threads run on the CPUs of the cpuset, spread over its NUMA nodes
+
         cpuset       = ple_cpuset_cpus();
         thread_cpus  = ple_thread_cpus(cpuset, PLE_READER_THREADS, threads_per_node);
 #else
-        // the platform has no NUMA information for the threads: they run where the scheduler puts
-        // them
+
         threads_per_node.assign(1, PLE_READER_THREADS);
 #endif
 
@@ -566,7 +530,6 @@ private:
         return true;
     }
 
-    // group the requested rows into block aligned reads and collect the copies out of them
     bool build_plan(const int32_t * rows, size_t n) {
         order.clear();
         order.reserve(n);
@@ -583,7 +546,6 @@ private:
         copies.clear();
         n_unique = 0;
 
-        // the rows are sorted, so the rows of one block are adjacent: one read serves all of them
         size_t i = 0;
         while (i < order.size()) {
             const uint64_t b0 = (offset + (uint64_t) order[i].first * row_bytes) / block_size;
@@ -601,7 +563,7 @@ private:
                 const uint64_t file_off = offset + (uint64_t) row * row_bytes;
 
                 if (file_off / block_size != b0) {
-                    break; // the next row starts in another block
+                    break;
                 }
 
                 b1_max = std::max(b1_max, (file_off + row_bytes - 1) / block_size);
@@ -660,7 +622,7 @@ private:
 
     void worker(int id) {
 #if defined(__linux__)
-        // the read threads must not inherit the pin of the host thread (Strata-AC922: 10x on POWER9)
+
         ple_set_affinity(cpuset);
         if ((size_t) id < thread_cpus.size() && thread_cpus[id] >= 0) {
             ple_set_affinity({ thread_cpus[id] });
@@ -690,7 +652,7 @@ private:
 
             double cur = max_latency_ms.load();
             while (ms > cur && !max_latency_ms.compare_exchange_weak(cur, ms)) {
-                // retry with the value another thread stored
+
             }
 
             if (nread < 0) {
@@ -720,7 +682,6 @@ private:
         }
     }
 
-    // the table
     std::string file;
     size_t      offset    = 0;
     size_t      n_rows    = 0;
@@ -733,7 +694,6 @@ private:
     size_t block_size = 0;
     uint64_t file_size = 0;
 
-    // the read pool
     std::vector<std::thread> workers;
     std::vector<uint8_t *>   slots;
     std::deque<ple_task>     queue;
@@ -744,7 +704,6 @@ private:
     int                      n_pending = 0;
     bool                     stop      = false;
 
-    // the batch that is in flight
     mutable std::mutex   mtx_batch;
     std::vector<std::pair<int32_t, uint32_t>> order;
     std::vector<ple_group>   groups;
@@ -752,7 +711,6 @@ private:
     uint8_t *                cur_dst   = nullptr;
     size_t                   n_unique  = 0;
 
-    // the counters
     std::atomic<uint64_t> bytes_read    { 0 };
     std::atomic<double>   max_latency_ms { 0.0 };
     std::atomic<bool>     failed        { false };
@@ -761,13 +719,12 @@ private:
     llama_ple_reader::stats st;
 
 #if defined(__linux__)
-    std::vector<int> cpuset;       // the CPUs of the cpuset
-    std::vector<int> thread_cpus;  // the CPU of every read thread
+    std::vector<int> cpuset;
+    std::vector<int> thread_cpus;
 #endif
-    std::vector<int> threads_per_node; // the number of read threads per NUMA node
+    std::vector<int> threads_per_node;
 };
 
-// one implementation per reader: the reader itself only carries the description of the table
 std::mutex g_impl_mtx;
 std::unordered_map<const llama_ple_reader *, std::unique_ptr<ple_reader_impl>> g_impls;
 
@@ -779,7 +736,7 @@ static ple_reader_impl * ple_impl_for(const llama_ple_reader * reader, bool crea
         if (it->second->matches(*reader)) {
             return it->second.get();
         }
-        // the address was reused by another table: drop the old reader
+
         g_impls.erase(it);
     }
 
@@ -796,9 +753,9 @@ static ple_reader_impl * ple_impl_for(const llama_ple_reader * reader, bool crea
     return res;
 }
 
-} // namespace
+}
 
-#endif // LLAMA_PLE_POSIX
+#endif
 
 bool llama_ple_reader::read_rows(const int32_t * rows, size_t n, uint8_t * dst) {
 #if !LLAMA_PLE_POSIX
@@ -817,8 +774,6 @@ bool llama_ple_reader::read_rows(const int32_t * rows, size_t n, uint8_t * dst) 
 #endif
 }
 
-// open the file of the table and start the read threads: the load calls it, so a table that can
-// not be read stops the load instead of the first decode
 bool llama_ple_reader::init() {
 #if !LLAMA_PLE_POSIX
     LLAMA_LOG_ERROR("%s: the n-gram table reader needs O_DIRECT and is not available on this platform\n", __func__);
@@ -857,7 +812,7 @@ bool llama_ple_reader::is_direct() const {
 
 llama_ple_reader::~llama_ple_reader() {
 #if LLAMA_PLE_POSIX
-    // the model that owns the reader is going away: stop the read threads and close the file
+
     std::lock_guard<std::mutex> lock(g_impl_mtx);
     g_impls.erase(this);
 #endif

@@ -1,17 +1,9 @@
 
 
-
-
-
-
-
 #include "fused-expert-scale.cuh"
 #include "mmq.cuh"
 
 #define FES_BLOCK 256
-
-
-
 
 __global__ void fused_expert_x16_scaled_kernel(
         const float * __restrict__ x, __half * __restrict__ y, int32_t * __restrict__ row_k,
@@ -42,8 +34,6 @@ __global__ void fused_expert_x16_scaled_kernel(
         m = warp_reduce_max<FES_BLOCK / 32>(m);
         if (lane == 0) {
 
-
-
             int k = 0;
             if (isfinite(m) && m > 65504.0f) {
                 int e;
@@ -58,7 +48,6 @@ __global__ void fused_expert_x16_scaled_kernel(
     const int k = k_shared;
     __half * yr = y + row * ne0;
     if (k == 0) {
-
 
         for (int64_t i = threadIdx.x; i < ne0; i += FES_BLOCK) {
             yr[i] = __float2half_rn(xr[i] * 1.0f);

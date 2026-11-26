@@ -1,3 +1,4 @@
+// Portions from Strata and its AC922 fork; Copyright (c) 2026 Niko1221 and the Strata contributors (MIT); see licenses/LICENSE-strata.
 #include "moe-grouped.cuh"
 
 #include "mmid.cuh"
@@ -6,18 +7,6 @@
 #include "ggml-cuda-expert.cuh"
 
 #include <cstdint>
-
-// Grouped-expert MUL_MAT_ID kernel for Volta (sm_70).
-//
-// The kernel structure follows Strata's src/kernels/cuda/s2_expert_grouped.cu (MIT license):
-// the activation rows of the (token, expert) entries routed to one expert are staged into
-// shared memory, then a warp computes one output row against all staged entries. No column
-// is padded to a fixed tile, unlike the MMQ MUL_MAT_ID path which pads every expert to a J
-// wide tile. The weight row is read once per staged group and reused across the group.
-//
-// Both decode (T <= 8) and prefill use this kernel. The staged group width is picked at
-// launch time (MOE_GROUPED_CT_DECODE / MOE_GROUPED_CT_PREFILL); the column loop keeps a hot
-// expert correct when it receives more columns than the group width.
 
 template <ggml_type type>
 struct moe_grouped_traits;
@@ -39,10 +28,6 @@ MOE_GROUPED_TRAITS(GGML_TYPE_Q5_K, QK_K,  QI5_K, VDR_Q5_K_Q8_1_MMVQ, block_q5_K,
 MOE_GROUPED_TRAITS(GGML_TYPE_Q6_K, QK_K,  QI6_K, VDR_Q6_K_Q8_1_MMVQ, block_q6_K, vec_dot_q6_K_q8_1)
 MOE_GROUPED_TRAITS(GGML_TYPE_Q5_1, QK5_1, QI5_1, VDR_Q5_1_Q8_1_MMVQ, block_q5_1, vec_dot_q5_1_q8_1)
 MOE_GROUPED_TRAITS(GGML_TYPE_Q8_0, QK8_0, QI8_0, VDR_Q8_0_Q8_1_MMVQ, block_q8_0, vec_dot_q8_0_q8_1)
-
-
-
-
 
 template <ggml_type type, int ROWS, int CT, bool expert_store>
 __launch_bounds__(256, 1)
@@ -67,8 +52,6 @@ static __global__ void moe_grouped_kernel(
         return;
     }
 
-
-
     const char * expert_base;
     if constexpr (expert_store) {
         expert_base = expert_ptrs[expert];
@@ -80,7 +63,6 @@ static __global__ void moe_grouped_kernel(
     const int warp   = threadIdx.x / 32;
     const int nwarps = blockDim.x / 32;
     const int row0   = blockIdx.x * ROWS;
-
 
     constexpr int blocks_per_iter = vdr * 32 / qi;
     const int     kbx0            = lane / (qi / vdr);
@@ -109,7 +91,6 @@ static __global__ void moe_grouped_kernel(
             float acc[CT] = {0.0f};
             for (int kbx = kbx0; kbx < nblocks_weight; kbx += blocks_per_iter) {
 
-
                 const char * wb = wrow + (size_t) kbx * bs;
 #pragma unroll
                 for (int e = 0; e < CT; ++e) {
@@ -133,7 +114,6 @@ static __global__ void moe_grouped_kernel(
     }
 }
 
-
 bool ggml_cuda_moe_grouped_mul_mat_id_supported(const ggml_tensor * dst, const int cc) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -155,11 +135,6 @@ bool ggml_cuda_moe_grouped_mul_mat_id_supported(const ggml_tensor * dst, const i
         default:
             return false;
     }
-
-
-
-
-
 
     if (dst->ne[2] <= MOE_GROUPED_MAX_TOKENS) {
         return false;
@@ -206,7 +181,6 @@ static void moe_grouped_launch_ct(
     const dim3 grid((nrows_x + ROWS - 1) / ROWS, n_experts);
     const dim3 block(256);
 
-
 #if !defined(GGML_USE_HIP)
     CUDA_CHECK(cudaFuncSetAttribute((moe_grouped_kernel<type, ROWS, CT, expert_store>),
         cudaFuncAttributeMaxDynamicSharedMemorySize, (int) nbytes_shared));
@@ -224,11 +198,6 @@ static void moe_grouped_launch(
         const int64_t nb01, const int64_t nb02, const int64_t dst_stride_col, const int n_experts, cudaStream_t stream,
         const char * const * expert_ptrs, const int64_t ncols_avg) {
 
-
-
-
-
-
     const size_t smpbo = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
     const bool prefill = ncols_avg > MOE_GROUPED_CT_DECODE &&
         (size_t) MOE_GROUPED_CT_PREFILL * nblocks_row_q8 * sizeof(block_q8_1) <= smpbo;
@@ -241,8 +210,6 @@ static void moe_grouped_launch(
             nrows_x, nblocks_weight, nblocks_row_q8, nb01, nb02, dst_stride_col, n_experts, stream, expert_ptrs);
     }
 }
-
-
 
 template <ggml_type type>
 static void moe_grouped_launch_dispatch(
@@ -278,16 +245,11 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
 
     cudaStream_t stream = ctx.stream();
 
-
-
     const int64_t nblocks_row_q8 = GGML_PAD(ne10, MATRIX_ROW_PADDING) / QK8_1;
     const int64_t nbytes_shared  = MOE_GROUPED_CT_DECODE * nblocks_row_q8 * (int64_t) sizeof(block_q8_1);
     if (nbytes_shared > (int64_t) ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo) {
         return false;
     }
-
-
-
 
     const int64_t n_experts = ggml_cuda_mul_mat_id_n_expert_density(dst);
     const int64_t ncols_avg = (ne12 * n_expert_used + n_experts - 1) / n_experts;
@@ -297,12 +259,7 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
     ggml_cuda_pool_alloc<int32_t> expert_fill(ctx.pool(), ne02);
 
-
-
-
     const ggml_cuda_expert_lut lut = ggml_cuda_mul_mat_id_lut(ctx, dst);
-
-
 
     if (ggml_mul_mat_id_is_expert_parallel(dst) && ctx.moe_reduce_local_slots != dst) {
 
@@ -317,11 +274,10 @@ bool ggml_cuda_moe_grouped_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tens
         const int sis1 = nb12 / nb11;
 
         ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(),
-            expert_bounds.get(), expert_fill.get(), ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/false,
+            expert_bounds.get(), expert_fill.get(), ne02, ne12, n_expert_used, ne11, si1, sis1,                    false,
             lut, stream);
         CUDA_CHECK(cudaGetLastError());
     }
-
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne11*ne12 * ne10_padded * sizeof(block_q8_1) / QK8_1);

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import ModelLoadHighlight from '../ModelLoadHighlight.svelte';
 	import { ChevronDown, Loader2 } from '@lucide/svelte';
 	import {
@@ -108,7 +109,7 @@
 				modelId={selectedOption.model}
 			/>
 		{:else}
-			<span class="min-w-0 font-medium">Select model</span>
+			<span class="min-w-0 font-medium">{tr("Select model")}</span>
 		{/if}
 	</span>
 
@@ -198,7 +199,7 @@
 					<DropdownMenu.Item class="gap-2" onSelect={handleManageModels}>
 						<MODEL_ICON class="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
 
-						Manage models
+						{tr("Manage models")}
 					</DropdownMenu.Item>
 				</DropdownMenu.Group>
 			{/snippet}

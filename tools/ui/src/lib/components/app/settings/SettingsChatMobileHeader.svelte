@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { ScrollCarousel } from '$lib/components/app';
 	import { ICON_CLASS_DEFAULT, UI_DATA_ATTRS } from '$lib/constants';
 	import { BooleanString } from '$lib/enums';
@@ -53,7 +54,7 @@
 				>
 					<section.icon class="{ICON_CLASS_DEFAULT} flex-shrink-0" />
 
-					<span>{section.title}</span>
+					<span>{tr(section.title)}</span>
 				</button>
 			{/each}
 		</ScrollCarousel>

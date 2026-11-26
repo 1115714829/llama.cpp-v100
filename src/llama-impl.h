@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ggml.h" // for ggml_log_level
+#include "ggml.h"
 
 #include <string>
 #include <type_traits>
@@ -16,10 +16,6 @@
 #    define LLAMA_ATTRIBUTE_FORMAT(...)
 #endif
 
-//
-// logging
-//
-
 LLAMA_ATTRIBUTE_FORMAT(2, 3)
 void llama_log_internal        (ggml_log_level level, const char * format, ...);
 void llama_log_callback_default(ggml_log_level level, const char * text, void * user_data);
@@ -30,10 +26,6 @@ void llama_log_callback_default(ggml_log_level level, const char * text, void * 
 #define LLAMA_LOG_ERROR(...) llama_log_internal(GGML_LOG_LEVEL_ERROR, __VA_ARGS__)
 #define LLAMA_LOG_DEBUG(...) llama_log_internal(GGML_LOG_LEVEL_DEBUG, __VA_ARGS__)
 #define LLAMA_LOG_CONT(...)  llama_log_internal(GGML_LOG_LEVEL_CONT , __VA_ARGS__)
-
-//
-// helpers
-//
 
 template <typename T>
 struct no_init {
@@ -74,7 +66,6 @@ static inline ggml_tensor * llama_mul_mat_hadamard(
     return res;
 }
 
-// Prefetch the host pages needed to gather these rows.
 void llama_prefetch_rows(const ggml_tensor * tensor, const int32_t * rows, size_t n_rows);
 
 struct time_meas {
@@ -100,11 +91,10 @@ void llama_clear_tensor_data(ggml_tensor * t, size_t offset, size_t size);
 
 void replace_all(std::string & s, const std::string & search, const std::string & replace);
 
-// TODO: rename to llama_format ?
 LLAMA_ATTRIBUTE_FORMAT(1, 2)
 std::string format(const char * fmt, ...);
 
 std::string llama_format_tensor_shape(const std::vector<int64_t> & ne);
 std::string llama_format_tensor_shape(const struct ggml_tensor * t);
 
-std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i);
+std::string gguf_kv_to_str(const struct gguf_context * ctx_gguf, int i, size_t max_len = SIZE_MAX);

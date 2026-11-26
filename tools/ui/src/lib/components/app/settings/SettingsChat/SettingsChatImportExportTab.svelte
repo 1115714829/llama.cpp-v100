@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import SettingsChatImportExportSection from './SettingsChatImportExportSection.svelte';
 	import { Download, Trash2, Upload } from '@lucide/svelte';
 	import {
@@ -258,7 +259,7 @@
 </script>
 
 <div in:fade={{ duration: 150 }} class="space-y-12">
-	<SettingsGroup title="Conversations">
+	<SettingsGroup title={tr("Conversations")}>
 		<SettingsChatImportExportSection
 			IconComponent={Download}
 			buttonText="Export conversations"
@@ -289,7 +290,7 @@
 		/>
 	</SettingsGroup>
 
-	<SettingsGroup title="Settings">
+	<SettingsGroup title={tr("Settings")}>
 		<SettingsChatImportExportSection
 			IconComponent={Download}
 			buttonText="Export settings"

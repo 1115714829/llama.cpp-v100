@@ -38,6 +38,7 @@ RUN source /opt/rh/gcc-toolset-12/enable && \
         -DLLAMA_BUILD_TESTS=OFF \
         -DLLAMA_BUILD_EXAMPLES=OFF \
         -DLLAMA_BUILD_UI=OFF \
+        -DLLAMA_USE_PREBUILT_UI=OFF \
         -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
         -DCMAKE_INSTALL_RPATH='$ORIGIN' \
         -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON 2>&1 | tee cmake.log && \

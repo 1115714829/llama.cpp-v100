@@ -1,9 +1,5 @@
 llama_add_compile_flags()
 
-
-
-
-
 find_package(Threads REQUIRED)
 
 # Optional args:
@@ -234,7 +230,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     #       this branch and run them on all platforms
     llama_build(test-llama-archs.cpp)
 
-
     llama_build_and_test(test-expert-assign.cpp)
     target_include_directories(test-expert-assign PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
@@ -262,7 +257,6 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         FIXTURES_REQUIRED generate-models
         ENVIRONMENT "GGML_SCHED_DEBUG_REALLOC=1"
     )
-
 
     llama_build(test-kpool-layout.cpp)
     llama_test(
@@ -338,7 +332,6 @@ llama_build(test-backend-ops.cpp LINK ggml Threads::Threads)
 
 target_include_directories(test-backend-ops PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
-
 if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-expert-store.cpp)
     target_include_directories(test-expert-store PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
@@ -355,17 +348,12 @@ endif()
 
 llama_build_and_test(test-sched-pipeline.cpp)
 
-
-
-
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-ple-reader.cpp)
     target_include_directories(test-ple-reader PRIVATE ${PROJECT_SOURCE_DIR}/src)
 endif()
 
-
 llama_build(test-cuda-allreduce.cpp)
-
 
 if (GGML_CUDA)
     llama_build_and_test(test-cuda-host-register.cpp)

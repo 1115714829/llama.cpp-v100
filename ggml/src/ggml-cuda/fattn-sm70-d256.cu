@@ -1,12 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2026 the llama.cpp authors
 // SPDX-License-Identifier: MIT
-//
-// SM70 (Volta) D256 Split-D prefill attention, host side: dispatch predicate,
-// scratch layout, K/V dequant (F16 read in place, Q8_0 or Q4_0 mirrored to f16),
-// Q staging, mask pre-scan, kernel launch and O scatter. Device kernel
-// provenance: fattn-sm70-d256-kernel.cuh.
-
-
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
@@ -18,11 +11,6 @@
 
 #include <climits>
 
-// NOTE: no anonymous namespace in this file. The CuTe vendor headers
-// (cute/atom/mma_traits_sm70.hpp) open their own anonymous namespaces; a second
-// one in this TU makes cudafe's _GLOBAL__N__<hash> symbol mangling ambiguous.
-
-
 #ifndef M_LOG2E
 #define M_LOG2E 1.4426950408889634
 #endif
@@ -30,35 +18,15 @@
 constexpr int SM70_D256_BLOCK_M = 64;
 constexpr int SM70_D256_D       = 256;
 
-
-
-
-
-
 #define SM70_D256_KV_WINDOW 131072
 static_assert(SM70_D256_KV_WINDOW % SM70_D256_BLOCK_M == 0, "window is not a multiple of the q block");
 
 static_assert(SM70_D256_KV_WINDOW == GGML_BACKEND_META_ASSIST_KV_WINDOW, "assist window mismatch");
 
-
-
-
-
-
-
-
-
 constexpr int SM70_D256_KV_SPLITS = 2;
 constexpr int SM70_D256_SPLIT_MIN_BLOCKS = 32;
 
-
-
-
 constexpr int SM70_D256_NSM = 80;
-
-
-
-
 
 __global__ void sm70_d256_stage_q_kernel(
         const float2 * __restrict__ src, half2 * __restrict__ dst,
@@ -83,13 +51,6 @@ __global__ void sm70_d256_stage_q_kernel(
         + (int64_t) head_q * q_pad * (SM70_D256_D/2)
         + (int64_t) r * (SM70_D256_D/2)] = __float22half2_rn(v);
 }
-
-
-
-
-
-
-
 
 template <bool Normalize = false>
 __global__ void sm70_d256_scatter_kernel(
@@ -123,18 +84,6 @@ __global__ void sm70_d256_scatter_kernel(
         + (int64_t) b * dst_batch] = v;
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 static constexpr int SM70_D256_MASK_BLOCK_N = 32;
 static constexpr int SM70_D256_MASK_SPLIT   = 8192;
 static_assert(SM70_D256_MASK_BLOCK_N == FLASH_NAMESPACE::Sm70D256SplitDTraits::kBlockN,
@@ -160,9 +109,6 @@ __global__ void sm70_d256_mask_bounds_kernel(
     int last_fin = -1;
     for (int row = row_begin; row < row_end; ++row) {
         const __half * mask_row = batch_mask + (int64_t) row * mask_row_stride;
-
-
-
 
 #pragma unroll
         for (int j = 0; j < SM70_D256_MASK_SPLIT / (8 * 256); ++j) {
@@ -226,7 +172,6 @@ __global__ void sm70_d256_mask_bounds_kernel(
         }
         int2 & b = bounds[(int64_t) batch * gridDim.x + q_block];
 
-
         if (first_nz < kv_len) {
             atomicMax(&b.x, kv_len - first_nz);
         }
@@ -235,9 +180,6 @@ __global__ void sm70_d256_mask_bounds_kernel(
         }
     }
 }
-
-
-
 
 __global__ void sm70_d256_range_bounds_kernel(
         const int4 * __restrict__ range, int2 * __restrict__ bounds,
@@ -248,7 +190,6 @@ __global__ void sm70_d256_range_bounds_kernel(
     const int batch   = blockIdx.y;
     const int row     = q_block * SM70_D256_BLOCK_M + threadIdx.x;
 
-
     int first_nz = kv_len;
     int last_fin = -1;
     if (row < q_len) {
@@ -257,8 +198,6 @@ __global__ void sm70_d256_range_bounds_kernel(
         const int hi0 = r.y < 0 ? 0 : (r.y > kv_len ? kv_len : r.y);
         const int lo1 = r.z < 0 ? 0 : (r.z > kv_len ? kv_len : r.z);
         const int hi1 = r.w < 0 ? 0 : (r.w > kv_len ? kv_len : r.w);
-
-
 
         const bool seg0 = hi0 > lo0;
         const bool seg1 = hi1 > lo1;
@@ -305,30 +244,10 @@ __global__ void sm70_d256_range_bounds_kernel(
 
         bounds[(int64_t) batch * gridDim.x + q_block] = make_int2(kv_len - first_nz, last_fin + 1);
 
-
-
         const int rows = ((last_fin + 1 + SM70_D256_MASK_BLOCK_N - 1) / SM70_D256_MASK_BLOCK_N) * SM70_D256_MASK_BLOCK_N;
         atomicMax(kv_limit, rows < kv_len ? rows : kv_len);
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #define SM70_D256_ASSIST_ROW_COST_NUM 9
 #define SM70_D256_ASSIST_ROW_COST_DEN 7
@@ -347,24 +266,6 @@ __global__ void sm70_d256_assist_split_kernel(int * __restrict__ kv_limit, ggml_
     split->s = s;
     *kv_limit = s;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 struct sm70_d256_scratch {
     size_t total;
@@ -400,13 +301,9 @@ static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst) {
 
     const bool need_f16_v = !(v_is_k_view && K->type == GGML_TYPE_F16) && V->type != GGML_TYPE_F16;
 
-
     const bool windowed = mask != nullptr && mask->type == GGML_TYPE_I32
         && (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0)
         && K->ne[1] > SM70_D256_KV_WINDOW;
-
-
-
 
     const int q_pad = (int) GGML_PAD(Q->ne[1], SM70_D256_BLOCK_M);
     const int64_t kv_len = mask == nullptr ? 0
@@ -430,8 +327,6 @@ static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst) {
     const char * base = (const char *) dst->data + ggml_nbytes(dst);
 
     if (windowed) {
-
-
 
         uintptr_t end = (uintptr_t) base;
         if (need_f16_k) {
@@ -475,12 +370,6 @@ static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst) {
     return s;
 }
 
-
-
-
-
-
-
 static void sm70_d256_dequant_kv_tensor(
         const ggml_tensor * t, half * dst, cudaStream_t stream) {
     const size_t ts = ggml_type_size(t->type);
@@ -489,15 +378,12 @@ static void sm70_d256_dequant_kv_tensor(
             t->nb[1] / ts, t->nb[2] / ts, t->nb[3] / ts, stream);
 }
 
-
-
 template <ggml_type type>
 struct sm70_d256_dequant_block;
 
 template <>
 struct sm70_d256_dequant_block<GGML_TYPE_Q8_0> {
     static constexpr int kBlockBytes = sizeof(block_q8_0);
-
 
     static __device__ __forceinline__ void decode(const char * block, const int iq, const float d, half2 * h) {
         const int8_t * qs = reinterpret_cast<const int8_t *>(block) + sizeof(__half);
@@ -517,9 +403,7 @@ struct sm70_d256_dequant_block<GGML_TYPE_Q4_0> {
                                  d * ((int) ((packed >> (8 + shift)) & 0xf) - 8));
     }
 
-
     static __device__ __forceinline__ void decode(const char * block, const int iq, const float d, half2 * h) {
-
 
         const char * codes = block + sizeof(__half) + (iq & 15);
         const uint32_t w0 = (uint32_t) *reinterpret_cast<const uint16_t *>(codes)
@@ -533,13 +417,6 @@ struct sm70_d256_dequant_block<GGML_TYPE_Q4_0> {
         h[3] = pair(w1 >> 16, shift, d);
     }
 };
-
-
-
-
-
-
-
 
 template <ggml_type type>
 static __global__ void sm70_d256_dequant_rows(
@@ -564,7 +441,6 @@ static __global__ void sm70_d256_dequant_rows(
     const int i2 = blockIdx.y;
     const int i3 = blockIdx.z;
 
-
     const int ib = lane / 4;
     const int iq = (lane % 4) * 8;
 
@@ -582,9 +458,6 @@ static __global__ void sm70_d256_dequant_rows(
     memcpy(&out.w, &h[3], sizeof(uint32_t));
     *reinterpret_cast<uint4 *>(dst_row + ib*32 + iq) = out;
 }
-
-
-
 
 static void sm70_d256_dequant_kv_window(
         const ggml_tensor * t, half * dst, const int * kv_limit,
@@ -606,13 +479,10 @@ static void sm70_d256_dequant_kv_window(
     CUDA_CHECK(cudaGetLastError());
 }
 
-
 static void sm70_d256_dequant_kv_partial(
         const ggml_tensor * t, half * dst, const int * kv_limit, cudaStream_t stream) {
     sm70_d256_dequant_kv_window(t, dst, kv_limit, 0, (int) t->ne[1], stream);
 }
-
-
 
 static bool sm70_d256_kv_type_ok(const ggml_tensor * t) {
     if (t->type == GGML_TYPE_F16) {
@@ -651,7 +521,6 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
     if (Q->ne[2] % K->ne[2] != 0 || K->ne[2] != V->ne[2] || K->ne[3] != Q->ne[3] || V->ne[3] != Q->ne[3]) {
         return false;
     }
-
 
     const bool mask_range = mask && mask->type == GGML_TYPE_I32;
     if (!mask || (mask->type != GGML_TYPE_F16 && !mask_range) || mask->ne[2] != 1) {
@@ -692,9 +561,6 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
         return false;
     }
 
-
-
-
     if (Q->nb[0] != sizeof(float) ||
         Q->nb[1] % sizeof(float2) != 0 || Q->nb[2] % sizeof(float2) != 0 ||
         Q->nb[3] % sizeof(float2) != 0 || (uintptr_t) Q->data % 8 != 0) {
@@ -705,19 +571,6 @@ bool ggml_cuda_sm70_d256_supported(int cc, const ggml_tensor * dst) {
     }
     return true;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 template <bool Partial>
 static void sm70_d256_launch_dense(
@@ -748,8 +601,6 @@ static void sm70_d256_launch_dense(
 
     const dim3 block(Traits::kNThreads);
     const dim3 grid(q_pad / Traits::kBlockM, batch * kv_splits, heads_q);
-
-
 
     if (kv_splits > 1) {
         auto kernel_split = FLASH_NAMESPACE::sm70_d256_splitd_dense_kernel<Traits, El, float, false, Partial, SM70_D256_KV_SPLITS>;
@@ -808,24 +659,10 @@ void ggml_cuda_sm70_d256_launch_raw(
         stream);
 }
 
-// ---------------------------------------------------------------------------
-// Meta assist: cross-device epochs, idle-rank workspace and idle-rank run
-// ---------------------------------------------------------------------------
-
-
-
-
 static __global__ void sm70_d256_assist_signal(uint32_t * epoch) {
     __threadfence_system();
     atomicAdd(epoch, 1);
 }
-
-
-
-
-
-
-
 
 static __global__ void sm70_d256_assist_wait(volatile uint32_t * epoch, uint32_t * gen, uint32_t bump, uint32_t lag) {
     if (threadIdx.x != 0) {
@@ -850,8 +687,6 @@ static void sm70_d256_assist_wait_launch(volatile uint32_t * epoch, uint32_t * g
     CUDA_CHECK(cudaGetLastError());
 }
 
-
-
 __global__ void sm70_d256_assist_read_split(volatile const ggml_backend_meta_assist_split * __restrict__ src,
         ggml_backend_meta_assist_split * __restrict__ dst) {
     if (threadIdx.x == 0) {
@@ -863,10 +698,6 @@ __global__ void sm70_d256_assist_read_split(volatile const ggml_backend_meta_ass
         dst->s      = split;
     }
 }
-
-
-
-
 
 __global__ void sm70_d256_fetch_rows(
         const char * __restrict__ src, char * __restrict__ dst,
@@ -888,8 +719,6 @@ __global__ void sm70_d256_fetch_rows(
     }
 }
 
-
-
 __global__ void sm70_d256_assist_clear_partial(
         float * __restrict__ out, float * __restrict__ pmax, float * __restrict__ psum,
         const int64_t rows) {
@@ -902,12 +731,6 @@ __global__ void sm70_d256_assist_clear_partial(
         psum[i] = 0.0f;
     }
 }
-
-
-
-
-
-
 
 struct sm70_d256_assist_workspace {
     size_t total;
@@ -956,9 +779,6 @@ size_t ggml_cuda_sm70_d256_assist_workspace_size(int q_pad, int heads_q) {
 
     return sm70_d256_assist_get_workspace(q_pad, heads_q, GGML_TYPE_Q8_0).total;
 }
-
-
-
 
 template <ggml_type type>
 static void sm70_d256_dequant_staging_window(
@@ -1026,15 +846,11 @@ bool ggml_cuda_sm70_d256_assist_run(void * backend, const ggml_backend_meta_assi
     const unsigned fetch_blocks = (unsigned) (((int64_t) SM70_D256_KV_WINDOW * (row_bytes / 16) + 255) / 256);
     const unsigned clear_blocks = (unsigned) std::min<int64_t>((w.rows * SM70_D256_D + 255) / 256, 65535);
 
-
-
-
     for (int j = 0; j < d->n_owners; ++j) {
         GGML_ASSERT(d->k_src[j] != nullptr && d->v_src[j] != nullptr && d->qs_src[j] != nullptr);
         GGML_ASSERT(d->p_out_dst[j] != nullptr && d->p_max_dst[j] != nullptr && d->p_sum_dst[j] != nullptr);
         GGML_ASSERT(d->epoch_kv[j] != nullptr && d->epoch_partial[j] != nullptr && d->epoch_free[j] != nullptr);
         GGML_ASSERT(d->gen[j] != nullptr && d->free_lag[j] <= 1 && d->split_src[j] != nullptr);
-
 
         sm70_d256_assist_wait_launch(d->epoch_kv[j], d->gen[j], 1, 0, stream);
         sm70_d256_assist_read_split<<<1, 32, 0, stream>>>(d->split_src[j], split);
@@ -1050,10 +866,6 @@ bool ggml_cuda_sm70_d256_assist_run(void * backend, const ggml_backend_meta_assi
             CUDA_CHECK(cudaGetLastError());
         }
 
-
-
-
-
         sm70_d256_assist_wait_launch(d->epoch_free[j], d->gen[j], 0, d->free_lag[j], stream);
         sm70_d256_assist_clear_partial<<<clear_blocks, 256, 0, stream>>>(
             d->p_out_dst[j], d->p_max_dst[j], d->p_sum_dst[j], w.rows);
@@ -1063,7 +875,6 @@ bool ggml_cuda_sm70_d256_assist_run(void * backend, const ggml_backend_meta_assi
             const int win_lo = wi * SM70_D256_KV_WINDOW;
             const int rows_left = d->kv_view - win_lo;
             const int win_rows = rows_left < SM70_D256_KV_WINDOW ? rows_left : SM70_D256_KV_WINDOW;
-
 
             sm70_d256_fetch_rows<<<fetch_blocks, 256, 0, stream>>>(
                 (const char *) d->k_src[j], stage_k, split, win_lo, win_rows, (int) row_bytes);
@@ -1107,9 +918,6 @@ bool ggml_cuda_sm70_d256_assist_run(void * backend, const ggml_backend_meta_assi
                 kv_lo, kv_hi,
                 stream);
 
-
-
-
             FLASH_NAMESPACE::sm70_d256_window_merge_kernel<<<n_merge, 256, 0, stream>>>(
                 d->p_out_dst[j], d->p_max_dst[j], d->p_sum_dst[j],
                 win_out, win_max, win_sum,
@@ -1125,9 +933,6 @@ bool ggml_cuda_sm70_d256_assist_run(void * backend, const ggml_backend_meta_assi
 size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
     return sm70_d256_get_scratch(dst).total;
 }
-
-
-
 
 bool ggml_cuda_sm70_d256_assist_scratch_layout(const ggml_tensor * dst, ggml_backend_meta_assist_scratch * layout) {
     if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT || layout == nullptr) {
@@ -1177,10 +982,6 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
 
     cudaStream_t stream = ctx.stream();
 
-
-
-
-
     const ggml_backend_meta_assist_rank * const assist = ctx.assist;
     const bool assist_owner = assist != nullptr && assist->role == 0;
     if (assist_owner && !scratch.windowed) {
@@ -1189,9 +990,6 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     }
 
     if (scratch.windowed) {
-
-
-
 
         if (assist_owner) {
             GGML_ASSERT(assist->batch == 1 && assist->q_pad == q_pad && assist->q_len == q_len);
@@ -1214,9 +1012,6 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 Q->nb[1] / sizeof(float2), Q->nb[2] / sizeof(float2), Q->nb[3] / sizeof(float2));
             CUDA_CHECK(cudaGetLastError());
         }
-
-
-
 
         {
             const dim3 grid(scratch.n_q_blocks, batch);
@@ -1244,16 +1039,9 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         float * const p_max   = (float *) (base + scratch.p_max_offset);
         float * const p_sum   = (float *) (base + scratch.p_sum_offset);
 
-
-
-
-
         const int m_blocks = q_pad / SM70_D256_BLOCK_M;
         const int window_ctas = m_blocks * batch * heads_q;
         const bool split_window = window_ctas < 4 * SM70_D256_NSM;
-
-
-
 
         const int64_t n_kv_rows = K->ne[1];
         const int n_win = (int) ((n_kv_rows + SM70_D256_KV_WINDOW - 1) / SM70_D256_KV_WINDOW);
@@ -1262,24 +1050,16 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             const int64_t rows_left = n_kv_rows - row_lo;
             const int win_rows = (int) (rows_left < SM70_D256_KV_WINDOW ? rows_left : SM70_D256_KV_WINDOW);
 
-
-
-
-
             const int win_blocks =
                 (win_rows + SM70_D256_MASK_BLOCK_N - 1) / SM70_D256_MASK_BLOCK_N;
             const int kv_splits = split_window
                 && win_blocks >= 2 * SM70_D256_SPLIT_MIN_BLOCKS
                 ? SM70_D256_KV_SPLITS : 1;
 
-
             sm70_d256_dequant_kv_window(K, (half *) K_mirror, kv_limit, (int) row_lo, win_rows, stream);
             if (scratch.need_f16_v && !scratch.v_is_k_view) {
                 sm70_d256_dequant_kv_window(V, (half *) scratch.f16_extra.V, kv_limit, (int) row_lo, win_rows, stream);
             }
-
-
-
 
             const half * const K_win = K_mirror - row_lo * SM70_D256_D;
             const int64_t k_row_stride   = SM70_D256_D;
@@ -1305,9 +1085,6 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                 v_head_stride  = (int64_t) win_rows * SM70_D256_D;
                 v_outer_stride = (int64_t) V->ne[2] * win_rows * SM70_D256_D;
             }
-
-
-
 
             const bool direct_acc = w == 0 && kv_splits == 1;
             float * const win_out = direct_acc ? Os : p_out;
@@ -1340,8 +1117,6 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
                     / FLASH_NAMESPACE::kWindowMergeRowsPerCta);
                 const int64_t slice_out = (int64_t) scratch.rows * SM70_D256_D;
 
-
-
                 FLASH_NAMESPACE::sm70_d256_window_merge_kernel<<<n_merge, 256, 0, stream>>>(
                     Os, acc_max, acc_sum, win_out, win_max, win_sum,
                     (int64_t) scratch.rows, w == 0, scale * float(M_LOG2E));
@@ -1357,8 +1132,6 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
 
         if (assist_owner) {
 
-
-
             sm70_d256_assist_wait_launch(assist->epoch_partial_local, assist->gen_local, 1, 0, stream);
             const unsigned n_merge = (unsigned) ((scratch.rows
                 + FLASH_NAMESPACE::kWindowMergeRowsPerCta - 1)
@@ -1371,11 +1144,9 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         }
     } else {
 
-
         const bool k_partial = mask_range && (K->type == GGML_TYPE_Q8_0 || K->type == GGML_TYPE_Q4_0);
         const bool v_partial = mask_range && !scratch.v_is_k_view &&
                                (V->type == GGML_TYPE_Q8_0 || V->type == GGML_TYPE_Q4_0);
-
 
         CUDA_CHECK(cudaMemsetAsync(Qs, 0, scratch.n_q * sizeof(half), stream));
 
@@ -1388,13 +1159,10 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             sm70_d256_dequant_kv_tensor(K, (half *) scratch.f16_extra.K, stream);
         }
 
-
         if (scratch.need_f16_v && !scratch.v_is_k_view && !v_partial) {
             GGML_ASSERT(scratch.f16_extra.V != 0);
             sm70_d256_dequant_kv_tensor(V, (half *) scratch.f16_extra.V, stream);
         }
-
-
 
         const half * K_h2;
         const half * V_h2;
@@ -1458,10 +1226,8 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
             const int n_splits = (kv_len + SM70_D256_MASK_SPLIT - 1) / SM70_D256_MASK_SPLIT;
             const dim3 grid(scratch.n_q_blocks, batch, n_splits);
 
-
             CUDA_CHECK(cudaMemsetAsync(mask_bounds, 0,
                 (size_t) batch * scratch.n_q_blocks * sizeof(int2), stream));
-
 
             const bool vec_ok = mask->nb[1] % 16 == 0
                 && (mask->ne[3] == 1 || mask->nb[3] % 16 == 0)
@@ -1476,8 +1242,6 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         }
 
         if (scratch.partial) {
-
-
 
             float * const p_out   = (float *) (base + scratch.p_out_offset);
             float * const p_max   = (float *) (base + scratch.p_max_offset);
@@ -1531,12 +1295,9 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         }
     }
 
-
-
     {
         const dim3 grid(q_len, batch * heads_q);
         if (scratch.partial) {
-
 
             sm70_d256_scatter_kernel<true><<<grid, SM70_D256_D/2, 0, stream>>>(
                 (const float2 *) Os, (float2 *) dst->data,
@@ -1555,8 +1316,6 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
         }
         CUDA_CHECK(cudaGetLastError());
     }
-
-
 
     if (assist_owner) {
         sm70_d256_assist_signal_launch(assist->epoch_free_local, stream);

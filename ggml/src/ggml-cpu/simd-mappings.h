@@ -4,13 +4,10 @@
 
 #ifdef __ARM_FEATURE_SVE
 #include <arm_sve.h>
-#endif // __ARM_FEATURE_SVE
+#endif
 
 #if defined(__ARM_NEON) && !defined(__CUDACC__) && !defined(__MUSACC__)
-// if YCM cannot find <arm_neon.h>, make a symbolic link to it, for example:
-//
-//   $ ln -sfn /Library/Developer/CommandLineTools/usr/lib/clang/13.1.6/include/arm_neon.h ./src/
-//
+
 #include <arm_neon.h>
 #endif
 
@@ -21,12 +18,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-//
-// simd mappings
-//
-
-// FP16 to FP32 conversion
 
 // 16-bit float
 // on Arm, we use __fp16, which requires the IEEE fp16 format: implied on
@@ -66,7 +57,7 @@ extern "C" {
 #elif defined(__POWER9_VECTOR__)
     #define GGML_CPU_COMPUTE_FP16_TO_FP32(x) power_compute_fp16_to_fp32(x)
     #define GGML_CPU_COMPUTE_FP32_TO_FP16(x) power_compute_fp32_to_fp16(x)
-    /* the inline asm below is about 12% faster than the lookup method */
+
     #define GGML_CPU_FP16_TO_FP32(x) GGML_CPU_COMPUTE_FP16_TO_FP32(x)
     #define GGML_CPU_FP32_TO_FP16(x) GGML_CPU_COMPUTE_FP32_TO_FP16(x)
 
@@ -77,21 +68,21 @@ extern "C" {
             "mtfprd %0,%2\n"
             "xscvhpdp %0,%0\n"
             "frsp %1,%0\n" :
-            /* temp */ "=d"(d),
-            /* out */  "=f"(f):
-            /* in */   "r"(h));
+                       "=d"(d),
+                       "=f"(f):
+                       "r"(h));
         return f;
     }
 
     static inline ggml_fp16_t power_compute_fp32_to_fp16(float f) {
         double d;
         ggml_fp16_t r;
-        __asm__( /* xscvdphp can work on double or single precision */
+        __asm__(
             "xscvdphp %0,%2\n"
             "mffprd %1,%0\n" :
-            /* temp */ "=d"(d),
-            /* out */  "=r"(r):
-            /* in */   "f"(f));
+                       "=d"(d),
+                       "=r"(r):
+                       "f"(f));
         return r;
     }
 #elif defined(__riscv) && defined(__riscv_zfhmin)
@@ -114,35 +105,25 @@ extern "C" {
     #define GGML_CPU_FP32_TO_FP16(x) GGML_CPU_COMPUTE_FP32_TO_FP16(x)
 #endif
 
-// precomputed f32 table for f16 (256 KB)
-// defined in ggml-cpu.c, initialized in ggml_cpu_init()
 extern float ggml_table_f32_f16[1 << 16];
 
-// precomputed f32 table for e8m0 half (1 KB)
-// defined in ggml-cpu.c, initialized in ggml_cpu_init()
 extern float ggml_table_f32_e8m0_half[1 << 8];
 
-// precomputed f32 table for ue4m3 (1 KB)
-// defined in ggml-cpu.c, initialized in ggml_cpu_init()
 extern float ggml_table_f32_ue4m3[1 << 8];
+extern float ggml_table_f32_f8_e4m3[1 << 8];
 
-// Use lookup table for E8M0 on x86 (faster than bit manipulation)
 #if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
 #define GGML_CPU_E8M0_TO_FP32_HALF(x) ggml_table_f32_e8m0_half[(uint8_t)(x)]
 #else
 #define GGML_CPU_E8M0_TO_FP32_HALF(x) GGML_E8M0_TO_FP32_HALF(x)
 #endif
 
-// Use lookup table for UE4M3 on x86 and ARM (faster than bit manipulation)
 #if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__ARM_NEON)
 #define GGML_CPU_UE4M3_TO_FP32(x) ggml_table_f32_ue4m3[(uint8_t)(x)]
 #else
 #define GGML_CPU_UE4M3_TO_FP32(x) ggml_ue4m3_to_fp32(x)
 #endif
 
-// Pre AVX512 CPUs (AVX2 with F16C, such as i5-8th gen or i7-4790)
-// do not produce codegen as checks below don't test for __F16C__
-// but this check does.
 #if defined(__F16C__)
 // force FP16 -> FP32 conversion to use LUT instead
 // see: https://github.com/ggml-org/llama.cpp/issues/30342
@@ -150,9 +131,6 @@ extern float ggml_table_f32_ue4m3[1 << 8];
 #define GGML_CPU_FP32_TO_FP16(x) GGML_CPU_COMPUTE_FP32_TO_FP16(x)
 #endif
 
-// On ARM NEON, it's quicker to directly convert x -> x instead of calling into ggml_lookup_fp16_to_fp32,
-// so we define GGML_CPU_FP16_TO_FP32 and GGML_CPU_FP32_TO_FP16 elsewhere for NEON.
-// This is also true for POWER9.
 #if !defined(GGML_CPU_FP16_TO_FP32)
 inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
     uint16_t s;
@@ -166,7 +144,6 @@ inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
 #if !defined(GGML_CPU_FP32_TO_FP16)
 #define GGML_CPU_FP32_TO_FP16(x) GGML_COMPUTE_FP32_TO_FP16(x)
 #endif
-
 
 // we define a common set of C macros which map to specific intrinsics based on the current architecture
 // we then implement the fundamental computation operations below using only these macros
@@ -183,7 +160,6 @@ inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
 
 #define GGML_SIMD
 
-// F32 SVE
 #define GGML_F32_EPR 8
 #define DEFAULT_PG svptrue_b32()
 
@@ -226,7 +202,6 @@ inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
 #define GGML_F32_VEC_MUL    GGML_F32xt_MUL
 #define GGML_F32_VEC_REDUCE GGML_F32xt_REDUCE
 
-// F16 SVE
 #define DEFAULT_PG32    svptrue_b32()
 #define DEFAULT_PG16    svptrue_b16()
 
@@ -268,8 +243,6 @@ inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
 #define GGML_F16xt_REDUCE_MIXED(res, sum1, sum2, sum3, sum4)  \
         GGML_F16xt_REDUCE_MIXED_IMPL(DEFAULT_PG16, res, sum1, sum2, sum3, sum4)
 
-// F16 NEON
-
 #if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
     #define GGML_F16_STEP 32
     #define GGML_F16_EPR  8
@@ -311,8 +284,6 @@ inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
     #define GGML_F16_VEC_MUL            GGML_F16x8_MUL
     #define GGML_F16_VEC_REDUCE         GGML_F16x8_REDUCE
 #else
-    // if FP16 vector arithmetic is not supported, we use FP32 instead
-    // and take advantage of the vcvt_ functions to convert to/from FP16
 
     #define GGML_F16_STEP 16
     #define GGML_F16_EPR  4
@@ -341,8 +312,6 @@ inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
 #elif defined(__ARM_NEON) && defined(__ARM_FEATURE_FMA) && defined(__ARM_FP16_FORMAT_IEEE)
 
 #define GGML_SIMD
-
-// F32 NEON
 
 #define GGML_F32_STEP 16
 #define GGML_F32_EPR  4
@@ -383,8 +352,6 @@ inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
 #define GGML_F32_VEC_MUL    GGML_F32x4_MUL
 #define GGML_F32_VEC_REDUCE GGML_F32x4_REDUCE
 
-// F16 NEON
-
 #if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
     #define GGML_F16_STEP 32
     #define GGML_F16_EPR  8
@@ -426,8 +393,6 @@ inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
     #define GGML_F16_VEC_MUL            GGML_F16x8_MUL
     #define GGML_F16_VEC_REDUCE         GGML_F16x8_REDUCE
 #else
-    // if FP16 vector arithmetic is not supported, we use FP32 instead
-    // and take advantage of the vcvt_ functions to convert to/from FP16
 
     #define GGML_F16_STEP 16
     #define GGML_F16_EPR  4
@@ -457,8 +422,6 @@ inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
 
 #define GGML_SIMD
 
-// F32 AVX512
-
 #define GGML_F32_STEP 64
 #define GGML_F32_EPR  16
 
@@ -467,7 +430,7 @@ inline static float ggml_lookup_fp16_to_fp32(ggml_fp16_t f) {
 #define GGML_F32x16_SET1(x) _mm512_set1_ps(x)
 #define GGML_F32x16_LOAD    _mm512_loadu_ps
 #define GGML_F32x16_STORE   _mm512_storeu_ps
-// _mm512_fmadd_ps is defined in AVX512F so no guard is required
+
 #define GGML_F32x16_FMA(a, b, c) _mm512_fmadd_ps(b, c, a)
 #define GGML_F32x16_ADD     _mm512_add_ps
 #define GGML_F32x16_MUL     _mm512_mul_ps
@@ -485,10 +448,8 @@ do {                                                                  \
     for (int i = 0; i < offset; ++i) {                                \
         x[i] = _mm512_add_ps(x[i], x[offset+i]);                      \
     }                                                                 \
-    res = (ggml_float) _mm512_reduce_add_ps(x[0]);                    \
+    res = _mm512_reduce_add_ps(x[0]);                    \
 } while (0)
-
-// TODO: is this optimal ?
 
 #define GGML_F32_VEC        GGML_F32x16
 #define GGML_F32_VEC_ZERO   GGML_F32x16_ZERO
@@ -499,8 +460,6 @@ do {                                                                  \
 #define GGML_F32_VEC_ADD    GGML_F32x16_ADD
 #define GGML_F32_VEC_MUL    GGML_F32x16_MUL
 #define GGML_F32_VEC_REDUCE GGML_F32x16_REDUCE
-
-// F16 AVX512
 
 #if defined(__AVX512FP16__)
 
@@ -529,7 +488,7 @@ do {                                                                   \
     for (int i = 0; i < offset; ++i) {                                 \
         x[i] = _mm512_add_ph(x[i], x[offset+i]);                       \
     }                                                                  \
-    res = (ggml_float) _mm512_reduce_add_ph(x[0]);                     \
+    res = _mm512_reduce_add_ph(x[0]);                     \
 } while (0)
 
 #define GGML_F16_VEC                GGML_F16x32
@@ -542,7 +501,7 @@ do {                                                                   \
 #define GGML_F16_VEC_MUL            GGML_F16x32_MUL
 #define GGML_F16_VEC_REDUCE         GGML_F16x32_REDUCE
 
-#else // Fallback FP16 <-> FP32
+#else
 
 #define GGML_F16_STEP 64
 #define GGML_F16_EPR  16
@@ -551,8 +510,6 @@ do {                                                                   \
 #define GGML_F32Cx16_ZERO        _mm512_setzero_ps()
 #define GGML_F32Cx16_SET1(x)     _mm512_set1_ps(x)
 
-// unlike  _mm256_cvt intrinsics that require F16C, _mm512_cvt is defined in AVX512F
-// so F16C guard isn't required
 #define GGML_F32Cx16_LOAD(x)     _mm512_cvtph_ps(_mm256_loadu_si256((const __m256i *)(x)))
 #define GGML_F32Cx16_STORE(x, y) _mm256_storeu_si256((__m256i *)(x), _mm512_cvtps_ph(y, 0))
 
@@ -573,7 +530,7 @@ do {                                                              \
     for (int i = 0; i < offset; ++i) {                            \
         x[i] = _mm512_add_ps(x[i], x[offset+i]);                  \
     }                                                             \
-    res = (ggml_float) _mm512_reduce_add_ps(x[0]);                \
+    res = _mm512_reduce_add_ps(x[0]);                \
 } while (0)
 
 #define GGML_F16_VEC                GGML_F32Cx16
@@ -587,12 +544,10 @@ do {                                                              \
 
 #define GGML_F16_VEC_REDUCE         GGML_F32Cx16_REDUCE
 
-#endif // __AVX512FP16__
+#endif
 #elif defined(__AVX__)
 
 #define GGML_SIMD
-
-// F32 AVX
 
 #define GGML_F32_STEP 32
 #define GGML_F32_EPR  8
@@ -626,9 +581,8 @@ do {                                                              \
     const __m128 t0 = _mm_add_ps(_mm256_castps256_ps128(x[0]),    \
                                  _mm256_extractf128_ps(x[0], 1)); \
     const __m128 t1 = _mm_hadd_ps(t0, t0);                        \
-    res = (ggml_float) _mm_cvtss_f32(_mm_hadd_ps(t1, t1));        \
+    res = _mm_cvtss_f32(_mm_hadd_ps(t1, t1));        \
 } while (0)
-// TODO: is this optimal ?
 
 #define GGML_F32_VEC        GGML_F32x8
 #define GGML_F32_VEC_ZERO   GGML_F32x8_ZERO
@@ -640,19 +594,15 @@ do {                                                              \
 #define GGML_F32_VEC_MUL    GGML_F32x8_MUL
 #define GGML_F32_VEC_REDUCE GGML_F32x8_REDUCE
 
-// F16 AVX
-
 #define GGML_F16_STEP 32
 #define GGML_F16_EPR  8
-
-// F16 arithmetic is not supported by AVX, so we use F32 instead
 
 #define GGML_F32Cx8             __m256
 #define GGML_F32Cx8_ZERO        _mm256_setzero_ps()
 #define GGML_F32Cx8_SET1(x)     _mm256_set1_ps(x)
 
 #if defined(__F16C__)
-// the  _mm256_cvt intrinsics require F16C
+
 #define GGML_F32Cx8_LOAD(x)     _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)(x)))
 #define GGML_F32Cx8_STORE(x, y) _mm_storeu_si128((__m128i *)(x), _mm256_cvtps_ph(y, 0))
 #else
@@ -695,8 +645,6 @@ static inline void __avx_f32cx8_store(ggml_fp16_t *x, __m256 y) {
 #elif defined(__POWER9_VECTOR__)
 
 #define GGML_SIMD
-
-// F32 POWER9
 
 #define GGML_F32_STEP 32
 #define GGML_F32_EPR  4
@@ -747,7 +695,6 @@ static inline void __avx_f32cx8_store(ggml_fp16_t *x, __m256 y) {
 #define GGML_F32_VEC_MUL    GGML_F32x4_MUL
 #define GGML_F32_VEC_REDUCE GGML_F32x4_REDUCE
 
-// F16 POWER9
 #define GGML_F16_STEP       GGML_F32_STEP
 #define GGML_F16_EPR        GGML_F32_EPR
 #define GGML_F16_VEC        GGML_F32x4
@@ -757,7 +704,7 @@ static inline void __avx_f32cx8_store(ggml_fp16_t *x, __m256 y) {
 #define GGML_F16_VEC_ADD    GGML_F32x4_ADD
 #define GGML_F16_VEC_MUL    GGML_F32x4_MUL
 #define GGML_F16_VEC_REDUCE GGML_F32x4_REDUCE
-// Use vec_xl, not vec_ld, in case the load address is not aligned.
+
 #define GGML_F16_VEC_LOAD(p, i) (i & 0x1) ?                   \
   vec_extract_fp32_from_shorth(vec_xl(0, p - GGML_F16_EPR)) : \
   vec_extract_fp32_from_shortl(vec_xl(0, p))
@@ -772,7 +719,6 @@ static inline unsigned char ggml_endian_byte(int i) {
                                    r[i - GGML_ENDIAN_BYTE(0)]), \
             0, p - GGML_F16_EPR)
 
-//BF16 POWER9
 #define GGML_BF16_STEP 16
 #define GGML_BF16_EPR  8
 
@@ -798,8 +744,6 @@ static inline unsigned char ggml_endian_byte(int i) {
 #elif defined(__wasm_simd128__)
 
 #define GGML_SIMD
-
-// F32 WASM
 
 #define GGML_F32_STEP 16
 #define GGML_F32_EPR  4
@@ -841,8 +785,6 @@ static inline unsigned char ggml_endian_byte(int i) {
 #define GGML_F32_VEC_ADD    GGML_F32x4_ADD
 #define GGML_F32_VEC_MUL    GGML_F32x4_MUL
 #define GGML_F32_VEC_REDUCE GGML_F32x4_REDUCE
-
-// F16 WASM
 
 #define GGML_F16_STEP 16
 #define GGML_F16_EPR  4
@@ -911,8 +853,6 @@ inline static void __wasm_f16x4_store(ggml_fp16_t * p, v128_t x) {
 
 #define GGML_SIMD
 
-// F32 SSE
-
 #define GGML_F32_STEP 32
 #define GGML_F32_EPR  4
 
@@ -922,7 +862,7 @@ inline static void __wasm_f16x4_store(ggml_fp16_t * p, v128_t x) {
 #define GGML_F32x4_LOAD    _mm_loadu_ps
 #define GGML_F32x4_STORE   _mm_storeu_ps
 #if defined(__FMA__)
-    // TODO: Does this work?
+
     #define GGML_F32x4_FMA(a, b, c) _mm_fmadd_ps(b, c, a)
 #else
     #define GGML_F32x4_FMA(a, b, c) _mm_add_ps(_mm_mul_ps(b, c), a)
@@ -944,9 +884,8 @@ inline static void __wasm_f16x4_store(ggml_fp16_t * p, v128_t x) {
         x[i] = _mm_add_ps(x[i], x[offset+i]);                     \
     }                                                             \
     const __m128 t0 = _mm_hadd_ps(x[0], x[0]);                    \
-    res = (ggml_float) _mm_cvtss_f32(_mm_hadd_ps(t0, t0));        \
+    res = _mm_cvtss_f32(_mm_hadd_ps(t0, t0));        \
 }
-// TODO: is this optimal ?
 
 #define GGML_F32_VEC        GGML_F32x4
 #define GGML_F32_VEC_ZERO   GGML_F32x4_ZERO
@@ -957,8 +896,6 @@ inline static void __wasm_f16x4_store(ggml_fp16_t * p, v128_t x) {
 #define GGML_F32_VEC_ADD    GGML_F32x4_ADD
 #define GGML_F32_VEC_MUL    GGML_F32x4_MUL
 #define GGML_F32_VEC_REDUCE GGML_F32x4_REDUCE
-
-// F16 SSE
 
 #define GGML_F16_STEP 32
 #define GGML_F16_EPR  4
@@ -1009,7 +946,6 @@ static inline void __sse_f16x4_store(ggml_fp16_t * x, __m128 y) {
 
 #define GGML_SIMD
 
-// F32 LASX
 #define GGML_F32_STEP 32
 #define GGML_F32_EPR  8
 
@@ -1038,7 +974,6 @@ do {                                                              \
     float *tmp_p = (float *)&x[0]; \
     res = tmp_p[0] + tmp_p[1] + tmp_p[2] + tmp_p[3] + tmp_p[4] + tmp_p[5] + tmp_p[6] + tmp_p[7];  \
 } while (0)
-// TODO: is this optimal ?
 
 #define GGML_F32_VEC        GGML_F32x8
 #define GGML_F32_VEC_ZERO   GGML_F32x8_ZERO
@@ -1050,12 +985,8 @@ do {                                                              \
 #define GGML_F32_VEC_MUL    GGML_F32x8_MUL
 #define GGML_F32_VEC_REDUCE GGML_F32x8_REDUCE
 
-// F16 LASX
-
 #define GGML_F16_STEP 32
 #define GGML_F16_EPR  8
-
-// F16 arithmetic is not supported by LASX, so we use F32 instead
 
 #define GGML_F32Cx8          __m256
 #define GGML_F32Cx8_ZERO    (__m256)__lasx_xvldi(0)
@@ -1094,8 +1025,6 @@ static inline void __lasx_f32cx8_store(ggml_fp16_t * x, __m256 y) {
 #elif defined(__loongarch_sx)
 
 #define GGML_SIMD
-
-// F32 LSX
 
 #define GGML_F32_STEP 32
 #define GGML_F32_EPR  4
@@ -1142,8 +1071,6 @@ static inline void __lasx_f32cx8_store(ggml_fp16_t * x, __m256 y) {
 #define GGML_F32_VEC_MUL    GGML_F32x4_MUL
 #define GGML_F32_VEC_REDUCE GGML_F32x4_REDUCE
 
-// F16 LSX
-
 #define GGML_F16_STEP 32
 #define GGML_F16_EPR  4
 
@@ -1179,8 +1106,6 @@ static inline void __lsx_f16x4_store(ggml_fp16_t * x, __m128 y) {
 #elif defined(__VXE__) || defined(__VXE2__)
 
 #define GGML_SIMD
-
-// F32 s390x
 
 #define GGML_F32_STEP 32
 #define GGML_F32_EPR  4
@@ -1229,7 +1154,6 @@ static inline void __lsx_f16x4_store(ggml_fp16_t * x, __m128 y) {
 #define GGML_F32_VEC_MUL    GGML_F32x4_MUL
 #define GGML_F32_VEC_REDUCE GGML_F32x4_REDUCE
 
-// F16 s390x
 #define GGML_F16_STEP GGML_F32_STEP
 #define GGML_F16_EPR  GGML_F32_EPR
 
@@ -1279,7 +1203,6 @@ static inline void __lzs_f16cx4_store(ggml_fp16_t * x, float32x4_t v_y) {
 #define GGML_F16_VEC_MUL            GGML_F32x4_MUL
 #define GGML_F16_VEC_REDUCE         GGML_F32x4_REDUCE
 
-// BF16 s390x
 #define GGML_BF16_STEP 16
 #define GGML_BF16_EPR  8
 
@@ -1299,11 +1222,7 @@ static inline void __lzs_f16cx4_store(ggml_fp16_t * x, float32x4_t v_y) {
 
 #elif defined(__riscv_v_intrinsic)
 
-// compatible with vlen >= 128
-
 #define GGML_SIMD
-
-// F32
 
 #define GGML_F32_STEP 16
 #define GGML_F32_EPR  4
@@ -1329,15 +1248,10 @@ static inline void __lzs_f16cx4_store(ggml_fp16_t * x, float32x4_t v_y) {
 
 #endif
 
-// GGML_F32_ARR / GGML_F16_ARR
-//   number of registers to use per step
 #ifdef GGML_SIMD
 #define GGML_F32_ARR (GGML_F32_STEP/GGML_F32_EPR)
 #define GGML_F16_ARR (GGML_F16_STEP/GGML_F16_EPR)
 #endif
-
-// GGML_F16_DOT_*
-// like GGML_F16_* but for dot products which need F32 accumulation on AVX512-FP16
 
 #if defined(__AVX512FP16__)
 
@@ -1361,7 +1275,7 @@ static inline void __lzs_f16cx4_store(ggml_fp16_t * x, float32x4_t v_y) {
 #define GGML_F16_DOT_VEC_FMA        GGML_F16_VEC_FMA
 #define GGML_F16_DOT_VEC_REDUCE     GGML_F16_VEC_REDUCE
 
-#endif // defined(__AVX512FP16__)
+#endif
 
 #ifdef __cplusplus
 }

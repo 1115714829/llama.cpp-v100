@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { InputWithSuggestions } from '$lib/components/app';
 	import { Button } from '$lib/components/ui/button';
 	import { MIN_AUTOCOMPLETE_INPUT_LENGTH } from '$lib/constants';
@@ -164,7 +165,7 @@
 	{/if}
 
 	<div class="flex justify-end gap-2 pt-1">
-		<Button onclick={onCancel} size="sm" type="button" variant="secondary">Cancel</Button>
+		<Button onclick={onCancel} size="sm" type="button" variant="secondary">{tr("Cancel")}</Button>
 
 		<Button disabled={!isComplete} size="sm" type="submit">Read Resource</Button>
 	</div>

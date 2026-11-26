@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from "$lib/stores/locale.svelte";
 	import ContextGaugePopup from './ChatFormContextGauge/ContextGaugePopup.svelte';
 	import {
 		ChatAttachmentsList,
@@ -617,7 +618,7 @@
 				}}
 				onKeydown={handleKeydown}
 				onPaste={handlePaste}
-				{placeholder}
+				placeholder={tr(placeholder)}
 				{useRichInput}
 			/>
 

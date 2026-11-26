@@ -5,7 +5,6 @@
 #include <cmath>
 #include <initializer_list>
 
-// Kernel config struct - passed by value to CUDA kernel
 struct topk_moe_config {
     bool use_sigmoid;
     bool use_sqrt_softplus;
@@ -13,7 +12,6 @@ struct topk_moe_config {
     bool delayed_softmax;
 };
 
-// Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
 template <int experts_per_thread, bool use_limit>
 __device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
     float max_val = -INFINITY;
@@ -78,9 +76,6 @@ __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], co
     }
 }
 
-
-
-
 template <int n>
 __device__ __forceinline__ void topk_moe_set(float (&v)[n], const int idx, const float x) {
 #pragma unroll
@@ -90,9 +85,6 @@ __device__ __forceinline__ void topk_moe_set(float (&v)[n], const int idx, const
         }
     }
 }
-
-
-
 
 template <int n>
 __device__ __forceinline__ void topk_moe_lane_argmax(const float (&wt)[n], float & max_val, int & max_expert) {
@@ -117,9 +109,6 @@ __device__ __forceinline__ void topk_moe_lane_argmax(const float (&wt)[n], float
     max_val    = v[0];
     max_expert = threadIdx.x + e[0] * WARP_SIZE;
 }
-
-
-
 
 static __device__ __forceinline__ void topk_moe_quantize_block(const ggml_cuda_topk_moe_quant & q, const int qb) {
     constexpr int per_block = TOPK_MOE_ROWS_PER_BLOCK*WARP_SIZE;
@@ -152,15 +141,6 @@ static __device__ __forceinline__ void topk_moe_quantize_block(const ggml_cuda_t
     }
 }
 
-/*
-    This kernel does the following:
-    1. optionally softmax over the logits per token [n_experts, n_tokens]
-    2. argmax reduce over the top-k (n_experts_used) logits
-    3. write weights + ids to global memory
-    4. optionally normalize the weights or apply softmax over the selected logits
-
-    It is intended as fusion of softmax->top-k->get_rows pipeline for MoE models
-*/
 template <int n_experts, bool has_bias>
 __launch_bounds__(TOPK_MOE_ROWS_PER_BLOCK * WARP_SIZE, 1)
 __global__ void topk_moe_cuda(const float *         logits,
@@ -179,11 +159,11 @@ __global__ void topk_moe_cuda(const float *         logits,
         return;
     }
 #if defined(GGML_USE_MUSA)
-    // MUSA: every warp of a partially filled block must reach the barrier below.
+
     const int row = MIN(blockIdx.x * blockDim.y + threadIdx.y, n_rows - 1);
 #else
     const int row = blockIdx.x * blockDim.y + threadIdx.y;
-#endif // defined(GGML_USE_MUSA)
+#endif
     if (row >= n_rows) {
         return;
     }
@@ -196,7 +176,6 @@ __global__ void topk_moe_cuda(const float *         logits,
 
     float wt[experts_per_thread];
 
-    // Initialize all slots to -INFINITY
 #pragma unroll
     for (int i = 0; i < experts_per_thread; i++) {
         wt[i] = -INFINITY;
@@ -209,7 +188,6 @@ __global__ void topk_moe_cuda(const float *         logits,
         wt[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? logits[expert] : -INFINITY;
     }
 
-    // Weights and IDs can alias logits, so wait until every row in the block reads its logits.
     __syncthreads();
 
     if (!config.delayed_softmax) {
@@ -234,8 +212,6 @@ __global__ void topk_moe_cuda(const float *         logits,
         }
     }
 
-    // selection_wt is only needed when bias is present (selection uses wt + bias)
-    // when no bias, we use wt directly for both selection and weight values
     [[maybe_unused]] float selection_wt[has_bias ? experts_per_thread : 1];
 
     if constexpr (has_bias) {
@@ -248,12 +224,11 @@ __global__ void topk_moe_cuda(const float *         logits,
             const int expert = i + threadIdx.x;
             selection_wt[i / WARP_SIZE] =
                 (n_experts % WARP_SIZE == 0 || expert < n_experts) ? wt[i / WARP_SIZE] + bias[expert] : -INFINITY;
+            if (__isnanf(selection_wt[i / WARP_SIZE])) {
+                selection_wt[i / WARP_SIZE] = -FLT_MAX;
+            }
         }
     }
-
-    //at this point, each thread holds either a portion of the softmax distribution
-    //or the raw logits. We do the argmax reduce over n_expert_used, each time marking
-    //the expert weight as -inf to exclude from the next iteration
 
     float wt_sum = 0.f;
 
@@ -301,8 +276,6 @@ __global__ void topk_moe_cuda(const float *         logits,
             if constexpr (n_experts % WARP_SIZE == 0 && experts_per_thread > 1 &&
                           (experts_per_thread & (experts_per_thread - 1)) == 0) {
 
-
-
                 topk_moe_lane_argmax<experts_per_thread>(wt, max_val, max_expert);
             } else {
 #pragma unroll
@@ -331,7 +304,6 @@ __global__ void topk_moe_cuda(const float *         logits,
         }
 
         if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
-
 
             if (k < WARP_SIZE) {
                 output_weights[0] = max_val;
@@ -429,7 +401,7 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
             ggml_cuda_kernel_launch(topk_moe_cuda<256, has_bias>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, quant);
             break;
-        case 288: // StepFun 3.7
+        case 288:
             ggml_cuda_kernel_launch(topk_moe_cuda<288, has_bias>, launch_params,
                 logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val, config, quant);
             break;
@@ -500,8 +472,7 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
                                    const ggml_tensor * weights,
                                    const ggml_tensor * logits,
                                    const ggml_tensor * ids) {
-    // must match an instantiation of launch_topk_moe_cuda: a power of 2 up to 512,
-    // or one of the non-power-of-2 expert counts of supported models
+
     const int n_expert = ids->nb[1] / ids->nb[0];
     if (((n_expert & (n_expert - 1)) != 0 || n_expert > 512) && n_expert != 288 && n_expert != 576) {
         return false;
@@ -527,7 +498,6 @@ bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,
             return false;
         }
 
-        // don't fuse when masks or sinks are present
         if (softmax->src[1] || softmax->src[2]) {
             return false;
         }

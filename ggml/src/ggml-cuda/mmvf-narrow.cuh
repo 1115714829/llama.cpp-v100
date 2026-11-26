@@ -2,20 +2,6 @@
 
 #include "common.cuh"
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 static constexpr int mmvf_narrow_block_size  = 256;
 static constexpr int mmvf_narrow_split_warps = mmvf_narrow_block_size / WARP_SIZE;
 
@@ -51,8 +37,6 @@ static __device__ __forceinline__ void mul_mat_vec_f_narrow_accumulate(
     }
 }
 
-
-
 template <typename T, int ncols_dst>
 static __device__ __forceinline__ void mul_mat_vec_f_split_warp(
         const T * __restrict__ x_row, const float2 * __restrict__ y2, const int ncols2, const int stride_col_y2,
@@ -65,7 +49,6 @@ static __device__ __forceinline__ void mul_mat_vec_f_split_warp(
         sumf[j] = 0.0f;
     }
     mul_mat_vec_f_narrow_accumulate<T, ncols_dst>(x_row, y2, ncols2, stride_col_y2, warp*WARP_SIZE + lane, sumf);
-
 
     float * warp_sums = row_scratch + warp*ncols_dst;
 #pragma unroll
@@ -104,9 +87,6 @@ static __device__ __forceinline__ void mul_mat_vec_f_split_warp(
 #endif
 }
 
-
-
-
 struct mmvf_narrow_side_rows {
     const float *  x;
     const float *  y;
@@ -131,7 +111,6 @@ static __device__ __forceinline__ void mmvf_narrow_side_rows_warp_n(const mmvf_n
                                                s.scratch + (int64_t) row*mmvf_narrow_split_warps*ncols_dst,
                                                s.counters + row, warp, lane);
 }
-
 
 static __device__ __forceinline__ void mmvf_narrow_side_rows_warp(const mmvf_narrow_side_rows & s, const int vwarp,
                                                                   const int lane) {

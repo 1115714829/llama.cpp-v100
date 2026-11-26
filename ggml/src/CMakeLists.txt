@@ -3,9 +3,6 @@ include("../cmake/common.cmake")
 
 add_compile_definitions(GGML_SCHED_MAX_COPIES=${GGML_SCHED_MAX_COPIES})
 
-
-
-
 if (DEFINED GGML_EXPERT_ADAPTIVE)
     if (GGML_EXPERT_ADAPTIVE)
         add_compile_definitions(GGML_EXPERT_ADAPTIVE=1)
@@ -218,6 +215,11 @@ add_library(ggml-base
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
+            ggml-safe-io.cpp
+            ggml-safe-io.h
+            ggml-safe-io-authority.h
+            ggml-pin-settle.cpp
+            ggml-pin-settle.h
             ggml-quants.c
             ggml-quants.h
             gguf.cpp)

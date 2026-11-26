@@ -1,21 +1,9 @@
+// Portions from Strata and its AC922 fork; Copyright (c) 2026 Niko1221 and the Strata contributors (MIT); see licenses/LICENSE-strata.
 #pragma once
 
 #include "common.cuh"
 
-// Grouped-expert MUL_MAT_ID kernel for Volta (sm_70).
-// The activation is quantized once and staged per expert, then one block serves all tokens
-// routed to that expert, so no tile is padded to a fixed J like the MMQ MUL_MAT_ID path.
-// The kernel structure follows Strata's s2_expert_grouped.cu (MIT), see moe-grouped.cu.
-
-
-
-
-
 #define MOE_GROUPED_MAX_TOKENS 8
-
-
-
-
 
 #define MOE_GROUPED_CT_DECODE  8
 #define MOE_GROUPED_CT_PREFILL 32

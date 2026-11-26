@@ -258,7 +258,7 @@ export const SETTINGS_REGISTRY: SettingsSectionEntry[] = [
 				type: SettingsFieldType.CHECKBOX
 			},
 			{
-				defaultValue: false,
+				defaultValue: true,
 				help: 'Always keep the sidebar visible on desktop instead of auto-hiding it.',
 				key: SETTINGS_KEYS.ALWAYS_SHOW_SIDEBAR_ON_DESKTOP,
 				label: 'Always show sidebar on desktop',

@@ -2,19 +2,21 @@
 #include "dequantize.cuh"
 #include "convert.cuh"
 
+#include <cstdlib>
+
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
-        const int64_t ne00, /*const int64_t ne01, const int64_t ne02, const int64_t ne03,*/
-        /*const int64_t ne10,*/ const int64_t ne11, const uint3 ne12_fdv, /*const int64_t ne13,*/
-        /*const size_t s0,*/ const size_t s1, const size_t s2, const size_t s3,
-        /*const size_t nb00,*/ const size_t nb01, const size_t nb02, const size_t nb03,
-        const size_t s10, const size_t s11, const size_t s12/*, const size_t s13*/) {
+        const int64_t ne00,
+                                const int64_t ne11, const uint3 ne12_fdv,
+                             const size_t s1, const size_t s2, const size_t s3,
+                               const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12                      ) {
 
     ggml_cuda_pdl_sync();
     for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
         for (int64_t i00 = 2*(blockIdx.y*blockDim.x + threadIdx.x); i00 < ne00; i00 += gridDim.y*blockDim.x) {
-            // The x and y dimensions of the grid are swapped because the maximum allowed grid size for x is higher.
+
             const int i10 =  blockIdx.x;
             const uint2 dm  = fast_div_modulo((uint32_t)z, ne12_fdv);
             const int i11 =  dm.x;
@@ -25,12 +27,11 @@ static __global__ void k_get_rows(
             dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
             const void * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
 
-            const int ib   =  i00/qk;      // block index
-            const int iqs  = (i00%qk)/qr;  // quant index
-            const int iybs = i00 - i00%qk; // dst block start index
+            const int ib   =  i00/qk;
+            const int iqs  = (i00%qk)/qr;
+            const int iybs = i00 - i00%qk;
             const int y_offset = qr == 1 ? 1 : qk/2;
 
-            // dequantize
             float2 v;
             dequantize_kernel(src0_row, ib, iqs, v);
 
@@ -43,16 +44,16 @@ static __global__ void k_get_rows(
 template<typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
 static __global__ void k_get_rows_kq(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
-        const int64_t ne00, /*const int64_t ne01, const int64_t ne02, const int64_t ne03,*/
-        /*const int64_t ne10,*/ const int64_t ne11, const uint3 ne12_fdv, /*const int64_t ne13,*/
-        /*const size_t s0,*/ const size_t s1, const size_t s2, const size_t s3,
-        /*const size_t nb00,*/ const size_t nb01, const size_t nb02, const size_t nb03,
-        const size_t s10, const size_t s11, const size_t s12/*, const size_t s13*/) {
+        const int64_t ne00,
+                                const int64_t ne11, const uint3 ne12_fdv,
+                             const size_t s1, const size_t s2, const size_t s3,
+                               const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12                      ) {
 
     ggml_cuda_pdl_sync();
-    const int64_t nsb = ne00/QK_K; // super-blocks per row
+    const int64_t nsb = ne00/QK_K;
     for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
-        // The x and y dimensions of the grid are swapped because the maximum allowed grid size for x is higher.
+
         const int i10 = blockIdx.x;
         const uint2 dm  = fast_div_modulo((uint32_t)z, ne12_fdv);
         const int i11 = dm.x;
@@ -69,21 +70,21 @@ static __global__ void k_get_rows_kq(
     }
 }
 
-
-
-template<typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
+template<typename dst_t, dequantize_kq_t<dst_t> dequantize_kq, int warps>
 static __global__ void k_get_rows_kq32(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
-        const int64_t ne00, /*const int64_t ne01, const int64_t ne02, const int64_t ne03,*/
-        /*const int64_t ne10,*/ const int64_t ne11, const uint3 ne12_fdv, /*const int64_t ne13,*/
-        /*const size_t s0,*/ const size_t s1, const size_t s2, const size_t s3,
-        /*const size_t nb00,*/ const size_t nb01, const size_t nb02, const size_t nb03,
-        const size_t s10, const size_t s11, const size_t s12/*, const size_t s13*/) {
+        const int64_t ne00,
+                                const int64_t ne11, const uint3 ne12_fdv,
+                             const size_t s1, const size_t s2, const size_t s3,
+                               const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12                      ) {
 
     ggml_cuda_pdl_sync();
-    const int64_t nsb = ne00/QK4_NL; // sub-blocks per row
+    const int64_t nsb = ne00/QK4_NL;
+    const int warp = threadIdx.x / QK4_NL;
+    const int lane = threadIdx.x % QK4_NL;
     for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
-        // The x and y dimensions of the grid are swapped because the maximum allowed grid size for x is higher.
+
         const int i10 = blockIdx.x;
         const uint2 dm  = fast_div_modulo((uint32_t)z, ne12_fdv);
         const int i11 = dm.x;
@@ -94,8 +95,8 @@ static __global__ void k_get_rows_kq32(
         dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
         const void * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
 
-        for (int64_t ib = blockIdx.y; ib < nsb; ib += gridDim.y) {
-            dequantize_kq(src0_row, ib, dst_row + ib*QK4_NL, threadIdx.x);
+        for (int64_t ib = int64_t(blockIdx.y)*warps + warp; ib < nsb; ib += int64_t(gridDim.y)*warps) {
+            dequantize_kq(src0_row, ib, dst_row + ib*QK4_NL, lane);
         }
     }
 }
@@ -103,11 +104,11 @@ static __global__ void k_get_rows_kq32(
 template<typename src0_t, typename dst_t>
 static __global__ void k_get_rows_float(
         const src0_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
-        const int64_t ne00, /*const int64_t ne01, const int64_t ne02, const int64_t ne03,*/
-        /*const int64_t ne10,*/ const int64_t ne11, const uint3 ne12_fdv, /*const int64_t ne13,*/
-        /*const size_t s0,*/ const size_t s1, const size_t s2, const size_t s3,
-        /*const size_t nb00,*/ const size_t nb01, const size_t nb02, const size_t nb03,
-        const size_t s10, const size_t s11, const size_t s12/*, const size_t s13*/) {
+        const int64_t ne00,
+                                const int64_t ne11, const uint3 ne12_fdv,
+                             const size_t s1, const size_t s2, const size_t s3,
+                               const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12                      ) {
 
     ggml_cuda_pdl_lc();
     const src0_t  * GGML_CUDA_RESTRICT src0 = src0_ptr;
@@ -115,7 +116,7 @@ static __global__ void k_get_rows_float(
     dst_t         * GGML_CUDA_RESTRICT dst  = dst_ptr;
     ggml_cuda_pdl_sync();
     for (int64_t z = blockIdx.z; z < ne11*(int64_t)ne12_fdv.z; z += gridDim.z) {
-        // The x and y dimensions of the grid are swapped because the maximum allowed grid size for x is higher.
+
         const int i10 = blockIdx.x;
         const uint2 dm = fast_div_modulo((uint32_t)z, ne12_fdv);
         const int i11 = dm.x;
@@ -172,7 +173,6 @@ static __global__ void k_get_rows_back_float(
 
     ggml_cuda_pdl_sync();
 
-    // grid.y is clamped to the CUDA grid limit, so stride over the destination rows
     for (int64_t dst_row = blockIdx.y; dst_row < nrows_dst; dst_row += gridDim.y) {
         float sum = 0.0f;
 
@@ -198,8 +198,6 @@ static void get_rows_cuda_q(
     const int block_num_y = (ne00 + 2*CUDA_GET_ROWS_BLOCK_SIZE - 1) / (2*CUDA_GET_ROWS_BLOCK_SIZE);
     const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
 
-    // strides in elements
-    // const size_t s0 = nb0 / sizeof(dst_t);
     const size_t s1 = nb1 / sizeof(dst_t);
     const size_t s2 = nb2 / sizeof(dst_t);
     const size_t s3 = nb3 / sizeof(dst_t);
@@ -207,7 +205,6 @@ static void get_rows_cuda_q(
     const size_t s10 = nb10 / sizeof(int32_t);
     const size_t s11 = nb11 / sizeof(int32_t);
     const size_t s12 = nb12 / sizeof(int32_t);
-    // const size_t s13 = nb13 / sizeof(int32_t);
 
     GGML_ASSERT(ne00 % 2 == 0);
 
@@ -217,11 +214,11 @@ static void get_rows_cuda_q(
 
     k_get_rows<qk, qr, dq><<<block_nums, block_dims, 0, stream>>>(
         src0_d, src1_d, dst_d,
-        ne00, /*ne01, ne02, ne03,*/
-        /*ne10,*/ ne11, ne12_fdv, /*ne13,*/
-        /* s0,*/ s1, s2, s3,
-        /* nb00,*/ nb01, nb02, nb03,
-        s10, s11, s12/*, s13*/);
+        ne00,
+                  ne11, ne12_fdv,
+                 s1, s2, s3,
+                   nb01, nb02, nb03,
+        s10, s11, s12         );
 }
 
 template<int block_dim, typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
@@ -237,8 +234,6 @@ static void get_rows_cuda_kq(
     const dim3 block_dims(block_dim, 1, 1);
     const dim3 block_nums(ne10, MIN(nsb, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
 
-    // strides in elements
-    // const size_t s0 = nb0 / sizeof(dst_t);
     const size_t s1 = nb1 / sizeof(dst_t);
     const size_t s2 = nb2 / sizeof(dst_t);
     const size_t s3 = nb3 / sizeof(dst_t);
@@ -246,7 +241,6 @@ static void get_rows_cuda_kq(
     const size_t s10 = nb10 / sizeof(int32_t);
     const size_t s11 = nb11 / sizeof(int32_t);
     const size_t s12 = nb12 / sizeof(int32_t);
-    // const size_t s13 = nb13 / sizeof(int32_t);
 
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
@@ -254,11 +248,11 @@ static void get_rows_cuda_kq(
 
     k_get_rows_kq<dst_t, dequantize_kq><<<block_nums, block_dims, 0, stream>>>(
         src0_d, src1_d, dst_d,
-        ne00, /*ne01, ne02, ne03,*/
-        /*ne10,*/ ne11, ne12_fdv, /*ne13,*/
-        /* s0,*/ s1, s2, s3,
-        /* nb00,*/ nb01, nb02, nb03,
-        s10, s11, s12/*, s13*/);
+        ne00,
+                  ne11, ne12_fdv,
+                 s1, s2, s3,
+                   nb01, nb02, nb03,
+        s10, s11, s12         );
 }
 
 template<int block_dim, typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
@@ -271,11 +265,13 @@ static void get_rows_cuda_kq32(
     GGML_ASSERT(ne00 % QK4_NL == 0);
     const int64_t nsb = ne00/QK4_NL;
 
-    const dim3 block_dims(block_dim, 1, 1);
-    const dim3 block_nums(ne10, MIN(nsb, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+    static_assert(block_dim == QK4_NL, "invalid block size");
+    static const bool disable_multiwarp = false;
 
-    // strides in elements
-    // const size_t s0 = nb0 / sizeof(dst_t);
+    const int warps = !disable_multiwarp && ne10 >= 1024 && nsb >= 4 ? 4 : 1;
+    const dim3 block_dims(warps * block_dim, 1, 1);
+    const dim3 block_nums(ne10, MIN((nsb + warps - 1) / warps, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
+
     const size_t s1 = nb1 / sizeof(dst_t);
     const size_t s2 = nb2 / sizeof(dst_t);
     const size_t s3 = nb3 / sizeof(dst_t);
@@ -283,19 +279,28 @@ static void get_rows_cuda_kq32(
     const size_t s10 = nb10 / sizeof(int32_t);
     const size_t s11 = nb11 / sizeof(int32_t);
     const size_t s12 = nb12 / sizeof(int32_t);
-    // const size_t s13 = nb13 / sizeof(int32_t);
 
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
 
-    k_get_rows_kq32<dst_t, dequantize_kq><<<block_nums, block_dims, 0, stream>>>(
-        src0_d, src1_d, dst_d,
-        ne00, /*ne01, ne02, ne03,*/
-        /*ne10,*/ ne11, ne12_fdv, /*ne13,*/
-        /* s0,*/ s1, s2, s3,
-        /* nb00,*/ nb01, nb02, nb03,
-        s10, s11, s12/*, s13*/);
+    if (warps == 4) {
+        k_get_rows_kq32<dst_t, dequantize_kq, 4><<<block_nums, block_dims, 0, stream>>>(
+            src0_d, src1_d, dst_d,
+            ne00,
+                      ne11, ne12_fdv,
+                     s1, s2, s3,
+                       nb01, nb02, nb03,
+            s10, s11, s12         );
+    } else {
+        k_get_rows_kq32<dst_t, dequantize_kq, 1><<<block_nums, block_dims, 0, stream>>>(
+            src0_d, src1_d, dst_d,
+            ne00,
+                      ne11, ne12_fdv,
+                     s1, s2, s3,
+                       nb01, nb02, nb03,
+            s10, s11, s12         );
+    }
 }
 
 template<typename src0_t, typename dst_t>
@@ -307,8 +312,6 @@ static void get_rows_cuda_float(
         cudaStream_t stream) {
     const dim3 block_dims(CUDA_GET_ROWS_BLOCK_SIZE, 1, 1);
 
-    // strides in elements
-    // const size_t s0 = nb0 / sizeof(dst_t);
     const size_t s1 = nb1 / sizeof(dst_t);
     const size_t s2 = nb2 / sizeof(dst_t);
     const size_t s3 = nb3 / sizeof(dst_t);
@@ -316,7 +319,6 @@ static void get_rows_cuda_float(
     const size_t s10 = nb10 / sizeof(int32_t);
     const size_t s11 = nb11 / sizeof(int32_t);
     const size_t s12 = nb12 / sizeof(int32_t);
-    // const size_t s13 = nb13 / sizeof(int32_t);
 
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
@@ -353,11 +355,11 @@ static void get_rows_cuda_float(
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
     ggml_cuda_kernel_launch(k_get_rows_float<src0_t, dst_t>, launch_params,
         src0_d, src1_d, dst_d,
-        ne00, /*ne01, ne02, ne03,*/
-        /*ne10,*/ ne11, ne12_fdv, /*ne13,*/
-        /* s0,*/ s1, s2, s3,
-        /* nb00,*/ nb01, nb02, nb03,
-        s10, s11, s12/*, s13*/);
+        ne00,
+                  ne11, ne12_fdv,
+                 s1, s2, s3,
+                   nb01, nb02, nb03,
+        s10, s11, s12         );
 }
 
 template <typename dst_t>
@@ -530,8 +532,8 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0]; // gradients of forward pass output
-    const ggml_tensor * src1 = dst->src[1]; // src1 in forward pass
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
 
     GGML_TENSOR_BINARY_OP_LOCALS
 

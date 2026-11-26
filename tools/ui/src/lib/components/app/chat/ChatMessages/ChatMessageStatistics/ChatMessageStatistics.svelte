@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { t } from "$lib/stores/locale.svelte";
 	import { BookOpenText, Clock, Gauge, Layers, Sparkles, WholeWord, Wrench } from '@lucide/svelte';
 	import { ChatMessageStatisticsBadge } from '$lib/components/app';
 	import * as Tooltip from '$lib/components/ui/tooltip';
@@ -174,8 +175,8 @@
 			{#if hasPromptStats || isLive}
 				{@render viewButton({
 					icon: BookOpenText,
-					label: 'Reading',
-					tooltipText: 'Processing',
+					label: t('预填充','Reading'),
+					tooltipText: t('预填充统计','Processing'),
 					view: ChatMessageStatsView.READING
 				})}
 			{/if}
@@ -183,24 +184,24 @@
 			{@render viewButton({
 				disabled: isGenerationDisabled,
 				icon: Sparkles,
-				label: 'Generation',
-				tooltipText: isGenerationDisabled ? 'Waiting for tokens...' : 'Generation',
+				label: t('吐字','Generation'),
+				tooltipText: isGenerationDisabled ? t('等待生成词元…','Waiting for tokens...') : t('吐字','Generation'),
 				view: ChatMessageStatsView.GENERATION
 			})}
 
 			{#if hasAgenticStats}
 				{@render viewButton({
 					icon: Wrench,
-					label: 'Tools',
-					tooltipText: 'Tool calls',
+					label: t('工具','Tools'),
+					tooltipText: t('工具调用','Tool calls'),
 					view: ChatMessageStatsView.TOOLS
 				})}
 
 				{#if !hideSummary}
 					{@render viewButton({
 						icon: Layers,
-						label: 'Summary',
-						tooltipText: 'Agentic summary',
+						label: t('汇总','Summary'),
+						tooltipText: t('智能体汇总','Agentic summary'),
 						view: ChatMessageStatsView.SUMMARY
 					})}
 				{/if}
@@ -213,85 +214,85 @@
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={WholeWord}
-				tooltipLabel="Generated tokens"
-				value="{predictedTokens?.toLocaleString()} tokens"
+				tooltipLabel={t("生成词元数","Generated tokens")}
+				value="{predictedTokens?.toLocaleString()} {t("词元","tokens")}"
 			/>
 
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={Clock}
-				tooltipLabel="Generation time"
+				tooltipLabel={t("生成耗时","Generation time")}
 				value={formattedTime}
 			/>
 
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={Gauge}
-				tooltipLabel="Generation speed"
-				value="{fixedFormatter.format(tokensPerSecond)} t/s"
+				tooltipLabel={t("吐字速度","Generation speed")}
+				value="{fixedFormatter.format(tokensPerSecond)} tok/s"
 			/>
 		{:else if activeView === ChatMessageStatsView.TOOLS && hasAgenticStats}
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={Wrench}
-				tooltipLabel="Tool calls executed"
+				tooltipLabel={t("工具调用次数","Tool calls executed")}
 				value="{agenticTimings!.toolCallsCount.toLocaleString()} calls"
 			/>
 
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={Clock}
-				tooltipLabel="Tool execution time"
+				tooltipLabel={t("工具执行耗时","Tool execution time")}
 				value={formattedAgenticToolsTime}
 			/>
 
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={Gauge}
-				tooltipLabel="Tool execution rate"
+				tooltipLabel={t("工具执行速率","Tool execution rate")}
 				value="{fixedFormatter.format(agenticToolsPerSecond)} calls/s"
 			/>
 		{:else if activeView === ChatMessageStatsView.SUMMARY && hasAgenticStats}
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={Layers}
-				tooltipLabel="Agentic turns (LLM calls)"
+				tooltipLabel={t("模型调用轮数","Agentic turns (LLM calls)")}
 				value="{agenticTimings!.turns.toLocaleString()} turns"
 			/>
 
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={WholeWord}
-				tooltipLabel="Total tokens generated"
-				value="{agenticTimings!.llm.predicted_n.toLocaleString()} tokens"
+				tooltipLabel={t("累计生成词元数","Total tokens generated")}
+				value="{agenticTimings!.llm.predicted_n.toLocaleString()} {t("词元","tokens")}"
 			/>
 
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={Clock}
-				tooltipLabel="Total time (LLM + tools)"
+				tooltipLabel={t("总耗时（模型与工具）","Total time (LLM + tools)")}
 				value={formattedAgenticTotalTime}
 			/>
 		{:else if hasPromptStats && (mode === ChatMessageStatisticsMode.READING || isSwitchable)}
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={WholeWord}
-				tooltipLabel="Prompt tokens"
-				value="{promptTokens?.toLocaleString()} tokens"
+				tooltipLabel={t("预填充词元数","Prompt tokens")}
+				value="{promptTokens?.toLocaleString()} {t("词元","tokens")}"
 			/>
 
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={Clock}
-				tooltipLabel="Prompt processing time"
+				tooltipLabel={t("预填充耗时","Prompt processing time")}
 				value={formattedPromptTime ?? '0s'}
 			/>
 
 			<ChatMessageStatisticsBadge
 				class="bg-transparent"
 				icon={Gauge}
-				tooltipLabel="Prompt processing speed"
-				value="{fixedFormatter.format(promptTokensPerSecond!)} tokens/s"
+				tooltipLabel={t("预填充速度","Prompt processing speed")}
+				value="{fixedFormatter.format(promptTokensPerSecond!)} tok/s"
 			/>
 		{/if}
 	</div>

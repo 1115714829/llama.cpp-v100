@@ -1,14 +1,8 @@
-// QPN8 lane/column/physical-K permutations shared by the skinny GEMM kernels for sm_70 (Volta).
-//
-// Adapted from 1Cat-vLLM csrc/sm70_turbomind/ops/fp8_qpn8_sm70.cu (Apache-2.0). The QPN8
-// execution layout is derived from dnv2003/v100-skinny (MIT) and its block-scale adaptation
-// in haohervchb/sglang-V100. See licenses/LICENSE-v100-skinny in the repository root.
+// Portions from 1Cat-vLLM, v100-skinny and haohervchb/sglang-V100; see licenses/LICENSE-1Cat-vLLM and licenses/LICENSE-v100-skinny.
 
 #pragma once
 
 #include "common.cuh"
-
-// ---- 1Cat fp8_qpn8_sm70.cu:39-50 (lane/column mapping, unchanged) ----
 
 static __device__ __forceinline__ int qpn8_col_from_lane(int lane) {
     return ((lane >> 2) & 3) * 8 + (lane & 3) + ((lane & 16) ? 4 : 0);

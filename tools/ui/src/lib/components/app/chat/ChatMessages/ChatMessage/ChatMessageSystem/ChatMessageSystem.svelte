@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Check, X } from '@lucide/svelte';
 	import { ChatMessageActionIcons, MarkdownContent } from '$lib/components/app';
 	import { Button } from '$lib/components/ui/button';
@@ -99,7 +100,7 @@
 				<Button class="h-8 px-3" onclick={editCtx.cancel} size="sm" variant="outline">
 					<X class="mr-1 h-3 w-3" />
 
-					Cancel
+					{tr("Cancel")}
 				</Button>
 
 				<Button
@@ -110,7 +111,7 @@
 				>
 					<Check class="mr-1 h-3 w-3" />
 
-					Save
+					{tr("Save")}
 				</Button>
 			</div>
 		</div>

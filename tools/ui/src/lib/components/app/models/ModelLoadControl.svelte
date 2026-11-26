@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { ActionIcon } from '$lib/components/app';
 	import { ICON_CLASS_DEFAULT, MODEL_LOAD_ICONS } from '$lib/constants';
 	import { modelsStore } from '$lib/stores';
@@ -98,7 +99,7 @@
 					iconSize="h-4 w-4"
 					onclick={() => modelsStore.status.load(option.model)}
 					stopPropagationOnClick
-					tooltip="Load model"
+					tooltip={tr("Load model")}
 					tooltipAsTitle
 				/>
 			{/if}

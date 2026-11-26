@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import {
 		Database,
 		ExternalLink,
@@ -24,7 +25,7 @@
 		<Badge class="h-5 gap-1 bg-green-50 px-1.5 text-[10px] dark:bg-green-950" variant="outline">
 			<Wrench class="h-3 w-3 text-green-600 dark:text-green-400" />
 
-			Tools
+			{tr("Tools")}
 		</Badge>
 	{/if}
 

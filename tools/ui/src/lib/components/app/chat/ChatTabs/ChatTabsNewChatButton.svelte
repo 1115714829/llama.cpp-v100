@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Plus } from '@lucide/svelte';
 	import * as Tooltip from '$lib/components/ui/tooltip';
 	import { ICON_CLASS_DEFAULT } from '$lib/constants';
@@ -15,7 +16,7 @@
 		{#snippet child({ props })}
 			<button
 				{...props}
-				aria-label="New chat"
+				aria-label={tr("New chat")}
 				class="backdrop-blur-lg flex h-8 w-8 mr-4 shrink-0 cursor-pointer items-center justify-center rounded-md transition-colors hover:bg-foreground/5"
 				{onclick}
 			>
@@ -25,6 +26,6 @@
 	</Tooltip.Trigger>
 
 	<Tooltip.Content>
-		<p>New chat</p>
+		<p>{tr("New chat")}</p>
 	</Tooltip.Content>
 </Tooltip.Root>

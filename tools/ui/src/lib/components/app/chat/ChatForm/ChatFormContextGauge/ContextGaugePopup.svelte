@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { colorLevelBgClass, colorLevelTextClass } from './context-gauge';
 	import ContextGaugeDetails from './ContextGaugeDetails.svelte';
 	import ContextGaugeLoadModel from './ContextGaugeLoadModel.svelte';
@@ -89,7 +90,7 @@
 			</span>
 		</div>
 	{:else}
-		<div class="text-xs text-muted-foreground">No context info available</div>
+		<div class="text-xs text-muted-foreground">{tr("No context info available")}</div>
 	{/if}
 
 	{#if gauge.hasAnyUsage}
@@ -112,7 +113,7 @@
 	<Drawer.Root bind:open={gaugePopup.open}>
 		<Drawer.Content>
 			<Drawer.Header>
-				<Drawer.Title>Context</Drawer.Title>
+				<Drawer.Title>{tr("Context")}</Drawer.Title>
 
 				<Drawer.Description class="sr-only">
 					Context window usage of the model the chat runs
@@ -137,7 +138,7 @@
 	>
 		<div class="flex flex-col gap-2">
 			<div class="flex items-center gap-2">
-				<span class="font-medium">Context</span>
+				<span class="font-medium">{tr("Context")}</span>
 
 				<span class="text-muted-foreground">·</span>
 

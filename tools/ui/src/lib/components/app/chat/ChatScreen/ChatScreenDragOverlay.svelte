@@ -1,4 +1,5 @@
 <script>
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Upload } from '@lucide/svelte';
 </script>
 
@@ -10,8 +11,8 @@
 	>
 		<Upload class="mb-4 h-12 w-12 text-muted-foreground" />
 
-		<p class="text-lg font-medium text-foreground">Attach a file</p>
+		<p class="text-lg font-medium text-foreground">{tr("Attach a file")}</p>
 
-		<p class="text-sm text-muted-foreground">Drop your files here to upload</p>
+		<p class="text-sm text-muted-foreground">{tr("Drop your files here to upload")}</p>
 	</div>
 </div>

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr, t } from '$lib/stores/locale.svelte';
 	import { Check, Info, Lightbulb, LightbulbOff } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import * as Drawer from '$lib/components/ui/drawer';
@@ -19,7 +20,8 @@
 	// a phone picks the level in a drawer, where a thumb reaches it
 	let isMobile = $derived(deviceStore.isMobile);
 
-	const MAX_EFFORT_HINT = 'Maximum reasoning effort with extended context usage';
+	const MAX_EFFORT_HINT = $derived(t('最高思考强度，允许使用更多上下文', 'Maximum reasoning effort with extended context usage'));
+ const labels: Record<string,string> = {default:'默认',off:'关闭',low:'低',medium:'中',high:'高',max:'最高'};
 
 	function select(level: ReasoningEffortLevel): void {
 		reasoning.select(level);
@@ -35,9 +37,7 @@
 			<Lightbulb class="size-3 max-md:size-4 shrink-0" />
 		{/if}
 
-		{#if !isDefault}
-			<span class="capitalize">{reasoning.currentEffort}</span>
-		{/if}
+		<span>{tr("Reasoning effort")} · {t(labels[reasoning.currentEffort] ?? reasoning.currentEffort, reasoning.currentEffort)}</span>
 	</span>
 {/snippet}
 
@@ -56,7 +56,7 @@
 			<div class="{ICON_CLASS_DEFAULT} shrink-0"></div>
 		{/if}
 
-		<span class="min-w-0 flex-1 truncate">{level.label}</span>
+		<span class="min-w-0 flex-1 truncate">{t(labels[level.value] ?? level.label, level.label)}</span>
 
 		{#if tokenLabel}
 			<span class="shrink-0 text-[11px] text-muted-foreground opacity-60">{tokenLabel}</span>
@@ -72,7 +72,7 @@
 <!-- the level belongs to the chat, not to the model list -->
 {#if isMobile}
 	<Button
-		aria-label="Reasoning effort"
+		aria-label={tr("Reasoning effort")}
 		class="h-auto gap-1 rounded-sm bg-transparent! backdrop-blur-none! {isDefault
 			? 'px-1'
 			: 'px-1.75!'} py-1 text-xs max-md:h-8"
@@ -85,7 +85,7 @@
 	<Drawer.Root bind:open={isOpen}>
 		<Drawer.Content>
 			<Drawer.Header>
-				<Drawer.Title>Reasoning effort</Drawer.Title>
+				<Drawer.Title>{tr("Reasoning effort")}</Drawer.Title>
 			</Drawer.Header>
 
 			<div class="flex flex-col px-2 pb-4">
@@ -101,7 +101,7 @@
 			{#snippet child({ props })}
 				<Button
 					{...props}
-					aria-label="Reasoning effort"
+					aria-label={tr("Reasoning effort")}
 					class="h-auto gap-1 rounded-sm bg-transparent! backdrop-blur-none! {isDefault
 						? 'px-1'
 						: 'px-1.75!'} py-1 text-xs hover:bg-transparent!"
@@ -123,7 +123,7 @@
 						<div class="{ICON_CLASS_DEFAULT} shrink-0"></div>
 					{/if}
 
-					<span class="min-w-0 flex-1 truncate">{level.label}</span>
+					<span class="min-w-0 flex-1 truncate">{t(labels[level.value] ?? level.label, level.label)}</span>
 
 					{#if tokenLabel}
 						<span class="shrink-0 text-[11px] text-muted-foreground opacity-60">{tokenLabel}</span>

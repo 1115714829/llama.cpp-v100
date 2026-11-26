@@ -79,35 +79,6 @@ static void concat_cont_cuda(const T * x,
     concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #define CUDA_CONCAT_TILE 32
 
 template <typename T>
@@ -145,7 +116,6 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_dim0_tra
     const int64_t x0 = (int64_t) blockIdx.x * CUDA_CONCAT_TILE;
     const int64_t y0 = (int64_t) blockIdx.y * CUDA_CONCAT_TILE;
 
-
     for (int ix = threadIdx.y; ix < CUDA_CONCAT_TILE; ix += blockDim.y) {
         const int64_t x = x0 + ix;
         const char * s   = x < ne00 ? b0 : b1;
@@ -161,7 +131,6 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_dim0_tra
 
     __syncthreads();
 
-
     for (int iy = threadIdx.y; iy < CUDA_CONCAT_TILE; iy += blockDim.y) {
         const int64_t y = y0 + iy;
         if (y >= ne1) {
@@ -176,7 +145,6 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_dim0_tra
         }
     }
 }
-
 
 template <typename T>
 static void concat_dim0_transpose_cuda(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
@@ -286,9 +254,6 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
-
-
-
 
         if (dim == 0 && dst->nb[0] == sizeof(T) && src1->nb[1] == sizeof(T) && src1->nb[0] != sizeof(T)) {
             concat_dim0_transpose_cuda<T>(src0, src1, dst, stream);

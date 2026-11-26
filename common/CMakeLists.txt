@@ -57,6 +57,16 @@ include(parsers/sources.cmake)
 
 add_library(${TARGET}
     ${LLAMA_CHAT_PARSERS_SOURCES}
+    admission_gate.cpp
+    admission_gate.h
+    admission_authority.cpp
+    admission_authority.h
+    admission_numa.cpp
+    admission_owned_math.cpp
+    admission_pin_math.cpp
+    admission_pin_math.h
+    admission_pin_table.cpp
+    admission_pin_table.h
     arg.cpp
     arg.h
     base64.hpp
@@ -78,6 +88,7 @@ add_library(${TARGET}
     download.h
     fit.cpp
     fit.h
+    fit-host-account.h
     hf-cache.cpp
     hf-cache.h
     http.h
@@ -150,6 +161,10 @@ endif()
 
 target_link_libraries(${TARGET} PUBLIC  llama-common-base)
 target_link_libraries(${TARGET} PRIVATE cpp-httplib)
+# The safe-IO authority registers its signing table into the ggml base layer
+# at library load.  This is a one-way dependency (common on top of ggml-base,
+# never the reverse): the base layer itself stays free of any common include.
+target_link_libraries(${TARGET} PRIVATE ggml-base)
 
 if (LLAMA_LLGUIDANCE)
     include(ExternalProject)

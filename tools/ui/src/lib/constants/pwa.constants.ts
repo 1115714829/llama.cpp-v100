@@ -251,7 +251,7 @@ export const CACHE_SETTINGS = {
 	API_CACHE_MAX_AGE_SECONDS: 60 * 60 * 24,
 	API_CACHE_MAX_ENTRIES: 50,
 	IMMUTABLE_MAX_AGE_SECONDS: 31536000,
-	MAX_FILE_SIZE_BYTES: 10 * 1024 * 1024
+	MAX_FILE_SIZE_BYTES: 16 * 1024 * 1024
 } as const;
 
 export const GLOB_PATTERNS: string[] = [
@@ -330,32 +330,6 @@ export const SVELTEKIT_PWA_OPTIONS: SvelteKitPWAOptions = {
 		// endpoints (e.g. /slots, /models, /v1/models) which should return
 		// JSON, not the SPA HTML shell. The server's own static-file fallback
 		// handles non-API navigation to index.html for the SPA router.
-		navigateFallback: '',
-
-		// Runtime caching for API calls - use NetworkFirst so APIs are always fresh
-		runtimeCaching: [
-			{
-				handler: RUNTIME_CACHING.HANDLER,
-				options: {
-					cacheName: RUNTIME_CACHING.CACHE_NAME,
-					expiration: {
-						maxAgeSeconds: CACHE_SETTINGS.API_CACHE_MAX_AGE_SECONDS,
-						maxEntries: CACHE_SETTINGS.API_CACHE_MAX_ENTRIES
-					}
-				},
-				urlPattern: API_CACHING_PATTERNS.V1_API
-			},
-			{
-				handler: RUNTIME_CACHING.HANDLER,
-				options: {
-					cacheName: RUNTIME_CACHING.CACHE_NAME,
-					expiration: {
-						maxAgeSeconds: CACHE_SETTINGS.API_CACHE_MAX_AGE_SECONDS,
-						maxEntries: CACHE_SETTINGS.API_CACHE_MAX_ENTRIES
-					}
-				},
-				urlPattern: API_CACHING_PATTERNS.STATIC_API
-			}
-		]
+		navigateFallback: ''
 	}
 };

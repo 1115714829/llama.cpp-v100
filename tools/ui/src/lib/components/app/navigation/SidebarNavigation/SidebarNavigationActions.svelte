@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr, t } from "$lib/stores/locale.svelte";
 	import { Search } from '@lucide/svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
@@ -140,7 +141,7 @@
 			bind:value={searchQuery}
 			onClose={handleSearchModeDeactivate}
 			onKeyDown={(e) => e.key === 'Escape' && handleSearchModeDeactivate()}
-			placeholder="Search conversations..."
+			placeholder={t("搜索会话…", "Search conversations...")}
 		/>
 	</div>
 {:else if isExpandedMode || isOnMobile}
@@ -176,7 +177,7 @@
 
 							{#if showIcons}
 								<span in:fade={itemTransition} out:fade={itemTransition} class="min-w-0 truncate"
-									>{item.tooltip}</span
+									>{tr(item.tooltip)}</span
 								>
 							{/if}
 						</span>
@@ -211,7 +212,7 @@
 						iconSize={ICON_CLASS_DEFAULT}
 						onclick={itemOnClick}
 						size="lg"
-						tooltip={item.tooltip}
+						tooltip={tr(item.tooltip)}
 						tooltipSide={TooltipSide.RIGHT}
 					/>
 				</div>

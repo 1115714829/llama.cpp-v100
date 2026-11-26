@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Lightbulb } from '@lucide/svelte';
 	import { CollapsibleContentBlock, MarkdownContent } from '$lib/components/app';
 	import { REASONING_SCROLL_AT_BOTTOM_THRESHOLD_PX } from '$lib/constants';
@@ -130,8 +131,8 @@
 	{onToggle}
 	{open}
 	{shimmerTitle}
-	{subtitle}
-	{title}
+	subtitle={subtitle ? tr(subtitle) : subtitle}
+	title={tr(title)}
 >
 	<div
 		bind:this={scrollEl}

@@ -8,12 +8,6 @@
 #include <set>
 #include <vector>
 
-//
-// llama_memory_recurrent
-//
-
-// TODO: extract the cache state used for graph computation into llama_memory_recurrent_context_i
-//       see the implementation of llama_kv_cache_context_i for an example how to do it
 class llama_memory_recurrent : public llama_memory_i {
 public:
     llama_memory_recurrent(
@@ -27,10 +21,6 @@ public:
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
-
-    //
-    // llama_memory_i
-    //
 
     llama_memory_context_ptr init_batch(
             llama_batch_allocr & balloc,
@@ -58,40 +48,34 @@ public:
 
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 
-    // find a contiguous slot of memory cells and emplace the ubatch there
     bool find_slot(const llama_ubatch & ubatch);
 
     bool get_can_shift() const override;
 
-    // state write/load
-
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
-    uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
-    uint32_t size = 0; // total number of cells, shared across all sequences
-    uint32_t used = 0; // used cells (i.e. at least one seq_id)
+    uint32_t head = 0;
+    uint32_t size = 0;
+    uint32_t used = 0;
 
-    // number of recurrent-state snapshots per seq for rollback; tensors are widened to (1 + n_rs_seq) groups
     uint32_t n_rs_seq = 0;
 
-    // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
-    // computed before each graph build
     uint32_t n = 0;
 
-    // first zero-ed state
     int32_t rs_z = -1;
 
-    // TODO: optimize for recurrent state needs
     struct mem_cell {
         llama_pos pos  = -1;
-        int32_t   src  = -1; // used to know where states should be copied from
-        int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
+        int32_t   src  = -1;
+        int32_t   src0 = -1;
         int32_t   tail = -1;
+
+        uint32_t rs_max = 0;
 
         std::set<llama_seq_id> seq_id;
 
@@ -110,22 +94,19 @@ public:
 
     std::vector<mem_cell> cells;
 
-    // per layer
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
-    // a second conv history that must stay replicated across devices, so it cannot share the r row
+
     std::vector<ggml_tensor *> p_l;
 
 private:
-    //const llama_model & model;
+
     const llama_hparams & hparams;
 
     const uint32_t n_seq_max = 1;
 
-    // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
 
-    // true if no layers - can happen if the layer filter removes all layers
     bool is_empty() const;
 
     size_t total_size() const;
@@ -145,33 +126,23 @@ private:
 
 class llama_memory_recurrent_context : public llama_memory_context_i {
 public:
-    // used for errors
+
     llama_memory_recurrent_context(llama_memory_status status);
 
-    // used to create a full-cache or update context
     llama_memory_recurrent_context(
             llama_memory_recurrent * mem);
 
-    // used to create a batch processing context from a batch
     llama_memory_recurrent_context(
             llama_memory_recurrent * mem,
             std::vector<llama_ubatch> ubatches);
 
     virtual ~llama_memory_recurrent_context();
 
-    //
-    // llama_memory_context_i
-    //
-
     bool next()  override;
     bool apply() override;
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
-
-    //
-    // llama_memory_recurrent_context specific API
-    //
 
     uint32_t get_n_rs() const;
     uint32_t get_head() const;
@@ -192,11 +163,6 @@ private:
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;
-
-    //
-    // data needed for building the compute graph for the current ubatch:
-    // TODO: extract all the state like `head` and `n` here
-    //
 
     const bool is_full = false;
 };

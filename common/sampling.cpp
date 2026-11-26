@@ -16,8 +16,6 @@
 #include <unordered_map>
 #include <vector>
 
-// the ring buffer works similarly to std::deque, but with a fixed capacity
-// TODO: deduplicate with llama-impl.h
 template<typename T>
 struct ring_buffer {
     ring_buffer(size_t cap) : capacity(cap), data(cap) {}
@@ -52,7 +50,7 @@ struct ring_buffer {
 
     void push_back(const T & value) {
         if (sz == capacity) {
-            // advance the start when buffer is full
+
             first = (first + 1) % capacity;
         } else {
             sz++;
@@ -88,7 +86,7 @@ struct ring_buffer {
     }
 
     void clear() {
-        // here only reset the status of the buffer
+
         sz = 0;
         first = 0;
         pos = 0;
@@ -122,7 +120,6 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
-    // for rejection sampling; independent of the draft, or the target distribution is not preserved
     std::mt19937 rng;
 
     void reset() {
@@ -170,7 +167,6 @@ struct common_sampler {
     }
 
     mutable int64_t t_total_us = 0;
-
 
     int32_t n_logit_bans = 0;
 };
@@ -222,7 +218,7 @@ struct common_sampler * common_sampler_init(
         grmr = llama_sampler_init_llg(vocab, "lark", grammar_str.c_str());
 #else
         throw std::runtime_error("failed to parse grammar: llguidance is not enabled");
-#endif // LLAMA_USE_LLGUIDANCE
+#endif
     } else {
         std::vector<std::string> trigger_patterns;
         std::vector<llama_token> trigger_tokens;
@@ -282,7 +278,6 @@ struct common_sampler * common_sampler_init(
         throw std::runtime_error("failed to parse grammar");
     }
 
-    // Compute prefill tokens from the generation prompt
     std::vector<llama_token> prefill_tokens;
     if (!params.generation_prompt.empty()) {
         GGML_ASSERT(vocab != nullptr);
@@ -290,7 +285,7 @@ struct common_sampler * common_sampler_init(
         for (size_t i = 0; i < tokens.size(); i++) {
             std::string piece = common_token_to_piece(vocab, tokens[i], true);
             if (i == 0 && std::isspace(piece[0]) && !std::isspace(params.generation_prompt[0])) {
-                // Some tokenizers will add a space before the first special token, need to exclude
+
                 continue;
             }
             LOG_DBG("%s: prefill token: %d = %s\n", __func__, tokens[i], piece.c_str());
@@ -298,9 +293,6 @@ struct common_sampler * common_sampler_init(
         }
     }
 
-    // Feed generation prompt tokens to the grammar sampler so it advances past
-    // tokens the template already placed in the prompt.
-    // Only applies to output-format and tool-call grammars; user-supplied grammars must not be prefilled.
     if (grmr && !params.grammar_lazy && common_grammar_needs_prefill(params.grammar)) {
         try {
             for (const auto & token : prefill_tokens) {
@@ -314,7 +306,6 @@ struct common_sampler * common_sampler_init(
         }
     }
 
-    // reasoning budget sampler (skip when budget is unlimited unless a lazy grammar is active, which needs rbudget for thinking-block suppression)
     if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control)) {
         rbudget = common_reasoning_budget_init(
             vocab,
@@ -329,7 +320,6 @@ struct common_sampler * common_sampler_init(
         }
     }
 
-    // logit bias: user biases + model suppress tokens (-INFINITY)
     int32_t n_logit_bans = 0;
     {
         std::vector<llama_logit_bias> merged = params.logit_bias;
@@ -355,7 +345,7 @@ struct common_sampler * common_sampler_init(
 
     if (params.mirostat == 0) {
 
-        bool use_adaptive_p = false; // see below
+        bool use_adaptive_p = false;
 
         for (const auto & cnstr : params.samplers) {
             switch (cnstr) {
@@ -397,10 +387,7 @@ struct common_sampler * common_sampler_init(
                     samplers.push_back(llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), params.penalty_last_n, params.penalty_repeat, params.penalty_freq, params.penalty_present));
                     break;
                 case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
-                    // the `adaptive-p` sampler is like `dist` and `mirostat` in that it selects
-                    // a single token, so we will add `dist` at the end of the chain by default,
-                    // unless the user specifically included `adaptive-p`. we set this flag here
-                    // so we know to add the sampler at the very end.
+
                     use_adaptive_p = true;
                     break;
                 default:
@@ -408,18 +395,10 @@ struct common_sampler * common_sampler_init(
             }
         }
         if (use_adaptive_p) {
-            // only if user explicitly included adaptive-p sampler
+
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
         } else {
-            // default: sample from distribution
-            // upstream 0.7.0 (#29797) picks the greedy sampler here when the chain ends with the
-            // temperature sampler at T = 0 (or with the top-k sampler at top_k = 1). We keep the
-            // 2.0.1.1 behavior: the chain always ends with "dist". Two reasons:
-            //   - the user visible default does not change without the user's decision (the
-            //     change is listed in the default value list of the merge)
-            //   - our own T = 0 greedy verification path (common_sampler_can_greedy_topk) and the
-            //     sparse rejection path both require the last sampler of the chain to be "dist";
-            //     a "greedy" tail would silently switch our verification path off
+
             samplers.push_back(llama_sampler_init_dist(params.seed));
         }
     } else if (params.mirostat == 1) {
@@ -449,15 +428,15 @@ struct common_sampler * common_sampler_init(
     }
 
     auto * result = new common_sampler {
-        /* .params  = */ params,
-        /* .grmr    = */ grmr,
-        /* .rbudget = */ rbudget,
-        /* .chain   = */ chain,
-        /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-        /* .cur     = */ {},
-        /* .cur_p   = */ {},
-        // mix it, the chain and the draft are seeded from this one too
-        /* .rng     = */ std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
+                         params,
+                         grmr,
+                         rbudget,
+                         chain,
+                         ring_buffer<llama_token>(std::max(32, params.n_prev)),
+                         {},
+                         {},
+
+                         std::mt19937(llama_sampler_get_seed(chain) ^ 0x9e3779b9u),
     };
 
     result->n_logit_bans = n_logit_bans;
@@ -485,7 +464,7 @@ static bool grammar_should_apply(struct common_sampler * gsmpl) {
         return true;
     }
     if (gsmpl->params.grammar_lazy) {
-        // if grammar is lazy, only apply when reasoning budget is not active
+
         const auto state = common_reasoning_budget_get_state(gsmpl->rbudget);
         return state == REASONING_BUDGET_IDLE || state == REASONING_BUDGET_DONE;
     }
@@ -499,13 +478,11 @@ void common_sampler_accept(struct common_sampler * gsmpl, llama_token token, boo
 
     const auto tm = gsmpl->tm();
 
-    // grammar_should_apply() checks the reasoning budget state, so calculate this before we accept
     const auto accept_grammar = is_generated && grammar_should_apply(gsmpl);
 
     if (gsmpl->rbudget && is_generated) {
         llama_sampler_accept(gsmpl->rbudget, token);
 
-        // if done, replay end sequence which may contain a grammar trigger
         const bool is_done = common_reasoning_budget_get_state(gsmpl->rbudget) == REASONING_BUDGET_DONE;
         if (gsmpl->grmr && !accept_grammar && is_done) {
             const llama_tokens * end_seq = common_reasoning_budget_get_end_match(gsmpl->rbudget);
@@ -536,14 +513,14 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     auto * result = new common_sampler {
-        /* .params  = */ gsmpl->params,
-        /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
-        /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .chain   = */ llama_sampler_clone(gsmpl->chain),
-        /* .prev    = */ gsmpl->prev,
-        /* .cur     = */ gsmpl->cur,
-        /* .cur_p   = */ gsmpl->cur_p,
-        /* .rng     = */ gsmpl->rng,
+                         gsmpl->params,
+                         llama_sampler_clone(gsmpl->grmr),
+                         llama_sampler_clone(gsmpl->rbudget),
+                         llama_sampler_clone(gsmpl->chain),
+                         gsmpl->prev,
+                         gsmpl->cur,
+                         gsmpl->cur_p,
+                         gsmpl->rng,
     };
 
     result->n_logit_bans = gsmpl->n_logit_bans;
@@ -567,14 +544,13 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->prev       = src->prev;
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
-    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
+    dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr;
     dst->rng        = src->rng;
     dst->t_total_us = src->t_total_us;
     dst->n_logit_bans = src->n_logit_bans;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
-    // TODO: measure grammar performance
 
     const double t_sampling_ms = gsmpl ? 1e-3*gsmpl->t_total_us : 0;
 
@@ -589,7 +565,6 @@ void common_perf_print(const struct llama_context * ctx, const struct common_sam
 
         data = llama_perf_sampler(gsmpl->chain);
 
-        // note: the sampling time includes the samplers time + extra time spent in common/sampling
         LOG_INF("%s:    sampling time = %10.2f ms\n", __func__, t_sampling_ms);
         LOG_INF("%s:    samplers time = %10.2f ms / %5d tokens\n", __func__, data.t_sample_ms, data.n_sample);
     }
@@ -630,7 +605,6 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
-    // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
 
     llama_token id = LLAMA_TOKEN_NULL;
@@ -638,12 +612,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & grmr  = gsmpl->grmr;
     auto & rbudget = gsmpl->rbudget;
     auto & chain = gsmpl->chain;
-    auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+    auto & cur_p = gsmpl->cur_p;
 
     gsmpl->set_logits(ctx, idx);
 
-    // Check if a backend sampler has already sampled a token in which case we
-    // return that token id directly.
     {
         id = llama_get_sampled_token_ith(ctx, idx);
 
@@ -664,7 +636,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
     }
 
-    // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
 
     if (grammar_first && grammar_should_apply(gsmpl)) {
@@ -679,7 +650,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         return id;
     }
 
-    // check if it the sampled token fits the grammar (grammar-based rejection sampling)
     {
         llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
         llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
@@ -692,8 +662,6 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
     }
 
-    // resampling:
-    // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
     gsmpl->set_logits(ctx, idx);
 
     llama_sampler_apply(rbudget,  &cur_p);
@@ -732,9 +700,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
                     (int) strlen(__func__), __func__, i, draft[i], id, draft[i] == id ? "ACCEPT" : "REJECT");
         }
 
-        // do not accept draft tokens after an EOG - they are not output but would stay in the context
-        // on replay the last token is from the target and can be EOG, so a trailing EOG is still accepted
-        if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
+        if (draft[i] != id || (!gsmpl->params.ignore_eos && llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
             break;
         }
     }
@@ -763,9 +729,6 @@ static float prob_of(const llama_token_data * data, size_t n, llama_token id) {
     return 0.0f;
 }
 
-// Accept a drafted token with probability min(1, p/q), else draw from norm(max(0, p - q)).
-// Preserves the target distribution exactly, and accepts more often than matching does when the
-// draft samples instead of taking its argmax.
 std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q, bool grammar_first) {
     GGML_ASSERT(idxs.size()    == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(draft_q.size() == draft.size() && "draft_q must have one entry per draft token");
@@ -773,16 +736,15 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
-    // draws come from the sampler's own stream, so they stay independent of what was drafted
     std::uniform_real_distribution<float> uni(0.0f, 1.0f);
 
     std::vector<llama_token_data> residual;
 
-    std::vector<llama_token_data> cand; // candidate array masked by the grammar, if there is one
+    std::vector<llama_token_data> cand;
 
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        // leaves the target distribution in the candidate array
+
         const llama_token id_tgt = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
         const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
@@ -795,12 +757,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
             llama_sampler_apply(gsmpl->grmr, &arr);
         }
 
-        // a candidate the grammar rejects carries no probability, whatever the target thinks
         auto p_raw = [&](size_t k) {
             return masked && cand[k].logit == -INFINITY ? 0.0f : cur_p->data[k].p;
         };
 
-        // masking drops probability mass, so rescale what is left or the residual is over-weighted
         float p_sum = 0.0f;
         if (masked) {
             for (size_t k = 0; k < cur_p->size; ++k) {
@@ -814,7 +774,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
             return p_raw(k)*p_norm;
         };
 
-        // q_x is never 0 for a token the draft produced, but guard the divide
         const float q_x = prob_of(q.data(), q.size(), draft[i]);
 
         float p_x = 0.0f;
@@ -831,7 +790,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
             continue;
         }
 
-        // rejected: tokens outside q's support keep all of p
         residual.clear();
         float sum = 0.0f;
         for (size_t k = 0; k < cur_p->size; ++k) {
@@ -881,8 +839,6 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
 }
 
-
-
 static bool common_sampler_name_is(const char * name, const char * base) {
 
     if (name[0] == '+' || name[0] == '-') {
@@ -892,15 +848,7 @@ static bool common_sampler_name_is(const char * name, const char * base) {
     return strcmp(name, base) == 0;
 }
 
-
-
-
 static const int32_t COMMON_SPARSE_K_MAX = 256;
-
-
-
-
-
 
 static int32_t common_sampler_sparse_n_penalized(const struct common_sampler * gsmpl) {
     struct llama_sampler * chain = gsmpl->chain;
@@ -933,11 +881,9 @@ bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl) {
         return false;
     }
 
-
     if (params.backend_sampling) {
         return false;
     }
-
 
     if (params.top_k <= 0 || params.top_k > 64) {
         return false;
@@ -964,10 +910,6 @@ bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl) {
         return false;
     }
 
-
-
-
-
     for (int32_t i = 0; i < i_top_k; ++i) {
         const char * name = llama_sampler_name(llama_sampler_chain_get(chain, i));
         if (name[0] == '?') {
@@ -981,8 +923,6 @@ bool common_sampler_can_sparse_reject(const struct common_sampler * gsmpl) {
         }
         return false;
     }
-
-
 
     for (int32_t i = i_top_k + 1; i < n - 1; ++i) {
         const char * name = llama_sampler_name(llama_sampler_chain_get(chain, i));
@@ -1018,8 +958,6 @@ bool common_sampler_can_greedy_topk(const struct common_sampler * gsmpl) {
 
     const auto & params = gsmpl->params;
 
-
-
     if (params.temp > 0.0f || params.n_probs != 0 || params.dynatemp_range != 0.0f || params.mirostat != 0) {
         return false;
     }
@@ -1037,9 +975,6 @@ bool common_sampler_can_greedy_topk(const struct common_sampler * gsmpl) {
     if (n < 1 || !common_sampler_name_is(llama_sampler_name(llama_sampler_chain_get(chain, n - 1)), "dist")) {
         return false;
     }
-
-
-
 
     for (int32_t i = 0; i < n - 1; ++i) {
         const char * name = llama_sampler_name(llama_sampler_chain_get(chain, i));
@@ -1066,8 +1001,6 @@ bool common_sampler_can_greedy_topk(const struct common_sampler * gsmpl) {
         return false;
     }
 
-
-
     const int64_t k = 1 + gsmpl->n_logit_bans + n_penalized;
     if (k > 64) {
         return false;
@@ -1087,7 +1020,6 @@ int32_t common_sampler_greedy_topk_k(const struct common_sampler * gsmpl) {
     return 1 + gsmpl->n_logit_bans + n_penalized;
 }
 
-
 static llama_token common_sampler_sample_greedy_topk(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
     const auto tm = gsmpl->tm();
 
@@ -1103,8 +1035,6 @@ static llama_token common_sampler_sample_greedy_topk(struct common_sampler * gsm
     for (int32_t i = 0; i < n; ++i) {
         cur[i] = llama_token_data{topk_ids[i], topk_logits[i], 0.0f};
     }
-
-
 
     std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
         return a.logit != b.logit ? a.logit > b.logit : a.id < b.id;
@@ -1145,9 +1075,7 @@ std::vector<llama_token> common_sampler_greedy_topk_and_accept_n(struct common_s
                     (int) strlen(__func__), __func__, i, draft[i], id, draft[i] == id ? "ACCEPT" : "REJECT");
         }
 
-        // do not accept draft tokens after an EOG - they are not output but would stay in the context
-        // on replay the last token is from the target and can be EOG, so a trailing EOG is still accepted
-        if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
+        if (draft[i] != id || (!gsmpl->params.ignore_eos && llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
             break;
         }
     }
@@ -1239,7 +1167,6 @@ std::vector<llama_token> common_sampler_reject_core(
             continue;
         }
 
-
         std::vector<llama_token> r_ids;
         std::vector<float>       r_probs;
         r_ids.reserve(p.ids.size());
@@ -1263,14 +1190,11 @@ std::vector<llama_token> common_sampler_reject_core(
         return result;
     }
 
-
     const auto & p_last = p_rows.back();
     result.push_back(common_sampler_sparse_sample(p_last.ids, p_last.probs, uniform, uniform_data));
 
     return result;
 }
-
-
 
 static common_sampler_sparse_probs common_sampler_sparse_p(
         struct llama_sampler * chain,
@@ -1278,7 +1202,6 @@ static common_sampler_sparse_probs common_sampler_sparse_p(
         int idx,
         int32_t k) {
     std::vector<llama_token_data> cur;
-
 
     const llama_token * topk_ids    = nullptr;
     const float       * topk_logits = nullptr;
@@ -1289,7 +1212,6 @@ static common_sampler_sparse_probs common_sampler_sparse_p(
         for (int32_t i = 0; i < n_topk; ++i) {
             cur[i] = llama_token_data{topk_ids[i], topk_logits[i], 0.0f};
         }
-
 
         std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
             return a.logit != b.logit ? a.logit > b.logit : a.id < b.id;
@@ -1303,8 +1225,6 @@ static common_sampler_sparse_probs common_sampler_sparse_p(
 
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
         GGML_ASSERT(k > 0 && k <= n_vocab);
-
-
 
         cur.reserve(k + 1);
         for (llama_token id = 0; id < n_vocab; ++id) {
@@ -1324,13 +1244,11 @@ static common_sampler_sparse_probs common_sampler_sparse_p(
 
     llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
 
-
     const int32_t n = llama_sampler_chain_n(chain);
     for (int32_t i = 0; i < n - 1; ++i) {
         llama_sampler_apply(llama_sampler_chain_get(chain, i), &cur_p);
     }
     GGML_ASSERT(cur_p.size > 0);
-
 
     common_sampler_sparse_probs res;
     res.ids.reserve(cur_p.size);
@@ -1373,9 +1291,6 @@ std::vector<llama_token> common_sampler_reject_and_accept_n(
 
     const int32_t k = common_sampler_sparse_k(gsmpl);
 
-
-
-
     struct llama_sampler * chain_draft = nullptr;
     if (!draft.empty() && common_sampler_sparse_n_penalized(gsmpl) > 0) {
         chain_draft = llama_sampler_clone(gsmpl->chain);
@@ -1416,22 +1331,19 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
     return common_reasoning_budget_force(gsmpl->rbudget);
 }
 
-// helpers
-
 llama_token_data_array * common_sampler_get_candidates(struct common_sampler * gsmpl, bool do_sort) {
     const auto tm = gsmpl->tm();
 
     auto * res = &gsmpl->cur_p;
 
     if (do_sort && !res->sorted) {
-        // remember the selected token before sorting
+
         const llama_token id = res->data[res->selected].id;
 
         std::sort(res->data, res->data + res->size, [](const llama_token_data & a, const llama_token_data & b) {
             return a.p > b.p;
         });
 
-        // restore the selected token after sorting
         for (size_t i = 0; i < res->size; ++i) {
             if (res->data[i].id == id) {
                 res->selected = i;
@@ -1469,7 +1381,7 @@ std::string common_sampler_prev_str(common_sampler * gsmpl, llama_context * ctx_
     }
 
     std::string result;
-    result.reserve(8*n); // 8 is the average length of a token [citation needed], TODO: compute this from the vocab
+    result.reserve(8*n);
 
     for (int i = n - 1; i >= 0; i--) {
         const llama_token id = gsmpl->prev.rat(i);
@@ -1517,9 +1429,9 @@ std::string common_sampler_type_to_str(enum common_sampler_type cnstr) {
 }
 
 std::vector<common_sampler_type> common_sampler_types_from_names(const std::vector<std::string> & names) {
-    // sampler names can be written multiple ways; generate aliases from canonical names
+
     static const auto sampler_name_map = []{
-        // canonical sampler name mapping
+
         std::unordered_map<std::string, common_sampler_type> canonical_name_map {
             { "dry",         COMMON_SAMPLER_TYPE_DRY         },
             { "top_k",       COMMON_SAMPLER_TYPE_TOP_K       },
@@ -1539,24 +1451,24 @@ std::vector<common_sampler_type> common_sampler_types_from_names(const std::vect
             if (canonical.find('_') == std::string::npos) {
                 continue;
             }
-            // kebab-case: "top-k", "min-p", etc.
+
             {
                 std::string kebab_case = canonical;
                 std::replace(kebab_case.begin(), kebab_case.end(), '_', '-');
                 alias_name_map.insert({kebab_case, entry.second});
             }
-            // no dash: "topk", "minp", etc.
+
             {
                 std::string no_dash = canonical;
                 no_dash.erase(std::remove(no_dash.begin(), no_dash.end(), '_'), no_dash.end());
                 alias_name_map.insert({no_dash, entry.second});
             }
         }
-        // misc. aliases
+
         alias_name_map.insert({"nucleus", COMMON_SAMPLER_TYPE_TOP_P});
         alias_name_map.insert({"temp",    COMMON_SAMPLER_TYPE_TEMPERATURE});
         alias_name_map.insert({"typ",     COMMON_SAMPLER_TYPE_TYPICAL_P});
-        // include aliases + canonical names in the complete mapping
+
         alias_name_map.merge(canonical_name_map);
         return alias_name_map;
     }();

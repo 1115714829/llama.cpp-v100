@@ -10,13 +10,11 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
     return 128;
 }
 
-// Currently llvm with the amdgcn target does not support unrolling loops
-// that contain a break that can not be resolved at compile time.
 #ifdef __clang__
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wpass-failed"
-#endif // __clang__
-template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
+#endif
+template<int D, int ncols, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
 __launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), 1)
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
@@ -51,7 +49,6 @@ static __global__ void flash_attn_ext_vec(
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
 
-    // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(D == 128 || D == 256)) {
         GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
             max_bias, m0, m1, n_head_log2, logit_softcap,
@@ -66,8 +63,6 @@ static __global__ void flash_attn_ext_vec(
         return;
     }
 
-    //In this kernel Q, K, V are matrices while i, j, k are matrix indices.
-
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
@@ -76,12 +71,12 @@ static __global__ void flash_attn_ext_vec(
     constexpr int nthreads_KQ_q = 2;
 #else
     constexpr int nthreads_KQ_q = 4;
-#endif // RDNA
+#endif
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
 #else
     constexpr int nthreads_KQ_q = (D/4 < 32 ? D/4 : 32);
     constexpr int nthreads_V_q  = (D/4 < 32 ? D/4 : 32);
-#endif // GGML_USE_HIP
+#endif
 
     constexpr int nthreads    = ggml_cuda_fattn_vec_get_nthreads_device();
     constexpr int nthreads_KQ = (type_K == GGML_TYPE_F16 || type_K == GGML_TYPE_BF16) ? 128 / cpy_nb : nthreads_KQ_q;
@@ -99,13 +94,13 @@ static __global__ void flash_attn_ext_vec(
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, half,  V_rows_per_thread>();
 #else
     constexpr dequantize_V_t dequantize_V = get_dequantize_V<type_V, float, V_rows_per_thread>();
-#endif // V_DOT2_F32_F16_AVAILABLE
+#endif
 
-    const int ic0 = blockIdx.x * ncols; // Index of the Q/QKV column to work on.
+    const int ic0 = blockIdx.x * ncols;
 
     const int sequence = blockIdx.z / ne02;
     const int head = blockIdx.z - sequence*ne02;
-    const int gqa_ratio = ne02 / ne12; // With grouped query attention there are > 1 Q matrices per K, V matrix.
+    const int gqa_ratio = ne02 / ne12;
     Q += nb03*sequence + nb02* head              + nb01*ic0;
     K += nb13*sequence + nb12*(head / gqa_ratio);
     V += nb23*sequence + nb22*(head / gqa_ratio);
@@ -127,7 +122,7 @@ static __global__ void flash_attn_ext_vec(
 #else
     float2           VKQ[ncols][(D/2)/nthreads_V] = {{{0.0f, 0.0f}}};
     __shared__ float  KQ[ne_KQ > ne_combine ? ne_KQ : ne_combine];
-#endif // V_DOT2_F32_F16_AVAILABLE
+#endif
 
     float KQ_max[ncols];
     float KQ_sum[ncols];
@@ -137,12 +132,11 @@ static __global__ void flash_attn_ext_vec(
         KQ_sum[j] = 0.0f;
     }
 
-    // Convert Q to float2 (f16 K) or q8_1 (quantized K) and store in registers:
 #ifdef V_DOT2_F32_F16_AVAILABLE
-    half2  Q_reg[ncols][(D/2)/nthreads_KQ]; // Will be initialized completely.
+    half2  Q_reg[ncols][(D/2)/nthreads_KQ];
 #else
-    __align__(16) float2 Q_reg[ncols][(D/2)/nthreads_KQ] = {{{0.0f, 0.0f}}}; // May be only partially initialized.
-#endif // V_DOT2_F32_F16_AVAILABLE
+    __align__(16) float2 Q_reg[ncols][(D/2)/nthreads_KQ] = {{{0.0f, 0.0f}}};
+#endif
     int    Q_i32[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
     float2  Q_ds[ncols][1 > D/(sizeof(int)*nthreads_KQ) ? 1 : D/(sizeof(int)*nthreads_KQ)];
 
@@ -156,11 +150,9 @@ static __global__ void flash_attn_ext_vec(
                 break;
             }
 
-            // Reuse KQ as temporary storage for converting Q to q8_1:
             int    * tmp_q_i32 = (int    *) &KQ[j*D];
             float2 * tmp_q_ds  = (float2 *) (tmp_q_i32 + D/sizeof(int));
 
-            // Set memory to zero if out of bounds:
             if (ncols > 1 && ic0 + j >= int(ne01.z)) {
 #pragma unroll
                 for (int i0 = 0; i0 < int(D/sizeof(int)); i0 += WARP_SIZE) {
@@ -244,7 +236,7 @@ static __global__ void flash_attn_ext_vec(
                 Q_reg[j][k].y *= scale;
             }
         }
-#endif // V_DOT2_F32_F16_AVAILABLE
+#endif
     }
 
     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
@@ -252,11 +244,10 @@ static __global__ void flash_attn_ext_vec(
     V     += blockIdx.y*nthreads * nb21;
     maskh += blockIdx.y*nthreads;
     for (int k_VKQ_0 = blockIdx.y*nthreads; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nthreads,
-             // Increment pointers after each loop:
+
              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
 
-        // Calculate KQ tile and keep track of new maximum KQ values:
-        float KQ_reg[ncols]; // KQ in registers.
+        float KQ_reg[ncols];
 
         float KQ_max_new[ncols];
 #pragma unroll
@@ -314,7 +305,7 @@ static __global__ void flash_attn_ext_vec(
                 VKQ[j][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
                 VKQ[j][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
             }
-#endif // V_DOT2_F32_F16_AVAILABLE
+#endif
         }
 
         ggml_cuda_syncwarp();
@@ -372,8 +363,10 @@ static __global__ void flash_attn_ext_vec(
                     }
                 }
             }
-#endif // V_DOT2_F32_F16_AVAILABLE
+#endif
         }
+
+        ggml_cuda_syncwarp();
     }
 
     if (sinks && blockIdx.y == 0) {
@@ -405,7 +398,7 @@ static __global__ void flash_attn_ext_vec(
                 VKQ[j][i_VKQ_0/nthreads_V].x *= KQ_max_scale;
                 VKQ[j][i_VKQ_0/nthreads_V].y *= KQ_max_scale;
             }
-#endif // V_DOT2_F32_F16_AVAILABLE
+#endif
         }
     }
 
@@ -471,7 +464,7 @@ static __global__ void flash_attn_ext_vec(
             ggml_cuda_memcpy_1<V_rows_per_thread/2*sizeof(float)>(VKQ_tmp + i_VKQ,                       &VKQ[j_VKQ][i_VKQ_0/nthreads_V]);
             ggml_cuda_memcpy_1<V_rows_per_thread/2*sizeof(float)>(VKQ_tmp + i_VKQ + V_rows_per_thread/4, &VKQ[j_VKQ][i_VKQ_0/nthreads_V + V_rows_per_thread/4]);
         }
-#endif // V_DOT2_F32_F16_AVAILABLE
+#endif
 
         KQ_sum[j_VKQ] *= kqmax_scale;
         KQ_sum[j_VKQ] = warp_reduce_sum(KQ_sum[j_VKQ]);
@@ -522,11 +515,11 @@ static __global__ void flash_attn_ext_vec(
               ne31, ne32, ne33,
               nb31, nb32, nb33);
     NO_DEVICE_CODE;
-#endif // FLASH_ATTN_AVAILABLE
+#endif
 }
 #ifdef __clang__
 #pragma clang diagnostic pop
-#endif // __clang__
+#endif
 
 template <int D, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
 void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

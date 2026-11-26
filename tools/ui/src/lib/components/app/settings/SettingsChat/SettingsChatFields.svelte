@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { FlaskConical, RotateCcw } from '@lucide/svelte';
 	import { SettingsChatParameterSourceIndicator } from '$lib/components/app/settings';
 	import { Checkbox } from '$lib/components/ui/checkbox';
@@ -67,7 +68,7 @@
 
 				<div class="flex items-center gap-2">
 					<Label class="flex items-center gap-1.5 text-sm font-medium" for={field.key}>
-						{field.label}
+						{tr(field.label)}
 
 						{#if field.isExperimental}
 							<FlaskConical class="h-3.5 w-3.5 text-muted-foreground" />
@@ -101,13 +102,13 @@
 
 					{#if isCustomRealTime}
 						<button
-							aria-label="Reset to default"
+							aria-label={tr("Reset to default")}
 							class="absolute top-1/2 right-2 inline-flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded transition-colors hover:bg-muted"
 							onclick={() => {
 								settingsStore.resetParameterToServerDefault(field.key);
 								onConfigChange(field.key, '');
 							}}
-							title="Reset to default"
+							title={tr("Reset to default")}
 							type="button"
 						>
 							<RotateCcw class="h-3 w-3" />
@@ -123,7 +124,7 @@
 			{:else if field.type === SettingsFieldType.TEXTAREA}
 				{#if field.label}
 					<Label class="block flex items-center gap-1.5 text-sm font-medium" for={field.key}>
-						{field.label}
+						{tr(field.label)}
 
 						{#if field.isExperimental}
 							<FlaskConical class="h-3.5 w-3.5 text-muted-foreground" />
@@ -155,7 +156,7 @@
 						/>
 
 						<Label class="cursor-pointer text-sm font-normal" for="showSystemMessage">
-							Show system message in conversations
+							{tr("Show system message in conversations")}
 						</Label>
 					</div>
 				{/if}
@@ -176,7 +177,7 @@
 
 				<div class="flex items-center gap-2">
 					<Label class="flex items-center gap-1.5 text-sm font-medium" for={field.key}>
-						{field.label}
+						{tr(field.label)}
 
 						{#if field.isExperimental}
 							<FlaskConical class="h-3.5 w-3.5 text-muted-foreground" />
@@ -207,19 +208,19 @@
 									<IconComponent class={ICON_CLASS_DEFAULT} />
 								{/if}
 
-								{selectedOption?.label || `Select ${field.label.toLowerCase()}`}
+								{selectedOption ? tr(selectedOption.label) : tr(field.label)}
 							</div>
 						</Select.Trigger>
 
 						{#if isCustomRealTime}
 							<button
-								aria-label="Reset to default"
+								aria-label={tr("Reset to default")}
 								class="absolute top-1/2 right-8 inline-flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded transition-colors hover:bg-muted"
 								onclick={() => {
 									settingsStore.resetParameterToServerDefault(field.key);
 									onConfigChange(field.key, '');
 								}}
-								title="Reset to default"
+								title={tr("Reset to default")}
 								type="button"
 							>
 								<RotateCcw class="h-3 w-3" />
@@ -230,13 +231,13 @@
 					<Select.Content>
 						{#if field.options}
 							{#each field.options as option (option.value)}
-								<Select.Item label={option.label} value={option.value}>
+								<Select.Item label={tr(option.label)} value={option.value}>
 									<div class="flex items-center gap-2">
 										{#if option.icon}
 											{@const IconComponent = option.icon}
 											<IconComponent class={ICON_CLASS_DEFAULT} />
 										{/if}
-										{option.label}
+										{tr(option.label)}
 									</div>
 								</Select.Item>
 							{/each}
@@ -256,7 +257,7 @@
 					radioOptions[0].value}
 
 				<Label class="flex items-center gap-1.5 text-sm font-medium mb-4">
-					{field.label}
+					{tr(field.label)}
 
 					{#if field.isExperimental}
 						<FlaskConical class="h-3.5 w-3.5 text-muted-foreground" />
@@ -310,7 +311,7 @@
 							class="flex cursor-pointer items-center gap-1.5 pt-1 pb-0.5 text-sm leading-none font-medium"
 							for={field.key}
 						>
-							{field.label}
+							{tr(field.label)}
 
 							{#if field.isExperimental}
 								<FlaskConical class="h-3.5 w-3.5 text-muted-foreground" />

@@ -3,19 +3,19 @@ from __future__ import annotations
 from enum import Enum, IntEnum, auto
 from typing import Any
 
-#
-# constants
-#
+ 
+           
+ 
 
-GGUF_MAGIC             = 0x46554747  # "GGUF"
+GGUF_MAGIC             = 0x46554747          
 GGUF_VERSION           = 3
 GGUF_DEFAULT_ALIGNMENT = 32
-GGML_QUANT_VERSION     = 2  # GGML_QNT_VERSION from ggml.h
-GGML_MAX_DIMS          = 4  # GGML_MAX_DIMS from ggml.h
+GGML_QUANT_VERSION     = 2                                
+GGML_MAX_DIMS          = 4                             
 
-#
-# metadata keys
-#
+ 
+               
+ 
 
 
 class Keys:
@@ -26,11 +26,11 @@ class Keys:
         ALIGNMENT                  = "general.alignment"
         FILE_TYPE                  = "general.file_type"
 
-        # Per-tensor extra options (tensor name array + parallel option arrays, e.g. prec_a4).
+                                                                                              
         TENSOR_EXTRA_NAME          = "general.tensor_extra.name"
         TENSOR_EXTRA_PREC_A4       = "general.tensor_extra.prec_a4"
 
-        # Recommended Sampler Parameters
+                                        
         SAMPLING_SEQUENCE           = "general.sampling.sequence"
         SAMPLING_TOP_K              = "general.sampling.top_k"
         SAMPLING_TOP_P              = "general.sampling.top_p"
@@ -44,7 +44,7 @@ class Keys:
         SAMPLING_MIROSTAT_TAU       = "general.sampling.mirostat_tau"
         SAMPLING_MIROSTAT_ETA       = "general.sampling.mirostat_eta"
 
-        # Authorship Metadata
+                             
         NAME                       = "general.name"
         AUTHOR                     = "general.author"
         VERSION                    = "general.version"
@@ -58,50 +58,50 @@ class Keys:
 
         SIZE_LABEL                 = "general.size_label"
 
-        # Licensing details
+                           
         LICENSE                    = "general.license"
         LICENSE_NAME               = "general.license.name"
         LICENSE_LINK               = "general.license.link"
 
-        # Typically represents the converted GGUF repo (Unless native)
-        URL                        = "general.url" # Model Website/Paper
+                                                                      
+        URL                        = "general.url"                      
         DOI                        = "general.doi"
         UUID                       = "general.uuid"
-        REPO_URL                   = "general.repo_url" # Model Source Repository (git/svn/etc...)
+        REPO_URL                   = "general.repo_url"                                           
 
-        # Model Source during conversion
-        SOURCE_URL                 = "general.source.url" # Model Website/Paper
+                                        
+        SOURCE_URL                 = "general.source.url"                      
         SOURCE_DOI                 = "general.source.doi"
         SOURCE_UUID                = "general.source.uuid"
-        SOURCE_REPO_URL            = "general.source.repo_url" # Model Source Repository (git/svn/etc...)
+        SOURCE_REPO_URL            = "general.source.repo_url"                                           
 
-        # Base Model Source. There can be more than one source if it's a merged
-        # model like with 'Mistral-7B-Merge-14-v0.1'. This will assist in
-        # tracing linage of models as it is finetuned or merged over time.
+                                                                               
+                                                                         
+                                                                          
         BASE_MODEL_COUNT           = "general.base_model.count"
         BASE_MODEL_NAME            = "general.base_model.{id}.name"
         BASE_MODEL_AUTHOR          = "general.base_model.{id}.author"
         BASE_MODEL_VERSION         = "general.base_model.{id}.version"
         BASE_MODEL_ORGANIZATION    = "general.base_model.{id}.organization"
         BASE_MODEL_DESCRIPTION     = "general.base_model.{id}.description"
-        BASE_MODEL_URL             = "general.base_model.{id}.url" # Model Website/Paper
+        BASE_MODEL_URL             = "general.base_model.{id}.url"                      
         BASE_MODEL_DOI             = "general.base_model.{id}.doi"
         BASE_MODEL_UUID            = "general.base_model.{id}.uuid"
-        BASE_MODEL_REPO_URL        = "general.base_model.{id}.repo_url" # Model Source Repository (git/svn/etc...)
+        BASE_MODEL_REPO_URL        = "general.base_model.{id}.repo_url"                                           
 
-        # Dataset Source
+                        
         DATASET_COUNT           = "general.dataset.count"
         DATASET_NAME            = "general.dataset.{id}.name"
         DATASET_AUTHOR          = "general.dataset.{id}.author"
         DATASET_VERSION         = "general.dataset.{id}.version"
         DATASET_ORGANIZATION    = "general.dataset.{id}.organization"
         DATASET_DESCRIPTION     = "general.dataset.{id}.description"
-        DATASET_URL             = "general.dataset.{id}.url" # Model Website/Paper
+        DATASET_URL             = "general.dataset.{id}.url"                      
         DATASET_DOI             = "general.dataset.{id}.doi"
         DATASET_UUID            = "general.dataset.{id}.uuid"
-        DATASET_REPO_URL        = "general.dataset.{id}.repo_url" # Model Source Repository (git/svn/etc...)
+        DATASET_REPO_URL        = "general.dataset.{id}.repo_url"                                           
 
-        # Array based KV stores
+                               
         TAGS                       = "general.tags"
         LANGUAGES                  = "general.languages"
 
@@ -229,19 +229,19 @@ class Keys:
             HEAD_COUNT = "{arch}.attention.indexer.head_count"
             KEY_LENGTH = "{arch}.attention.indexer.key_length"
             TOP_K      = "{arch}.attention.indexer.top_k"
-            BLOCK_SIZE   = "{arch}.attention.indexer.block_size"    # MSA
-            LOCAL_BLOCKS = "{arch}.attention.indexer.local_blocks"  # MSA
+            BLOCK_SIZE   = "{arch}.attention.indexer.block_size"         
+            LOCAL_BLOCKS = "{arch}.attention.indexer.local_blocks"       
             TYPES      = "{arch}.attention.indexer.types"
-            KPOOL             = "{arch}.attention.indexer.kpool"              # GLM5-Next
-            KPOOL_SELECT_TAIL = "{arch}.attention.indexer.kpool_select_tail"  # GLM5-Next
+            KPOOL             = "{arch}.attention.indexer.kpool"                         
+            KPOOL_SELECT_TAIL = "{arch}.attention.indexer.kpool_select_tail"             
 
     class HyperConnection:
         COUNT                = "{arch}.hyper_connection.count"
         SINKHORN_ITERATIONS  = "{arch}.hyper_connection.sinkhorn_iterations"
         EPSILON              = "{arch}.hyper_connection.epsilon"
-        # scale of the post gate (DeepSeek-V4 hardcodes 2.0)
+                                                            
         MAGNITUDE            = "{arch}.hyper_connection.magnitude"
-        # absent means the mix projection is full rank (DeepSeek-V4 behaviour)
+                                                                              
         LOW_RANK             = "{arch}.hyper_connection.low_rank"
 
     class PerLayerEmbedding:
@@ -337,20 +337,20 @@ class Keys:
 
     class Decision:
         TYPE               = "{arch}.decision.type"
-        # note: single-use-case keys can be hard-coded in cpp code
+                                                                  
         BLOCK_COUNT        = "{arch}.decision.block_count"
         ROUTING_BLOCK_COUNT = "{arch}.decision.routing_block_count"
         HEAD_COUNT         = "{arch}.decision.head_count"
         MAX_HEAD_TOKENS    = "{arch}.decision.max_head_tokens"
-        TEMPERATURE        = "{arch}.decision.temperature.{name}"  # name: "<type>" or "<type>.<n_opt bucket>"
-        SCORE_BIAS         = "{arch}.decision.score_bias.{n}.{i}"  # added to the logit of level i of a score question with n levels
+        TEMPERATURE        = "{arch}.decision.temperature.{name}"                                             
+        SCORE_BIAS         = "{arch}.decision.score_bias.{n}.{i}"                                                                   
 
     class Tokenizer:
         MODEL                = "tokenizer.ggml.model"
         PRE                  = "tokenizer.ggml.pre"
         LIST                 = "tokenizer.ggml.tokens"
         TOKEN_TYPE           = "tokenizer.ggml.token_type"
-        TOKEN_TYPE_COUNT     = "tokenizer.ggml.token_type_count"  # for BERT-style token types
+        TOKEN_TYPE_COUNT     = "tokenizer.ggml.token_type_count"                              
         SCORES               = "tokenizer.ggml.scores"
         MERGES               = "tokenizer.ggml.merges"
         BOS_ID               = "tokenizer.ggml.bos_token_id"
@@ -373,18 +373,18 @@ class Keys:
         CHAT_TEMPLATE        = "tokenizer.chat_template"
         CHAT_TEMPLATE_N      = "tokenizer.chat_template.{name}"
         CHAT_TEMPLATES       = "tokenizer.chat_templates"
-        # Normalizer constants
+                              
         NORMALIZER_NFC           = "tokenizer.ggml.normalizer.nfc"
         NORMALIZER_LOWERCASE     = "tokenizer.ggml.normalizer.lowercase"
         NORMALIZER_STRIP_ACCENTS = "tokenizer.ggml.normalizer.strip_accents"
-        # FIM/Infill special tokens constants
+                                             
         FIM_PRE_ID           = "tokenizer.ggml.fim_pre_token_id"
         FIM_SUF_ID           = "tokenizer.ggml.fim_suf_token_id"
         FIM_MID_ID           = "tokenizer.ggml.fim_mid_token_id"
         FIM_PAD_ID           = "tokenizer.ggml.fim_pad_token_id"
         FIM_REP_ID           = "tokenizer.ggml.fim_rep_token_id"
         FIM_SEP_ID           = "tokenizer.ggml.fim_sep_token_id"
-        # deprecated:
+                     
         PREFIX_ID            = "tokenizer.ggml.prefix_token_id"
         SUFFIX_ID            = "tokenizer.ggml.suffix_token_id"
         MIDDLE_ID            = "tokenizer.ggml.middle_token_id"
@@ -409,7 +409,7 @@ class Keys:
         HAS_LLAVA_PROJECTOR   = "clip.has_llava_projector"
 
     class ClipVision:
-        PROJECTOR_TYPE        = "clip.vision.projector_type" # for mixed modality models
+        PROJECTOR_TYPE        = "clip.vision.projector_type"                            
         IMAGE_SIZE            = "clip.vision.image_size"
         IMAGE_MIN_PIXELS      = "clip.vision.image_min_pixels"
         IMAGE_MAX_PIXELS      = "clip.vision.image_max_pixels"
@@ -427,22 +427,22 @@ class Keys:
         IMAGE_RESIZE_ALGO     = "clip.vision.image_resize_algo"
         SPATIAL_MERGE_SIZE    = "clip.vision.spatial_merge_size"
         SWIGLU_CLAMP          = "clip.vision.swiglu_clamp"
-        EXPERT_COUNT_PER_LAYER = "clip.vision.expert_count_per_layer" # dots3note pyramid MoE, 0 = dense layer
+        EXPERT_COUNT_PER_LAYER = "clip.vision.expert_count_per_layer"                                         
         EXPERT_USED_COUNT     = "clip.vision.expert_used_count"
         USE_GELU              = "clip.use_gelu"
         USE_SILU              = "clip.use_silu"
-        N_WA_PATTERN          = "clip.vision.n_wa_pattern"     # used by qwen2.5vl
-        WA_LAYER_INDEXES      = "clip.vision.wa_layer_indexes" # used by youtuvl
-        WA_PATTERN_MODE       = "clip.vision.wa_pattern_mode"  # used by mimovl, per-layer -1/0/1
+        N_WA_PATTERN          = "clip.vision.n_wa_pattern"                        
+        WA_LAYER_INDEXES      = "clip.vision.wa_layer_indexes"                  
+        WA_PATTERN_MODE       = "clip.vision.wa_pattern_mode"                                    
         IS_DEEPSTACK_LAYERS   = "clip.vision.is_deepstack_layers"
         WINDOW_SIZE           = "clip.vision.window_size"
-        FEATURE_LAYERS        = "clip.vision.feature_layer" # Granite4 Vision
-        IMAGE_GRID_PINPOINTS  = "clip.vision.image_grid_pinpoints" # Granite4 Vision
+        FEATURE_LAYERS        = "clip.vision.feature_layer"                  
+        IMAGE_GRID_PINPOINTS  = "clip.vision.image_grid_pinpoints"                  
 
         class Attention:
             HEAD_COUNT      = "clip.vision.attention.head_count"
-            HEAD_COUNT_KV   = "clip.vision.attention.head_count_kv" # used by mimovl (GQA)
-            HEAD_DIM        = "clip.vision.attention.head_dim" # set when qkv width != n_embd
+            HEAD_COUNT_KV   = "clip.vision.attention.head_count_kv"                       
+            HEAD_DIM        = "clip.vision.attention.head_dim"                               
             LAYERNORM_EPS   = "clip.vision.attention.layer_norm_epsilon"
 
         class Projector:
@@ -457,7 +457,7 @@ class Keys:
             HEAD_COUNT          = "clip.vision.sam.head_count"
 
     class ClipAudio:
-        PROJECTOR_TYPE      = "clip.audio.projector_type" # for mixed modality models
+        PROJECTOR_TYPE      = "clip.audio.projector_type"                            
         NUM_MEL_BINS        = "clip.audio.num_mel_bins"
         EMBEDDING_LENGTH    = "clip.audio.embedding_length"
         FEED_FORWARD_LENGTH = "clip.audio.feed_forward_length"
@@ -467,13 +467,13 @@ class Keys:
         CHUNK_SIZE          = "clip.audio.chunk_size"
         CONV_KERNEL_SIZE    = "clip.audio.conv_kernel_size"
         MAX_POS_EMB         = "clip.audio.max_pos_emb"
-        FEATURE_LAYERS      = "clip.audio.feature_layer" # Granite Speech Plus
+        FEATURE_LAYERS      = "clip.audio.feature_layer"                      
         RVQ_NUM_QUANTIZERS  = "clip.audio.rvq.num_quantizers"
         RVQ_CODEBOOK_SIZE   = "clip.audio.rvq.codebook_size"
-        WA_PATTERN_MODE     = "clip.audio.wa_pattern_mode" # per-layer -1 (full) / 0 (windowed)
+        WA_PATTERN_MODE     = "clip.audio.wa_pattern_mode"                                     
         WINDOW_SIZE         = "clip.audio.window_size"
-        LOCAL_BLOCK_COUNT   = "clip.audio.local_block_count" # mimo-v2.5: input_local_transformer layer count
-        LOCAL_GROUP_SIZE    = "clip.audio.local_group_size"  # mimo-v2.5: input_local_transformer grouping size
+        LOCAL_BLOCK_COUNT   = "clip.audio.local_block_count"                                                 
+        LOCAL_GROUP_SIZE    = "clip.audio.local_group_size"                                                    
 
         class Attention:
             HEAD_COUNT      = "clip.audio.attention.head_count"
@@ -486,8 +486,8 @@ class Keys:
             HEAD_COUNT      = "clip.audio.projector.head_count"
 
     class ClipGenAudio:
-        PROJECTOR_TYPE      = "clip.gen.audio.projector_type" # for mixed modality models
-        # name of the weight variant, for settings that are not in the checkpoint
+        PROJECTOR_TYPE      = "clip.gen.audio.projector_type"                            
+                                                                                 
         MODEL_VARIANT       = "clip.gen.audio.model_variant"
         EMBEDDING_LENGTH    = "clip.gen.audio.embedding_length"
         FEED_FORWARD_LENGTH = "clip.gen.audio.feed_forward_length"
@@ -522,20 +522,20 @@ class Keys:
         GDN_V_GROUPED        = "prism.hadamard.gdn_v_grouped"
 
 
-#
-# recommended mapping of model tensor names for storage in gguf
-#
+ 
+                                                               
+ 
 
 
 class GGUFType:
     MODEL   = "model"
     ADAPTER = "adapter"
     IMATRIX = "imatrix"
-    MMPROJ  = "mmproj" # dummy, unused for now
+    MMPROJ  = "mmproj"                        
 
 
 class MODEL_ARCH(IntEnum):
-    MMPROJ           = auto() # dummy arch for clip.cpp
+    MMPROJ           = auto()                          
     LLAMA            = auto()
     LLAMA4           = auto()
     DECI             = auto()
@@ -719,15 +719,15 @@ class MODEL_TENSOR(IntEnum):
     POS_EMBD             = auto()
     OUTPUT               = auto()
     HRM_Z_L_INIT         = auto()
-    DENSE_2_OUT          = auto() # embeddinggemma 2_Dense
-    DENSE_3_OUT          = auto() # embeddinggemma 3_Dense
+    DENSE_2_OUT          = auto()                         
+    DENSE_3_OUT          = auto()                         
     OUTPUT_NORM          = auto()
     HC_HEAD_FN           = auto()
     HC_HEAD_BASE         = auto()
     HC_HEAD_SCALE        = auto()
-    HC_HEAD_NORM         = auto() # qwen4exp
-    HC_HEAD_DOWN         = auto() # qwen4exp
-    HC_HEAD_UP           = auto() # qwen4exp
+    HC_HEAD_NORM         = auto()           
+    HC_HEAD_DOWN         = auto()           
+    HC_HEAD_UP           = auto()           
     ROPE_FREQS           = auto()
     ROPE_FACTORS_LONG    = auto()
     ROPE_FACTORS_SHORT   = auto()
@@ -746,11 +746,11 @@ class MODEL_TENSOR(IntEnum):
     FFN_GATE_INP         = auto()
     FFN_GATE_INP_SHEXP   = auto()
     FFN_NORM             = auto()
-    FFN_PRE_NORM         = auto() # alias of FFN_NORM
-    FFN_PRE_NORM_2       = auto() # gemma4
+    FFN_PRE_NORM         = auto()                    
+    FFN_PRE_NORM_2       = auto()         
     FFN_POST_NORM        = auto()
-    FFN_POST_NORM_1      = auto() # gemma4
-    FFN_POST_NORM_2      = auto() # gemma4
+    FFN_POST_NORM_1      = auto()         
+    FFN_POST_NORM_2      = auto()         
     FFN_GATE             = auto()
     FFN_DOWN             = auto()
     FFN_UP               = auto()
@@ -767,30 +767,30 @@ class MODEL_TENSOR(IntEnum):
     FFN_DOWN_CHEXP       = auto()
     FFN_UP_CHEXP         = auto()
     FFN_EXP_PROBS_B      = auto()
-    FFN_EXP_PROBS_B_VL   = auto() # deepseek4 vision (bias for image tokens)
+    FFN_EXP_PROBS_B_VL   = auto()                                           
     FFN_GATE_TID2EID     = auto()
-    MOE_LATENT_DOWN      = auto() # nemotron 3 super
-    MOE_LATENT_UP        = auto() # nemotron 3 super
+    MOE_LATENT_DOWN      = auto()                   
+    MOE_LATENT_UP        = auto()                   
     ATTN_Q_NORM          = auto()
     ATTN_K_NORM          = auto()
     LAYER_OUT_NORM       = auto()
     LAYER_OUT_SCALE      = auto()
-    PER_LAYER_TOKEN_EMBD = auto() # gemma3n
-    PER_LAYER_MODEL_PROJ = auto() # gemma3n
-    PER_LAYER_INP_GATE   = auto() # gemma3n
-    PER_LAYER_PROJ       = auto() # gemma3n
-    PER_LAYER_PROJ_NORM  = auto() # gemma3n
-    PER_LAYER_POST_NORM  = auto() # gemma3n
-    ALTUP_PROJ           = auto() # gemma3n
-    ALTUP_UNEMBD_PROJ    = auto() # gemma3n
-    ALTUP_CORRECT_COEF   = auto() # gemma3n
-    ALTUP_CORRECT_SCALE  = auto() # gemma3n
-    ALTUP_PREDICT_COEF   = auto() # gemma3n
-    ALTUP_ROUTER         = auto() # gemma3n
-    ALTUP_ROUTER_NORM    = auto() # gemma3n
-    LAUREL_L             = auto() # gemma3n
-    LAUREL_R             = auto() # gemma3n
-    LAUREL_POST_NORM     = auto() # gemma3n
+    PER_LAYER_TOKEN_EMBD = auto()          
+    PER_LAYER_MODEL_PROJ = auto()          
+    PER_LAYER_INP_GATE   = auto()          
+    PER_LAYER_PROJ       = auto()          
+    PER_LAYER_PROJ_NORM  = auto()          
+    PER_LAYER_POST_NORM  = auto()          
+    ALTUP_PROJ           = auto()          
+    ALTUP_UNEMBD_PROJ    = auto()          
+    ALTUP_CORRECT_COEF   = auto()          
+    ALTUP_CORRECT_SCALE  = auto()          
+    ALTUP_PREDICT_COEF   = auto()          
+    ALTUP_ROUTER         = auto()          
+    ALTUP_ROUTER_NORM    = auto()          
+    LAUREL_L             = auto()          
+    LAUREL_R             = auto()          
+    LAUREL_POST_NORM     = auto()          
     SSM_IN               = auto()
     SSM_CONV1D           = auto()
     SSM_X                = auto()
@@ -802,23 +802,23 @@ class MODEL_TENSOR(IntEnum):
     SSM_D                = auto()
     SSM_NORM             = auto()
     SSM_OUT              = auto()
-    SSM_ALPHA            = auto() # qwen3.5
-    SSM_BETA_ALPHA       = auto() # qwen3next
-    SSM_CONV1D_Q         = auto() # Kimi Linear
-    SSM_CONV1D_K         = auto() # Kimi Linear
-    SSM_CONV1D_V         = auto() # Kimi Linear
-    SSM_F_A              = auto() # Kimi Linear
-    SSM_F_B              = auto() # Kimi Linear
-    SSM_BETA             = auto() # Kimi Linear qwen3.5
-    SSM_G_A              = auto() # Kimi Linear
-    SSM_G_B              = auto() # Kimi Linear
-    SSM_G                = auto() # Kimi K3 (full-rank KDA gate, replaces SSM_G_A/SSM_G_B)
-    ATTN_RES_SCORE       = auto() # Kimi K3 (fused res_norm * res_proj, pre-attention)
-    FFN_RES_SCORE        = auto() # Kimi K3 (fused res_norm * res_proj, pre-FFN)
-    OUTPUT_RES_SCORE     = auto() # Kimi K3 (fused res_norm * res_proj, final)
-    FFN_ROUTED_DOWN      = auto() # Kimi K3 (latent MoE: hidden -> latent)
-    FFN_ROUTED_UP        = auto() # Kimi K3 (latent MoE: latent -> hidden)
-    FFN_ROUTED_NORM      = auto() # Kimi K3 (latent MoE: norm on expert output)
+    SSM_ALPHA            = auto()          
+    SSM_BETA_ALPHA       = auto()            
+    SSM_CONV1D_Q         = auto()              
+    SSM_CONV1D_K         = auto()              
+    SSM_CONV1D_V         = auto()              
+    SSM_F_A              = auto()              
+    SSM_F_B              = auto()              
+    SSM_BETA             = auto()                      
+    SSM_G_A              = auto()              
+    SSM_G_B              = auto()              
+    SSM_G                = auto()                                                         
+    ATTN_RES_SCORE       = auto()                                                     
+    FFN_RES_SCORE        = auto()                                               
+    OUTPUT_RES_SCORE     = auto()                                             
+    FFN_ROUTED_DOWN      = auto()                                         
+    FFN_ROUTED_UP        = auto()                                         
+    FFN_ROUTED_NORM      = auto()                                              
     TIME_MIX_W0          = auto()
     TIME_MIX_W1          = auto()
     TIME_MIX_W2          = auto()
@@ -873,20 +873,20 @@ class MODEL_TENSOR(IntEnum):
     HC_FFN_FN            = auto()
     HC_FFN_BASE          = auto()
     HC_FFN_SCALE         = auto()
-    HC_ATTN_NORM         = auto() # qwen4exp
-    HC_ATTN_DOWN         = auto() # qwen4exp
-    HC_ATTN_UP           = auto() # qwen4exp
-    HC_ATTN_INJECT       = auto() # qwen4exp
-    HC_FFN_NORM          = auto() # qwen4exp
-    HC_FFN_DOWN          = auto() # qwen4exp
-    HC_FFN_UP            = auto() # qwen4exp
-    HC_FFN_INJECT        = auto() # qwen4exp
-    PLE_KEY              = auto() # qwen4exp
-    PLE_VALUE            = auto() # qwen4exp
-    PLE_NORM_KEY         = auto() # qwen4exp
-    PLE_NORM_QUERY       = auto() # qwen4exp
-    PLE_NORM_CONV        = auto() # qwen4exp
-    PLE_CONV1D           = auto() # qwen4exp
+    HC_ATTN_NORM         = auto()           
+    HC_ATTN_DOWN         = auto()           
+    HC_ATTN_UP           = auto()           
+    HC_ATTN_INJECT       = auto()           
+    HC_FFN_NORM          = auto()           
+    HC_FFN_DOWN          = auto()           
+    HC_FFN_UP            = auto()           
+    HC_FFN_INJECT        = auto()           
+    PLE_KEY              = auto()           
+    PLE_VALUE            = auto()           
+    PLE_NORM_KEY         = auto()           
+    PLE_NORM_QUERY       = auto()           
+    PLE_NORM_CONV        = auto()           
+    PLE_CONV1D           = auto()           
     ATTN_COMPRESSOR_WKV  = auto()
     ATTN_COMPRESSOR_WGATE = auto()
     ATTN_COMPRESSOR_APE  = auto()
@@ -922,8 +922,8 @@ class MODEL_TENSOR(IntEnum):
     ENC_FFN_DOWN         = auto()
     ENC_FFN_UP           = auto()
     ENC_OUTPUT_NORM      = auto()
-    CLS                  = auto() # classifier
-    CLS_OUT              = auto() # classifier output projection
+    CLS                  = auto()             
+    CLS_OUT              = auto()                               
     CLS_NORM             = auto()
     DECISION_HIDDEN_NORM          = auto()
     DECISION_PROJ_MEMORY          = auto()
@@ -980,9 +980,9 @@ class MODEL_TENSOR(IntEnum):
     INDEXER_COMPRESSOR_NORM = auto()
     INDEXER_KPOOL_GATE   = auto()
     INDEXER_KPOOL_APE    = auto()
-    ATTN_V_GATE          = auto() # k2-horizon MoVA router
-    ATTN_V_EXP           = auto() # k2-horizon MoVA value experts
-    # vision
+    ATTN_V_GATE          = auto()                         
+    ATTN_V_EXP           = auto()                                
+            
     V_MMPROJ             = auto()
     V_MMPROJ_FC          = auto()
     V_MMPROJ_MLP         = auto()
@@ -990,7 +990,7 @@ class MODEL_TENSOR(IntEnum):
     V_ENC_EMBD_CLS       = auto()
     V_ENC_EMBD_PATCH     = auto()
     V_ENC_EMBD_NORM      = auto()
-    V_ENC_EMBD_PATCH_NORM = auto() # allow multiple norms in the same embd, e.g. for gemma4u
+    V_ENC_EMBD_PATCH_NORM = auto()                                                          
     V_ENC_EMBD_POS       = auto()
     V_ENC_INPUT_NORM     = auto()
     V_ENC_ATTN_QKV       = auto()
@@ -1001,96 +1001,96 @@ class MODEL_TENSOR(IntEnum):
     V_ENC_ATTN_V         = auto()
     V_ENC_ATTN_O         = auto()
     V_ENC_ATTN_O_NORM    = auto()
-    V_ENC_ATTN_SINKS     = auto() # mimovl
+    V_ENC_ATTN_SINKS     = auto()         
     V_ENC_POST_ATTN_NORM = auto()
     V_ENC_FFN_UP         = auto()
     V_ENC_FFN_GATE       = auto()
     V_ENC_FFN_DOWN       = auto()
-    V_ENC_FFN_GATE_INP   = auto() # dots3note vision MoE router
+    V_ENC_FFN_GATE_INP   = auto()                              
     V_ENC_FFN_GATE_EXPS  = auto()
     V_ENC_FFN_UP_EXPS    = auto()
     V_ENC_FFN_DOWN_EXPS  = auto()
     V_ENC_FFN_EXP_PROBS_B = auto()
-    V_ENC_ATTN_POST_NORM = auto() # gemma4
+    V_ENC_ATTN_POST_NORM = auto()         
     V_ENC_FFN_POST_NORM  = auto()
     V_LAYER_SCALE_1      = auto()
     V_LAYER_SCALE_2      = auto()
     V_LAYER_OUT_SCALE    = auto()
     V_PRE_NORM           = auto()
     V_POST_NORM          = auto()
-    V_MM_PRE_NORM        = auto() # hunyuanvl
+    V_MM_PRE_NORM        = auto()            
     V_MM_POST_NORM       = auto()
     V_MM_INP_NORM        = auto()
-    V_MM_INP_PROJ        = auto() # gemma3
-    V_MM_SOFT_EMB_NORM   = auto() # gemma3
-    V_MM_EMBEDDING       = auto() # gemma3n
-    V_MM_HARD_EMB_NORM   = auto() # gemma3n
-    V_ENC_CONV_STEM      = auto() # gemma3n
-    V_ENC_CONV_STEM_NORM = auto() # gemma3n
-    V_ENC_MSFA_EXP       = auto() # gemma3n
-    V_ENC_MSFA_EXP_NORM  = auto() # gemma3n
-    V_ENC_MSFA_PROJ      = auto() # gemma3n
-    V_ENC_MSFA_PROJ_NORM = auto() # gemma3n
-    V_ENC_MSFA_NORM      = auto() # gemma3n
-    V_RESMPL_POS_EMBD_K  = auto() # minicpmv
-    V_RESMPL_ATTN_Q      = auto() # minicpmv
-    V_RESMPL_ATTN_K      = auto() # minicpmv
-    V_RESMPL_ATTN_V      = auto() # minicpmv
-    V_RESMPL_ATTN_OUT    = auto() # minicpmv
-    V_RESMPL_KV          = auto() # minicpmv
-    V_RESMPL_KV_NORM     = auto() # minicpmv
-    V_RESMPL_POST_NORM   = auto() # minicpmv
-    V_RESMPL_Q_NORM      = auto() # minicpmv
-    V_RESMPL_PROJ        = auto() # minicpmv
-    V_RESMPL_QUERY       = auto() # minicpmv
-    V_TOK_EMBD_IMG_BREAK = auto() # pixtral
-    V_TOK_EMBD_IMG_START = auto() # deepseek4v
-    V_TOK_EMBD_IMG_END   = auto() # deepseek4v
-    V_TOK_EMBD_IMG_PAD   = auto() # deepseek4v
-    V_MM_PATCH_MERGER    = auto() # mistral small 3.1
-    V_DS_NORM            = auto() # qwen3vl
-    V_DS_FC1             = auto() # qwen3vl
-    V_DS_FC2             = auto() # qwen3vl
-    V_MERGER_LN1         = auto() # minicpmv4_6
-    V_MERGER_ATTN_Q      = auto() # minicpmv4_6
-    V_MERGER_ATTN_K      = auto() # minicpmv4_6
-    V_MERGER_ATTN_V      = auto() # minicpmv4_6
-    V_MERGER_ATTN_O      = auto() # minicpmv4_6
-    V_MERGER_DS_LN       = auto() # minicpmv4_6
-    V_MERGER_DS_UP       = auto() # minicpmv4_6
-    V_MERGER_DS_DOWN     = auto() # minicpmv4_6
-    V_MM_POST_FC_NORM    = auto() # cogvlm
-    V_MM_UP              = auto() # cogvlm
-    V_MM_DOWN            = auto() # cogvlm
-    V_MM_GATE            = auto() # cogvlm
-    V_MM_MERGER_FC1      = auto() # minimax-m3 (patch-merge MLP)
-    V_MM_MERGER_FC2      = auto() # minimax-m3 (patch-merge MLP)
-    V_TOK_BOI            = auto() # cogvlm
-    V_TOK_EOI            = auto() # cogvlm
-    V_TOK_IMG_BEGIN      = auto() # hunyuanvl
-    V_TOK_IMG_END        = auto() # hunyuanvl
-    V_STD_BIAS           = auto() # gemma4
-    V_STD_SCALE          = auto() # gemma4
-    V_SAM_POS_EMBD       = auto() # Deepseek-OCR
-    V_SAM_PATCH_EMBD     = auto() # Deepseek-OCR
-    V_SAM_PRE_NORM       = auto() # Deepseek-OCR
-    V_SAM_POST_NORM      = auto() # Deepseek-OCR
-    V_SAM_ATTN_POS_H     = auto() # Deepseek-OCR
-    V_SAM_ATTN_POS_W     = auto() # Deepseek-OCR
-    V_SAM_ATTN_QKV       = auto() # Deepseek-OCR
-    V_SAM_ATTN_OUT       = auto() # Deepseek-OCR
-    V_SAM_MLP_LIN_1      = auto() # Deepseek-OCR
-    V_SAM_MLP_LIN_2      = auto() # Deepseek-OCR
-    V_SAM_NECK           = auto() # Deepseek-OCR
-    V_SAM_NET_2          = auto() # Deepseek-OCR
-    V_SAM_NET_3          = auto() # Deepseek-OCR
-    V_ENC_EMBD_IMGNL     = auto() # Deepseek-OCR
-    V_ENC_EMBD_VSEP      = auto() # Deepseek-OCR
-    V_TOK_EMBD_SEP       = auto() # MiniCPM-V 4.7
-    V_RESMPL_QUERY_768   = auto() # Deepseek-OCR-2
-    V_RESMPL_QUERY_1024  = auto() # Deepseek-OCR-2
+    V_MM_INP_PROJ        = auto()         
+    V_MM_SOFT_EMB_NORM   = auto()         
+    V_MM_EMBEDDING       = auto()          
+    V_MM_HARD_EMB_NORM   = auto()          
+    V_ENC_CONV_STEM      = auto()          
+    V_ENC_CONV_STEM_NORM = auto()          
+    V_ENC_MSFA_EXP       = auto()          
+    V_ENC_MSFA_EXP_NORM  = auto()          
+    V_ENC_MSFA_PROJ      = auto()          
+    V_ENC_MSFA_PROJ_NORM = auto()          
+    V_ENC_MSFA_NORM      = auto()          
+    V_RESMPL_POS_EMBD_K  = auto()           
+    V_RESMPL_ATTN_Q      = auto()           
+    V_RESMPL_ATTN_K      = auto()           
+    V_RESMPL_ATTN_V      = auto()           
+    V_RESMPL_ATTN_OUT    = auto()           
+    V_RESMPL_KV          = auto()           
+    V_RESMPL_KV_NORM     = auto()           
+    V_RESMPL_POST_NORM   = auto()           
+    V_RESMPL_Q_NORM      = auto()           
+    V_RESMPL_PROJ        = auto()           
+    V_RESMPL_QUERY       = auto()           
+    V_TOK_EMBD_IMG_BREAK = auto()          
+    V_TOK_EMBD_IMG_START = auto()             
+    V_TOK_EMBD_IMG_END   = auto()             
+    V_TOK_EMBD_IMG_PAD   = auto()             
+    V_MM_PATCH_MERGER    = auto()                    
+    V_DS_NORM            = auto()          
+    V_DS_FC1             = auto()          
+    V_DS_FC2             = auto()          
+    V_MERGER_LN1         = auto()              
+    V_MERGER_ATTN_Q      = auto()              
+    V_MERGER_ATTN_K      = auto()              
+    V_MERGER_ATTN_V      = auto()              
+    V_MERGER_ATTN_O      = auto()              
+    V_MERGER_DS_LN       = auto()              
+    V_MERGER_DS_UP       = auto()              
+    V_MERGER_DS_DOWN     = auto()              
+    V_MM_POST_FC_NORM    = auto()         
+    V_MM_UP              = auto()         
+    V_MM_DOWN            = auto()         
+    V_MM_GATE            = auto()         
+    V_MM_MERGER_FC1      = auto()                               
+    V_MM_MERGER_FC2      = auto()                               
+    V_TOK_BOI            = auto()         
+    V_TOK_EOI            = auto()         
+    V_TOK_IMG_BEGIN      = auto()            
+    V_TOK_IMG_END        = auto()            
+    V_STD_BIAS           = auto()         
+    V_STD_SCALE          = auto()         
+    V_SAM_POS_EMBD       = auto()               
+    V_SAM_PATCH_EMBD     = auto()               
+    V_SAM_PRE_NORM       = auto()               
+    V_SAM_POST_NORM      = auto()               
+    V_SAM_ATTN_POS_H     = auto()               
+    V_SAM_ATTN_POS_W     = auto()               
+    V_SAM_ATTN_QKV       = auto()               
+    V_SAM_ATTN_OUT       = auto()               
+    V_SAM_MLP_LIN_1      = auto()               
+    V_SAM_MLP_LIN_2      = auto()               
+    V_SAM_NECK           = auto()               
+    V_SAM_NET_2          = auto()               
+    V_SAM_NET_3          = auto()               
+    V_ENC_EMBD_IMGNL     = auto()               
+    V_ENC_EMBD_VSEP      = auto()               
+    V_TOK_EMBD_SEP       = auto()                
+    V_RESMPL_QUERY_768   = auto()                 
+    V_RESMPL_QUERY_1024  = auto()                 
 
-    # qformer projector (vision) - Granite4 Vision
+                                                  
     V_QF_PROJ_QUERY      = auto()
     V_QF_PROJ_NORM       = auto()
     V_QF_PROJ_LINEAR     = auto()
@@ -1108,60 +1108,60 @@ class MODEL_TENSOR(IntEnum):
     V_QF_FFN_DOWN        = auto()
     V_QF_FFN_NORM        = auto()
     V_PROJ_NORM          = auto()
-    # multi-projector (bid => projector id) - Granite4 vision
+                                                             
     V_MULTI_PROJ_IMG_POS   = auto()
     V_MULTI_PROJ_QUERY     = auto()
     V_MULTI_PROJ_NORM      = auto()
     V_MULTI_PROJ_LINEAR    = auto()
     V_MULTI_PROJ_POST_NORM = auto()
 
-    # audio (mtmd)
+                  
     A_ENC_EMBD_POS        = auto()
     A_ENC_EMBD_NORM       = auto()
-    A_ENC_EMBD_TO_LOGITS  = auto() # lfm2
-    A_ENC_INP_PROJ        = auto() # gemma4
+    A_ENC_EMBD_TO_LOGITS  = auto()       
+    A_ENC_INP_PROJ        = auto()         
     A_ENC_CONV1D          = auto()
-    A_ENC_CONV1D_NORM     = auto() # gemma3n
+    A_ENC_CONV1D_NORM     = auto()          
     A_ENC_CONV2D          = auto()
     A_ENC_CONV_OUT        = auto()
     A_PRE_NORM            = auto()
     A_POST_NORM           = auto()
-    A_ENC_LAYER_PRE_NORM  = auto() # gemma3n
+    A_ENC_LAYER_PRE_NORM  = auto()          
     A_ENC_ATTN_Q          = auto()
     A_ENC_ATTN_K          = auto()
     A_ENC_ATTN_V          = auto()
     A_ENC_ATTN_POST_NORM  = auto()
     A_ENC_ATTN_PRE_NORM   = auto()
-    A_ENC_ATTN_K_REL      = auto() # gemma4
-    A_ENC_PER_DIM_SCALE   = auto() # gemma3n
+    A_ENC_ATTN_K_REL      = auto()         
+    A_ENC_PER_DIM_SCALE   = auto()          
     A_ENC_INPUT_NORM      = auto()
-    A_ENC_OUTPUT          = auto() # TODO @ngxson: rename to ATTN_OUT
-    A_ENC_OUTPUT_NORM     = auto() # TODO @ngxson: rename to ATTN_OUT
+    A_ENC_OUTPUT          = auto()                                   
+    A_ENC_OUTPUT_NORM     = auto()                                   
     A_ENC_FFN_UP          = auto()
     A_ENC_FFN_NORM        = auto()
-    A_ENC_FFN_POST_NORM   = auto() # gemma3n
-    A_ENC_FFN_SCALE       = auto() # gemma3n
+    A_ENC_FFN_POST_NORM   = auto()          
+    A_ENC_FFN_SCALE       = auto()          
     A_ENC_FFN_GATE        = auto()
     A_ENC_FFN_DOWN        = auto()
-    A_ENC_FFN_UP_1        = auto() # lfm2, gemma3n
-    A_ENC_FFN_NORM_1      = auto() # lfm2, gemma3n (pre-norm)
-    A_ENC_FFN_POST_NORM_1 = auto() # gemma3n
-    A_ENC_FFN_SCALE_1     = auto() # gemma3n
-    A_ENC_FFN_GATE_1      = auto() # lfm2, gemma3n
-    A_ENC_FFN_DOWN_1      = auto() # lfm2, gemma3n
-    A_ENC_DOWNSAMPLE_CONV = auto() # mimo-audio-tokenizer: post-transformer downsample conv
-    A_ENC_DOWNSAMPLE_NORM = auto() # mimo-audio-tokenizer: post-transformer downsample norm
-    A_ENC_RVQ_CODEBOOK    = auto() # mimo-audio-tokenizer: residual vector quantizer codebook, per quantizer index
-    A_ENC_CONV_RES2       = auto() # qwen3tts
-    A_ENC_SE_CONV1        = auto() # qwen3tts
-    A_ENC_SE_CONV2        = auto() # qwen3tts
-    A_ENC_ASP_ATTN        = auto() # qwen3tts
-    A_ENC_ASP_TDNN        = auto() # qwen3tts
-    # qwen3tts code_predictor: predicts the remaining RVQ codebooks
-    A_GEN_CODE_PROJ_IN     = auto() # small_to_mtp_projection
-    A_GEN_CODE_EMBD        = auto() # per-codebook embedding table, merged 3D [n_codebooks, vocab, dim]
-    A_GEN_CODE_HEAD        = auto() # per-codebook output head, merged 3D [n_codebooks, vocab, dim]
-    A_GEN_CODE_OUT_EMBD    = auto() # codebook-0 embedding, re-fed into the talker backbone (talker.model.codec_embedding)
+    A_ENC_FFN_UP_1        = auto()                
+    A_ENC_FFN_NORM_1      = auto()                           
+    A_ENC_FFN_POST_NORM_1 = auto()          
+    A_ENC_FFN_SCALE_1     = auto()          
+    A_ENC_FFN_GATE_1      = auto()                
+    A_ENC_FFN_DOWN_1      = auto()                
+    A_ENC_DOWNSAMPLE_CONV = auto()                                                         
+    A_ENC_DOWNSAMPLE_NORM = auto()                                                         
+    A_ENC_RVQ_CODEBOOK    = auto()                                                                                
+    A_ENC_CONV_RES2       = auto()           
+    A_ENC_SE_CONV1        = auto()           
+    A_ENC_SE_CONV2        = auto()           
+    A_ENC_ASP_ATTN        = auto()           
+    A_ENC_ASP_TDNN        = auto()           
+                                                                   
+    A_GEN_CODE_PROJ_IN     = auto()                          
+    A_GEN_CODE_EMBD        = auto()                                                                    
+    A_GEN_CODE_HEAD        = auto()                                                                
+    A_GEN_CODE_OUT_EMBD    = auto()                                                                                       
     A_GEN_CODE_ATTN_NORM   = auto()
     A_GEN_CODE_ATTN_Q      = auto()
     A_GEN_CODE_ATTN_Q_NORM = auto()
@@ -1174,13 +1174,13 @@ class MODEL_TENSOR(IntEnum):
     A_GEN_CODE_FFN_UP      = auto()
     A_GEN_CODE_FFN_DOWN    = auto()
     A_GEN_CODE_OUTPUT_NORM = auto()
-    # qwen3tts code2wav: RVQ codes -> raw PCM
-    A_GEN_WAV_QUANT_FIRST_IN       = auto() # semantic RVQ, in_proj (1x1 conv, loaded as 2D)
-    A_GEN_WAV_QUANT_FIRST_OUT      = auto() # semantic RVQ, out_proj
-    A_GEN_WAV_QUANT_FIRST_CB = auto() # semantic RVQ codebook (1 layer), folded from embedding_sum/cluster_usage
-    A_GEN_WAV_QUANT_REST_IN        = auto() # acoustic RVQ, in_proj
-    A_GEN_WAV_QUANT_REST_OUT       = auto() # acoustic RVQ, out_proj
-    A_GEN_WAV_QUANT_REST_CB  = auto() # acoustic RVQ codebooks, merged 3D [15, vocab, dim]
+                                             
+    A_GEN_WAV_QUANT_FIRST_IN       = auto()                                                 
+    A_GEN_WAV_QUANT_FIRST_OUT      = auto()                         
+    A_GEN_WAV_QUANT_FIRST_CB = auto()                                                                           
+    A_GEN_WAV_QUANT_REST_IN        = auto()                        
+    A_GEN_WAV_QUANT_REST_OUT       = auto()                         
+    A_GEN_WAV_QUANT_REST_CB  = auto()                                                     
     A_GEN_WAV_PRE_CONV             = auto()
     A_GEN_WAV_TFM_IN_PROJ          = auto()
     A_GEN_WAV_TFM_OUT_PROJ         = auto()
@@ -1190,69 +1190,69 @@ class MODEL_TENSOR(IntEnum):
     A_GEN_WAV_TFM_ATTN_K           = auto()
     A_GEN_WAV_TFM_ATTN_V           = auto()
     A_GEN_WAV_TFM_ATTN_OUT         = auto()
-    A_GEN_WAV_TFM_ATTN_SCALE       = auto() # layer scale (gamma) on the attn output
+    A_GEN_WAV_TFM_ATTN_SCALE       = auto()                                         
     A_GEN_WAV_TFM_FFN_NORM         = auto()
     A_GEN_WAV_TFM_FFN_GATE         = auto()
     A_GEN_WAV_TFM_FFN_UP           = auto()
     A_GEN_WAV_TFM_FFN_DOWN         = auto()
-    A_GEN_WAV_TFM_FFN_SCALE        = auto() # layer scale (gamma) on the FFN output
-    A_GEN_WAV_UP_CONV              = auto() # causal ConvTranspose1d, 2x upsample
-    A_GEN_WAV_UP_DWCONV            = auto() # ConvNeXt depthwise conv
-    A_GEN_WAV_UP_NORM              = auto() # ConvNeXt LayerNorm
-    A_GEN_WAV_UP_PW1               = auto() # ConvNeXt pointwise conv 1 (expand)
-    A_GEN_WAV_UP_PW2               = auto() # ConvNeXt pointwise conv 2 (project)
-    A_GEN_WAV_UP_GAMMA             = auto() # ConvNeXt layer scale
-    A_GEN_WAV_DAC_ENTRY            = auto() # DAC conv_pre
-    A_GEN_WAV_DAC_UP_SNAKE         = auto() # DAC per-block SnakeBeta before the upsample conv
-    A_GEN_WAV_DAC_UP_CONV          = auto() # DAC per-block causal ConvTranspose1d
-    A_GEN_WAV_DAC_RES_ACT1         = auto() # DAC residual unit, SnakeBeta before conv1
-    A_GEN_WAV_DAC_RES_CONV1        = auto() # DAC residual unit, dilated causal conv
-    A_GEN_WAV_DAC_RES_ACT2         = auto() # DAC residual unit, SnakeBeta before conv2
-    A_GEN_WAV_DAC_RES_CONV2        = auto() # DAC residual unit, pointwise causal conv
-    A_GEN_WAV_DAC_POST_SNAKE       = auto() # DAC final SnakeBeta
-    A_GEN_WAV_DAC_POST_CONV        = auto() # DAC conv_post -> 1-channel PCM
-    # pocket-tts: SEANet encoder (speaker path) and decoder (a.gen.wav path)
+    A_GEN_WAV_TFM_FFN_SCALE        = auto()                                        
+    A_GEN_WAV_UP_CONV              = auto()                                      
+    A_GEN_WAV_UP_DWCONV            = auto()                          
+    A_GEN_WAV_UP_NORM              = auto()                     
+    A_GEN_WAV_UP_PW1               = auto()                                     
+    A_GEN_WAV_UP_PW2               = auto()                                      
+    A_GEN_WAV_UP_GAMMA             = auto()                       
+    A_GEN_WAV_DAC_ENTRY            = auto()               
+    A_GEN_WAV_DAC_UP_SNAKE         = auto()                                                   
+    A_GEN_WAV_DAC_UP_CONV          = auto()                                       
+    A_GEN_WAV_DAC_RES_ACT1         = auto()                                            
+    A_GEN_WAV_DAC_RES_CONV1        = auto()                                         
+    A_GEN_WAV_DAC_RES_ACT2         = auto()                                            
+    A_GEN_WAV_DAC_RES_CONV2        = auto()                                           
+    A_GEN_WAV_DAC_POST_SNAKE       = auto()                      
+    A_GEN_WAV_DAC_POST_CONV        = auto()                                 
+                                                                            
     A_ENC_SEANET_CONV_IN     = auto()
     A_ENC_SEANET_CONV_OUT    = auto()
-    A_ENC_SEANET_RES_CONV1   = auto() # residual unit, dilated conv
-    A_ENC_SEANET_RES_CONV2   = auto() # residual unit, pointwise conv
-    A_ENC_SEANET_SCALE_CONV  = auto() # strided downsample conv
-    A_ENC_ATTN_SCALE         = auto() # layer scale (gamma) on the attn output
-    A_ENC_FFN_SCALE_LS       = auto() # layer scale (gamma) on the FFN output
-    A_ENC_SPEAKER_PROJ       = auto() # voice latent -> backbone embd
+    A_ENC_SEANET_RES_CONV1   = auto()                              
+    A_ENC_SEANET_RES_CONV2   = auto()                                
+    A_ENC_SEANET_SCALE_CONV  = auto()                          
+    A_ENC_ATTN_SCALE         = auto()                                         
+    A_ENC_FFN_SCALE_LS       = auto()                                        
+    A_ENC_SPEAKER_PROJ       = auto()                                
     A_GEN_FLOW_INPUT_PROJ    = auto()
     A_GEN_FLOW_COND_EMBD     = auto()
-    A_GEN_FLOW_TIME_FREQS    = auto() # timestep embedder, stored cos/sin frequencies
+    A_GEN_FLOW_TIME_FREQS    = auto()                                                
     A_GEN_FLOW_TIME_UP       = auto()
     A_GEN_FLOW_TIME_DOWN     = auto()
-    A_GEN_FLOW_TIME_NORM     = auto() # RMSNorm alpha
-    A_GEN_FLOW_BLK_NORM      = auto() # AdaLN res block, in_ln
+    A_GEN_FLOW_TIME_NORM     = auto()                
+    A_GEN_FLOW_BLK_NORM      = auto()                         
     A_GEN_FLOW_BLK_UP        = auto()
     A_GEN_FLOW_BLK_DOWN      = auto()
-    A_GEN_FLOW_BLK_ADA       = auto() # AdaLN modulation, -> shift/scale/gate
-    A_GEN_FLOW_FINAL_ADA     = auto() # final layer AdaLN modulation, -> shift/scale
+    A_GEN_FLOW_BLK_ADA       = auto()                                        
+    A_GEN_FLOW_FINAL_ADA     = auto()                                               
     A_GEN_FLOW_FINAL_PROJ    = auto()
-    A_GEN_OUT_EOS            = auto() # end-of-speech head on the backbone hidden state
-    A_GEN_INPUT_LINEAR       = auto() # generated latent -> backbone embd
-    A_GEN_EMB_MEAN           = auto() # latent denormalization stats
+    A_GEN_OUT_EOS            = auto()                                                  
+    A_GEN_INPUT_LINEAR       = auto()                                    
+    A_GEN_EMB_MEAN           = auto()                               
     A_GEN_EMB_STD            = auto()
-    A_GEN_WAV_QUANT_OUT      = auto() # DummyQuantizer output_proj, latent -> decoder dim
-    A_GEN_WAV_UPSAMPLE       = auto() # frame rate -> encoder frame rate, depthwise convtr
+    A_GEN_WAV_QUANT_OUT      = auto()                                                    
+    A_GEN_WAV_UPSAMPLE       = auto()                                                     
     A_GEN_WAV_SEANET_CONV_IN   = auto()
-    A_GEN_WAV_SEANET_CONV_OUT  = auto() # -> 1-channel PCM
+    A_GEN_WAV_SEANET_CONV_OUT  = auto()                   
     A_GEN_WAV_SEANET_RES_CONV1 = auto()
     A_GEN_WAV_SEANET_RES_CONV2 = auto()
-    A_GEN_WAV_SEANET_SCALE_CONV = auto() # strided upsample convtr
+    A_GEN_WAV_SEANET_SCALE_CONV = auto()                          
     A_MMPROJ              = auto()
     A_MMPROJ_FC           = auto()
     A_MM_NORM_PRE         = auto()
     A_MM_NORM_MID         = auto()
-    A_MM_EMBEDDING        = auto() # gemma3n
-    A_MM_HARD_EMB_NORM    = auto() # gemma3n
-    A_MM_SOFT_EMB_NORM    = auto() # gemma3n
-    A_MM_INP_PROJ         = auto() # gemma3n
-    A_MM_CODE_EMBD        = auto() # mimo: text-side RVQ code embedding table ("text codebook"), merged 3D [n_channels, vocab, dim]
-    A_MM_LOCAL_ATTN_Q     = auto() # mimo: input_local_transformer (LLM-side connector)
+    A_MM_EMBEDDING        = auto()          
+    A_MM_HARD_EMB_NORM    = auto()          
+    A_MM_SOFT_EMB_NORM    = auto()          
+    A_MM_INP_PROJ         = auto()          
+    A_MM_CODE_EMBD        = auto()                                                                                                 
+    A_MM_LOCAL_ATTN_Q     = auto()                                                     
     A_MM_LOCAL_ATTN_K     = auto()
     A_MM_LOCAL_ATTN_V     = auto()
     A_MM_LOCAL_ATTN_OUT   = auto()
@@ -1261,10 +1261,10 @@ class MODEL_TENSOR(IntEnum):
     A_MM_LOCAL_FFN_DOWN   = auto()
     A_MM_LOCAL_LN1        = auto()
     A_MM_LOCAL_LN2        = auto()
-    A_MM_LOCAL_NORM       = auto() # final norm after all input_local_transformer layers
-    A_PER_DIM_K_SCALE     = auto() # gemma4
-    A_PER_DIM_SCALE       = auto() # gemma4
-    # nextn/mtp
+    A_MM_LOCAL_NORM       = auto()                                                      
+    A_PER_DIM_K_SCALE     = auto()         
+    A_PER_DIM_SCALE       = auto()         
+               
     NEXTN_PROJ_PRE         = auto()
     NEXTN_PROJ_POST        = auto()
     NEXTN_EH_PROJ          = auto()
@@ -1276,13 +1276,13 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_HC_HEAD_NORM     = auto()
     NEXTN_HC_HEAD_DOWN     = auto()
     NEXTN_HC_HEAD_UP       = auto()
-    # eagle3
-    FC                     = auto()  # feature fusion layer
-    D2T                    = auto()  # draft to target vocabulary mapping
-    # dspark
-    DSPARK_MARKOV_W1       = auto()  # markov head: prev-token embed
-    DSPARK_MARKOV_W2       = auto()  # markov head: bias projection
-    DSPARK_CONF_PROJ       = auto()  # confidence head
+            
+    FC                     = auto()                        
+    D2T                    = auto()                                      
+            
+    DSPARK_MARKOV_W1       = auto()                                 
+    DSPARK_MARKOV_W2       = auto()                                
+    DSPARK_CONF_PROJ       = auto()                   
     DFLASH_ATTN_CONV_BASE  = auto()
     DFLASH_ATTN_CONV_PROJ  = auto()
     DFLASH_FFN_CONV_BASE   = auto()
@@ -1303,24 +1303,24 @@ class MODEL_TENSOR(IntEnum):
     LILICORR_OUT_HEAD             = auto()
     LILICORR_IN_HEAD              = auto()
     LILICORR_ANCHOR_OUT_HEAD      = auto()
-    # lfm2 audio
+                
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
     A_ENC_POS_BIAS_U       = auto()
     A_ENC_POS_BIAS_V       = auto()
     A_ENC_OUT              = auto()
-    A_ENC_CONV_DW          = auto() # SSM conv
-    A_ENC_CONV_NORM        = auto() # SSM conv
+    A_ENC_CONV_DW          = auto()           
+    A_ENC_CONV_NORM        = auto()           
     A_ENC_CONV_PW1         = auto()
     A_ENC_CONV_PW2         = auto()
-    A_ENC_CONV_NORM_MEAN   = auto() # parakeet
-    A_ENC_CONV_NORM_VAR    = auto() # parakeet
-    A_ENC_MEL_FILTERS      = auto() # parakeet
-    A_ENC_WINDOW           = auto() # parakeet
+    A_ENC_CONV_NORM_MEAN   = auto()           
+    A_ENC_CONV_NORM_VAR    = auto()           
+    A_ENC_MEL_FILTERS      = auto()           
+    A_ENC_WINDOW           = auto()           
     A_CTC_OUT              = auto()
     A_CTC_OUT_MID          = auto()
     A_ENC_ATTN_REL_POS_EMB = auto()
-    # audio qformer projector
+                             
     A_QF_PROJ_QUERY        = auto()
     A_QF_PROJ_NORM         = auto()
     A_QF_PROJ_LINEAR       = auto()
@@ -1340,7 +1340,7 @@ class MODEL_TENSOR(IntEnum):
 
 
 MODEL_ARCH_NAMES: dict[MODEL_ARCH, str] = {
-    MODEL_ARCH.MMPROJ:           "clip", # dummy arch for clip.cpp
+    MODEL_ARCH.MMPROJ:           "clip",                          
     MODEL_ARCH.LLAMA:            "llama",
     MODEL_ARCH.LLAMA4:           "llama4",
     MODEL_ARCH.DECI:             "deci",
@@ -1523,14 +1523,14 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.OUTPUT_NORM:               "output_norm",
     MODEL_TENSOR.OUTPUT:                    "output",
     MODEL_TENSOR.HRM_Z_L_INIT:              "hrm.z_l_init",
-    MODEL_TENSOR.DENSE_2_OUT:               "dense_2", # embeddinggemma 2_Dense
-    MODEL_TENSOR.DENSE_3_OUT:               "dense_3", # embeddinggemma 2_Dense
+    MODEL_TENSOR.DENSE_2_OUT:               "dense_2",                         
+    MODEL_TENSOR.DENSE_3_OUT:               "dense_3",                         
     MODEL_TENSOR.HC_HEAD_FN:                "output_hc_fn",
     MODEL_TENSOR.HC_HEAD_BASE:              "output_hc_base",
     MODEL_TENSOR.HC_HEAD_SCALE:             "output_hc_scale",
-    MODEL_TENSOR.HC_HEAD_NORM:              "output_hc_norm",                 # qwen4exp
-    MODEL_TENSOR.HC_HEAD_DOWN:              "output_hc_down",                 # qwen4exp
-    MODEL_TENSOR.HC_HEAD_UP:                "output_hc_up",                   # qwen4exp
+    MODEL_TENSOR.HC_HEAD_NORM:              "output_hc_norm",                           
+    MODEL_TENSOR.HC_HEAD_DOWN:              "output_hc_down",                           
+    MODEL_TENSOR.HC_HEAD_UP:                "output_hc_up",                             
     MODEL_TENSOR.ROPE_FREQS:                "rope_freqs",
     MODEL_TENSOR.ROPE_FACTORS_LONG:         "rope_factors_long",
     MODEL_TENSOR.ROPE_FACTORS_SHORT:        "rope_factors_short",
@@ -1553,9 +1553,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.FFN_NORM:                  "blk.{bid}.ffn_norm",
     MODEL_TENSOR.FFN_PRE_NORM:              "blk.{bid}.ffn_norm",
     MODEL_TENSOR.FFN_POST_NORM:             "blk.{bid}.post_ffw_norm",
-    MODEL_TENSOR.FFN_PRE_NORM_2:            "blk.{bid}.pre_ffw_norm_2",  # gemma4
-    MODEL_TENSOR.FFN_POST_NORM_1:           "blk.{bid}.post_ffw_norm_1", # gemma4
-    MODEL_TENSOR.FFN_POST_NORM_2:           "blk.{bid}.post_ffw_norm_2", # gemma4
+    MODEL_TENSOR.FFN_PRE_NORM_2:            "blk.{bid}.pre_ffw_norm_2",          
+    MODEL_TENSOR.FFN_POST_NORM_1:           "blk.{bid}.post_ffw_norm_1",         
+    MODEL_TENSOR.FFN_POST_NORM_2:           "blk.{bid}.post_ffw_norm_2",         
     MODEL_TENSOR.FFN_GATE:                  "blk.{bid}.ffn_gate",
     MODEL_TENSOR.FFN_DOWN:                  "blk.{bid}.ffn_down",
     MODEL_TENSOR.FFN_UP:                    "blk.{bid}.ffn_up",
@@ -1574,26 +1574,26 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.FFN_EXP_PROBS_B:           "blk.{bid}.exp_probs_b",
     MODEL_TENSOR.FFN_EXP_PROBS_B_VL:        "blk.{bid}.exp_probs_b_vl",
     MODEL_TENSOR.FFN_GATE_TID2EID:          "blk.{bid}.ffn_gate_tid2eid",
-    MODEL_TENSOR.MOE_LATENT_DOWN:           "blk.{bid}.ffn_latent_down",      # nemotron 3 super
-    MODEL_TENSOR.MOE_LATENT_UP:             "blk.{bid}.ffn_latent_up",        # nemotron 3 super
+    MODEL_TENSOR.MOE_LATENT_DOWN:           "blk.{bid}.ffn_latent_down",                        
+    MODEL_TENSOR.MOE_LATENT_UP:             "blk.{bid}.ffn_latent_up",                          
     MODEL_TENSOR.LAYER_OUT_NORM:            "blk.{bid}.layer_output_norm",
     MODEL_TENSOR.LAYER_OUT_SCALE:           "blk.{bid}.layer_output_scale",
-    MODEL_TENSOR.PER_LAYER_TOKEN_EMBD:      "per_layer_token_embd",           # gemma3n
-    MODEL_TENSOR.PER_LAYER_MODEL_PROJ:      "per_layer_model_proj",           # gemma3n
-    MODEL_TENSOR.PER_LAYER_PROJ_NORM:       "per_layer_proj_norm",            # gemma3n
-    MODEL_TENSOR.ALTUP_UNEMBD_PROJ:         "altup_unembd_proj",              # gemma3n
-    MODEL_TENSOR.ALTUP_PROJ:                "altup_proj",                     # gemma3n
-    MODEL_TENSOR.PER_LAYER_INP_GATE:        "blk.{bid}.inp_gate",             # gemma3n
-    MODEL_TENSOR.PER_LAYER_PROJ:            "blk.{bid}.proj",                 # gemma3n
-    MODEL_TENSOR.PER_LAYER_POST_NORM:       "blk.{bid}.post_norm",            # gemma3n
-    MODEL_TENSOR.ALTUP_CORRECT_COEF:        "blk.{bid}.altup_correct_coef",   # gemma3n
-    MODEL_TENSOR.ALTUP_CORRECT_SCALE:       "blk.{bid}.altup_correct_scale",  # gemma3n
-    MODEL_TENSOR.ALTUP_PREDICT_COEF:        "blk.{bid}.altup_predict_coef",   # gemma3n
-    MODEL_TENSOR.ALTUP_ROUTER:              "blk.{bid}.altup_router",         # gemma3n
-    MODEL_TENSOR.ALTUP_ROUTER_NORM:         "blk.{bid}.altup_router_norm",    # gemma3n
-    MODEL_TENSOR.LAUREL_L:                  "blk.{bid}.laurel_l",             # gemma3n
-    MODEL_TENSOR.LAUREL_R:                  "blk.{bid}.laurel_r",             # gemma3n
-    MODEL_TENSOR.LAUREL_POST_NORM:          "blk.{bid}.laurel_post_norm",     # gemma3n
+    MODEL_TENSOR.PER_LAYER_TOKEN_EMBD:      "per_layer_token_embd",                    
+    MODEL_TENSOR.PER_LAYER_MODEL_PROJ:      "per_layer_model_proj",                    
+    MODEL_TENSOR.PER_LAYER_PROJ_NORM:       "per_layer_proj_norm",                     
+    MODEL_TENSOR.ALTUP_UNEMBD_PROJ:         "altup_unembd_proj",                       
+    MODEL_TENSOR.ALTUP_PROJ:                "altup_proj",                              
+    MODEL_TENSOR.PER_LAYER_INP_GATE:        "blk.{bid}.inp_gate",                      
+    MODEL_TENSOR.PER_LAYER_PROJ:            "blk.{bid}.proj",                          
+    MODEL_TENSOR.PER_LAYER_POST_NORM:       "blk.{bid}.post_norm",                     
+    MODEL_TENSOR.ALTUP_CORRECT_COEF:        "blk.{bid}.altup_correct_coef",            
+    MODEL_TENSOR.ALTUP_CORRECT_SCALE:       "blk.{bid}.altup_correct_scale",           
+    MODEL_TENSOR.ALTUP_PREDICT_COEF:        "blk.{bid}.altup_predict_coef",            
+    MODEL_TENSOR.ALTUP_ROUTER:              "blk.{bid}.altup_router",                  
+    MODEL_TENSOR.ALTUP_ROUTER_NORM:         "blk.{bid}.altup_router_norm",             
+    MODEL_TENSOR.LAUREL_L:                  "blk.{bid}.laurel_l",                      
+    MODEL_TENSOR.LAUREL_R:                  "blk.{bid}.laurel_r",                      
+    MODEL_TENSOR.LAUREL_POST_NORM:          "blk.{bid}.laurel_post_norm",              
     MODEL_TENSOR.SSM_IN:                    "blk.{bid}.ssm_in",
     MODEL_TENSOR.SSM_CONV1D:                "blk.{bid}.ssm_conv1d",
     MODEL_TENSOR.SSM_X:                     "blk.{bid}.ssm_x",
@@ -1605,23 +1605,23 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.SSM_D:                     "blk.{bid}.ssm_d",
     MODEL_TENSOR.SSM_NORM:                  "blk.{bid}.ssm_norm",
     MODEL_TENSOR.SSM_OUT:                   "blk.{bid}.ssm_out",
-    MODEL_TENSOR.SSM_ALPHA:                 "blk.{bid}.ssm_alpha",            # qwen3.5
+    MODEL_TENSOR.SSM_ALPHA:                 "blk.{bid}.ssm_alpha",                     
     MODEL_TENSOR.SSM_BETA_ALPHA:            "blk.{bid}.ssm_ba",
-    MODEL_TENSOR.SSM_CONV1D_Q:              "blk.{bid}.ssm_conv1d_q",         # Kimi Linear
-    MODEL_TENSOR.SSM_CONV1D_K:              "blk.{bid}.ssm_conv1d_k",         # Kimi Linear
-    MODEL_TENSOR.SSM_CONV1D_V:              "blk.{bid}.ssm_conv1d_v",         # Kimi Linear
-    MODEL_TENSOR.SSM_F_A:                   "blk.{bid}.ssm_f_a",              # Kimi Linear
-    MODEL_TENSOR.SSM_F_B:                   "blk.{bid}.ssm_f_b",              # Kimi Linear
-    MODEL_TENSOR.SSM_BETA:                  "blk.{bid}.ssm_beta",             # Kimi Linear qwen3.5
-    MODEL_TENSOR.SSM_G_A:                   "blk.{bid}.ssm_g_a",              # Kimi Linear
-    MODEL_TENSOR.SSM_G_B:                   "blk.{bid}.ssm_g_b",              # Kimi Linear
-    MODEL_TENSOR.SSM_G:                     "blk.{bid}.ssm_g",                # Kimi K3
-    MODEL_TENSOR.ATTN_RES_SCORE:            "blk.{bid}.attn_res_score",       # Kimi K3
-    MODEL_TENSOR.FFN_RES_SCORE:             "blk.{bid}.ffn_res_score",        # Kimi K3
-    MODEL_TENSOR.OUTPUT_RES_SCORE:          "output_res_score",               # Kimi K3
-    MODEL_TENSOR.FFN_ROUTED_DOWN:           "blk.{bid}.ffn_routed_down",      # Kimi K3
-    MODEL_TENSOR.FFN_ROUTED_UP:             "blk.{bid}.ffn_routed_up",        # Kimi K3
-    MODEL_TENSOR.FFN_ROUTED_NORM:           "blk.{bid}.ffn_routed_norm",      # Kimi K3
+    MODEL_TENSOR.SSM_CONV1D_Q:              "blk.{bid}.ssm_conv1d_q",                      
+    MODEL_TENSOR.SSM_CONV1D_K:              "blk.{bid}.ssm_conv1d_k",                      
+    MODEL_TENSOR.SSM_CONV1D_V:              "blk.{bid}.ssm_conv1d_v",                      
+    MODEL_TENSOR.SSM_F_A:                   "blk.{bid}.ssm_f_a",                           
+    MODEL_TENSOR.SSM_F_B:                   "blk.{bid}.ssm_f_b",                           
+    MODEL_TENSOR.SSM_BETA:                  "blk.{bid}.ssm_beta",                                  
+    MODEL_TENSOR.SSM_G_A:                   "blk.{bid}.ssm_g_a",                           
+    MODEL_TENSOR.SSM_G_B:                   "blk.{bid}.ssm_g_b",                           
+    MODEL_TENSOR.SSM_G:                     "blk.{bid}.ssm_g",                         
+    MODEL_TENSOR.ATTN_RES_SCORE:            "blk.{bid}.attn_res_score",                
+    MODEL_TENSOR.FFN_RES_SCORE:             "blk.{bid}.ffn_res_score",                 
+    MODEL_TENSOR.OUTPUT_RES_SCORE:          "output_res_score",                        
+    MODEL_TENSOR.FFN_ROUTED_DOWN:           "blk.{bid}.ffn_routed_down",               
+    MODEL_TENSOR.FFN_ROUTED_UP:             "blk.{bid}.ffn_routed_up",                 
+    MODEL_TENSOR.FFN_ROUTED_NORM:           "blk.{bid}.ffn_routed_norm",               
     MODEL_TENSOR.TIME_MIX_W0:               "blk.{bid}.time_mix_w0",
     MODEL_TENSOR.TIME_MIX_W1:               "blk.{bid}.time_mix_w1",
     MODEL_TENSOR.TIME_MIX_W2:               "blk.{bid}.time_mix_w2",
@@ -1676,20 +1676,20 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.HC_FFN_FN:                 "blk.{bid}.hc_ffn_fn",
     MODEL_TENSOR.HC_FFN_BASE:               "blk.{bid}.hc_ffn_base",
     MODEL_TENSOR.HC_FFN_SCALE:              "blk.{bid}.hc_ffn_scale",
-    MODEL_TENSOR.HC_ATTN_NORM:              "blk.{bid}.hc_attn_norm",         # qwen4exp
-    MODEL_TENSOR.HC_ATTN_DOWN:              "blk.{bid}.hc_attn_down",         # qwen4exp
-    MODEL_TENSOR.HC_ATTN_UP:                "blk.{bid}.hc_attn_up",           # qwen4exp
-    MODEL_TENSOR.HC_ATTN_INJECT:            "blk.{bid}.hc_attn_inject",       # qwen4exp
-    MODEL_TENSOR.HC_FFN_NORM:               "blk.{bid}.hc_ffn_norm",          # qwen4exp
-    MODEL_TENSOR.HC_FFN_DOWN:               "blk.{bid}.hc_ffn_down",          # qwen4exp
-    MODEL_TENSOR.HC_FFN_UP:                 "blk.{bid}.hc_ffn_up",            # qwen4exp
-    MODEL_TENSOR.HC_FFN_INJECT:             "blk.{bid}.hc_ffn_inject",        # qwen4exp
-    MODEL_TENSOR.PLE_KEY:                   "blk.{bid}.ple_key",              # qwen4exp
-    MODEL_TENSOR.PLE_VALUE:                 "blk.{bid}.ple_value",            # qwen4exp
-    MODEL_TENSOR.PLE_NORM_KEY:              "blk.{bid}.ple_norm_key",         # qwen4exp
-    MODEL_TENSOR.PLE_NORM_QUERY:            "blk.{bid}.ple_norm_query",       # qwen4exp
-    MODEL_TENSOR.PLE_NORM_CONV:             "blk.{bid}.ple_norm_conv",        # qwen4exp
-    MODEL_TENSOR.PLE_CONV1D:                "blk.{bid}.ple_conv1d",           # qwen4exp
+    MODEL_TENSOR.HC_ATTN_NORM:              "blk.{bid}.hc_attn_norm",                   
+    MODEL_TENSOR.HC_ATTN_DOWN:              "blk.{bid}.hc_attn_down",                   
+    MODEL_TENSOR.HC_ATTN_UP:                "blk.{bid}.hc_attn_up",                     
+    MODEL_TENSOR.HC_ATTN_INJECT:            "blk.{bid}.hc_attn_inject",                 
+    MODEL_TENSOR.HC_FFN_NORM:               "blk.{bid}.hc_ffn_norm",                    
+    MODEL_TENSOR.HC_FFN_DOWN:               "blk.{bid}.hc_ffn_down",                    
+    MODEL_TENSOR.HC_FFN_UP:                 "blk.{bid}.hc_ffn_up",                      
+    MODEL_TENSOR.HC_FFN_INJECT:             "blk.{bid}.hc_ffn_inject",                  
+    MODEL_TENSOR.PLE_KEY:                   "blk.{bid}.ple_key",                        
+    MODEL_TENSOR.PLE_VALUE:                 "blk.{bid}.ple_value",                      
+    MODEL_TENSOR.PLE_NORM_KEY:              "blk.{bid}.ple_norm_key",                   
+    MODEL_TENSOR.PLE_NORM_QUERY:            "blk.{bid}.ple_norm_query",                 
+    MODEL_TENSOR.PLE_NORM_CONV:             "blk.{bid}.ple_norm_conv",                  
+    MODEL_TENSOR.PLE_CONV1D:                "blk.{bid}.ple_conv1d",                     
     MODEL_TENSOR.ATTN_COMPRESSOR_WKV:       "blk.{bid}.attn_compressor_kv",
     MODEL_TENSOR.ATTN_COMPRESSOR_WGATE:     "blk.{bid}.attn_compressor_gate",
     MODEL_TENSOR.ATTN_COMPRESSOR_APE:       "blk.{bid}.attn_compressor_ape",
@@ -1783,7 +1783,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.INDEXER_COMPRESSOR_NORM:   "blk.{bid}.indexer_compressor_norm",
     MODEL_TENSOR.INDEXER_KPOOL_GATE:        "blk.{bid}.indexer_compressor_gate",
     MODEL_TENSOR.INDEXER_KPOOL_APE:         "blk.{bid}.indexer_compressor_ape",
-    # vision
+            
     MODEL_TENSOR.V_MMPROJ:                  "mm.{bid}",
     MODEL_TENSOR.V_MMPROJ_FC:               "mm.model.fc",
     MODEL_TENSOR.V_MMPROJ_MLP:              "mm.model.mlp.{bid}",
@@ -1822,16 +1822,16 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_MM_POST_NORM:            "mm.post_norm",
     MODEL_TENSOR.V_MM_INP_PROJ:             "mm.input_projection",
     MODEL_TENSOR.V_MM_INP_NORM:             "mm.input_norm",
-    MODEL_TENSOR.V_MM_SOFT_EMB_NORM:        "mm.soft_emb_norm",         # gemma3n
-    MODEL_TENSOR.V_MM_EMBEDDING:            "mm.embedding",             # gemma3n
-    MODEL_TENSOR.V_MM_HARD_EMB_NORM:        "mm.hard_emb_norm",         # gemma3n
-    MODEL_TENSOR.V_ENC_CONV_STEM:           "v.conv_stem.conv",         # gemma3n
-    MODEL_TENSOR.V_ENC_CONV_STEM_NORM:      "v.conv_stem.bn",           # gemma3n
-    MODEL_TENSOR.V_ENC_MSFA_EXP:            "v.msfa.ffn.pw_exp.conv",   # gemma3n
-    MODEL_TENSOR.V_ENC_MSFA_EXP_NORM:       "v.msfa.ffn.pw_exp.bn",     # gemma3n
-    MODEL_TENSOR.V_ENC_MSFA_PROJ:           "v.msfa.ffn.pw_proj.conv",  # gemma3n
-    MODEL_TENSOR.V_ENC_MSFA_PROJ_NORM:      "v.msfa.ffn.pw_proj.bn",    # gemma3n
-    MODEL_TENSOR.V_ENC_MSFA_NORM:           "v.msfa.norm",              # gemma3n
+    MODEL_TENSOR.V_MM_SOFT_EMB_NORM:        "mm.soft_emb_norm",                  
+    MODEL_TENSOR.V_MM_EMBEDDING:            "mm.embedding",                      
+    MODEL_TENSOR.V_MM_HARD_EMB_NORM:        "mm.hard_emb_norm",                  
+    MODEL_TENSOR.V_ENC_CONV_STEM:           "v.conv_stem.conv",                  
+    MODEL_TENSOR.V_ENC_CONV_STEM_NORM:      "v.conv_stem.bn",                    
+    MODEL_TENSOR.V_ENC_MSFA_EXP:            "v.msfa.ffn.pw_exp.conv",            
+    MODEL_TENSOR.V_ENC_MSFA_EXP_NORM:       "v.msfa.ffn.pw_exp.bn",              
+    MODEL_TENSOR.V_ENC_MSFA_PROJ:           "v.msfa.ffn.pw_proj.conv",           
+    MODEL_TENSOR.V_ENC_MSFA_PROJ_NORM:      "v.msfa.ffn.pw_proj.bn",             
+    MODEL_TENSOR.V_ENC_MSFA_NORM:           "v.msfa.norm",                       
     MODEL_TENSOR.V_RESMPL_POS_EMBD_K:       "resampler.pos_embd_k",
     MODEL_TENSOR.V_RESMPL_ATTN_Q:           "resampler.attn.q",
     MODEL_TENSOR.V_RESMPL_ATTN_K:           "resampler.attn.k",
@@ -1843,11 +1843,11 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_RESMPL_Q_NORM:           "resampler.ln_q",
     MODEL_TENSOR.V_RESMPL_PROJ:             "resampler.proj",
     MODEL_TENSOR.V_RESMPL_QUERY:            "resampler.query",
-    MODEL_TENSOR.V_TOK_EMBD_IMG_BREAK:      "v.token_embd.img_break", # pixtral
-    MODEL_TENSOR.V_TOK_EMBD_IMG_START:      "v.token_embd.img_start", # deepseek4v
-    MODEL_TENSOR.V_TOK_EMBD_IMG_END:        "v.token_embd.img_end",   # deepseek4v
-    MODEL_TENSOR.V_TOK_EMBD_IMG_PAD:        "v.token_embd.img_pad",   # deepseek4v
-    MODEL_TENSOR.V_MM_PATCH_MERGER:         "mm.patch_merger", # mistral small 3.1
+    MODEL_TENSOR.V_TOK_EMBD_IMG_BREAK:      "v.token_embd.img_break",          
+    MODEL_TENSOR.V_TOK_EMBD_IMG_START:      "v.token_embd.img_start",             
+    MODEL_TENSOR.V_TOK_EMBD_IMG_END:        "v.token_embd.img_end",               
+    MODEL_TENSOR.V_TOK_EMBD_IMG_PAD:        "v.token_embd.img_pad",               
+    MODEL_TENSOR.V_MM_PATCH_MERGER:         "mm.patch_merger",                    
     MODEL_TENSOR.V_DS_NORM:                 "v.deepstack.{bid}.norm",
     MODEL_TENSOR.V_DS_FC1:                  "v.deepstack.{bid}.fc1",
     MODEL_TENSOR.V_DS_FC2:                  "v.deepstack.{bid}.fc2",
@@ -1859,7 +1859,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_MERGER_DS_LN:            "v.vit_merger.ds_ln",
     MODEL_TENSOR.V_MERGER_DS_UP:            "v.vit_merger.ds_ffn_up",
     MODEL_TENSOR.V_MERGER_DS_DOWN:          "v.vit_merger.ds_ffn_down",
-    MODEL_TENSOR.V_MM_POST_FC_NORM:         "mm.post_fc_norm", # cogvlm
+    MODEL_TENSOR.V_MM_POST_FC_NORM:         "mm.post_fc_norm",         
     MODEL_TENSOR.V_MM_UP:                   "mm.up",
     MODEL_TENSOR.V_MM_DOWN:                 "mm.down",
     MODEL_TENSOR.V_MM_GATE:                 "mm.gate",
@@ -1870,9 +1870,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_MM_PRE_NORM:             "mm.pre_norm",
     MODEL_TENSOR.V_TOK_IMG_BEGIN:           "mm.image_begin",
     MODEL_TENSOR.V_TOK_IMG_END:             "mm.image_end",
-    MODEL_TENSOR.V_STD_BIAS:                "v.std_bias", # gemma4
-    MODEL_TENSOR.V_STD_SCALE:               "v.std_scale", # gemma4
-    # DeepSeek-OCR SAM
+    MODEL_TENSOR.V_STD_BIAS:                "v.std_bias",         
+    MODEL_TENSOR.V_STD_SCALE:               "v.std_scale",         
+                      
     MODEL_TENSOR.V_SAM_POS_EMBD:            "v.sam.pos_embd",
     MODEL_TENSOR.V_SAM_PATCH_EMBD:          "v.sam.patch_embd",
     MODEL_TENSOR.V_SAM_PRE_NORM:            "v.sam.blk.{bid}.pre_ln",
@@ -1886,14 +1886,14 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_SAM_NECK:                "v.sam.neck.{bid}",
     MODEL_TENSOR.V_SAM_NET_2:               "v.sam.net_2",
     MODEL_TENSOR.V_SAM_NET_3:               "v.sam.net_3",
-    MODEL_TENSOR.V_ENC_EMBD_IMGNL:          "v.image_newline", # Deepseek-OCR, Granite4Vision
-    MODEL_TENSOR.V_ENC_EMBD_VSEP:           "v.view_seperator", # Deepseek-OCR
-    MODEL_TENSOR.V_TOK_EMBD_SEP:            "v.tok_embd_sep", # MiniCPM-V 4.7
-    MODEL_TENSOR.V_RESMPL_QUERY_768:        "v.resample_query_768", # Deepseek-OCR-2 qwen2
-    MODEL_TENSOR.V_RESMPL_QUERY_1024:       "v.resample_query_1024", # Deepseek-OCR-2 qwen2
-    # Granite4 Vision
-    # qformer layers (bid => proj_id)
-    # NOTE: Names align with A_QF_*
+    MODEL_TENSOR.V_ENC_EMBD_IMGNL:          "v.image_newline",                               
+    MODEL_TENSOR.V_ENC_EMBD_VSEP:           "v.view_seperator",               
+    MODEL_TENSOR.V_TOK_EMBD_SEP:            "v.tok_embd_sep",                
+    MODEL_TENSOR.V_RESMPL_QUERY_768:        "v.resample_query_768",                       
+    MODEL_TENSOR.V_RESMPL_QUERY_1024:       "v.resample_query_1024",                       
+                     
+                                     
+                                   
     MODEL_TENSOR.V_QF_SELF_ATTN_Q:          "v.proj_blk.{bid}.self_attn_q",
     MODEL_TENSOR.V_QF_SELF_ATTN_K:          "v.proj_blk.{bid}.self_attn_k",
     MODEL_TENSOR.V_QF_SELF_ATTN_V:          "v.proj_blk.{bid}.self_attn_v",
@@ -1907,15 +1907,15 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.V_QF_FFN_UP:               "v.proj_blk.{bid}.ffn_up",
     MODEL_TENSOR.V_QF_FFN_DOWN:             "v.proj_blk.{bid}.ffn_down",
     MODEL_TENSOR.V_QF_FFN_NORM:             "v.proj_blk.{bid}.ffn_norm",
-    # multi-projector (bid => projector ID)
+                                           
     MODEL_TENSOR.V_MULTI_PROJ_IMG_POS:   "v.proj_blk.{bid}.img_pos",
     MODEL_TENSOR.V_MULTI_PROJ_QUERY:     "v.proj_blk.{bid}.query",
     MODEL_TENSOR.V_MULTI_PROJ_NORM:      "v.proj_blk.{bid}.norm",
     MODEL_TENSOR.V_MULTI_PROJ_LINEAR:    "v.proj_blk.{bid}.linear",
     MODEL_TENSOR.V_MULTI_PROJ_POST_NORM: "v.proj_blk.{bid}.post_norm",
 
-    # audio (mtmd)
-    # note: all audio tensor names must use prefix "a." or "mm.a."
+                  
+                                                                  
     MODEL_TENSOR.A_ENC_EMBD_POS:            "a.position_embd",
     MODEL_TENSOR.A_ENC_EMBD_NORM:           "a.position_embd_norm",
     MODEL_TENSOR.A_ENC_EMBD_TO_LOGITS:      "a.embd_to_logits",
@@ -1961,14 +1961,14 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.A_GEN_CODE_EMBD:           "a.gen.code.embd",
     MODEL_TENSOR.A_GEN_CODE_HEAD:           "a.gen.code.head",
     MODEL_TENSOR.A_GEN_CODE_OUT_EMBD:       "a.gen.code.out_embd",
-    MODEL_TENSOR.A_GEN_CODE_ATTN_NORM:      "a.gen.code.blk.{bid}.ln1", # reuses the generic clip.cpp block loader (TN_LN_1)
+    MODEL_TENSOR.A_GEN_CODE_ATTN_NORM:      "a.gen.code.blk.{bid}.ln1",                                                     
     MODEL_TENSOR.A_GEN_CODE_ATTN_Q:         "a.gen.code.blk.{bid}.attn_q",
     MODEL_TENSOR.A_GEN_CODE_ATTN_Q_NORM:    "a.gen.code.blk.{bid}.attn_q_norm",
     MODEL_TENSOR.A_GEN_CODE_ATTN_K:         "a.gen.code.blk.{bid}.attn_k",
     MODEL_TENSOR.A_GEN_CODE_ATTN_K_NORM:    "a.gen.code.blk.{bid}.attn_k_norm",
     MODEL_TENSOR.A_GEN_CODE_ATTN_V:         "a.gen.code.blk.{bid}.attn_v",
     MODEL_TENSOR.A_GEN_CODE_ATTN_OUT:       "a.gen.code.blk.{bid}.attn_out",
-    MODEL_TENSOR.A_GEN_CODE_FFN_NORM:       "a.gen.code.blk.{bid}.ln2", # reuses the generic clip.cpp block loader (TN_LN_2)
+    MODEL_TENSOR.A_GEN_CODE_FFN_NORM:       "a.gen.code.blk.{bid}.ln2",                                                     
     MODEL_TENSOR.A_GEN_CODE_FFN_GATE:       "a.gen.code.blk.{bid}.ffn_gate",
     MODEL_TENSOR.A_GEN_CODE_FFN_UP:         "a.gen.code.blk.{bid}.ffn_up",
     MODEL_TENSOR.A_GEN_CODE_FFN_DOWN:       "a.gen.code.blk.{bid}.ffn_down",
@@ -2044,10 +2044,10 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.A_MMPROJ_FC:               "mm.a.fc",
     MODEL_TENSOR.A_MM_NORM_PRE:             "mm.a.norm_pre",
     MODEL_TENSOR.A_MM_NORM_MID:             "mm.a.norm_mid",
-    MODEL_TENSOR.A_MM_INP_PROJ:             "mm.a.input_projection",      # gemma3n
-    MODEL_TENSOR.A_MM_SOFT_EMB_NORM:        "mm.a.soft_emb_norm",         # gemma3n
-    MODEL_TENSOR.A_MM_EMBEDDING:            "mm.a.embedding",             # gemma3n
-    MODEL_TENSOR.A_MM_HARD_EMB_NORM:        "mm.a.hard_emb_norm",         # gemma3n
+    MODEL_TENSOR.A_MM_INP_PROJ:             "mm.a.input_projection",               
+    MODEL_TENSOR.A_MM_SOFT_EMB_NORM:        "mm.a.soft_emb_norm",                  
+    MODEL_TENSOR.A_MM_EMBEDDING:            "mm.a.embedding",                      
+    MODEL_TENSOR.A_MM_HARD_EMB_NORM:        "mm.a.hard_emb_norm",                  
     MODEL_TENSOR.A_MM_CODE_EMBD:            "mm.a.code_embd",
     MODEL_TENSOR.A_MM_LOCAL_ATTN_Q:         "mm.a.local_blk.{bid}.attn_q",
     MODEL_TENSOR.A_MM_LOCAL_ATTN_K:         "mm.a.local_blk.{bid}.attn_k",
@@ -2059,9 +2059,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.A_MM_LOCAL_LN1:            "mm.a.local_blk.{bid}.ln1",
     MODEL_TENSOR.A_MM_LOCAL_LN2:            "mm.a.local_blk.{bid}.ln2",
     MODEL_TENSOR.A_MM_LOCAL_NORM:           "mm.a.local_norm",
-    MODEL_TENSOR.A_PER_DIM_K_SCALE:         "a.blk.{bid}.per_dim_k_scale", # gemma4
-    MODEL_TENSOR.A_PER_DIM_SCALE:           "a.blk.{bid}.per_dim_scale",   # gemma4
-    # lfm2 audio
+    MODEL_TENSOR.A_PER_DIM_K_SCALE:         "a.blk.{bid}.per_dim_k_scale",         
+    MODEL_TENSOR.A_PER_DIM_SCALE:           "a.blk.{bid}.per_dim_scale",           
+                
     MODEL_TENSOR.A_ENC_NORM_CONV:           "a.blk.{bid}.norm_conv",
     MODEL_TENSOR.A_ENC_LINEAR_POS:          "a.blk.{bid}.linear_pos",
     MODEL_TENSOR.A_ENC_POS_BIAS_U:          "a.blk.{bid}.pos_bias_u",
@@ -2078,7 +2078,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.A_CTC_OUT:                 "a.enc_ctc_out",
     MODEL_TENSOR.A_CTC_OUT_MID:             "a.enc_ctc_out_mid",
     MODEL_TENSOR.A_ENC_ATTN_REL_POS_EMB:    "a.blk.{bid}.attn_rel_pos_emb",
-    # qformer projector
+                       
     MODEL_TENSOR.A_QF_PROJ_QUERY:           "a.proj_query",
     MODEL_TENSOR.A_QF_PROJ_NORM:            "a.proj_norm",
     MODEL_TENSOR.A_QF_PROJ_LINEAR:          "a.proj_linear",
@@ -2095,7 +2095,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.A_QF_FFN_UP:               "a.proj_blk.{bid}.ffn_up",
     MODEL_TENSOR.A_QF_FFN_DOWN:             "a.proj_blk.{bid}.ffn_down",
     MODEL_TENSOR.A_QF_FFN_NORM:             "a.proj_blk.{bid}.ffn_norm",
-    # NextN/MTP
+               
     MODEL_TENSOR.NEXTN_PROJ_PRE:            "nextn.pre_projection",
     MODEL_TENSOR.NEXTN_PROJ_POST:           "nextn.post_projection",
     MODEL_TENSOR.NEXTN_EH_PROJ:             "blk.{bid}.nextn.eh_proj",
@@ -2267,7 +2267,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.V_MULTI_PROJ_LINEAR,
         MODEL_TENSOR.V_MULTI_PROJ_NORM,
         MODEL_TENSOR.V_MULTI_PROJ_POST_NORM,
-        # audio
+               
         MODEL_TENSOR.A_ENC_EMBD_POS,
         MODEL_TENSOR.A_ENC_EMBD_NORM,
         MODEL_TENSOR.A_ENC_EMBD_TO_LOGITS,
@@ -2429,7 +2429,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.A_CTC_OUT,
         MODEL_TENSOR.A_CTC_OUT_MID,
         MODEL_TENSOR.A_ENC_ATTN_REL_POS_EMB,
-        # qformer projector
+                           
         MODEL_TENSOR.A_QF_PROJ_QUERY,
         MODEL_TENSOR.A_QF_PROJ_NORM,
         MODEL_TENSOR.A_QF_PROJ_LINEAR,
@@ -3025,7 +3025,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.SSM_BETA,
         MODEL_TENSOR.SSM_ALPHA,
         MODEL_TENSOR.SSM_OUT,
-        # NextN/MTP tensors - preserved but unused
+                                                  
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -3057,7 +3057,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.SSM_BETA,
         MODEL_TENSOR.SSM_ALPHA,
         MODEL_TENSOR.SSM_OUT,
-        # decision head
+                       
         MODEL_TENSOR.TOKEN_TYPES,
         MODEL_TENSOR.DEC_ATTN_NORM,
         MODEL_TENSOR.DEC_ATTN_Q,
@@ -3101,7 +3101,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
-        # decision head
+                       
         MODEL_TENSOR.DECISION_OPTION_NORM,
         MODEL_TENSOR.DECISION_QUERY_NORM,
         MODEL_TENSOR.DECISION_KEY,
@@ -3140,7 +3140,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.SSM_BETA,
         MODEL_TENSOR.SSM_ALPHA,
         MODEL_TENSOR.SSM_OUT,
-        # NextN/MTP tensors - preserved but unused
+                                                  
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -3151,7 +3151,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     MODEL_ARCH.QWEN4EXP: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT,
-        # no OUTPUT_NORM / ATTN_NORM / ATTN_POST_NORM: hyper-connections replace every layer norm
+                                                                                                 
         MODEL_TENSOR.HC_HEAD_NORM,
         MODEL_TENSOR.HC_HEAD_DOWN,
         MODEL_TENSOR.HC_HEAD_UP,
@@ -3163,7 +3163,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.HC_FFN_DOWN,
         MODEL_TENSOR.HC_FFN_UP,
         MODEL_TENSOR.HC_FFN_INJECT,
-        # full attention layers: ATTN_Q holds [q|gate] interleaved per head
+                                                                           
         MODEL_TENSOR.ATTN_Q,
         MODEL_TENSOR.ATTN_Q_NORM,
         MODEL_TENSOR.ATTN_K,
@@ -3199,7 +3199,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.PLE_NORM_QUERY,
         MODEL_TENSOR.PLE_NORM_CONV,
         MODEL_TENSOR.PLE_CONV1D,
-        # MTP block: [fc_embedding | fc_hidden] as eh_proj, its own hyper-connection mixer as the head
+                                                                                                      
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_ENORM,
         MODEL_TENSOR.NEXTN_HNORM,
@@ -3483,7 +3483,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_POST_NORM,
         MODEL_TENSOR.FFN_PRE_NORM,
         MODEL_TENSOR.FFN_POST_NORM,
-        # altup / laurel
+                        
         MODEL_TENSOR.PER_LAYER_TOKEN_EMBD,
         MODEL_TENSOR.PER_LAYER_MODEL_PROJ,
         MODEL_TENSOR.PER_LAYER_INP_GATE,
@@ -4069,7 +4069,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
-        # NextN/MTP tensors
+                           
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -4143,7 +4143,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.INDEXER_PROJ,
         MODEL_TENSOR.INDEXER_ATTN_K,
         MODEL_TENSOR.INDEXER_ATTN_Q_B,
-        # NextN/MTP tensors - preserved but unused
+                                                  
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -4269,7 +4269,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.ATTN_POST_NORM,
         MODEL_TENSOR.FFN_POST_NORM,
-        # NextN/MTP tensors - preserved but unused
+                                                  
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -4301,7 +4301,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
-        # NextN/MTP tensors
+                           
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -4342,7 +4342,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.INDEXER_PROJ,
         MODEL_TENSOR.INDEXER_ATTN_K,
         MODEL_TENSOR.INDEXER_ATTN_Q_B,
-        # NextN/MTP tensors - preserved but unused
+                                                  
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -4355,14 +4355,14 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.OUTPUT,
         MODEL_TENSOR.ATTN_NORM,
-        # mHC
+             
         MODEL_TENSOR.HC_ATTN_FN,
         MODEL_TENSOR.HC_ATTN_BASE,
         MODEL_TENSOR.HC_ATTN_SCALE,
         MODEL_TENSOR.HC_FFN_FN,
         MODEL_TENSOR.HC_FFN_BASE,
         MODEL_TENSOR.HC_FFN_SCALE,
-        # KDA (linear attention) layers
+                                       
         MODEL_TENSOR.ATTN_Q,
         MODEL_TENSOR.ATTN_K,
         MODEL_TENSOR.ATTN_V,
@@ -4378,7 +4378,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.SSM_G_B,
         MODEL_TENSOR.SSM_DT,
         MODEL_TENSOR.SSM_NORM,
-        # MLA (nope) + DSA layers
+                                 
         MODEL_TENSOR.ATTN_Q_A,
         MODEL_TENSOR.ATTN_Q_B,
         MODEL_TENSOR.ATTN_KV_A_MQA,
@@ -4393,7 +4393,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.INDEXER_ATTN_Q_B,
         MODEL_TENSOR.INDEXER_KPOOL_GATE,
         MODEL_TENSOR.INDEXER_KPOOL_APE,
-        # FFN
+             
         MODEL_TENSOR.FFN_NORM,
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_DOWN,
@@ -4406,7 +4406,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
-        # NextN/MTP tensors - preserved but unused
+                                                  
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -4557,18 +4557,18 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
-        # experts
+                 
         MODEL_TENSOR.FFN_GATE_INP,
         MODEL_TENSOR.FFN_UP_EXP,
         MODEL_TENSOR.FFN_DOWN_EXP,
-        # expert latent
+                       
         MODEL_TENSOR.MOE_LATENT_DOWN,
         MODEL_TENSOR.MOE_LATENT_UP,
-        # shared expert
+                       
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
-        # NextN/MTP (draft head)
+                                
         MODEL_TENSOR.ATTN_POST_NORM,
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -4609,7 +4609,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.FFN_POST_NORM,
-        # NextN/MTP tensors - preserved but unused
+                                                  
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -4642,7 +4642,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
-        # NextN/MTP tensors - preserved but unused
+                                                  
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -4702,7 +4702,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_V,
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.FFN_NORM,
-        # MoE
+             
         MODEL_TENSOR.FFN_GATE_INP,
         MODEL_TENSOR.FFN_GATE_EXP,
         MODEL_TENSOR.FFN_DOWN_EXP,
@@ -4710,7 +4710,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_DOWN_SHEXP,
-        # Dense
+               
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
@@ -4745,13 +4745,13 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
-        # MoE (GraniteMoeSWA)
+                             
         MODEL_TENSOR.FFN_GATE_INP,
         MODEL_TENSOR.FFN_GATE_EXP,
         MODEL_TENSOR.FFN_GATE_UP_EXP,
         MODEL_TENSOR.FFN_DOWN_EXP,
         MODEL_TENSOR.FFN_UP_EXP,
-        # Shared expert - gate+up kept fused in FFN_UP_SHEXP (LLM_FFN_SWIGLU)
+                                                                             
         MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.FFN_DOWN_SHEXP,
     ],
@@ -4943,7 +4943,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.INDEXER_PROJ,
         MODEL_TENSOR.INDEXER_ATTN_K,
         MODEL_TENSOR.INDEXER_ATTN_Q_B,
-        # NextN/MTP tensors - preserved but unused
+                                                  
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -5050,39 +5050,39 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_UP,
     ],
     MODEL_ARCH.FALCON_H1: [
-        # Token embedding
+                         
         MODEL_TENSOR.TOKEN_EMBD,
 
-        # Input layernorm
+                         
         MODEL_TENSOR.ATTN_NORM,
 
-        # Attention components
+                              
         MODEL_TENSOR.ATTN_QKV,
-        MODEL_TENSOR.ATTN_Q,         # Query projection
-        MODEL_TENSOR.ATTN_K,         # Key projection
-        MODEL_TENSOR.ATTN_V,         # Value projection
-        MODEL_TENSOR.ATTN_OUT,       # Output projection
+        MODEL_TENSOR.ATTN_Q,                           
+        MODEL_TENSOR.ATTN_K,                         
+        MODEL_TENSOR.ATTN_V,                           
+        MODEL_TENSOR.ATTN_OUT,                          
 
-        # SSM components (Mamba2 specific)
-        MODEL_TENSOR.SSM_IN,         # Input projection for SSM
-        MODEL_TENSOR.SSM_CONV1D,     # Convolution layer
-        MODEL_TENSOR.SSM_DT,         # Delta time projection
-        MODEL_TENSOR.SSM_A,          # A parameter (log form)
-        MODEL_TENSOR.SSM_D,          # D parameter
-        MODEL_TENSOR.SSM_NORM,       # Normalization in SSM
-        MODEL_TENSOR.SSM_OUT,        # Output projection
+                                          
+        MODEL_TENSOR.SSM_IN,                                   
+        MODEL_TENSOR.SSM_CONV1D,                        
+        MODEL_TENSOR.SSM_DT,                                
+        MODEL_TENSOR.SSM_A,                                  
+        MODEL_TENSOR.SSM_D,                       
+        MODEL_TENSOR.SSM_NORM,                             
+        MODEL_TENSOR.SSM_OUT,                           
 
-        # Pre-feedforward layernorm
+                                   
         MODEL_TENSOR.FFN_PRE_NORM,
 
-        # Feed-forward network components
-        MODEL_TENSOR.FFN_GATE,       # Gate projection (SwiGLU)
-        MODEL_TENSOR.FFN_DOWN,       # Down projection
-        MODEL_TENSOR.FFN_UP,         # Up projection
+                                         
+        MODEL_TENSOR.FFN_GATE,                                 
+        MODEL_TENSOR.FFN_DOWN,                        
+        MODEL_TENSOR.FFN_UP,                        
 
-        # Post-feedforward layernorm
-        MODEL_TENSOR.OUTPUT_NORM,    # Final layer norm
-        MODEL_TENSOR.OUTPUT,         # Output projection (lm_head)
+                                    
+        MODEL_TENSOR.OUTPUT_NORM,                      
+        MODEL_TENSOR.OUTPUT,                                      
     ],
     MODEL_ARCH.HUNYUAN_MOE: [
         MODEL_TENSOR.TOKEN_EMBD,
@@ -5163,7 +5163,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_SHEXP,
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_UP_SHEXP,
-        # NextN/MTP tensors (draft head)
+                                        
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -5257,7 +5257,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.FFN_NORM,
-        MODEL_TENSOR.ATTN_NORM, # operator_norm
+        MODEL_TENSOR.ATTN_NORM,                
         MODEL_TENSOR.ATTN_Q_NORM,
         MODEL_TENSOR.ATTN_K_NORM,
         MODEL_TENSOR.ATTN_QKV,
@@ -5266,8 +5266,8 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_V,
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.OUTPUT,
-        MODEL_TENSOR.DENSE_2_OUT, # LFM2-ColBert-350M
-        MODEL_TENSOR.TOKEN_TYPES, # decision head
+        MODEL_TENSOR.DENSE_2_OUT,                    
+        MODEL_TENSOR.TOKEN_TYPES,                
         MODEL_TENSOR.CLS,
         MODEL_TENSOR.CLS_NORM,
         MODEL_TENSOR.CLS_OUT,
@@ -5282,7 +5282,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
         MODEL_TENSOR.FFN_NORM,
-        MODEL_TENSOR.ATTN_NORM, # operator_norm
+        MODEL_TENSOR.ATTN_NORM,                
         MODEL_TENSOR.ATTN_Q_NORM,
         MODEL_TENSOR.ATTN_K_NORM,
         MODEL_TENSOR.ATTN_QKV,
@@ -5575,7 +5575,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FC,
         MODEL_TENSOR.ENC_OUTPUT_NORM,
         MODEL_TENSOR.D2T,
-        # optional DSpark heads
+                               
         MODEL_TENSOR.DSPARK_MARKOV_W1,
         MODEL_TENSOR.DSPARK_MARKOV_W2,
         MODEL_TENSOR.DSPARK_CONF_PROJ,
@@ -5685,7 +5685,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.FFN_GATE_SHEXP,
         MODEL_TENSOR.FFN_DOWN_SHEXP,
         MODEL_TENSOR.FFN_EXP_PROBS_B,
-        # NextN/MTP tensors (Step3p5 draft head)
+                                                
         MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_EMBED_TOKENS,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -5819,7 +5819,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_NORM,
         MODEL_TENSOR.ATTN_RES_SCORE,
         MODEL_TENSOR.FFN_RES_SCORE,
-        # MLA (full-attention layers)
+                                     
         MODEL_TENSOR.ATTN_Q,
         MODEL_TENSOR.ATTN_K,
         MODEL_TENSOR.ATTN_V,
@@ -5833,7 +5833,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.ATTN_V_B,
         MODEL_TENSOR.ATTN_Q_A_NORM,
         MODEL_TENSOR.ATTN_KV_A_NORM,
-        # KDA (linear-attention layers)
+                                       
         MODEL_TENSOR.SSM_CONV1D_Q,
         MODEL_TENSOR.SSM_CONV1D_K,
         MODEL_TENSOR.SSM_CONV1D_V,
@@ -5844,7 +5844,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.SSM_G,
         MODEL_TENSOR.SSM_DT,
         MODEL_TENSOR.SSM_NORM,
-        # FFN
+             
         MODEL_TENSOR.FFN_NORM,
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_DOWN,
@@ -5964,7 +5964,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     ],
 }
 
-# tensors that will not be serialized
+                                     
 MODEL_TENSOR_SKIP: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     MODEL_ARCH.LLAMA: [
         MODEL_TENSOR.ROPE_FREQS,
@@ -6038,9 +6038,9 @@ MODEL_TENSOR_SKIP: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     ],
 }
 
-#
-# types
-#
+ 
+       
+ 
 
 
 class TokenType(IntEnum):
@@ -6059,9 +6059,9 @@ class RopeScalingType(Enum):
     LONGROPE = 'longrope'
 
 
-# M-RoPE: input position slot (t, y, x, z) that feeds each RoPE section, in section order
+                                                                                         
 class RopeSectionOrder(Enum):
-    TYXZ = 'tyxz' # default
+    TYXZ = 'tyxz'          
     ZYXT = 'zyxt'
 
 
@@ -6109,6 +6109,7 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    F8_E4M3 = 43
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6117,56 +6118,57 @@ class ExpertGatingFuncType(IntEnum):
     SQRTSOFTPLUS  = 4
 
 
-# TODO: add GGMLFileType from ggml_ftype in ggml.h
+                                                  
 
 
-# from llama_ftype in llama.h
-# ALL VALUES SHOULD BE THE SAME HERE AS THEY ARE OVER THERE.
+                             
+                                                            
 class LlamaFileType(IntEnum):
     ALL_F32              = 0
-    MOSTLY_F16           = 1   # except 1d tensors
-    MOSTLY_Q4_0          = 2   # except 1d tensors
-    MOSTLY_Q4_1          = 3   # except 1d tensors
-    # MOSTLY_Q4_1_SOME_F16 = 4   # tok_embeddings.weight and output.weight are F16
-    # MOSTLY_Q4_2        = 5   # support has been removed
-    # MOSTLY_Q4_3        = 6   # support has been removed
-    MOSTLY_Q8_0          = 7   # except 1d tensors
-    MOSTLY_Q5_0          = 8   # except 1d tensors
-    MOSTLY_Q5_1          = 9   # except 1d tensors
-    MOSTLY_Q2_K          = 10  # except 1d tensors
-    MOSTLY_Q3_K_S        = 11  # except 1d tensors
-    MOSTLY_Q3_K_M        = 12  # except 1d tensors
-    MOSTLY_Q3_K_L        = 13  # except 1d tensors
-    MOSTLY_Q4_K_S        = 14  # except 1d tensors
-    MOSTLY_Q4_K_M        = 15  # except 1d tensors
-    MOSTLY_Q5_K_S        = 16  # except 1d tensors
-    MOSTLY_Q5_K_M        = 17  # except 1d tensors
-    MOSTLY_Q6_K          = 18  # except 1d tensors
-    MOSTLY_IQ2_XXS       = 19  # except 1d tensors
-    MOSTLY_IQ2_XS        = 20  # except 1d tensors
-    MOSTLY_Q2_K_S        = 21  # except 1d tensors
-    MOSTLY_IQ3_XS        = 22  # except 1d tensors
-    MOSTLY_IQ3_XXS       = 23  # except 1d tensors
-    MOSTLY_IQ1_S         = 24  # except 1d tensors
-    MOSTLY_IQ4_NL        = 25  # except 1d tensors
-    MOSTLY_IQ3_S         = 26  # except 1d tensors
-    MOSTLY_IQ3_M         = 27  # except 1d tensors
-    MOSTLY_IQ2_S         = 28  # except 1d tensors
-    MOSTLY_IQ2_M         = 29  # except 1d tensors
-    MOSTLY_IQ4_XS        = 30  # except 1d tensors
-    MOSTLY_IQ1_M         = 31  # except 1d tensors
-    MOSTLY_BF16          = 32  # except 1d tensors
-    # MOSTLY_Q4_0_4_4      = 33  # removed from gguf files, use Q4_0 and runtime repack
-    # MOSTLY_Q4_0_4_8      = 34  # removed from gguf files, use Q4_0 and runtime repack
-    # MOSTLY_Q4_0_8_8      = 35  # removed from gguf files, use Q4_0 and runtime repack
-    MOSTLY_TQ1_0         = 36  # except 1d tensors
-    MOSTLY_TQ2_0         = 37  # except 1d tensors
-    MOSTLY_MXFP4_MOE     = 38  # except 1d tensors
-    MOSTLY_NVFP4         = 39  # except 1d tensors
-    MOSTLY_Q1_0          = 40  # except 1d tensors
-    MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_F16           = 1                      
+    MOSTLY_Q4_0          = 2                      
+    MOSTLY_Q4_1          = 3                      
+                                                                                  
+                                                         
+                                                         
+    MOSTLY_Q8_0          = 7                      
+    MOSTLY_Q5_0          = 8                      
+    MOSTLY_Q5_1          = 9                      
+    MOSTLY_Q2_K          = 10                     
+    MOSTLY_Q3_K_S        = 11                     
+    MOSTLY_Q3_K_M        = 12                     
+    MOSTLY_Q3_K_L        = 13                     
+    MOSTLY_Q4_K_S        = 14                     
+    MOSTLY_Q4_K_M        = 15                     
+    MOSTLY_Q5_K_S        = 16                     
+    MOSTLY_Q5_K_M        = 17                     
+    MOSTLY_Q6_K          = 18                     
+    MOSTLY_IQ2_XXS       = 19                     
+    MOSTLY_IQ2_XS        = 20                     
+    MOSTLY_Q2_K_S        = 21                     
+    MOSTLY_IQ3_XS        = 22                     
+    MOSTLY_IQ3_XXS       = 23                     
+    MOSTLY_IQ1_S         = 24                     
+    MOSTLY_IQ4_NL        = 25                     
+    MOSTLY_IQ3_S         = 26                     
+    MOSTLY_IQ3_M         = 27                     
+    MOSTLY_IQ2_S         = 28                     
+    MOSTLY_IQ2_M         = 29                     
+    MOSTLY_IQ4_XS        = 30                     
+    MOSTLY_IQ1_M         = 31                     
+    MOSTLY_BF16          = 32                     
+                                                                                       
+                                                                                       
+                                                                                       
+    MOSTLY_TQ1_0         = 36                     
+    MOSTLY_TQ2_0         = 37                     
+    MOSTLY_MXFP4_MOE     = 38                     
+    MOSTLY_NVFP4         = 39                     
+    MOSTLY_Q1_0          = 40                     
+    MOSTLY_Q2_0          = 41                     
+    MOSTLY_F8_E4M3       = 42                     
 
-    GUESSED              = 1024  # not specified in the model file
+    GUESSED              = 1024                                   
 
 
 class GGUFEndian(IntEnum):
@@ -6201,23 +6203,23 @@ class GGUFValueType(IntEnum):
             return GGUFValueType.BOOL
         elif isinstance(val, int):
             return GGUFValueType.INT32
-        # TODO: need help with 64-bit types in Python
+                                                     
         else:
             raise ValueError(f"Unknown type: {type(val)}")
 
 
 class DecisionType:
-    LAYA    = "laya"     # head blocks + scorer on the hidden state of one marker token per option
-    OPENJEV = "openjev"  # logits of one label token per option
-    LEV     = "lev"      # same as openjev, noul is read from a rating scale
-    KEV     = "kev"      # dot product of the hidden states of the last token and of one end token per option
-    NIMBLE  = "nimble"   # same as openjev, the prompt lists all the questions of the request
-    CLEF    = "clef"     # joint head over all questions, one score per option
-    PPLX_DECIDER = "pplx-decider"  # same as openjev, label codes of 1 or 2 letters
-    VLLM_DECISION2 = "vllm-decision2"  # head over the end token of each option and the last token, one score per option
-    VLLM_D3 = "vllm-d3"  # same as pplx-decider, non-causal attention
-    LFM2_D1 = "lfm2-d1"  # same as openjev, the labels depend on the question type
-    LFM2_D1_OMNI = "lfm2-d1-omni"  # same head as laya on a bidirectional LFM2 trunk, other prompt layout
+    LAYA    = "laya"                                                                              
+    OPENJEV = "openjev"                                        
+    LEV     = "lev"                                                         
+    KEV     = "kev"                                                                                          
+    NIMBLE  = "nimble"                                                                       
+    CLEF    = "clef"                                                          
+    PPLX_DECIDER = "pplx-decider"                                                  
+    VLLM_DECISION2 = "vllm-decision2"                                                                                   
+    VLLM_D3 = "vllm-d3"                                              
+    LFM2_D1 = "lfm2-d1"                                                           
+    LFM2_D1_OMNI = "lfm2-d1-omni"                                                                        
 
 
 class VisionProjectorType:
@@ -6226,8 +6228,8 @@ class VisionProjectorType:
     GEMMA3NA = "gemma3na"
     GEMMA4V = "gemma4v"
     GEMMA4A = "gemma4a"
-    GEMMA4UV = "gemma4uv" # "unified" variant
-    GEMMA4UA = "gemma4ua" # "unified" variant
+    GEMMA4UV = "gemma4uv"                    
+    GEMMA4UA = "gemma4ua"                    
     PHI4 = "phi4"
     IDEFICS3 = "idefics3"
     PIXTRAL = "pixtral"
@@ -6240,12 +6242,12 @@ class VisionProjectorType:
     STEP3VL = "step3vl"
     ULTRAVOX = "ultravox"
     INTERNVL = "internvl"
-    QWEN2A = "qwen2a" # audio
-    QWEN3A = "qwen3a" # audio
-    GLMA = "glma" # audio
-    QWEN25O = "qwen2.5o" # omni
+    QWEN2A = "qwen2a"        
+    QWEN3A = "qwen3a"        
+    GLMA = "glma"        
+    QWEN25O = "qwen2.5o"       
     VOXTRAL = "voxtral"
-    MERALION = "meralion"  # audio: Whisper + gated MLP adaptor
+    MERALION = "meralion"                                      
     LFM2 = "lfm2"
     KIMIVL = "kimivl"
     PADDLEOCR = "paddleocr"
@@ -6255,37 +6257,37 @@ class VisionProjectorType:
     JANUS_PRO = "janus_pro"
     DOTSOCR = "dots_ocr"
     DOTS3NOTE_V = "dots3note_v"
-    DOTS3NOTE_A = "dots3note_a" # audio
+    DOTS3NOTE_A = "dots3note_a"        
     DEEPSEEKOCR = "deepseekocr"
     DEEPSEEKOCR2 = "deepseekocr2"
     DEEPSEEK4V = "deepseek4v"
-    LFM2A = "lfm2a" # audio
-    MUSIC_FLAMINGO = "musicflamingo" # audio
+    LFM2A = "lfm2a"        
+    MUSIC_FLAMINGO = "musicflamingo"        
     GLM4V = "glm4v"
     GLM5V = "glm5v"
     YOUTUVL = "youtuvl"
     NEMOTRON_V2_VL = "nemotron_v2_vl"
     NEMOTRON_OMNI = "nemotron_omni"
-    QWEN3TTS_SPKENC = "qwen3tts_spkenc" # audio: ECAPA-TDNN speaker encoder
-    QWEN3TTS_GEN = "qwen3tts_gen" # audio generation: code_predictor
-    POCKETTTS_SPKENC = "pockettts_spkenc" # audio: mimi encoder as voice-prompt encoder
-    POCKETTTS_GEN = "pockettts_gen" # audio generation: flow-matching decoder + mimi decoder
+    QWEN3TTS_SPKENC = "qwen3tts_spkenc"                                    
+    QWEN3TTS_GEN = "qwen3tts_gen"                                   
+    POCKETTTS_SPKENC = "pockettts_spkenc"                                              
+    POCKETTTS_GEN = "pockettts_gen"                                                         
     HUNYUANVL      = "hunyuanvl"
-    PARAKEET       = "parakeet"  # audio
+    PARAKEET       = "parakeet"         
     MINIMAXM3      = "minimax_m3"
     MINICPMV4_6    = "minicpmv4_6"
     MINICPMV4_7    = "minicpmv4_7"
-    GRANITE_SPEECH = "granite_speech"  # audio
+    GRANITE_SPEECH = "granite_speech"         
     MIMOVL         = "mimovl"
     MIMO_AUDIO     = "mimo_audio"
     GRANITE4_VISION = "granite4_vision"
     MUSE_GLIMMER   = "muse-glimmer"
     COHERE2V       = "cohere2v"
-    D1OMNI_V       = "d1omni_v"  # lfm2 vision, without separator tokens
-    D1OMNI_A       = "d1omni_a"  # lfm2a audio, with a residual block after the projector
+    D1OMNI_V       = "d1omni_v"                                         
+    D1OMNI_A       = "d1omni_a"                                                          
 
 
-# Items here are (block size, type size)
+                                        
 QK_K = 256
 GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.F32:     (1, 4),
@@ -6323,12 +6325,13 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.F8_E4M3: (1, 1),
 }
 
 
-# Aliases for backward compatibility.
+                                     
 
-# general
+         
 KEY_GENERAL_ARCHITECTURE         = Keys.General.ARCHITECTURE
 KEY_GENERAL_QUANTIZATION_VERSION = Keys.General.QUANTIZATION_VERSION
 KEY_GENERAL_ALIGNMENT            = Keys.General.ALIGNMENT
@@ -6340,7 +6343,7 @@ KEY_GENERAL_LICENSE              = Keys.General.LICENSE
 KEY_GENERAL_SOURCE_URL           = Keys.General.SOURCE_URL
 KEY_GENERAL_FILE_TYPE            = Keys.General.FILE_TYPE
 
-# LLM
+     
 KEY_VOCAB_SIZE            = Keys.LLM.VOCAB_SIZE
 KEY_CONTEXT_LENGTH        = Keys.LLM.CONTEXT_LENGTH
 KEY_EMBEDDING_LENGTH      = Keys.LLM.EMBEDDING_LENGTH
@@ -6349,7 +6352,7 @@ KEY_FEED_FORWARD_LENGTH   = Keys.LLM.FEED_FORWARD_LENGTH
 KEY_USE_PARALLEL_RESIDUAL = Keys.LLM.USE_PARALLEL_RESIDUAL
 KEY_TENSOR_DATA_LAYOUT    = Keys.LLM.TENSOR_DATA_LAYOUT
 
-# attention
+           
 KEY_ATTENTION_HEAD_COUNT        = Keys.Attention.HEAD_COUNT
 KEY_ATTENTION_HEAD_COUNT_KV     = Keys.Attention.HEAD_COUNT_KV
 KEY_ATTENTION_MAX_ALIBI_BIAS    = Keys.Attention.MAX_ALIBI_BIAS
@@ -6357,7 +6360,7 @@ KEY_ATTENTION_CLAMP_KQV         = Keys.Attention.CLAMP_KQV
 KEY_ATTENTION_LAYERNORM_EPS     = Keys.Attention.LAYERNORM_EPS
 KEY_ATTENTION_LAYERNORM_RMS_EPS = Keys.Attention.LAYERNORM_RMS_EPS
 
-# RoPE
+      
 KEY_ROPE_DIMENSION_COUNT           = Keys.Rope.DIMENSION_COUNT
 KEY_ROPE_FREQ_BASE                 = Keys.Rope.FREQ_BASE
 KEY_ROPE_SCALING_TYPE              = Keys.Rope.SCALING_TYPE
@@ -6365,7 +6368,7 @@ KEY_ROPE_SCALING_FACTOR            = Keys.Rope.SCALING_FACTOR
 KEY_ROPE_SCALING_ORIG_CTX_LEN      = Keys.Rope.SCALING_ORIG_CTX_LEN
 KEY_ROPE_SCALING_FINETUNED         = Keys.Rope.SCALING_FINETUNED
 
-# SSM
+     
 KEY_SSM_CONV_KERNEL    = Keys.SSM.CONV_KERNEL
 KEY_SSM_INNER_SIZE     = Keys.SSM.INNER_SIZE
 KEY_SSM_STATE_SIZE     = Keys.SSM.STATE_SIZE
@@ -6373,12 +6376,12 @@ KEY_SSM_TIME_STEP_RANK = Keys.SSM.TIME_STEP_RANK
 KEY_SSM_GROUP_COUNT    = Keys.SSM.GROUP_COUNT
 KEY_SSM_DT_B_C_RMS     = Keys.SSM.DT_B_C_RMS
 
-# KDA
+     
 KEY_KDA_HEAD_DIM         = Keys.KDA.HEAD_DIM
 KEY_KDA_SAFE_GATE        = Keys.KDA.SAFE_GATE
 KEY_KDA_GATE_LOWER_BOUND = Keys.KDA.GATE_LOWER_BOUND
 
-# tokenization
+              
 KEY_TOKENIZER_MODEL      = Keys.Tokenizer.MODEL
 KEY_TOKENIZER_PRE        = Keys.Tokenizer.PRE
 KEY_TOKENIZER_LIST       = Keys.Tokenizer.LIST
@@ -6403,7 +6406,7 @@ KEY_TOKENIZER_FIM_PAD_ID = Keys.Tokenizer.FIM_PAD_ID
 KEY_TOKENIZER_FIM_REP_ID = Keys.Tokenizer.FIM_REP_ID
 KEY_TOKENIZER_FIM_SEP_ID = Keys.Tokenizer.FIM_SEP_ID
 
-# deprecated
+            
 KEY_TOKENIZER_PREFIX_ID  = Keys.Tokenizer.PREFIX_ID
 KEY_TOKENIZER_SUFFIX_ID  = Keys.Tokenizer.SUFFIX_ID
 KEY_TOKENIZER_MIDDLE_ID  = Keys.Tokenizer.MIDDLE_ID

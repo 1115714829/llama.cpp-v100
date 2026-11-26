@@ -260,6 +260,7 @@ int llama_server(common_params & params, int argc, char ** argv, server_child & 
         ctx_http.del ("/models",               ex_wrapper(models_routes->del_router_models));
     }
 
+    if (!is_router_server) ctx_http.get("/v1/v100/status", ex_wrapper(routes.get_status));
     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));

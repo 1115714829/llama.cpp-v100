@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import SidebarNavigationConversationItem from './SidebarNavigationConversationItem.svelte';
 	import SidebarNavigationSearchResults from './SidebarNavigationSearchResults.svelte';
 	import SidebarNavigationSelectionBar from './SidebarNavigationSelectionBar.svelte';
@@ -102,7 +103,7 @@
 				>
 					<Pin class="h-3.5 w-3.5" />
 
-					<span>Pinned</span>
+					<span>{tr("Pinned")}</span>
 				</div>
 			</div>
 
@@ -141,7 +142,7 @@
 				<div
 					class="text-muted-foreground flex h-8 shrink-0 items-center rounded-md px-2 text-xs font-medium"
 				>
-					Recent conversations
+					{tr("Recent conversations")}
 				</div>
 			{/if}
 

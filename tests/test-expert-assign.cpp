@@ -1,8 +1,5 @@
 
 
-
-
-
 #include "ggml.h"
 #include "ggml-expert-store.h"
 
@@ -11,13 +8,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <vector>
 
 static int g_fail = 0;
-
-
 
 static void * fake_alloc_device(void * user, size_t size) {
     (void) user;
@@ -51,6 +47,25 @@ static void fake_table_upload(void * user, void * dst, const char * const * src,
     memcpy(dst, src, n * sizeof(char *));
 }
 
+static std::vector<uint8_t> g_pack_file;
+static bool g_pack_overflow = false;
+
+static void fake_write_file(void * user, int64_t file_id, int64_t offset, const void * src, size_t size) {
+    (void) user;
+    (void) file_id;
+    if (offset < 0 || (uint64_t) offset > g_pack_file.size() ||
+            size > g_pack_file.size() - (size_t) offset) {
+        g_pack_overflow = true;
+        return;
+    }
+    memcpy(g_pack_file.data() + offset, src, size);
+}
+
+static void * fake_file_base(void * user, int64_t file_id) {
+    (void) user;
+    (void) file_id;
+    return g_pack_file.empty() ? nullptr : g_pack_file.data();
+}
 
 static void fill_expert(std::vector<uint8_t> & buf, int g) {
     for (size_t i = 0; i < buf.size(); ++i) {
@@ -87,7 +102,6 @@ static void write_profile(const std::string & path, const std::vector<std::vecto
     fclose(f);
 }
 
-
 static ggml_expert_store_plan_tensor device_tensor(int layer) {
     ggml_expert_store_plan_tensor t;
     t.layer      = layer;
@@ -99,14 +113,20 @@ static ggml_expert_store_plan_tensor device_tensor(int layer) {
     return t;
 }
 
+static std::vector<int> list_devices(int n_dev) {
+    std::vector<int> devs((size_t) n_dev);
+    for (int i = 0; i < n_dev; ++i) {
+        devs[(size_t) i] = i;
+    }
+    return devs;
+}
+
 static void plan_of(int n_dev, const char * profile_path, int layer) {
     ggml_expert_store_plan_tensor t = device_tensor(layer);
     ggml_expert_store_placement plan;
-    ggml_expert_store_plan(&t, 1, n_dev, -1, profile_path, &plan);
+    const std::vector<int> devs = list_devices(n_dev);
+    ggml_expert_store_plan(&t, 1, devs.data(), n_dev, -1, 0, profile_path, &plan);
 }
-
-
-
 
 static void check_invariants(int n_dev, int n_layer, int n_expert, const char * tag) {
     ggml_expert_store_assignment_info info;
@@ -185,8 +205,6 @@ int main() {
     ggml_expert_store_assignment_info_get(&info);
     check(info.has_profile, "assignment used the profile");
 
-
-
     check_eq(ggml_expert_store_owner(0, 0), 0, "hottest expert on device 0");
     check_eq(ggml_expert_store_owner(0, 1), 1, "second hottest on device 1");
     check_eq(ggml_expert_store_owner(0, 3), 3, "fourth hottest on device 3");
@@ -206,9 +224,6 @@ int main() {
         hot_on_dev0 += ggml_expert_store_owner(0, e) == 0;
     }
     check(hot_on_dev0 < 8, "the hot experts are spread over the devices");
-
-
-
 
     const uint32_t tab_a = ggml_expert_assignment_from_proposal(n_dev, n_layer, n_expert);
     check(tab_a > 0, "a table from the proposal");
@@ -257,7 +272,6 @@ int main() {
         check(ggml_expert_assignment_fingerprint(tab_a) != 0, "the table has a fingerprint");
     }
 
-
     check_eq(ggml_expert_store_slice_device(0, 8),   0, "slice of device 0");
     check_eq(ggml_expert_store_slice_device(8, 8),   1, "slice of device 1");
     check_eq(ggml_expert_store_slice_device(24, 8),  3, "slice of device 3");
@@ -265,10 +279,6 @@ int main() {
     check_eq(ggml_expert_store_slice_device(1, 8),  -2, "a shifted slice is no segment");
     check_eq(ggml_expert_store_slice_device(0, 9),  -2, "a longer slice is no segment");
     check_eq(ggml_expert_store_slice_device(32, 8), -2, "a slice past the end is no segment");
-
-
-
-
 
     {
         ggml_expert_store_backend be;
@@ -281,12 +291,12 @@ int main() {
         be.copy_d2h     = fake_copy;
         be.table_upload = fake_table_upload;
 
-        ggml_expert_store * store = ggml_expert_store_init(&be, /*device =*/ 1, nullptr);
+        ggml_expert_store * store = ggml_expert_store_init(&be,              1, nullptr);
         const int64_t blob = 1024;
         std::vector<int64_t> slots((size_t) n_expert);
         std::iota(slots.begin(), slots.end(), 0);
         const int id = ggml_expert_store_add_tensor(store, 0, 7, 8, cap,
-            (size_t) blob, 0, 32, slots.data(), cap, -1);
+            (size_t) blob, 0, 32, slots.data(), cap, -1, nullptr, 0);
         check(id >= 0, "store tensor of device 1");
 
         std::vector<uint8_t> buf((size_t) blob);
@@ -303,8 +313,7 @@ int main() {
             ggml_expert_store_set_source_hash(name, g, ggml_expert_store_hash_expert(buf.data(), (size_t) blob));
         }
 
-
-        ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
+        ggml_init_params ip = { 16 * ggml_tensor_overhead(), nullptr,                true };
         ggml_context * ctx = ggml_init(ip);
         ggml_tensor * w = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 256, 1, n_expert);
         ggml_set_name(w, name);
@@ -329,12 +338,10 @@ int main() {
         check_eq(n_checked, 0, "nothing checked without source hashes");
         check_eq(n_skipped, cap, "every expert skipped without source hashes");
 
-
         const int g_wrong = ggml_expert_assignment_global_of(tab_a, 1, 0, 3);
         fill_expert(buf, g_wrong + 100);
         ggml_expert_store_set_source_hash(name, g_wrong, ggml_expert_store_hash_expert(buf.data(), (size_t) blob));
         check(!ggml_expert_store_verify_placement(store, id, name, &n_checked, &n_skipped), "a misplaced expert fails the placement check");
-
 
         ggml_expert_store_clear_source_hashes();
         for (int g = 0; g < n_expert; ++g) {
@@ -347,11 +354,10 @@ int main() {
         check(ggml_expert_store_verify_placement(store, id, name, &n_checked, &n_skipped) && n_skipped == cap,
             "cleared hashes: every expert skipped");
 
-
         std::vector<int64_t> all_slots((size_t) n_expert);
         std::iota(all_slots.begin(), all_slots.end(), 0);
         const int id_all = ggml_expert_store_add_tensor(store, 1, 7, 0, n_expert,
-            (size_t) blob, 0, 32, all_slots.data(), n_expert, -1);
+            (size_t) blob, 0, 32, all_slots.data(), n_expert, -1, nullptr, 0);
         std::vector<uint8_t> whole((size_t) n_expert * blob);
         const char * name_all = "blk.1.ffn_down_exps.weight";
         for (int g = 0; g < n_expert; ++g) {
@@ -370,7 +376,6 @@ int main() {
         ggml_expert_store_free(store);
         ggml_free(ctx);
     }
-
 
     {
         std::vector<uint8_t> a((size_t) 100 * 1024);
@@ -399,7 +404,6 @@ int main() {
         check(ggml_expert_store_hash_expert(zeros, 8) != ggml_expert_store_hash_expert(zeros, 16), "the length is part of the hash");
     }
 
-
     write_profile("test-expert-assign-profile-2.txt", counts);
     const std::vector<std::vector<int16_t>> first = dump_table(n_dev, n_layer, n_expert);
     plan_of(n_dev, "test-expert-assign-profile-2.txt", 0);
@@ -414,12 +418,12 @@ int main() {
     plan_of(n_dev, "test-expert-assign-profile-2.txt", 0);
     check(dump_table(n_dev, n_layer, n_expert) == second, "the cached table is reused");
 
-
     {
         ggml_expert_store_plan_tensor t = device_tensor(0);
         t.n_expert = n_expert;
         ggml_expert_store_placement plan;
-        ggml_expert_store_plan(&t, 1, n_dev, -1, nullptr, &plan);
+        const std::vector<int> devs = list_devices(n_dev);
+        ggml_expert_store_plan(&t, 1, devs.data(), n_dev, -1, 0, nullptr, &plan);
     }
     ggml_expert_store_assignment_info_get(&info);
     check(!info.has_profile, "no profile without --expert-profile");
@@ -436,7 +440,6 @@ int main() {
         }
         base += cap;
     }
-
 
     std::vector<std::vector<int64_t>> extreme(2, std::vector<int64_t>((size_t) n_expert, 0));
     extreme[0][5] = 1000000;
@@ -459,15 +462,9 @@ int main() {
         check_eq(n_local, cap, "the empty layer still fills every device");
     }
 
-
     check_eq(ggml_expert_store_owner(99, 0),      -1, "owner of an unknown layer");
     check_eq(ggml_expert_store_owner(0, 999),     -1, "owner of an unknown expert");
     check(ggml_expert_store_local_of(n_dev, 0) == nullptr, "local_of of an unknown device");
-
-
-
-
-
 
     {
         const int64_t caps_b[4] = { 7, 9, 8, 8 };
@@ -492,7 +489,7 @@ int main() {
             }
         }
 
-        ggml_init_params ip = { 512 * ggml_tensor_overhead(), nullptr, /*no_alloc =*/ true };
+        ggml_init_params ip = { 512 * ggml_tensor_overhead(), nullptr,                true };
         ggml_context * ctx = ggml_init(ip);
 
         const auto make_node = [&](int n_local, bool ep, int offset, int layer, int dev, int32_t table) {
@@ -512,7 +509,6 @@ int main() {
         };
 
         ggml_expert_assignment_activate(tab_b, nullptr, 0);
-
 
         const int16_t * idn = ggml_expert_store_node_lut(make_node(n_expert, false, 0, 0, 0, 0));
         for (int e = 0; e < n_expert && idn != nullptr; ++e) {
@@ -541,7 +537,6 @@ int main() {
         }
         check(rows_differ, "the two tables give the nodes of one layer different rows");
 
-
         ggml_tensor * w_a   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 16, n_expert);
         ggml_tensor * w_b   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 16, n_expert);
         ggml_tensor * w_off = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 32, 16, n_expert);
@@ -563,7 +558,6 @@ int main() {
         check_eq(ggml_expert_assignment_of_weight(v_a), tab_d, "a view answers for the tensor it views");
         check_eq(ggml_expert_assignment_of_weight(w_off), -1, "an unbound weight");
 
-
         const size_t n_tables = ggml_expert_assignment_count();
         ggml_expert_assignment_release(tab_d);
         check_eq((long long) ggml_expert_assignment_count(), (long long) n_tables - 1, "one table less");
@@ -582,16 +576,12 @@ int main() {
         ggml_free(ctx);
     }
 
-
-
     {
         const int nl = 2;
         std::vector<std::vector<int64_t>> cnt((size_t) nl, std::vector<int64_t>((size_t) n_expert, 0));
         std::vector<std::vector<int64_t>> lau((size_t) nl, std::vector<int64_t>((size_t) n_expert, 0));
         for (int l = 0; l < nl; ++l) {
             for (int e = 0; e < n_expert; ++e) {
-
-
 
                 cnt[(size_t) l][(size_t) e] = 4000 - 97 * e + l;
                 lau[(size_t) l][(size_t) e] = (e / 2) * 3;
@@ -612,11 +602,11 @@ int main() {
             }
         }
 
-
         const auto slots_of = [&](const char * path, std::vector<std::vector<int16_t>> & table) {
             ggml_expert_store_plan_tensor t = device_tensor(1);
             ggml_expert_store_placement plan;
-            ggml_expert_store_plan(&t, 1, n_dev, 3 * 1024, path, &plan);
+            const std::vector<int> devs = list_devices(n_dev);
+            ggml_expert_store_plan(&t, 1, devs.data(), n_dev, 3 * 1024, 0, path, &plan);
             table = dump_table(n_dev, nl, n_expert);
             return plan.slot_experts[0];
         };
@@ -624,7 +614,6 @@ int main() {
         const std::vector<int64_t> s_cnt = slots_of("test-expert-assign-profile-cnt.txt", tab_cnt);
         const std::vector<int64_t> s_lau = slots_of("test-expert-assign-profile-lau.txt", tab_lau);
         check(tab_cnt == tab_lau, "the launches field does not change the expert assignment");
-
 
         std::vector<int> loc;
         const int16_t * row = ggml_expert_store_local_of(0, 1);
@@ -654,6 +643,243 @@ int main() {
         check(s_cnt != s_lau, "the two rankings differ in this profile");
     }
 
+    {
+        const int model_devs[2] = { 1, 4 };
+        const int n_model  = 2;
+        const int nl       = 3;
+        const int ne       = 16;
+        const int half     = ne / 2;
+
+        std::vector<std::vector<int64_t>> cnt((size_t) nl, std::vector<int64_t>((size_t) ne, 0));
+        for (int l = 0; l < nl; ++l) {
+            for (int e = 0; e < ne; ++e) {
+                cnt[(size_t) l][(size_t) e] = 1000 - 7 * e + 3 * l;
+            }
+        }
+        write_profile("test-expert-assign-profile-2dev.txt", cnt);
+
+        std::vector<ggml_expert_store_plan_tensor> plan_in[2];
+        for (int l = 0; l < nl; ++l) {
+            for (int j = 0; j < n_model; ++j) {
+                ggml_expert_store_plan_tensor t = device_tensor(l);
+                t.n_expert    = half;
+                t.expert_base = j * half;
+                plan_in[j].push_back(t);
+            }
+        }
+
+        ggml_expert_store_placement plan[2];
+        for (int j = 0; j < n_model; ++j) {
+            ggml_expert_store_plan(plan_in[j].data(), plan_in[j].size(), model_devs, n_model, -1, 0,
+                "test-expert-assign-profile-2dev.txt", &plan[j]);
+        }
+
+        check_eq(ggml_expert_store_n_devices(), n_model, "the store knows the devices of the model");
+        check_eq(ggml_expert_store_device_id(0), 1, "the id of the first device of the model");
+        check_eq(ggml_expert_store_device_id(1), 4, "the id of the second device of the model");
+        check_eq(ggml_expert_store_device_id(2), -1, "the model has no third device");
+        check_eq(ggml_expert_store_device_index(1), 0, "the index of the device 1");
+        check_eq(ggml_expert_store_device_index(4), 1, "the index of the device 4");
+        check_eq(ggml_expert_store_device_index(0), -1, "the device 0 is not a device of the model");
+        check_eq(ggml_expert_store_device_index(2), -1, "the device 2 is not a device of the model");
+
+        ggml_expert_store_assignment_info info2;
+        check(ggml_expert_store_assignment_info_get(&info2), "assignment info of the two devices");
+        check_eq(info2.n_dev, n_model, "the assignment is over the devices of the model");
+        check_eq(info2.n_layer, nl, "the layers of the assignment");
+        check_eq(info2.n_expert, ne, "the experts of the assignment");
+        check_invariants(n_model, nl, ne, "two devices of six");
+
+        for (int l = 0; l < nl; ++l) {
+            for (int e = 0; e < ne; ++e) {
+                const int owner = ggml_expert_store_owner(l, e);
+                check(owner >= 0 && owner < n_model, "the expert is on a device of the model");
+                if (owner < 0 || owner >= n_model) {
+                    continue;
+                }
+                const int id = ggml_expert_store_device_id(owner);
+                check(id == 1 || id == 4, "the owner is the device 1 or the device 4");
+            }
+        }
+
+        for (int j = 0; j < n_model; ++j) {
+            for (size_t i = 0; i < plan_in[j].size(); ++i) {
+                check_eq(plan[j].n_slot[i], half, "every expert of the segment gets a slot");
+                check_eq((long long) plan[j].slot_experts[i].size(), (long long) half, "the slots of the segment");
+                for (const int64_t e : plan[j].slot_experts[i]) {
+                    check(e >= 0 && e < half, "the slot holds an expert of the segment");
+                }
+            }
+        }
+    }
+
+    {
+        const int64_t host_budget_before = ggml_expert_store_host_budget();
+        const int64_t disk_budget_before = ggml_expert_store_disk_budget();
+        ggml_expert_store_set_budgets(-1, -1);
+        const int64_t stride = (int64_t) ggml_expert_store_stride(1024, 0, 32);
+        const int64_t slot_budget = 4 * stride;
+
+        ggml_expert_store_plan_tensor t = device_tensor(0);
+        t.n_expert = 8;
+
+        ggml_expert_store_placement plan_off;
+        ggml_expert_store_plan(&t, 1, nullptr, 0, slot_budget, 0, "", &plan_off);
+        check_eq(plan_off.n_slot[0], 4, "borrow: the slots");
+        check_eq(plan_off.n_tail[0], 0, "borrow: no tail without a budget");
+        check_eq(plan_off.host_used[0], 4 * stride, "borrow: the host tier");
+
+        ggml_expert_store_placement plan_on;
+        ggml_expert_store_plan(&t, 1, nullptr, 0, slot_budget, 2 * stride, "", &plan_on);
+        check_eq(plan_on.n_slot[0], 4, "borrow: the slots with a budget");
+        check_eq(plan_on.n_tail[0], 2, "borrow: the tail takes the two hottest host experts");
+        check_eq(plan_on.tail_bytes, 2 * stride, "borrow: the tail bytes");
+        check_eq((int64_t) plan_on.tail_experts[0].size(), 2, "borrow: the tail list");
+        check_eq(plan_on.tail_experts[0][0], 4, "borrow: the first tail expert");
+        check_eq(plan_on.tail_experts[0][1], 5, "borrow: the second tail expert");
+        check(plan_on.tail_bytes <= 2 * stride, "borrow: the tail stays in the budget");
+        ggml_expert_store_set_budgets(host_budget_before, disk_budget_before);
+    }
+
+    {
+        const int64_t n_exp  = 8;
+        const size_t  blob   = 1024;
+        const size_t  tsize  = 32;
+        const int64_t stride = (int64_t) ggml_expert_store_stride(blob, 0, tsize);
+
+        const int64_t slot_e[] = { 0, 1 };
+        const int64_t disk_e[] = { 5, 6, 7 };
+        const int64_t n_slot   = 2;
+        const int64_t n_disk   = 3;
+
+        g_pack_file.assign((size_t) (n_disk * stride), 0);
+        g_pack_overflow = false;
+
+        ggml_expert_store_backend be;
+        be.user         = nullptr;
+        be.alloc_device = fake_alloc_device;
+        be.free_device  = fake_free_device;
+        be.alloc_host   = fake_alloc_host;
+        be.free_host    = fake_free_host;
+        be.copy_h2d     = fake_copy;
+        be.copy_d2h     = fake_copy;
+        be.table_upload = fake_table_upload;
+        be.write_file   = fake_write_file;
+        be.file_base    = fake_file_base;
+
+        ggml_expert_store * store = ggml_expert_store_init(&be, 0, nullptr);
+        const int id = ggml_expert_store_add_tensor(store, 0, 7, 0, n_exp,
+            blob, 0, tsize, slot_e, n_slot, -1, disk_e, n_disk);
+        check(id >= 0, "a tensor with a disk tier");
+        const ggml_expert_store_tensor * st = ggml_expert_store_tensor_at(store, id);
+        check(st != nullptr, "the disk tensor is there");
+        if (st != nullptr) {
+            check_eq(ggml_expert_store_tensor_n_slot(st), n_slot, "disk: slots");
+            check_eq(ggml_expert_store_tensor_n_host(st), n_exp - n_slot - n_disk, "disk: host experts");
+            check_eq(st->n_disk, n_disk, "disk: disk experts");
+            check_eq(st->host_used, (n_exp - n_slot - n_disk) * stride, "disk: the arena excludes the disk tier");
+            check(ggml_expert_store_tensor_check(st), "disk: the placement is consistent");
+
+            for (int64_t s = 0; s < n_slot; ++s) {
+                check_eq(ggml_expert_store_tensor_residency(st, slot_e[s]), (int32_t) s, "disk: a slot residency");
+                check_eq(ggml_expert_store_tensor_host_offset(st, slot_e[s]), GGML_EXPERT_STORE_INVALID,
+                    "disk: a slot is not on the host");
+            }
+            for (int64_t d = 0; d < n_disk; ++d) {
+                check_eq(ggml_expert_store_tensor_residency(st, disk_e[d]), GGML_EXPERT_STORE_DISK,
+                    "disk: a disk residency");
+                check_eq(ggml_expert_store_tensor_host_offset(st, disk_e[d]), GGML_EXPERT_STORE_INVALID,
+                    "disk: the disk tier is not on the host");
+                check_eq(st->file_offset[(size_t) disk_e[d]], d * stride, "disk: the pack offset");
+                check(st->table_host[(size_t) disk_e[d]] == (char *) g_pack_file.data() + d * stride,
+                    "disk: the table points into the pack");
+            }
+            for (int64_t e = n_slot; e < disk_e[0]; ++e) {
+                check_eq(ggml_expert_store_tensor_host_offset(st, e), (e - n_slot) * stride,
+                    "disk: the host offset skips the disk tier");
+            }
+
+            std::vector<uint8_t> data((size_t) n_exp * blob);
+            for (size_t i = 0; i < data.size(); ++i) {
+                data[i] = (uint8_t) (i * 7 + 3);
+            }
+            ggml_expert_store_write(store, id, data.data(), 0, data.size());
+            check(!g_pack_overflow, "disk: the pack write stayed in the preallocated file");
+            for (int64_t d = 0; d < n_disk; ++d) {
+                check(memcmp(g_pack_file.data() + (size_t) d * stride,
+                        data.data() + (size_t) disk_e[d] * blob, blob) == 0,
+                    "disk: the pack holds the disk expert");
+            }
+            for (int64_t s = 0; s < n_slot; ++s) {
+                check(memcmp(st->slot_addr[(size_t) s], data.data() + (size_t) slot_e[s] * blob, blob) == 0,
+                    "disk: the slot holds its expert");
+            }
+            for (int64_t e = n_slot; e < disk_e[0]; ++e) {
+                check(memcmp(st->host_host + (size_t) (e - n_slot) * stride,
+                        data.data() + (size_t) e * blob, blob) == 0,
+                    "disk: the host arena holds the host expert");
+            }
+
+            g_pack_overflow = false;
+            fake_write_file(nullptr, 0, (int64_t) g_pack_file.size(), data.data(), 1);
+            check(g_pack_overflow, "disk: an out-of-range pack write is refused");
+            g_pack_overflow = false;
+            fake_write_file(nullptr, 0, 1, data.data(), std::numeric_limits<size_t>::max());
+            check(g_pack_overflow, "disk: an overflowing pack write is refused");
+            g_pack_overflow = false;
+            fake_write_file(nullptr, 0, -1, data.data(), 1);
+            check(g_pack_overflow, "disk: a negative pack offset is refused");
+            g_pack_overflow = false;
+        }
+        ggml_expert_store_free(store);
+    }
+
+    {
+        const int64_t n_exp  = 8;
+        const size_t  blob   = 1024;
+        const size_t  tsize  = 32;
+        const int64_t stride = (int64_t) ggml_expert_store_stride(blob, 0, tsize);
+
+        const int64_t slot_e[] = { 0, 1 };
+        const int64_t tail_e[] = { 2, 3 };
+        const int64_t n_slot   = 2;
+        const int64_t n_tail   = 2;
+
+        std::vector<char> tail_dev((size_t) (n_tail * stride), 0);
+
+        ggml_expert_store_backend be;
+        be.user         = nullptr;
+        be.alloc_device = fake_alloc_device;
+        be.free_device  = fake_free_device;
+        be.alloc_host   = fake_alloc_host;
+        be.free_host    = fake_free_host;
+        be.copy_h2d     = fake_copy;
+        be.copy_d2h     = fake_copy;
+        be.table_upload = fake_table_upload;
+
+        ggml_expert_store * store = ggml_expert_store_init(&be, 0, nullptr);
+        const int id = ggml_expert_store_add_tensor(store, 0, 7, 0, n_exp,
+            blob, 0, tsize, slot_e, n_slot, -1, nullptr, 0, tail_e, n_tail, tail_dev.data());
+        check(id >= 0, "a tensor with tail slots");
+        const ggml_expert_store_tensor * st = ggml_expert_store_tensor_at(store, id);
+        check(st != nullptr, "the tail tensor is there");
+        if (st != nullptr) {
+            check_eq(st->n_tail, n_tail, "tail: the tail experts");
+            check_eq((int64_t) st->tail_experts.size(), n_tail, "tail: the tail list");
+            check_eq(st->tail_experts[0], tail_e[0], "tail: the first tail expert");
+            check_eq(st->tail_experts[1], tail_e[1], "tail: the second tail expert");
+            check_eq((int64_t) st->slot_addr.size(), n_slot + n_tail, "tail: the slot addresses");
+            for (int64_t s = 0; s < n_tail; ++s) {
+                check(st->slot_addr[(size_t) (n_slot + s)] == tail_dev.data() + s * stride,
+                    "tail: the tail slot is in the borrowed region");
+            }
+            check_eq(ggml_expert_store_tensor_n_host(st), n_exp - n_slot,
+                "tail: the tail experts are host experts too");
+            check(ggml_expert_store_tensor_check(st), "tail: the placement is consistent");
+        }
+        ggml_expert_store_free(store);
+    }
+
     if (g_fail == 0) {
         printf("expert assignment tests passed\n");
         return 0;
@@ -661,3 +887,4 @@ int main() {
     fprintf(stderr, "%d checks failed\n", g_fail);
     return 1;
 }
+

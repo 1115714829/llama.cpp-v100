@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { PanelLeftClose, PanelLeftOpen, X } from '@lucide/svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
@@ -326,8 +327,8 @@
 {#if innerWidth > 768 || !page.url.hash.includes(ROUTES.SEARCH)}
 	<aside
 		class={[
-			'fixed md:sticky top-2 left-2 md:left-0 md:ml-2 md:mt-2 pt-2 z-10 w-[calc(100dvw-1rem)]',
-			'md:h-[calc(100dvh-1.125rem)]',
+			'fixed md:sticky top-[5rem] left-2 md:left-0 md:ml-2 md:mt-2 pt-2 z-10 w-[calc(100dvw-1rem)]',
+			'md:h-[calc(100dvh-6rem)]',
 			uiStore.isSidebarExpanded &&
 				(deviceStore.isStandalone
 					? 'h-[calc(100dvh-2rem)]'
@@ -377,13 +378,13 @@
 						: ''}"
 				>
 					<ActionIcon
-						ariaLabel="Collapse navigation"
+						ariaLabel={tr("Collapse navigation")}
 						class="backdrop-blur-none md:h-9 md:w-9 h-10 w-10 rounded-full mr-1 max-md:-mr-1 max-md:-mt-1 hover:bg-accent!"
 						icon={deviceStore.isMobile ? X : PanelLeftClose}
 						iconSize="h-4 w-4"
 						onclick={toggleExpandedMode}
 						size="lg"
-						tooltip="Close Sidebar"
+						tooltip={tr("Close Sidebar")}
 						tooltipSide={TooltipSide.LEFT}
 					/>
 				</div>

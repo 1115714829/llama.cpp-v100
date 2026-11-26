@@ -1,5 +1,5 @@
-#define _CRT_SECURE_NO_DEPRECATE // Disables "unsafe" warnings on Windows
-#define _USE_MATH_DEFINES // For M_PI on MSVC
+#define _CRT_SECURE_NO_DEPRECATE
+#define _USE_MATH_DEFINES
 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
@@ -17,7 +17,7 @@
 #include "tiled/tiled.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
-#include <malloc.h> // using malloc.h with MSC/MINGW
+#include <malloc.h>
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
 #include <alloca.h>
 #endif
@@ -55,9 +55,6 @@
 #    include "spacemit/ime.h"
 #endif
 
-// Note: once we move threading into a separate C++ file
-// will use std::hardware_destructive_interference_size instead of hardcoding it here
-// and we'll use C++ attribute syntax.
 #define GGML_CACHE_LINE  64
 
 #if defined(__clang__) || defined(__GNUC__)
@@ -68,23 +65,21 @@
 #if __has_feature(thread_sanitizer)
 #define GGML_TSAN_ENABLED 1
 #endif
-#else  // __has_feature
+#else
 #if defined(__SANITIZE_THREAD__)
 #define GGML_TSAN_ENABLED 1
 #endif
-#endif // __has_feature
+#endif
 
 #define UNUSED GGML_UNUSED
 #define SWAP(x, y, T) do { T SWAP = x; (x) = y; (y) = SWAP; } while (0)
 
-// precomputed f32 table for f16 (256 KB) (simd-mappings.h)
 float ggml_table_f32_f16[1 << 16];
 
-// precomputed f32 table for e8m0 half (1 KB) (simd-mappings.h)
 float ggml_table_f32_e8m0_half[1 << 8];
 
-// precomputed f32 table for ue4m3 (1 KB) (simd-mappings.h)
 float ggml_table_f32_ue4m3[1 << 8];
+float ggml_table_f32_f8_e4m3[1 << 8];
 
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
@@ -128,21 +123,21 @@ static void atomic_store(atomic_int * ptr, LONG val) {
     InterlockedExchange(ptr, val);
 }
 static void atomic_store_explicit(atomic_int * ptr, LONG val, memory_order mo) {
-    // TODO: add support for explicit memory order
+
     InterlockedExchange(ptr, val);
 }
 static LONG atomic_load(atomic_int * ptr) {
     return InterlockedCompareExchange(ptr, 0, 0);
 }
 static LONG atomic_load_explicit(atomic_int * ptr, memory_order mo) {
-    // TODO: add support for explicit memory order
+
     return InterlockedCompareExchange(ptr, 0, 0);
 }
 static LONG atomic_fetch_add(atomic_int * ptr, LONG inc) {
     return InterlockedExchangeAdd(ptr, inc);
 }
 static LONG atomic_fetch_add_explicit(atomic_int * ptr, LONG inc, memory_order mo) {
-    // TODO: add support for explicit memory order
+
     return InterlockedExchangeAdd(ptr, inc);
 }
 static atomic_bool atomic_flag_test_and_set(atomic_flag * ptr) {
@@ -154,7 +149,7 @@ static void atomic_flag_clear(atomic_flag * ptr) {
 static void atomic_thread_fence(memory_order mo) {
     MemoryBarrier();
 }
-#else // clang
+#else
 #include <stdatomic.h>
 #endif
 
@@ -296,6 +291,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_F8_E4M3] = {
+        .from_float               = quantize_row_f8_e4m3,
+        .vec_dot                  = ggml_vec_dot_f8_e4m3_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q2_K] = {
         .from_float               = quantize_row_q2_K,
         .vec_dot                  = ggml_vec_dot_q2_K_q8_K,
@@ -347,20 +348,19 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
     },
     [GGML_TYPE_IQ3_XXS] = {
-        // NOTE: from_float for iq3 and iq2_s was removed because these quants require initialization in ggml_quantize_init
-        //.from_float               = quantize_row_iq3_xxs,
+
         .vec_dot                  = ggml_vec_dot_iq3_xxs_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
     [GGML_TYPE_IQ3_S] = {
-        //.from_float               = quantize_row_iq3_s,
+
         .vec_dot                  = ggml_vec_dot_iq3_s_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
     },
     [GGML_TYPE_IQ2_S] = {
-        //.from_float               = quantize_row_iq2_s,
+
         .vec_dot                  = ggml_vec_dot_iq2_s_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
         .nrows                    = 1,
@@ -419,10 +419,6 @@ const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type
     return &type_traits_cpu[type];
 }
 
-//
-// Threading defs
-//
-
 typedef pthread_t          ggml_thread_t;
 
 #if defined(_WIN32)
@@ -477,34 +473,30 @@ typedef pthread_mutex_t    ggml_mutex_t;
 
 #endif
 
-// Threadpool def
 struct ggml_threadpool {
-    ggml_mutex_t mutex;       // mutex for cond.var
-    ggml_cond_t  cond;        // cond.var for waiting for new work
+    ggml_mutex_t mutex;
+    ggml_cond_t  cond;
 
     struct ggml_cgraph * cgraph;
     struct ggml_cplan  * cplan;
 
-    // synchronization primitives
-    atomic_int n_graph;       // updated when there is work to be done (i.e each graph) holds graph and active thread counts.
+    atomic_int n_graph;
     atomic_int GGML_CACHE_ALIGN n_barrier;
     atomic_int GGML_CACHE_ALIGN n_barrier_passed;
-    atomic_int GGML_CACHE_ALIGN current_chunk; // currently processing chunk during Mat_Mul, shared between all the threads.
+    atomic_int GGML_CACHE_ALIGN current_chunk;
 
-    // these are atomic as an annotation for thread-sanitizer
-    atomic_bool stop;         // Used for stopping the threadpool altogether
-    atomic_bool pause;        // Used for pausing the threadpool or individual threads
-    atomic_int  abort;        // Used for aborting processing of a graph
+    atomic_bool stop;
+    atomic_bool pause;
+    atomic_int  abort;
 
-    struct ggml_compute_state * workers;   // per thread state
-    int          n_threads;   // Number of threads in the pool
-    int32_t      prio;        // Scheduling priority
-    uint32_t     poll;        // Polling level (0 - no polling)
+    struct ggml_compute_state * workers;
+    int          n_threads;
+    int32_t      prio;
+    uint32_t     poll;
 
     enum ggml_status ec;
 };
 
-// Per-thread state
 struct ggml_compute_state {
 #ifndef GGML_USE_OPENMP
     ggml_thread_t thrd;
@@ -516,7 +508,6 @@ struct ggml_compute_state {
     int ith;
 };
 
-// Helpers for polling loops
 #if defined(__aarch64__) && ( defined(__clang__) || defined(__GNUC__) )
 static inline void ggml_thread_cpu_relax(void) {
     __asm__ volatile("yield" ::: "memory");
@@ -530,7 +521,7 @@ static inline void ggml_thread_cpu_relax(void) {
     #ifdef __riscv_zihintpause
         __asm__ __volatile__ ("pause");
     #else
-        /* Encoding of the pause instruction */
+
         __asm__ __volatile__ (".4byte 0x100000F");
     #endif
 }
@@ -538,15 +529,11 @@ static inline void ggml_thread_cpu_relax(void) {
 static inline void ggml_thread_cpu_relax(void) {;}
 #endif
 
-//
-// NUMA support
-//
-
 #define GGML_NUMA_MAX_NODES 8
 #define GGML_NUMA_MAX_CPUS 512
 
 struct ggml_numa_node {
-    uint32_t cpus[GGML_NUMA_MAX_CPUS]; // hardware threads on this node
+    uint32_t cpus[GGML_NUMA_MAX_CPUS];
     uint32_t n_cpus;
 };
 
@@ -554,18 +541,14 @@ struct ggml_numa_nodes {
     enum ggml_numa_strategy numa_strategy;
     struct ggml_numa_node nodes[GGML_NUMA_MAX_NODES];
     uint32_t n_nodes;
-    uint32_t total_cpus; // hardware threads on system
-    uint32_t current_node; // node on which main process is execting
+    uint32_t total_cpus;
+    uint32_t current_node;
 #if defined(__gnu_linux__)
-    cpu_set_t cpuset; // cpuset from numactl
+    cpu_set_t cpuset;
 #else
-    uint32_t cpuset; // no NUMA support outside of Linux at this time. Use a portable datatype
+    uint32_t cpuset;
 #endif
 };
-
-//
-// ggml state
-//
 
 struct ggml_state {
     struct ggml_numa_nodes numa;
@@ -584,25 +567,20 @@ void ggml_barrier(struct ggml_threadpool * tp) {
 #else
     int n_passed = atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed);
 
-    // enter barrier (full seq-cst fence)
     int n_barrier = atomic_fetch_add_explicit(&tp->n_barrier, 1, memory_order_seq_cst);
 
     if (n_barrier == (n_threads - 1)) {
-        // last thread
+
         atomic_store_explicit(&tp->n_barrier, 0, memory_order_relaxed);
 
-        // exit barrier (full seq-cst fence)
         atomic_fetch_add_explicit(&tp->n_barrier_passed, 1, memory_order_seq_cst);
         return;
     }
 
-    // wait for other threads
     while (atomic_load_explicit(&tp->n_barrier_passed, memory_order_relaxed) == n_passed) {
         ggml_thread_cpu_relax();
     }
 
-    // exit barrier (full seq-cst fence)
-    // TSAN doesn't support standalone fence yet, we use a dummy read-modify-write instead
     #ifdef GGML_TSAN_ENABLED
     atomic_fetch_add_explicit(&tp->n_barrier_passed, 0, memory_order_seq_cst);
     #else
@@ -630,7 +608,7 @@ static cpu_set_t ggml_get_numa_affinity(void) {
 }
 #else
 static uint32_t ggml_get_numa_affinity(void) {
-    return 0; // no NUMA support
+    return 0;
 }
 #endif
 
@@ -646,14 +624,12 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     char path[256];
     int rv;
 
-    // set numa scheme
     g_state.numa.numa_strategy = numa_flag;
 
     GGML_PRINT_DEBUG("numa strategy %u\n",g_state.numa.numa_strategy);
 
     g_state.numa.cpuset = ggml_get_numa_affinity();
 
-    // enumerate nodes
     while (g_state.numa.n_nodes < GGML_NUMA_MAX_NODES) {
         rv = snprintf(path, sizeof(path), "/sys/devices/system/node/node%u", g_state.numa.n_nodes);
         GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
@@ -661,7 +637,6 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
         ++g_state.numa.n_nodes;
     }
 
-    // enumerate CPUs
     while (g_state.numa.total_cpus < GGML_NUMA_MAX_CPUS) {
         rv = snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%u", g_state.numa.total_cpus);
         GGML_ASSERT(rv > 0 && (unsigned)rv < sizeof(path));
@@ -671,15 +646,14 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
     GGML_PRINT_DEBUG("found %u numa nodes, %u CPUs\n", g_state.numa.n_nodes, g_state.numa.total_cpus);
 
-    // figure out which node we're on
     uint current_cpu;
     int getcpu_ret = 0;
 #if __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ > 33) || defined(__COSMOPOLITAN__)
     getcpu_ret = getcpu(&current_cpu, &g_state.numa.current_node);
 #else
-    // old glibc doesn't have a wrapper for this call. Fall back on direct syscall
+
 #   if !defined(SYS_getcpu) && defined(SYS_get_cpu)
-#       define SYS_getcpu SYS_get_cpu // some older glibc versions use this name
+#       define SYS_getcpu SYS_get_cpu
 #   endif
     getcpu_ret = syscall(SYS_getcpu, &current_cpu, &g_state.numa.current_node);
 #endif
@@ -718,7 +692,7 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     }
 #else
     UNUSED(numa_flag);
-    // TODO
+
 #endif
 }
 
@@ -735,7 +709,7 @@ static void ggml_init_arm_arch_features(void) {
 #else
 static void ggml_init_arm_arch_features(void) {}
 #endif
-#endif // __ARM_ARCH
+#endif
 
 #if defined(__riscv) && defined(__riscv_v_intrinsic)
 #include <riscv_vector.h>
@@ -1158,10 +1132,6 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-
-// ggml_compute_forward_mul_mat
-
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1182,13 +1152,9 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     ggml_vec_dot_t const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
-    // broadcast factors
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
-    //printf("ir0_start = %6lld, ir0_end = %6lld, ir1_start = %6lld, ir1_end = %6lld\n", ir0_start, ir0_end, ir1_start, ir1_end);
-
-    // threads with no work simply yield (not sure if it helps)
     if (ir0_start >= ir0_end || ir1_start >= ir1_end) {
         return;
     }
@@ -1199,14 +1165,11 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
 
-    // block-tiling attempt
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
 
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
 
-    // attempt to reduce false-sharing (does not seem to make a difference)
-    // 16 * 2, accounting for mmla kernels
     float tmp[32];
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
@@ -1216,7 +1179,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
                 const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
 
-                // broadcast src0 into src1
                 const int64_t i03 = i13 / r3;
                 const int64_t i02 = i12 / r2;
 
@@ -1226,19 +1188,11 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
                 const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
 
-                // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
-                //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
-                //       the original src1 data pointer, so we should index using the indices directly
-                // TODO: this is a bit of a hack, we should probably have a better way to handle this
                 const char * src1_col = (const char*)wdata +
                     (src1_cont || src1->type != vec_dot_type
                         ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
                         : (i11 * nb11 + i12 * nb12 + i13 * nb13));
                 float * dst_col = (float*)((char*)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
-
-                //for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
-                //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
-                //}
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
@@ -1265,7 +1219,6 @@ void ggml_compute_forward_mul_mat(
         return;
     }
 
-    // If tiled is supported, it will execute the full op here and we return
     if (ggml_compute_forward_mul_mat_tiled(params, dst)) {
         return;
     }
@@ -1284,22 +1237,16 @@ void ggml_compute_forward_mul_mat(
     GGML_ASSERT(ne2 == ne12);
     GGML_ASSERT(ne3 == ne13);
 
-    // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(src0->type));
     GGML_ASSERT(nb10 == ggml_type_size(src1->type));
 
-    // dst cannot be transposed or permuted
     GGML_ASSERT(nb0 == sizeof(float));
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
 
-    // nb01 >= nb00 - src0 is not transposed
-    //   compute by src0 rows
-
-    // TODO: extract to "extra_op"
 #if GGML_USE_LLAMAFILE
-    // broadcast factors
+
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
 
@@ -1334,7 +1281,7 @@ UseGgmlGemm1:;
         const size_t nbw3 = nbw2*ne12;
 
         assert(params->wsize >= ne13*nbw3);
-        // src1 is either packed from F32 into vec_dot_type, or widened from F16 or BF16 into the F32 work buffer
+
         const bool widen = src1->type != GGML_TYPE_F32;
 
         GGML_ASSERT(!widen || vec_dot_type == GGML_TYPE_F32);
@@ -1377,7 +1324,7 @@ UseGgmlGemm1:;
     }
 
     if (ith == 0) {
-        // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
+
         atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
     }
 
@@ -1407,16 +1354,12 @@ UseGgmlGemm1:;
 UseGgmlGemm2:;
 #endif
 
-    // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
     const int64_t nr0 = ne0;
 
-    // This is the size of the rest of the dimensions of the result
     const int64_t nr1 = ne1 * ne2 * ne3;
 
-    // Now select a reasonable chunk size.
     int chunk_size = 16;
 
-    // We need to step up the size if it's small
     if (nr0 == 1 || nr1 == 1) {
         chunk_size = 64;
     }
@@ -1432,15 +1375,13 @@ UseGgmlGemm2:;
     //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
     if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
         // distribute the thread work across the inner or outer loop based on which one is larger
-        nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
-        nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
+        nchunk0 = nr0 > nr1 ? nth : 1;
+        nchunk1 = nr0 > nr1 ? 1 : nth;
     }
 
-    // The number of elements in each chunk
     const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
     const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
 
-    // The first chunk comes from our thread_id, the rest will get auto-assigned.
     int current_chunk = ith;
 
     while (current_chunk < nchunk0 * nchunk1) {
@@ -1453,11 +1394,8 @@ UseGgmlGemm2:;
         const int64_t ir1_start = dr1 * ith1;
         const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
-        // dot kernels can handle 1 row and col at a time, but mmla kernels can process 2 rows and cols
         int64_t num_rows_per_vec_dot = vec_dot_num_rows;
 
-        // these checks are needed to avoid crossing dim1 boundaries
-        // can be optimized, but the logic would become more complicated, so keeping it like this for simplicity
         if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
             num_rows_per_vec_dot = 1;
         }
@@ -1470,8 +1408,6 @@ UseGgmlGemm2:;
         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
     }
 }
-
-// ggml_compute_forward_mul_mat_id
 
 #define MMID_MATRIX_ROW(row_id, i1) matrix_rows[(row_id)*ids->ne[0]*ids->ne[1] + (i1)]
 
@@ -1504,8 +1440,6 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
 
-
-
     const bool swiglu = epilogue == GGML_MUL_MAT_ID_EPILOGUE_SWIGLU;
     GGML_ASSERT(!swiglu || (ir0_start % 2 == 0 && ir0_end % 2 == 0));
 
@@ -1517,21 +1451,17 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
-                const int64_t _i12 = ir1; // logical row index for this expert
+                const int64_t _i12 = ir1;
 
                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
-                const int id       = row_mapping.i1; // selected expert index
+                const int id       = row_mapping.i1;
 
                 const int64_t  i11 = id % ne11;
-                const int64_t  i12 = row_mapping.i2; // row index in src1
+                const int64_t  i12 = row_mapping.i2;
 
-                const int64_t  i1 = id;  // selected expert index
-                const int64_t  i2 = i12; // row
+                const int64_t  i1 = id;
+                const int64_t  i2 = i12;
 
-                // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
-                //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
-                //       the original src1 data pointer, so we should index using the indices directly
-                // TODO: this is a bit of a hack, we should probably have a better way to handle this
                 const char * src1_col = (const char *) wdata +
                     (src1_cont || src1->type != vec_dot_type
                     ? (i11      + i12*ne11)*row_size
@@ -1586,29 +1516,21 @@ static void ggml_compute_forward_mul_mat_id(
     enum ggml_type    const vec_dot_type    = type_traits_cpu[type].vec_dot_type;
     ggml_from_float_t const from_float      = type_traits_cpu[vec_dot_type].from_float;
 
-
     const int32_t epilogue = ggml_mul_mat_id_get_epilogue(dst);
     const bool    swiglu   = epilogue == GGML_MUL_MAT_ID_EPILOGUE_SWIGLU;
 
-    // we don't support permuted src0 or src1
     GGML_ASSERT(nb00 == ggml_type_size(type));
     GGML_ASSERT(nb10 == ggml_type_size(src1->type));
 
-    // dst cannot be transposed or permuted
     GGML_ASSERT(nb0 == ggml_type_size(dst->type));
     GGML_ASSERT(nb0 <= nb1);
     GGML_ASSERT(nb1 <= nb2);
     GGML_ASSERT(nb2 <= nb3);
 
-
     GGML_ASSERT(!swiglu || (ne01 % 2 == 0 && dst->type == GGML_TYPE_F16));
 
-    // row groups
-    const int n_ids = ids->ne[0]; // n_expert_used
-    const int n_as  = ne02;       // n_expert
-
-
-
+    const int n_ids = ids->ne[0];
+    const int n_as  = ne02;
 
     const bool    expert_parallel = ggml_mul_mat_id_is_expert_parallel(dst);
     const int32_t n_expert_total  = expert_parallel ? ggml_mul_mat_id_get_n_expert_total(dst) : n_as;
@@ -1620,24 +1542,21 @@ static void ggml_compute_forward_mul_mat_id(
         incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
     }
 
-
     float * wdata_wide = NULL;
     if (src1->type != vec_dot_type && src1->type != GGML_TYPE_F32) {
         GGML_ASSERT(src1->type == GGML_TYPE_F16 || src1->type == GGML_TYPE_BF16);
         wdata_wide = (float *) incr_ptr_aligned(&wdata_cur, ggml_row_size(GGML_TYPE_F32, ggml_nelements(src1)), sizeof(int64_t));
     }
 
-    int64_t * matrix_row_counts = // [n_as]
+    int64_t * matrix_row_counts =
         incr_ptr_aligned(&wdata_cur, n_as*sizeof(int64_t), sizeof(int64_t));
 
-    struct mmid_row_mapping * matrix_rows = // [n_as][ids->ne[0]*ids->ne[1]]
+    struct mmid_row_mapping * matrix_rows =
         incr_ptr_aligned(&wdata_cur, n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping), sizeof(int64_t));
 
-    char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
+    char (*atomic_current_chunk)[CACHE_LINE_SIZE] =
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
 
-    // Tiled matmul (see tiled.h); per-thread work buffers, 0 bytes when disabled. The
-    // reservation is unconditional, the per expert eligibility is decided at dispatch time
     char * tiled_scratch = incr_ptr_aligned(&wdata_cur, ggml_tiled_wdata_size(nth, dst), 64);
 
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
@@ -1679,8 +1598,6 @@ static void ggml_compute_forward_mul_mat_id(
                         continue;
                     }
 
-
-
                     float * wide_row = wdata_wide + ((i13*ne12 + i12)*ne11 + i11)*ne10 + ne10_block_start*bs;
                     if (src1->type == GGML_TYPE_F16) {
                         ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) src1_row, wide_row, n_block);
@@ -1695,17 +1612,12 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
-        // initialize matrix_row_counts
+
         memset(matrix_row_counts, 0, n_as*sizeof(int64_t));
-
-
-
-
 
         const int16_t * expert_lut = ggml_expert_store_node_lut(dst);
         GGML_ASSERT(expert_lut != NULL);
 
-        // group rows by src0 matrix
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; ++iid1) {
             for (int id = 0; id < n_ids; ++id) {
                 const int32_t i02 = *(const int32_t *) ((const char *) ids->data + iid1*ids->nb[1] + id*ids->nb[0]);
@@ -1734,7 +1646,6 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
 
-    // reset current_chunk
     for (int cur_a = ith; cur_a < n_as; cur_a += nth) {
         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
         *current_chunk_ctr = nth;
@@ -1749,8 +1660,6 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        // tiled takes over if profitable for this expert (see tiled.h). it is a plain F32 matmul
-        // without an epilogue, so a fused epilogue stays on the row-block loop below
         if (!swiglu && ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1, (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
@@ -1767,7 +1676,6 @@ static void ggml_compute_forward_mul_mat_id(
             chunk_size = 64;
         }
 
-        // disable for NUMA
         const bool disable_chunking = ggml_is_numa();
 
         int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
@@ -1777,7 +1685,6 @@ static void ggml_compute_forward_mul_mat_id(
             nchunk0 = nr0 > nr1 ? nth : 1;
             nchunk1 = nr0 > nr1 ? 1 : nth;
         }
-
 
         const int64_t dr0 = GGML_PAD((nr0 + nchunk0 - 1) / nchunk0, swiglu ? 2 : 1);
         const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
@@ -1811,8 +1718,6 @@ static void ggml_compute_forward_mul_mat_id(
     }
 }
 
-/////////////////////////////////
-
 static void ggml_compute_forward(struct ggml_compute_params * params, struct ggml_tensor * tensor) {
     GGML_ASSERT(params);
 
@@ -1820,7 +1725,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         return;
     }
 
-    // extra_buffer op?
     if (ggml_cpu_extra_compute_forward(params, tensor)) {
         return;
     }
@@ -2243,23 +2147,23 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             break;
         case GGML_OP_NONE:
             {
-                // nop
+
             } break;
         case GGML_OP_RESHAPE:
             {
-                // nop
+
             } break;
         case GGML_OP_PERMUTE:
             {
-                // nop
+
             } break;
         case GGML_OP_VIEW:
             {
-                // nop
+
             } break;
         case GGML_OP_TRANSPOSE:
             {
-                // nop
+
             } break;
         case GGML_OP_COUNT:
             {
@@ -2268,7 +2172,6 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 }
 
-// Android's libc implementation "bionic" does not support setting affinity
 #if defined(__gnu_linux__)
 static void set_numa_thread_affinity(int thread_n) {
     if (!ggml_is_numa()) {
@@ -2281,15 +2184,15 @@ static void set_numa_thread_affinity(int thread_n) {
 
     switch(g_state.numa.numa_strategy) {
         case GGML_NUMA_STRATEGY_DISTRIBUTE:
-            // run thread on node_num thread_n / (threads per node)
+
             node_num = thread_n % g_state.numa.n_nodes;
             break;
         case GGML_NUMA_STRATEGY_ISOLATE:
-            // run thread on current_node
+
             node_num = g_state.numa.current_node;
             break;
         case GGML_NUMA_STRATEGY_NUMACTL:
-            // use the cpuset that numactl gave us
+
             rv = pthread_setaffinity_np(pthread_self(), setsize, &g_state.numa.cpuset);
             if (rv) {
                 fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n",strerror(rv));
@@ -2336,8 +2239,7 @@ static void clear_numa_thread_affinity(void) {
     CPU_FREE(cpus);
 }
 #else
-// TODO: Windows etc.
-// (the linux implementation may also work on BSD, someone should test)
+
 static void set_numa_thread_affinity(int thread_n) { UNUSED(thread_n);  }
 static void clear_numa_thread_affinity(void) {}
 #endif
@@ -2346,7 +2248,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
     int n_tasks = 0;
 
     if (ggml_is_empty(node)) {
-        // no need to multi-thread a no-op
+
         n_tasks = 1;
         return n_tasks;
     }
@@ -2464,9 +2366,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_GET_ROWS:
             {
-                // FIXME: get_rows can use additional threads, but the cost of launching additional threads
-                // decreases performance with GPU offloading
-                //n_tasks = n_threads;
+
                 n_tasks = 1;
             } break;
         case GGML_OP_SCALE:
@@ -2491,7 +2391,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             } break;
         case GGML_OP_CLAMP:
             {
-                n_tasks = 1; //TODO
+                n_tasks = 1;
             } break;
         case GGML_OP_SOFT_MAX:
             {
@@ -2624,7 +2524,6 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data);
 #if defined(_WIN32)
 #include "windows.h"
 
-// TODO: support > 64 CPUs
 static bool ggml_thread_apply_affinity(bool * mask) {
     HANDLE    h = GetCurrentThread();
     uint64_t  bitmask = 0ULL;
@@ -2660,8 +2559,7 @@ static bool ggml_thread_apply_affinity(bool * mask) {
 }
 
 static bool ggml_thread_apply_priority(int32_t prio) {
-    // Note that on Windows the Process Priority Class must be updated in order to set Thread priority.
-    // This is up to the applications.
+
     DWORD p = THREAD_PRIORITY_NORMAL;
     switch (prio) {
         case GGML_SCHED_PRIO_LOW:      p = THREAD_PRIORITY_BELOW_NORMAL;  break;
@@ -2672,10 +2570,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
     }
 
     if (prio != GGML_SCHED_PRIO_LOW) {
-        // Tell Windows that this thread should not be throttled (needs its own CPU core).
-        // Newer Windows 11 versions aggressively park (offline) CPU cores and often place
-        // all our threads onto the first 4 cores which results in terrible performance with
-        // n_threads > 4
+
         #if _WIN32_WINNT >= 0x0602
         THREAD_POWER_THROTTLING_STATE t;
         ZeroMemory(&t, sizeof(t));
@@ -2691,7 +2586,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
     }
 
     if (prio == GGML_SCHED_PRIO_NORMAL) {
-        // Keep inherited policy/priority
+
         return true;
     }
 
@@ -2708,7 +2603,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
 #include <sys/resource.h>
 
 static bool ggml_thread_apply_affinity(const bool * mask) {
-    // Not supported on Apple platforms
+
     UNUSED(mask);
     return true;
 }
@@ -2717,7 +2612,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
     struct sched_param p;
     int32_t policy = SCHED_OTHER;
     switch (prio) {
-        // TODO: there seems to be no way to set lower prio on Apple platforms
+
         case GGML_SCHED_PRIO_LOW:      policy = SCHED_OTHER; p.sched_priority = 0;  break;
         case GGML_SCHED_PRIO_NORMAL:   policy = SCHED_OTHER; p.sched_priority = 0;  break;
         case GGML_SCHED_PRIO_MEDIUM:   policy = SCHED_FIFO;  p.sched_priority = 40; break;
@@ -2726,7 +2621,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
     }
 
     if (prio == GGML_SCHED_PRIO_NORMAL) {
-        // Keep inherited policy/priority
+
         return true;
     }
 
@@ -2740,7 +2635,6 @@ static bool ggml_thread_apply_priority(int32_t prio) {
 }
 
 #elif defined(__linux__)
-// TODO: this may not work on BSD, to be verified
 
 static bool ggml_thread_apply_affinity(const bool * mask) {
     cpu_set_t cpuset;
@@ -2783,7 +2677,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
     }
 
     if (prio == GGML_SCHED_PRIO_NORMAL) {
-        // Keep inherited policy/priority
+
         return true;
     }
 
@@ -2796,7 +2690,7 @@ static bool ggml_thread_apply_priority(int32_t prio) {
     return true;
 }
 
-#else // unsupported platforms
+#else
 
 static bool ggml_thread_apply_affinity(const bool * mask) {
     UNUSED(mask);
@@ -2827,7 +2721,7 @@ static void ggml_thread_cpumask_next(const bool * global_mask, bool * local_mask
         for (int32_t i = 0; i < GGML_MAX_N_THREADS; i++) {
             int32_t idx = base_idx + i;
             if (idx >= GGML_MAX_N_THREADS) {
-                // Just a cheaper modulo
+
                 idx -= GGML_MAX_N_THREADS;
             }
             if (global_mask[idx]) {
@@ -2863,7 +2757,7 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
 
     ggml_mutex_destroy(&threadpool->mutex);
     ggml_cond_destroy(&threadpool->cond);
-#endif // GGML_USE_OPENMP
+#endif
 
     const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;
     ggml_aligned_free(threadpool->workers, workers_size);
@@ -2871,7 +2765,7 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
 }
 
 #ifndef GGML_USE_OPENMP
-// pause/resume must be called under mutex
+
 static void ggml_threadpool_pause_locked(struct ggml_threadpool * threadpool) {
     GGML_PRINT_DEBUG("Pausing threadpool\n");
     threadpool->pause = true;
@@ -2915,19 +2809,19 @@ struct ggml_cplan ggml_graph_plan(
             struct ggml_threadpool * threadpool) {
 
     if (threadpool == NULL) {
-        //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
+
     }
     if (n_threads <= 0) {
         n_threads = threadpool ? threadpool->n_threads : GGML_DEFAULT_N_THREADS;
     }
 
 #if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
-    // Emscripten without pthreads support can only use a single thread
+
     n_threads = 1;
 #endif
 
 #if defined(__wasi__)
-    // WASI doesn't support parallelism yet
+
     n_threads = 1;
 #endif
 
@@ -2938,7 +2832,6 @@ struct ggml_cplan ggml_graph_plan(
 
     int max_tasks = 1;
 
-    // thread scheduling for the different operations + work buffer size estimation
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
 
@@ -2954,10 +2847,10 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_DUP:
                     {
                         if (ggml_is_quantized(node->type) ||
-                            // F16 -> BF16 and BF16 -> F16 copies go through intermediate F32
+
                             (node->src[0]->type == GGML_TYPE_F16  && node->src[1] && node->src[1]->type == GGML_TYPE_BF16) ||
                             (node->src[0]->type == GGML_TYPE_BF16 && node->src[1] && node->src[1]->type == GGML_TYPE_F16) ||
-                            // conversion between F32 and I32
+
                             (node->src[0]->type == GGML_TYPE_F32 && node->src[1] && node->src[1]->type == GGML_TYPE_I32) ||
                             (node->src[0]->type == GGML_TYPE_I32 && node->src[1] && node->src[1]->type == GGML_TYPE_F32)) {
                             cur = ggml_type_size(GGML_TYPE_F32) * node->ne[0] * n_tasks;
@@ -2987,7 +2880,7 @@ struct ggml_cplan ggml_graph_plan(
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }
-                        // Workspace for tiled (see tiled.h)
+
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
@@ -2999,7 +2892,7 @@ struct ggml_cplan ggml_graph_plan(
                         const struct ggml_tensor * ids = node->src[2];
                         const enum ggml_type vec_dot_type = type_traits_cpu[src0->type].vec_dot_type;
                         const int n_as = src0->ne[2];
-                        // src1
+
                         if (src1->type != vec_dot_type) {
                             cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
 
@@ -3007,13 +2900,13 @@ struct ggml_cplan ggml_graph_plan(
                                 cur += ggml_row_size(GGML_TYPE_F32, ggml_nelements(src1)) + sizeof(int64_t);
                             }
                         }
-                        // matrix_row_counts
+
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
-                        // matrix_rows
+
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
-                        // atomic_current_chunk
+
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
-                        // Workspace for tiled (see tiled.h)
+
                         cur = GGML_PAD(cur, 64);
                         cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
@@ -3042,11 +2935,11 @@ struct ggml_cplan ggml_graph_plan(
                         GGML_ASSERT(node->src[1]->ne[2] == 1);
                         GGML_ASSERT(node->src[1]->ne[3] == 1);
 
-                        const int64_t ne00 = node->src[0]->ne[0];  // K
-                        const int64_t ne01 = node->src[0]->ne[1];  // Cout
-                        const int64_t ne02 = node->src[0]->ne[2];  // Cin
-                        const int64_t ne10 = node->src[1]->ne[0];  // L
-                        const int64_t ne11 = node->src[1]->ne[1];  // Cin
+                        const int64_t ne00 = node->src[0]->ne[0];
+                        const int64_t ne01 = node->src[0]->ne[1];
+                        const int64_t ne02 = node->src[0]->ne[2];
+                        const int64_t ne10 = node->src[1]->ne[0];
+                        const int64_t ne11 = node->src[1]->ne[1];
 
                         if ((node->src[0]->type == GGML_TYPE_F16 ||
                              node->src[0]->type == GGML_TYPE_BF16) &&
@@ -3068,15 +2961,15 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_CONV_TRANSPOSE_2D:
                     {
-                        const int64_t ne00 = node->src[0]->ne[0]; // W
-                        const int64_t ne01 = node->src[0]->ne[1]; // H
-                        const int64_t ne02 = node->src[0]->ne[2]; // Channels Out
-                        const int64_t ne03 = node->src[0]->ne[3]; // Channels In
+                        const int64_t ne00 = node->src[0]->ne[0];
+                        const int64_t ne01 = node->src[0]->ne[1];
+                        const int64_t ne02 = node->src[0]->ne[2];
+                        const int64_t ne03 = node->src[0]->ne[3];
 
-                        const int64_t ne10 = node->src[1]->ne[0]; // W
-                        const int64_t ne11 = node->src[1]->ne[1]; // H
-                        const int64_t ne12 = node->src[1]->ne[2]; // Channels In
-                        const int64_t ne13 = node->src[1]->ne[3]; // Batch
+                        const int64_t ne10 = node->src[1]->ne[0];
+                        const int64_t ne11 = node->src[1]->ne[1];
+                        const int64_t ne12 = node->src[1]->ne[2];
+                        const int64_t ne13 = node->src[1]->ne[3];
 
                         GGML_ASSERT(node->src[0]->type == GGML_TYPE_F16 || node->src[0]->type == GGML_TYPE_F32);
                         GGML_ASSERT(node->src[1]->type == GGML_TYPE_F32);
@@ -3091,16 +2984,12 @@ struct ggml_cplan ggml_graph_plan(
                     } break;
                 case GGML_OP_FLASH_ATTN_EXT:
                     {
-                        const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
+                        const int64_t neq2 = node->src[0]->ne[2];
                         const int64_t DK = node->src[1]->ne[0];
                         const int64_t DV = node->src[2]->ne[0];
 
-                        // Tiled flash attention scratch (tile sizes defined in common.h)
-                        // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
                         size_t prefill  = sizeof(float)*(GGML_FA_TILE_Q*DK + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV + GGML_FA_TILE_KV*DK)*n_tasks;
 
-                        // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
-                        // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
                         size_t n_chunks = n_tasks;
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
@@ -3110,16 +2999,16 @@ struct ggml_cplan ggml_graph_plan(
                     {
                         const int64_t    D = node->src[0]->ne[0];
                         const int64_t ne11 = ggml_up(node->src[1]->ne[1], GGML_SOFT_MAX_UNROLL);
-                        const int64_t mxDn = MAX(D, ne11) * 2; // *2 because of S and SM in ggml_compute_forward_flash_attn_back
+                        const int64_t mxDn = MAX(D, ne11) * 2;
                         if (node->src[1]->type == GGML_TYPE_F32) {
-                            cur  = sizeof(float)*mxDn*n_tasks; // TODO: this can become (n_tasks-1)
-                            cur += sizeof(float)*mxDn*n_tasks; // this is overestimated by x2
+                            cur  = sizeof(float)*mxDn*n_tasks;
+                            cur += sizeof(float)*mxDn*n_tasks;
                         } else if (node->src[1]->type == GGML_TYPE_F16) {
-                            cur  = sizeof(float)*mxDn*n_tasks; // TODO: this can become (n_tasks-1)
-                            cur += sizeof(float)*mxDn*n_tasks; // this is overestimated by x2
+                            cur  = sizeof(float)*mxDn*n_tasks;
+                            cur += sizeof(float)*mxDn*n_tasks;
                         } else if (node->src[1]->type == GGML_TYPE_BF16) {
-                            cur  = sizeof(float)*mxDn*n_tasks; // TODO: this can become (n_tasks-1)
-                            cur += sizeof(float)*mxDn*n_tasks; // this is overestimated by x2
+                            cur  = sizeof(float)*mxDn*n_tasks;
+                            cur += sizeof(float)*mxDn*n_tasks;
                         }
                     } break;
 
@@ -3140,13 +3029,12 @@ struct ggml_cplan ggml_graph_plan(
                     }
                 case GGML_OP_LIGHTNING_INDEXER:
                     {
-                        // temp buffer for dequantizing lightning indexer keys
+
                         const int64_t ne10 = node->src[1]->ne[0];
                         cur += sizeof(float)*ne10*n_tasks;
                     } break;
                 case GGML_OP_QSA_SELECT:
                     {
-
 
                         const bool    pool_only = ggml_get_op_params_i32(node, 3) == 1;
                         const int64_t n_embd    = node->src[1]->ne[0];
@@ -3180,10 +3068,7 @@ struct ggml_cplan ggml_graph_plan(
     return cplan;
 }
 
-
-// Try to fuse the current node with subsequent nodes for better performance.
-// Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
-static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
+static bool ggml_cpu_disable_fusion = false;
 
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
@@ -3198,7 +3083,7 @@ static int ggml_cpu_try_fuse_ops(
     struct ggml_tensor * node = cgraph->nodes[node_n];
 
     if (node->op == GGML_OP_RMS_NORM) {
-        // RMS_NORM + MUL fusion
+
         const enum ggml_op fuse_ops[] = { GGML_OP_RMS_NORM, GGML_OP_MUL };
         if (ggml_can_fuse(cgraph, node_n, fuse_ops, 2)) {
             struct ggml_tensor * mul_node = cgraph->nodes[node_n + 1];
@@ -3233,12 +3118,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     struct ggml_compute_params params = {
-        /*.ith        =*/ state->ith,
-        /*.nth        =*/ atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
-        /*.wsize      =*/ cplan->work_size,
-        /*.wdata      =*/ cplan->work_data,
-        /*.threadpool =*/ tp,
-        /*.use_ref    =*/ cplan->use_ref,
+                          state->ith,
+                          atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK,
+                          cplan->work_size,
+                          cplan->work_data,
+                          tp,
+                          cplan->use_ref,
     };
 
 #ifdef GGML_USE_OPENMP
@@ -3251,7 +3136,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
         if (ggml_op_is_empty(node->op)) {
-            // skip NOPs
+
             continue;
         }
 
@@ -3259,8 +3144,6 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
-        // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
-        // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
@@ -3296,14 +3179,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
 #ifndef GGML_USE_OPENMP
 
-// check if thread is ready to proceed (exit from polling or sleeping)
-// returns true if loops should exit, sets state->pending to indicate new work
 static inline bool ggml_graph_compute_thread_ready(struct ggml_compute_state * state) {
     struct ggml_threadpool * threadpool = state->threadpool;
 
     if (state->pending || threadpool->stop || threadpool->pause) { return true; }
 
-    // check for new graph/work
     int n_graph   = atomic_load_explicit(&threadpool->n_graph, memory_order_relaxed);
     int n_threads = n_graph & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_graph != state->last_graph) {
@@ -3315,9 +3195,8 @@ static inline bool ggml_graph_compute_thread_ready(struct ggml_compute_state * s
     return false;
 }
 
-// sync thread state after polling
 static inline void ggml_graph_compute_thread_sync(struct ggml_compute_state * state) {
-    // TSAN doesn't support standalone fence yet, we use a dummy read-modify-write instead
+
     #ifdef GGML_TSAN_ENABLED
     atomic_fetch_add_explicit(&state->threadpool->n_graph, 0, memory_order_seq_cst);
     #else
@@ -3334,7 +3213,7 @@ static inline bool ggml_graph_compute_poll_for_work(struct ggml_compute_state * 
     const uint64_t n_rounds = 1024UL * 128 * threadpool->poll;
 
     for (uint64_t i=0; !ggml_graph_compute_thread_ready(state) && i < n_rounds; i++) {
-        // No new work. Keep polling.
+
         ggml_thread_cpu_relax();
     }
 
@@ -3351,7 +3230,7 @@ static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state *
 
     ggml_mutex_lock_shared(&threadpool->mutex);
     while (!ggml_graph_compute_thread_ready(state)) {
-        // No new work. Wait for the signal.
+
         GGML_PRINT_DEBUG("thread #%d waiting for work (sleeping)\n", state->ith);
         ggml_cond_wait(&threadpool->cond, &threadpool->mutex);
     }
@@ -3370,7 +3249,7 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     }
 
     while (true) {
-        // Check if we need to sleep
+
         while (threadpool->pause) {
             GGML_PRINT_DEBUG("thread #%d inside pause loop\n", state->ith);
             ggml_mutex_lock_shared(&threadpool->mutex);
@@ -3381,11 +3260,7 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
             ggml_mutex_unlock_shared(&threadpool->mutex);
         }
 
-        // This needs to be checked for after the cond_wait
         if (threadpool->stop) break;
-
-        // Check if there is new work
-        // The main thread is the only one that can dispatch new work
 
         ggml_graph_compute_check_for_work(state);
         if (state->pending) {
@@ -3397,31 +3272,25 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     return (thread_ret_t) 0;
 }
 
-// Start processing new graph
 static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int n_threads)
 {
-    // Always take the mutex here because the worker threads are doing hybrid poll/wait
 
     ggml_mutex_lock(&threadpool->mutex);
 
-    // Update the number of active threads and the graph count
     int n_graph = atomic_load_explicit(&threadpool->n_graph, memory_order_relaxed) >> GGML_THREADPOOL_N_THREADS_BITS;
     n_graph = ((n_graph + 1) << GGML_THREADPOOL_N_THREADS_BITS) | (n_threads & GGML_THREADPOOL_N_THREADS_MASK);
 
     GGML_PRINT_DEBUG("compute-kickoff: n_threads %d n_graph %d\n", n_threads, n_graph);
 
-    // Indicate the graph is ready to be processed
-    // We need the full seq-cst fence here because of the polling threads (used in thread_sync)
     atomic_store_explicit(&threadpool->n_graph, n_graph, memory_order_seq_cst);
 
     if (threadpool->pause) {
-       // Update main thread prio and affinity to match the threadpool settings
+
        ggml_thread_apply_priority(threadpool->prio);
        if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
            ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
        }
 
-       // resume does cond broadcast
        ggml_threadpool_resume_locked(threadpool);
     } else {
        ggml_cond_broadcast(&threadpool->cond);
@@ -3430,7 +3299,7 @@ static void ggml_graph_compute_kickoff(struct ggml_threadpool * threadpool, int 
     ggml_mutex_unlock(&threadpool->mutex);
 }
 
-#endif // GGML_USE_OPENMP
+#endif
 
 static struct ggml_threadpool * ggml_threadpool_new_impl(
     struct ggml_threadpool_params * tpp,
@@ -3456,7 +3325,6 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
-    // Allocate and init workers state
     const size_t workers_size = sizeof(struct ggml_compute_state) * tpp->n_threads;
     struct ggml_compute_state * workers = ggml_aligned_malloc(workers_size);
 
@@ -3471,16 +3339,12 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 #ifdef GGML_USE_OPENMP
     int32_t cpumask_iter = 0;
 
-    // Compute CPU masks for each thread
     for (int j = 0; j < tpp->n_threads; j++) {
         ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
     }
-#else // GGML_USE_OPENMP
+#else
     ggml_mutex_init(&threadpool->mutex);
     ggml_cond_init(&threadpool->cond);
-
-    // Spin the threads for all workers, and update CPU placements.
-    // Place the main thread last (towards the higher numbered CPU cores).
 
     int32_t cpumask_iter = 0;
 
@@ -3494,13 +3358,13 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
     ggml_thread_cpumask_next(tpp->cpumask, workers[0].cpumask, tpp->strict_cpu, &cpumask_iter);
 
     if (!threadpool->pause) {
-        // Update main thread prio and affinity at the start, otherwise we'll do it in resume
+
         ggml_thread_apply_priority(threadpool->prio);
         if (ggml_thread_cpumask_is_valid(threadpool->workers[0].cpumask)) {
             ggml_thread_apply_affinity(threadpool->workers[0].cpumask);
         }
     }
-#endif // GGML_USE_OPENMP
+#endif
 
     return threadpool;
 }
@@ -3522,14 +3386,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     bool disposable_threadpool = false;
 
     if (threadpool == NULL) {
-        //GGML_PRINT_DEBUG("Threadpool is not specified. Will create a disposable threadpool : n_threads %d\n", n_threads);
+
         disposable_threadpool = true;
 
         struct ggml_threadpool_params ttp = ggml_threadpool_params_default(n_threads);
         threadpool = ggml_threadpool_new_impl(&ttp, cgraph, cplan);
     } else {
-        // Reset some of the parameters that need resetting
-        // No worker threads should be accessing the parameters below at this stage
+
         threadpool->cgraph           = cgraph;
         threadpool->cplan            = cplan;
         threadpool->current_chunk    = 0;
@@ -3543,12 +3406,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         {
             #pragma omp single
             {
-                // update the number of threads from the actual number of threads that we got from OpenMP
+
                 n_threads = omp_get_num_threads();
                 atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
             }
 
-            // Apply thread CPU mask and priority
             int ith = omp_get_thread_num();
 
             ggml_thread_apply_priority(threadpool->prio);
@@ -3567,14 +3429,11 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         n_threads = threadpool->n_threads;
     }
 
-    // Kick all threads to start the new graph
     ggml_graph_compute_kickoff(threadpool, n_threads);
 
-    // This is a work thread too
     ggml_graph_compute_thread(&threadpool->workers[0]);
 #endif
 
-    // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
 
     enum ggml_status ret = threadpool->ec;
@@ -3659,12 +3518,11 @@ void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
     }
 
 #elif defined(__riscv_v_intrinsic) && defined(__riscv_zvfhmin)
-    // calculate step size
+
     const int epr = __riscv_vsetvlmax_e16m2();
     const int step = epr * 2;
     const int np = (n & ~(step - 1));
 
-    // unroll by 2
     for (; i < np; i += step) {
         vfloat16m2_t ax0 = __riscv_vle16_v_f16m2((const _Float16*)x + i, epr);
         vfloat32m4_t ay0 = __riscv_vfwcvt_f_f_v_f32m4(ax0, epr);
@@ -3675,7 +3533,6 @@ void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
         __riscv_vse32_v_f32m4(y + i + epr, ay1, epr);
     }
 
-    // leftovers
     int vl;
     for (i = np; i < n; i += vl) {
         vl = __riscv_vsetvl_e16m2(n - i);
@@ -3729,12 +3586,11 @@ void ggml_cpu_bf16_to_fp32(const ggml_bf16_t * x, float * y, int64_t n) {
                                 16)));
     }
 #elif defined(__riscv_v_intrinsic) && defined(__riscv_zvfbfmin)
-    // calculate step size
+
     const int epr = __riscv_vsetvlmax_e16m2();
     const int step = epr * 2;
     const int np = (n & ~(step - 1));
 
-    // unroll by 2
     for (; i < np; i += step) {
         vbfloat16m2_t ax0 = __riscv_vle16_v_bf16m2((const __bf16*)x + i, epr);
         vfloat32m4_t ay0 = __riscv_vfwcvtbf16_f_f_v_f32m4(ax0, epr);
@@ -3745,7 +3601,6 @@ void ggml_cpu_bf16_to_fp32(const ggml_bf16_t * x, float * y, int64_t n) {
         __riscv_vse32_v_f32m4(y + i + epr, ay1, epr);
     }
 
-    // leftovers
     int vl;
     for (i = np; i < n; i += vl) {
         vl = __riscv_vsetvl_e16m2(n - i);
@@ -3984,7 +3839,7 @@ int ggml_cpu_has_sme2(void) {
 }
 
 void ggml_cpu_init(void) {
-    // needed to initialize ggml_time
+
     {
         struct ggml_init_params params = { 0, NULL, false };
         struct ggml_context * ctx = ggml_init(params);
@@ -3996,7 +3851,7 @@ void ggml_cpu_init(void) {
     static bool is_first_call = true;
 
     if (is_first_call) {
-        // initialize GELU, Quick GELU, SILU and EXP F32 tables
+
         {
             const uint64_t t_start = ggml_time_us(); UNUSED(t_start);
 
@@ -4011,14 +3866,13 @@ void ggml_cpu_init(void) {
                 ggml_table_gelu_quick_f16[i] = GGML_CPU_FP32_TO_FP16(ggml_gelu_quick_f32(f));
             }
 
-            // initialize E8M0 half table (256 entries)
             for (int i = 0; i < (1 << 8); ++i) {
                 ggml_table_f32_e8m0_half[i] = GGML_E8M0_TO_FP32_HALF(i);
             }
 
-            // initialize UE4M3 table (256 entries)
             for (int i = 0; i < (1 << 8); ++i) {
                 ggml_table_f32_ue4m3[i] = ggml_ue4m3_to_fp32(i);
+                ggml_table_f32_f8_e4m3[i] = ggml_f8_e4m3_to_fp32(i);
             }
 
             const uint64_t t_end = ggml_time_us(); UNUSED(t_end);
@@ -4026,18 +3880,13 @@ void ggml_cpu_init(void) {
             GGML_PRINT_DEBUG("%s: GELU, Quick GELU, SILU and EXP tables initialized in %f ms\n", __func__, (t_end - t_start)/1000.0);
 
 #ifdef GGML_USE_OPENMP
-            //if (!getenv("OMP_WAIT_POLICY")) {
-            //    // set the wait policy to active, so that OpenMP threads don't sleep
-            //    setenv("OMP_WAIT_POLICY", "active", 0)
-            //}
 
             if (!getenv("KMP_BLOCKTIME")) {
-                // set the time to wait before sleeping a thread
-                // this is less aggressive than setting the wait policy to active, but should achieve similar results in most cases
+
 #ifdef _WIN32
-                _putenv_s("KMP_BLOCKTIME", "200"); // 200ms
+                _putenv_s("KMP_BLOCKTIME", "200");
 #else
-                setenv("KMP_BLOCKTIME", "200", 0); // 200ms
+                setenv("KMP_BLOCKTIME", "200", 0);
 #endif
             }
 #endif

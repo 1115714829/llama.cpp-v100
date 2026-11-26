@@ -1,10 +1,4 @@
-﻿// Q2_K/Q3_K/Q4_K/Q5_K/Q6_K skinny GEMM for sm_70 (Volta).
-//
-// Design follows the QPN8 execution layout of q8-skinny.cu (itself adapted from 1Cat-vLLM
-// fp8_qpn8_sm70.cu, Apache-2.0) and the int4 scale/bias folding of 1Cat's awq_qpn_m1_sm70.cu
-// and ninfer-v100's q4 Volta kernels. The QPN8 layout is derived from dnv2003/v100-skinny
-// (MIT) and its block-scale adaptation in haohervchb/sglang-V100. See licenses/LICENSE-v100-skinny in
-// the repository root, and q4k-skinny.cuh for the repacked weight layout.
+// Portions from 1Cat-vLLM, v100-skinny and haohervchb/sglang-V100; see licenses/LICENSE-1Cat-vLLM and licenses/LICENSE-v100-skinny.
 
 #include "common.cuh"
 #include "convert.cuh"
@@ -14,20 +8,14 @@
 #include <algorithm>
 #include <vector>
 
-// sentinel object whose address tags a repacked Q4_K tensor (not const: it is stored in tensor->extra)
 static char q4k_skinny_marker = 0;
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
-// ---- codec: per-type code decode plus scale/min parsing ----
-
-// One loaded record: the record bytes as two little-endian 64-bit words, hi zero padded. The
-// bits of one value sit at bit offset slot*bits_per_value of the record, slot = qpn8_physical_k.
 struct qskinny_code {
     unsigned long long lo, hi;
 };
 
-// record buffers of the sizes that have no matching builtin load type
 struct qskinny_rec6  { uint8_t b[6];  };
 struct qskinny_rec10 { uint8_t b[10]; };
 struct qskinny_rec12 { uint8_t b[12]; };
@@ -56,24 +44,10 @@ static __device__ __forceinline__ void qskinny_code_put(qskinny_code & rec, cons
     }
 }
 
-// get_scale_min_k4 from dequantize.cuh on two little-endian 64-bit words of scale bytes
 static __device__ __forceinline__ uint8_t qskinny_scale_byte(const unsigned long long s_lo,
                                                              const unsigned long long s_hi, const int i) {
     return (uint8_t) ((i < 8 ? s_lo : s_hi) >> (8 * (i & 7)));
 }
-
-// One record holds values_per_record raw codes in qpn8 physical slot order; meta holds the raw
-// super-block header. 16*record_bytes + meta_bytes == block size, so a repacked tensor keeps the
-// byte count of its quantized type and the repack stays in place. decode() turns the two records
-// of one 32-value sub-block plus the meta of its super-block into 16 half2 weights.
-//
-// Q4_K: w = d*sc*q - dmin*m folded into one half FMA. Q2_K/Q3_K/Q5_K/Q6_K fold the same way
-// (their raw code lands exact in the 1024 + code bit pattern), so one hsub2 + one half FMA or
-// multiply per value pair; the f16 result matches the float expression of dequantize.cuh up to
-// the single f16 rounding of the scale, exactly as the Q4_K decoder has always done.
-
-// ---- Q4_K: 8 code bytes per 16 K values and lane (16 nibbles, physical slot s in byte s/2,
-// half s&1) and 16 meta bytes per 256 K values (the raw super-block header). ----
 
 template <> struct qskinny_codec<GGML_TYPE_Q4_K> {
     using record_t = uint2;
@@ -107,13 +81,10 @@ template <> struct qskinny_codec<GGML_TYPE_Q4_K> {
         *reinterpret_cast<meta_t *>(p) = meta;
     }
 
-    // the raw 16-byte super-block header (dm + scales), copied unchanged
     static __device__ __forceinline__ meta_t pack_meta(const uint8_t * block) {
         return *reinterpret_cast<const meta_t *>(block);
     }
 
-    // a 32-value sub-block uses 32 consecutive qs bytes: low nibbles for even sub-blocks, high
-    // nibbles for odd ones; group g covers the first (g&1 == 0) or second 16 values
     static __device__ __forceinline__ qskinny_code pack_record(const uint8_t * block, const int g) {
         const uint8_t * qs = block + 16;
         const int qs_base  = 32 * (g >> 2) + ((g & 1) ? 16 : 0);
@@ -128,12 +99,11 @@ template <> struct qskinny_codec<GGML_TYPE_Q4_K> {
     }
 
     static __device__ __forceinline__ uint8_t meta_byte(const uint4 meta, const int i) {
-        // scales[12] starts at byte 4 of the super-block header
+
         const unsigned word = i < 4 ? meta.y : i < 8 ? meta.z : meta.w;
         return (uint8_t) (word >> (8 * (i & 3)));
     }
 
-    // get_scale_min_k4 from dequantize.cuh, applied to the raw meta bytes
     static __device__ __forceinline__ void get_scale_min(const uint4 meta, const int j,
                                                          uint8_t & sc, uint8_t & m) {
         if (j < 4) {
@@ -145,19 +115,17 @@ template <> struct qskinny_codec<GGML_TYPE_Q4_K> {
         }
     }
 
-    // One record holds 16 nibbles in physical order. The m8n8k4 B fragment pairs physical
-    // slots (s, s+4), exactly like the Q8_0 decoder pairs bytes (i, i+4).
     static __device__ __forceinline__ void decode_record(const qskinny_code rec, half2 out[8]) {
         const unsigned rx = (unsigned) rec.lo;
         const unsigned ry = (unsigned) (rec.lo >> 32);
-        // the second byte goes to result byte 2, where the mask below reads it
+
         const unsigned pairs[4] = {
-            __byte_perm(rx, 0, 0x0200),  // bytes (0, 2)
-            __byte_perm(rx, 0, 0x0301),  // bytes (1, 3)
-            __byte_perm(ry, 0, 0x0200),  // bytes (4, 6)
-            __byte_perm(ry, 0, 0x0301),  // bytes (5, 7)
+            __byte_perm(rx, 0, 0x0200),
+            __byte_perm(rx, 0, 0x0301),
+            __byte_perm(ry, 0, 0x0200),
+            __byte_perm(ry, 0, 0x0301),
         };
-        const unsigned offset_bits = 0x64006400u; // f16 1024 in both halves
+        const unsigned offset_bits = 0x64006400u;
         const half2 offset = *reinterpret_cast<const half2 *>(&offset_bits);
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -178,7 +146,7 @@ template <> struct qskinny_codec<GGML_TYPE_Q4_K> {
         const half2 dm = *reinterpret_cast<const half2 *>(&meta.x);
         const float d    = __half2float(__low2half(dm));
         const float dmin = __half2float(__high2half(dm));
-        // f32 folding, rounded once to f16 (see 3.4 of the design note)
+
         const half2 scale2 = __float2half2_rn(d * (float) sc);
         const half2 bias2  = __float2half2_rn(-dmin * (float) m);
 #pragma unroll
@@ -187,9 +155,6 @@ template <> struct qskinny_codec<GGML_TYPE_Q4_K> {
         }
     }
 };
-
-// ---- Q5_K: same 16-byte meta as Q4_K (dm + scales), 5 code bits per value: the low 4 bits as
-// in Q4_K, the high bit from qh at byte j_in_sub, bit sub_block. ----
 
 template <> struct qskinny_codec<GGML_TYPE_Q5_K> {
     using record_t = qskinny_rec10;
@@ -256,22 +221,21 @@ template <> struct qskinny_codec<GGML_TYPE_Q5_K> {
     static __device__ __forceinline__ void decode(const qskinny_code records[2], const meta_t meta,
                                                   const int sub_block, half2 out[16]) {
         uint8_t sc, m;
-        // the meta header has the Q4_K layout (dm + 12 scale bytes)
+
         qskinny_codec<GGML_TYPE_Q4_K>::get_scale_min(meta, sub_block, sc, m);
         const half2 dm = *reinterpret_cast<const half2 *>(&meta.x);
         const float dall = __half2float(__low2half(dm));
         const float dmin = __half2float(__high2half(dm));
-        // f16 folding, rounded once to f16 like the Q4_K decoder: the 5-bit code lands exact
-        // in the 1024 + code bit pattern, one hsub2 + one hfma2 per pair
+
         const half2 scale2 = __float2half2_rn(dall * (float) sc);
         const half2 bias2  = __float2half2_rn(-dmin * (float) m);
-        const unsigned offset_bits = 0x64006400u; // f16 1024 in both halves
+        const unsigned offset_bits = 0x64006400u;
         const half2 offset = *reinterpret_cast<const half2 *>(&offset_bits);
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                // the B fragment pairs physical slots (s, s+4), logical values (2i, 2i+1)
+
                 const int s = (i & 3) + 8 * (i >> 2);
                 const unsigned q0 = qskinny_code_get(records[r], 5 * s, 5);
                 const unsigned q1 = qskinny_code_get(records[r], 5 * (s + 4), 5);
@@ -282,9 +246,6 @@ template <> struct qskinny_codec<GGML_TYPE_Q5_K> {
         }
     }
 };
-
-// ---- Q6_K: 18 meta bytes per 256 K values (16 int8 scales + d), 6 code bits per value: the
-// low 4 bits as in Q4_K, the high 2 bits from qh at byte 32*(sub_block>>2) + j_in_sub. ----
 
 template <> struct qskinny_codec<GGML_TYPE_Q6_K> {
     using record_t = qskinny_rec12;
@@ -336,7 +297,6 @@ template <> struct qskinny_codec<GGML_TYPE_Q6_K> {
         w[8] = meta.d;
     }
 
-    // scales[16] + d, copied unchanged
     static __device__ __forceinline__ meta_t pack_meta(const uint8_t * block) {
         return load_meta(block + 192);
     }
@@ -363,8 +323,8 @@ template <> struct qskinny_codec<GGML_TYPE_Q6_K> {
     static __device__ __forceinline__ void decode(const qskinny_code records[2], const meta_t meta,
                                                   const int sub_block, half2 out[16]) {
         const float d = __half2float(__ushort_as_half(meta.d));
-        // f16 folding: 1024 + q is exact for the 6-bit code, one hsub2 gives q - 32
-        const unsigned offset_bits = 0x64206420u; // f16 1056 in both halves
+
+        const unsigned offset_bits = 0x64206420u;
         const half2 offset = *reinterpret_cast<const half2 *>(&offset_bits);
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
@@ -381,8 +341,6 @@ template <> struct qskinny_codec<GGML_TYPE_Q6_K> {
         }
     }
 };
-
-// ---- Q2_K: 20 meta bytes per 256 K values (dm + 16 scale/min bytes), 2 code bits per value. ----
 
 template <> struct qskinny_codec<GGML_TYPE_Q2_K> {
     using record_t = uint32_t;
@@ -428,7 +386,6 @@ template <> struct qskinny_codec<GGML_TYPE_Q2_K> {
         w[4] = (unsigned) (meta.s_hi >> 32);
     }
 
-    // dm lives after qs in the block, the scales before it: meta keeps dm first
     static __device__ __forceinline__ meta_t pack_meta(const uint8_t * block) {
         return load_meta_from(block + 80, block);
     }
@@ -461,14 +418,14 @@ template <> struct qskinny_codec<GGML_TYPE_Q2_K> {
                                                   const int sub_block, half2 out[16]) {
         const float dall = __half2float(__ushort_as_half((unsigned short) meta.dm));
         const float dmin = __half2float(__ushort_as_half((unsigned short) (meta.dm >> 16)));
-        const unsigned offset_bits = 0x64006400u; // f16 1024 in both halves
+        const unsigned offset_bits = 0x64006400u;
         const half2 offset = *reinterpret_cast<const half2 *>(&offset_bits);
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
             const int is = 2 * sub_block + r;
             const int sc = qskinny_scale_byte(meta.s_lo, meta.s_hi, is) & 0xF;
             const int mn = qskinny_scale_byte(meta.s_lo, meta.s_hi, is) >> 4;
-            // f16 folding, rounded once to f16 like the Q4_K decoder
+
             const half2 scale2 = __float2half2_rn(dall * (float) sc);
             const half2 bias2  = __float2half2_rn(-dmin * (float) mn);
 #pragma unroll
@@ -483,9 +440,6 @@ template <> struct qskinny_codec<GGML_TYPE_Q2_K> {
         }
     }
 };
-
-// ---- Q3_K: 14 meta bytes per 256 K values (12 scale bytes + d), 3 code bits per value: the
-// low 2 bits as in Q2_K, the sign bit from hmask at byte j_in_sub, bit sub_block. ----
 
 template <> struct qskinny_codec<GGML_TYPE_Q3_K> {
     using record_t = qskinny_rec6;
@@ -515,7 +469,7 @@ template <> struct qskinny_codec<GGML_TYPE_Q3_K> {
         meta_t meta;
         meta.s_lo = (unsigned long long) w[0] | ((unsigned long long) w[1] << 16) |
                     ((unsigned long long) w[2] << 32) | ((unsigned long long) w[3] << 48);
-        // scales[8..11] then d, zero padded into the second word
+
         meta.s_hi = (unsigned long long) w[4] | ((unsigned long long) w[5] << 16) |
                     ((unsigned long long) w[6] << 32);
         return meta;
@@ -538,7 +492,6 @@ template <> struct qskinny_codec<GGML_TYPE_Q3_K> {
         }
     }
 
-    // scales[12] + d, copied unchanged
     static __device__ __forceinline__ meta_t pack_meta(const uint8_t * block) {
         return load_meta(block + 96);
     }
@@ -564,14 +517,13 @@ template <> struct qskinny_codec<GGML_TYPE_Q3_K> {
     static __device__ __forceinline__ void decode(const qskinny_code records[2], const meta_t meta,
                                                   const int sub_block, half2 out[16]) {
         const float d_all = __half2float(__ushort_as_half((unsigned short) (meta.s_hi >> 32)));
-        // f16 folding: the effective code is code2 - (hbit ? 0 : 4), in [-4, 3]. 1024 + code2 + 8
-        // (hbit set) or 1024 + code2 + 4 (hbit clear) minus 1032 gives it exactly, in one hsub2.
-        const unsigned offset_bits = 0x64086408u; // f16 1032 in both halves
+
+        const unsigned offset_bits = 0x64086408u;
         const half2 offset = *reinterpret_cast<const half2 *>(&offset_bits);
 #pragma unroll
         for (int r = 0; r < 2; ++r) {
             const int is = 2 * sub_block + r;
-            // the 6-bit scale unpack of dequantize.cuh
+
             const int8_t us = is <  4 ? (qskinny_scale_byte(meta.s_lo, meta.s_hi, is - 0) & 0xF) |
                                         (((qskinny_scale_byte(meta.s_lo, meta.s_hi, is + 8) >> 0) & 3) << 4) :
                               is <  8 ? (qskinny_scale_byte(meta.s_lo, meta.s_hi, is - 0) & 0xF) |
@@ -606,10 +558,6 @@ static_assert(qskinny_codec<GGML_TYPE_Q4_K>::record_bytes * 16 + qskinny_codec<G
 static_assert(qskinny_codec<GGML_TYPE_Q5_K>::record_bytes * 16 + qskinny_codec<GGML_TYPE_Q5_K>::meta_bytes == qskinny_codec<GGML_TYPE_Q5_K>::block_bytes, "q5_K packing");
 static_assert(qskinny_codec<GGML_TYPE_Q6_K>::record_bytes * 16 + qskinny_codec<GGML_TYPE_Q6_K>::meta_bytes == qskinny_codec<GGML_TYPE_Q6_K>::block_bytes, "q6_K packing");
 
-// ---- repack: row-major block -> codes + meta ----
-
-// One CTA per tile. src points at the first tile of the range, codes at its codes
-// destination and meta at the full meta array indexed by the global tile.
 template <ggml_type T>
 __global__ void qskinny_repack_kernel(const uint8_t * __restrict__ src, uint8_t * __restrict__ codes,
                                       uint8_t * __restrict__ meta, int n, int k, int tile0) {
@@ -628,8 +576,6 @@ __global__ void qskinny_repack_kernel(const uint8_t * __restrict__ src, uint8_t 
         codec::store_meta(codec::pack_meta(block),
                           meta + ((size_t) kb * n + (size_t) tile * 32 + lane) * codec::meta_bytes);
 
-        // 16 groups of 16 values per super-block, group g holds the first (g&1 == 0) or second
-        // 16 values of sub-block g/2
 #pragma unroll
         for (int g = 0; g < 16; ++g) {
             codec::store_record(codec::pack_record(block, g),
@@ -642,18 +588,12 @@ __global__ void qskinny_repack_kernel(const uint8_t * __restrict__ src, uint8_t 
 #endif
 }
 
-// ---- dequantize: codes + meta -> dense F16 [N][K], same layout as the Q4_K to F16 conversion ----
-
-// One CTA per (tile of 32 rows, 256-K super-block). A warp decodes one 32-value sub-block per
-// lane; a code record decodes to one output row, so the warps stage the decoded values in
-// shared memory first. That keeps the stores to global memory coalesced along K instead of one
-// 4-byte store per row.
 template <ggml_type T>
 __global__ void qskinny_to_f16_kernel(half * __restrict__ output, const uint8_t * __restrict__ codes,
                                       int n, int k) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
     using codec = qskinny_codec<T>;
-    // values_per_meta / 2 half2 per row plus 4 half2 of padding
+
     __shared__ __align__(16) half2 tile_smem[32][codec::values_per_meta / 2 + 4];
     __shared__ __align__(16) typename codec::meta_t meta_smem[32];
 
@@ -663,14 +603,12 @@ __global__ void qskinny_to_f16_kernel(half * __restrict__ output, const uint8_t 
     const int kb     = blockIdx.x;
     const int groups = k >> 4;
 
-    // one meta per lane, for the row this lane holds the codes of
     if (warp == 0) {
         meta_smem[lane] = codec::load_meta(codes + codec::codes_bytes(n, k) +
                                            (size_t) codec::meta_bytes * ((size_t) kb * n + tile * 32 + lane));
     }
     __syncthreads();
 
-    // sub-block `warp` of this super-block: records 2*warp and 2*warp+1
     const int group = kb * (codec::values_per_meta / codec::values_per_record) + 2 * warp;
     const typename codec::record_t * code_ptr = reinterpret_cast<const typename codec::record_t *>(codes);
     const qskinny_code records[2] = {
@@ -687,7 +625,6 @@ __global__ void qskinny_to_f16_kernel(half * __restrict__ output, const uint8_t 
     }
     __syncthreads();
 
-    // 4 uint4 (four half2 each) per thread
     half * out_tile = output + (size_t) tile * 32 * k + (size_t) kb * codec::values_per_meta;
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -703,8 +640,6 @@ __global__ void qskinny_to_f16_kernel(half * __restrict__ output, const uint8_t 
 #endif
 }
 
-// ---- 1Cat fp8_qpn8_sm70.cu:168-175 (mma.m8n8k4 macro, unchanged) ----
-
 #define Q4K_SKINNY_MMA_8N8K4(C, A0, A1, B0, B1)                      \
   asm volatile(                                                      \
       "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "             \
@@ -713,8 +648,6 @@ __global__ void qskinny_to_f16_kernel(half * __restrict__ output, const uint8_t 
       : "+f"(C[0]), "+f"(C[1]), "+f"(C[2]), "+f"(C[3]), "+f"(C[4]),  \
         "+f"(C[5]), "+f"(C[6]), "+f"(C[7])                           \
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
-
-// ---- 1Cat fp8_qpn8_sm70.cu:207-432 (main kernel, adapted to the codec) ----
 
 template <ggml_type T, int SplitK, int NAcc, bool M1Only = false, int RowTiles = 1>
 __global__ void q4k_skinny_kernel(
@@ -734,14 +667,13 @@ __global__ void q4k_skinny_kernel(
     const int quadpair = (lane >> 2) & 3;
     const int row = (lane & 3) + ((lane & 16) ? 4 : 0);
     const int groups_k16 = k >> 4;
-    // one iteration per 32-value sub-block; SplitK divides the sub-block count, the meta is
-    // reloaded whenever the 256-value super-block index changes
+
     const int sub_blocks = k >> 5;
     const int sub_blocks_per_warp = sub_blocks / SplitK;
     const int sub_block_begin = warp * sub_blocks_per_warp;
     const typename codec::record_t * code_ptr = reinterpret_cast<const typename codec::record_t *>(codes) +
                                                 (size_t) tile * groups_k16 * 32 + lane;
-    // meta stride and offset are per codec type
+
     const uint8_t * meta_ptr = codes + codec::codes_bytes(n, k) +
                                (size_t) codec::meta_bytes * (tile * 32 + lane);
 
@@ -763,13 +695,13 @@ __global__ void q4k_skinny_kernel(
     for (int sub_block = sub_block_begin; sub_block < sub_block_begin + sub_blocks_per_warp; ++sub_block) {
         const int kb = sub_block >> 3;
         if (kb != loaded_meta_kb) {
-            // one meta per 256 values; shared by the 8 sub-blocks that follow
+
             meta = codec::load_meta(meta_ptr + (size_t) kb * n * codec::meta_bytes);
             loaded_meta_kb = kb;
         }
 
         const int group = sub_block << 1;
-        const qskinny_code records[2] = { // record load per codec type
+        const qskinny_code records[2] = {
             codec::load_record(code_ptr + (size_t) (group + 0) * 32),
             codec::load_record(code_ptr + (size_t) (group + 1) * 32),
         };
@@ -847,7 +779,6 @@ __global__ void q4k_skinny_kernel(
     }
     __syncthreads();
 
-    // fixed reduction order over the split-K warps keeps the result reproducible
     constexpr int kOutputElements = M1Only ? 32 : RowTiles * 256;
     for (int element = threadIdx.x; element < kOutputElements;
          element += blockDim.x) {
@@ -872,11 +803,6 @@ __global__ void q4k_skinny_kernel(
 #endif
 }
 
-// ---- multiple projections of one input in one launch ----
-
-// One segment is a repacked weight (N is a multiple of 32) plus its output tile range.
-// first_tile is the running sum of n / 32 over the previous segments, so a CTA finds its
-// segment from blockIdx.x with a short scan.
 struct q4k_skinny_seg {
     const uint8_t * codes;
     int             n;
@@ -884,7 +810,6 @@ struct q4k_skinny_seg {
     int             first_tile;
 };
 
-// Passed by value. One CTA per 32-column tile, the segments cover the grid in order.
 struct q4k_skinny_multi_params {
     q4k_skinny_seg seg[4];
     int n_seg;
@@ -894,9 +819,6 @@ struct q4k_skinny_multi_params {
     int m;
 };
 
-// Same execution as q4k_skinny_kernel, but each CTA picks its segment from blockIdx.x and
-// writes to that segment's dst with its own row length. launch_bounds keeps the register
-// count at the single-kernel level so a row tile fits two CTAs per SM.
 template <ggml_type T, int SplitK, int NAcc, bool M1Only = false, int RowTiles = 1>
 __global__ void __launch_bounds__(32 * SplitK, RowTiles == 1 ? 2 : 1)
 q4k_skinny_multi_kernel(const q4k_skinny_multi_params p) {
@@ -930,7 +852,7 @@ q4k_skinny_multi_kernel(const q4k_skinny_multi_params p) {
     const int sub_block_begin = warp * sub_blocks_per_warp;
     const typename codec::record_t * code_ptr = reinterpret_cast<const typename codec::record_t *>(codes) +
                                                 (size_t) tile * groups_k16 * 32 + lane;
-    // meta stride and offset are per codec type
+
     const uint8_t * meta_ptr = codes + codec::codes_bytes(n, k) +
                                (size_t) codec::meta_bytes * (tile * 32 + lane);
 
@@ -957,7 +879,7 @@ q4k_skinny_multi_kernel(const q4k_skinny_multi_params p) {
         }
 
         const int group = sub_block << 1;
-        const qskinny_code records[2] = { // record load per codec type
+        const qskinny_code records[2] = {
             codec::load_record(code_ptr + (size_t) (group + 0) * 32),
             codec::load_record(code_ptr + (size_t) (group + 1) * 32),
         };
@@ -1035,7 +957,6 @@ q4k_skinny_multi_kernel(const q4k_skinny_multi_params p) {
     }
     __syncthreads();
 
-    // fixed reduction order over the split-K warps keeps the result reproducible
     constexpr int kOutputElements = M1Only ? 32 : RowTiles * 256;
     for (int element = threadIdx.x; element < kOutputElements;
          element += blockDim.x) {
@@ -1060,15 +981,6 @@ q4k_skinny_multi_kernel(const q4k_skinny_multi_params p) {
 #endif
 }
 
-// ---- gated pair: the gate and up projections of one SwiGLU in one launch ----
-
-// gate and up are two separate tensors: the block computes the two projections in two
-// phases with the same split-K, accumulator chains and reduction order as two
-// q4k_skinny_kernel launches, so each projection is bit-exact with its single-weight
-// launch. Phase 0 keeps its reduced gate in registers; the phase 1 epilogue applies
-// silu(gate) * up with the ggml_cuda_op_silu_single formula and writes float.
-// launch_bounds keeps the register count at the single-kernel level so a row tile fits
-// two CTAs per SM; the phase loop is not unrolled to keep the body shared.
 template <ggml_type T, int SplitK, int NAcc, bool M1Only = false, int RowTiles = 1>
 __global__ void __launch_bounds__(32 * SplitK, RowTiles == 1 ? 2 : 1)
 q4k_skinny_gated_kernel(
@@ -1093,8 +1005,7 @@ q4k_skinny_gated_kernel(
     const int sub_blocks = k >> 5;
     const int sub_blocks_per_warp = sub_blocks / SplitK;
     const int sub_block_begin = warp * sub_blocks_per_warp;
-    // the reduced gate of phase 0 stays in registers: each thread keeps the values of its
-    // own strided loop, so the shared footprint matches the single-weight kernel
+
     float gate_red[(kOutputElements + 32 * SplitK - 1) / (32 * SplitK)];
 
 #pragma unroll 1
@@ -1102,7 +1013,7 @@ q4k_skinny_gated_kernel(
         const uint8_t * codes = projection ? up_codes : gate_codes;
         const typename codec::record_t * code_ptr = reinterpret_cast<const typename codec::record_t *>(codes) +
                                                     (size_t) tile * groups_k16 * 32 + lane;
-        // meta stride and offset are per codec type
+
         const uint8_t * meta_ptr = codes + codec::codes_bytes(n, k) +
                                    (size_t) codec::meta_bytes * (tile * 32 + lane);
 
@@ -1129,7 +1040,7 @@ q4k_skinny_gated_kernel(
             }
 
             const int group = sub_block << 1;
-            const qskinny_code records[2] = { // record load per codec type
+            const qskinny_code records[2] = {
                 codec::load_record(code_ptr + (size_t) (group + 0) * 32),
                 codec::load_record(code_ptr + (size_t) (group + 1) * 32),
             };
@@ -1238,9 +1149,6 @@ q4k_skinny_gated_kernel(
 #endif
 }
 
-// Split-K 16 for the long K weights, 8 for the smallest ones (k = 256 has only 8 sub-blocks
-// per tile). can_repack guarantees k % 256 == 0, so one of the two always divides the
-// sub-block count. The long K weights use two accumulator chains, as in the Q8_0 path.
 struct q4k_skinny_config {
     int  split_k;
     int  n_acc;
@@ -1267,7 +1175,6 @@ static void q4k_skinny_launch(const uint8_t * codes, const half * input, float *
         }                                                                                       \
     } while (0)
 
-// the launch table is instantiated per codec type
 template <ggml_type T>
 static void q4k_skinny_mul_mat_launch_t(const uint8_t * codes, const half * input, float * output,
                                         int n, int k, int m, cudaStream_t stream) {
@@ -1283,7 +1190,7 @@ static void q4k_skinny_mul_mat_launch_t(const uint8_t * codes, const half * inpu
 }
 
 #undef Q4K_SKINNY_LAUNCH
-// Same epilogue as q4k_skinny_gated_kernel, applied after both projections of an M > 16 run.
+
 __global__ void q4k_skinny_swiglu_kernel(float * __restrict__ gate, const float * __restrict__ up,
                                          int count) {
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < count; i += gridDim.x * blockDim.x) {
@@ -1305,7 +1212,6 @@ static void q4k_skinny_multi_launch(const q4k_skinny_multi_params & p, cudaStrea
         }                                                                                        \
     } while (0)
 
-// the launch table is instantiated per codec type
 template <ggml_type T>
 static void q4k_skinny_multi_mul_mat_launch_t(const q4k_skinny_multi_params & p, cudaStream_t stream) {
     const q4k_skinny_config config = q4k_skinny_config_for(p.k);
@@ -1333,8 +1239,6 @@ static void q4k_skinny_multi_mul_mat_launch(ggml_type type, const q4k_skinny_mul
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Same split-K/accumulator-chain table as the single-weight kernel, so a projection is
-// bit-exact with its own q4k_skinny_kernel launch.
 template <ggml_type T, int SplitK, int NAcc, bool M1Only, int RowTiles>
 static void q4k_skinny_gated_launch(const uint8_t * gate_codes, const uint8_t * up_codes,
                                     const half * input, float * output, int n, int k, int m,
@@ -1353,7 +1257,6 @@ static void q4k_skinny_gated_launch(const uint8_t * gate_codes, const uint8_t * 
         }                                                                                      \
     } while (0)
 
-// the launch table is instantiated per codec type
 template <ggml_type T>
 static void q4k_skinny_gated_mul_mat_launch_t(const uint8_t * gate_codes, const uint8_t * up_codes,
                                               const half * input, float * output, int n, int k, int m,
@@ -1385,12 +1288,6 @@ static void q4k_skinny_gated_mul_mat_launch(ggml_type type, const uint8_t * gate
     CUDA_CHECK(cudaGetLastError());
 }
 
-// ---- M=32 two-phase kernel (1Cat fp8_qpn8_sm70.cu:445-573, adapted to the codec) ----
-
-// M=32 needs four 8-row accumulator tiles. Keeping all logical split-K warps resident would
-// need 64 KiB of reduction storage for split-16, so half of the physical warps run the
-// original logical warp ranges in two ordered phases. The compact first-half sum keeps the
-// final reduction in the p0 + ... + p(SplitK-1) order at 36 KiB of shared memory.
 template <ggml_type T, int SplitK>
 __global__ void q4k_skinny_m32_kernel(
     const uint8_t * __restrict__ codes, const half * __restrict__ input,
@@ -1414,7 +1311,7 @@ __global__ void q4k_skinny_m32_kernel(
     const int sub_blocks_per_warp = sub_blocks / SplitK;
     const typename codec::record_t * code_ptr = reinterpret_cast<const typename codec::record_t *>(codes) +
                                                 (size_t) tile * groups_k16 * 32 + lane;
-    // meta stride and offset are per codec type
+
     const uint8_t * meta_ptr = codes + codec::codes_bytes(n, k) +
                                (size_t) codec::meta_bytes * (tile * 32 + lane);
 
@@ -1445,7 +1342,7 @@ __global__ void q4k_skinny_m32_kernel(
             }
 
             const int group = sub_block << 1;
-            const qskinny_code records[2] = { // record load per codec type
+            const qskinny_code records[2] = {
                 codec::load_record(code_ptr + (size_t) (group + 0) * 32),
                 codec::load_record(code_ptr + (size_t) (group + 1) * 32),
             };
@@ -1525,8 +1422,6 @@ __global__ void q4k_skinny_m32_kernel(
 
 #undef Q4K_SKINNY_MMA_8N8K4
 
-// Only split-16 is enabled in the launcher below: the shapes that reach M > 16 all select
-// split 16, and the kernel keeps the 1Cat split-12 variant unused.
 template <ggml_type T>
 static void q4k_skinny_m32_mul_mat_launch(const uint8_t * codes, const half * input,
                                           float * output, int n, int k, int m,
@@ -1537,9 +1432,6 @@ static void q4k_skinny_m32_mul_mat_launch(const uint8_t * codes, const half * in
     CUDA_CHECK(cudaGetLastError());
 }
 
-// Dispatches an already F16-converted input: M <= 16 keeps the single-stage kernel, M = 17..32
-// uses the two-phase M=32 kernel and M = 33..64 runs it on two row blocks. Shapes whose
-// split-K is not 16 have no M > 16 kernel and return false so the caller can fall back.
 template <ggml_type T>
 static bool q4k_skinny_mul_mat_dispatch_t(const uint8_t * codes, const half * input, float * output,
                                           int n, int k, int m, cudaStream_t stream) {
@@ -1561,7 +1453,6 @@ static bool q4k_skinny_mul_mat_dispatch_t(const uint8_t * codes, const half * in
     return true;
 }
 
-// the dispatch is instantiated per codec type
 static bool q4k_skinny_mul_mat_dispatch(ggml_type type, const uint8_t * codes, const half * input,
                                         float * output, int n, int k, int m, cudaStream_t stream) {
     switch (type) {
@@ -1601,7 +1492,7 @@ bool ggml_cuda_q4k_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const g
     if (!ggml_cuda_q4k_skinny_is_repacked(gate_w) || !ggml_cuda_q4k_skinny_is_repacked(up_w)) {
         return false;
     }
-    // the gated kernel runs one codec type for both projections
+
     if (gate_w->type != up_w->type) {
         return false;
     }
@@ -1613,11 +1504,10 @@ bool ggml_cuda_q4k_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const g
             !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
             src1->ne[2] != 1 || src1->ne[3] != 1 ||
             dst->ne[0] != n || dst->ne[1] != m || dst->ne[2] != 1 || dst->ne[3] != 1 ||
-            m < 1 || m > 64) { // M=32 kernel
+            m < 1 || m > 64) {
         return false;
     }
-    // M = 17..64 uses the two-phase M=32 kernel, which only exists for split-16 shapes;
-    // return false before any allocation so the caller can fall back
+
     if (m > 16 && q4k_skinny_config_for(k).split_k != 16) {
         return false;
     }
@@ -1634,8 +1524,6 @@ bool ggml_cuda_q4k_skinny_mul_mat_gated(ggml_backend_cuda_context & ctx, const g
         return true;
     }
 
-    // M = 17..64 runs both projections with the M=32 kernel, then the SwiGLU epilogue, with
-    // the same silu formula as the fused kernel
     float * gate = (float *) dst->data;
     ggml_cuda_pool_alloc<float> up(ctx.pool(), n * m);
     GGML_ASSERT(q4k_skinny_mul_mat_dispatch(gate_w->type, (const uint8_t *) gate_w->data, input.get(), gate,
@@ -1658,11 +1546,10 @@ bool ggml_cuda_q4k_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
     const int64_t k = src0s[0]->ne[0];
     const int64_t m = src1->ne[1];
     if (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
-            src1->ne[2] != 1 || src1->ne[3] != 1 || m < 1 || m > 64) { // M=32 kernel
+            src1->ne[2] != 1 || src1->ne[3] != 1 || m < 1 || m > 64) {
         return false;
     }
-    // M = 17..64 uses the two-phase M=32 kernel, which only exists for split-16 shapes;
-    // return false before any allocation so the caller can fall back
+
     if (m > 16 && q4k_skinny_config_for(k).split_k != 16) {
         return false;
     }
@@ -1676,7 +1563,7 @@ bool ggml_cuda_q4k_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
         ggml_tensor * dst = dsts[i];
         const int64_t n = w->ne[1];
         if (!ggml_cuda_q4k_skinny_is_repacked(w) ||
-                // the multi kernel runs one codec type for all segments
+
                 w->type != src0s[0]->type ||
                 w->ne[0] != k || w->ne[2] != 1 || w->ne[3] != 1 || !ggml_is_contiguous(w) ||
                 dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) ||
@@ -1704,8 +1591,6 @@ bool ggml_cuda_q4k_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
         return true;
     }
 
-    // M = 17..64 has no segment dispatch in the M=32 kernel, so each repacked weight gets
-    // its own launch from the one converted input (the group is homogeneous)
     for (int s = 0; s < p.n_seg; ++s) {
         const q4k_skinny_seg & seg = p.seg[s];
         GGML_ASSERT(q4k_skinny_mul_mat_dispatch(src0s[s]->type, seg.codes, p.input, seg.dst, seg.n,
@@ -1714,7 +1599,7 @@ bool ggml_cuda_q4k_skinny_mul_mat_multi(ggml_backend_cuda_context & ctx,
     return true;
 }
 
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif
 
 bool ggml_cuda_q4k_skinny_is_repacked(const ggml_tensor * t) {
     return t->extra == (const void *) &q4k_skinny_marker;
@@ -1725,9 +1610,7 @@ bool ggml_cuda_q4k_skinny_can_repack(const ggml_tensor * t) {
     GGML_UNUSED(t);
     return false;
 #else
-    // the codec family serves Q2_K/Q3_K/Q4_K/Q5_K/Q6_K (see qskinny_codec) and all
-    // five are repacked at runtime. Their compute moves from the MMVQ q8_1 path to F16, which
-    // changes greedy tokens at ulp level; that is the intended cost of covering the mixed types.
+
     switch (t->type) {
         case GGML_TYPE_Q2_K:
         case GGML_TYPE_Q3_K:
@@ -1755,16 +1638,13 @@ bool ggml_cuda_q4k_skinny_can_repack(const ggml_tensor * t) {
     }
     const int64_t k = t->ne[0];
     const int64_t n = t->ne[1];
-    // a whole number of 256-value super-blocks (k % 256 == 0) and whole 32-row tiles; k >= 256
-    // keeps the split-K, the M=1 specialization and the to_f16 tile loop non-empty. Under
-    // tensor split a device can hold an empty K slice, such a weight is never multiplied.
+
     return k >= 256 && k % 256 == 0 && n % 32 == 0 && n >= 32;
 #endif
 }
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
-// the repack kernel is instantiated per codec type
 template <ggml_type T>
 static void q4k_skinny_repack_tiles(const void * staging, uint8_t * codes, uint8_t * meta,
                                     int n, int k, int t0, int t1, cudaStream_t stream) {
@@ -1791,8 +1671,7 @@ void ggml_cuda_q4k_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_t
     const int64_t n = t->ne[1];
     const int64_t ntiles = n / 32;
     GGML_ASSERT(k >= 256 && ntiles >= 1);
-    // one codec record per 16 K values and row, one meta per 256 K values and row;
-    // 16*record_bytes + meta_bytes is the block size, so codes + meta fill the tensor
+
     const size_t record_bytes = t->type == GGML_TYPE_Q2_K ? 4  :
                                 t->type == GGML_TYPE_Q3_K ? 6  :
                                 t->type == GGML_TYPE_Q5_K ? 10 :
@@ -1822,10 +1701,6 @@ void ggml_cuda_q4k_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_t
     CUDA_CHECK(cudaMalloc(&staging, tiles_per_chunk * tile_src_bytes));
     CUDA_CHECK(cudaMalloc(&meta_tmp, meta_total));
 
-    // Chunk [t0, t1) writes codes to [t0*tile_dst, t1*tile_dst), which ends before the source
-    // [t1*tile_src, ...) of the remaining tiles (tile_dst <= tile_src), and its own source was
-    // copied to staging first. The meta region [codes_total, codes_total + meta_total) overlaps
-    // the sources of the last tiles, so it is written only after all codes are done.
     for (int64_t t0 = 0; t0 < ntiles; t0 += (int64_t) tiles_per_chunk) {
         const int64_t t1 = std::min(t0 + (int64_t) tiles_per_chunk, ntiles);
         CUDA_CHECK(cudaMemcpyAsync(staging, data + t0 * tile_src_bytes, (t1 - t0) * tile_src_bytes,
@@ -1836,7 +1711,6 @@ void ggml_cuda_q4k_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_t
     CUDA_CHECK(cudaMemcpyAsync(data + codes_total, meta_tmp, meta_total,
                                cudaMemcpyDeviceToDevice, stream));
 
-    // no pool: the staging must not stay resident after the one-time repack
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(staging));
     CUDA_CHECK(cudaFree(meta_tmp));
@@ -1845,14 +1719,11 @@ void ggml_cuda_q4k_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_t
 }
 
 void ggml_cuda_q4k_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph) {
-    // The idle counter is shared with the Q8_0 prepass, which controls the scan rate for both:
-    // once it reaches 1024, neither prepass finds anything new, so the graph walk is skipped.
-    // This prepass never modifies the counter so that the Q8_0 behaviour is unchanged.
+
     if (ctx.q8_skinny_idle_scans >= 1024) {
         return;
     }
 
-    // candidates: Q4_K weights used as MUL_MAT src0; none in steady state
     std::vector<ggml_tensor *> candidates;
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -1871,16 +1742,12 @@ void ggml_cuda_q4k_skinny_prepass(ggml_backend_cuda_context & ctx, ggml_cgraph *
         return;
     }
 
-    // repacking cannot be recorded into a CUDA graph; the capture is checked only here so that
-    // the steady state costs no CUDA API call
     cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
     CUDA_CHECK(cudaStreamIsCapturing(ctx.stream(), &capture_status));
     if (capture_status != cudaStreamCaptureStatusNone) {
         return;
     }
 
-    // Repacked data can only be read by the new kernel, so drop candidates that are read
-    // anywhere else (non-MUL_MAT src, MUL_MAT src1) or viewed by another tensor.
     for (int i = 0; i < cgraph->n_nodes && !candidates.empty(); ++i) {
         const ggml_tensor * node = cgraph->nodes[i];
         if (node->view_src != nullptr) {
@@ -1913,7 +1780,7 @@ void ggml_cuda_q4k_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStrea
     const int k = (int) src0->ne[0];
     const uint8_t * data = (const uint8_t *) src0->data;
     const dim3 grid((unsigned) (k / 256), (unsigned) (n / 32), 1);
-    // the dequantize kernel is instantiated per codec type
+
     switch (src0->type) {
         case GGML_TYPE_Q2_K: qskinny_to_f16_kernel<GGML_TYPE_Q2_K><<<grid, 256, 0, stream>>>(dst, data, n, k); break;
         case GGML_TYPE_Q3_K: qskinny_to_f16_kernel<GGML_TYPE_Q3_K><<<grid, 256, 0, stream>>>(dst, data, n, k); break;
@@ -1925,7 +1792,7 @@ void ggml_cuda_q4k_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStrea
     CUDA_CHECK(cudaGetLastError());
 }
 
-#else // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#else
 
 void ggml_cuda_q4k_skinny_repack_inplace(ggml_backend_cuda_context & ctx, ggml_tensor * t) {
     GGML_UNUSED(ctx);
@@ -1952,4 +1819,4 @@ void ggml_cuda_q4k_skinny_to_f16(const ggml_tensor * src0, half * dst, cudaStrea
     GGML_UNUSED(stream);
 }
 
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif

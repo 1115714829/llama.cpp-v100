@@ -1,24 +1,5 @@
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 #include "../src/llama-kv-cells.h"
 #include "../src/llama-hparams.h"
 
@@ -37,7 +18,6 @@ struct ring {
     ring(uint32_t size, uint32_t n_swa) : n_swa(n_swa) {
         cells.resize(size);
     }
-
 
     std::vector<uint32_t> find_slot(uint32_t n_tokens) const {
         const uint32_t size = cells.size();
@@ -68,8 +48,6 @@ struct ring {
         return idxs;
     }
 
-
-
     void seq_rm(llama_pos p0, llama_pos p1) {
         const bool ring_tail = cells.seq_n_cells(0) > 0 && p0 > cells.seq_pos_min(0) && p1 > cells.seq_pos_max(0);
         uint32_t new_head  = cells.size();
@@ -88,7 +66,6 @@ struct ring {
             head = new_head;
         }
     }
-
 
     void apply(const std::vector<uint32_t> & idxs, llama_pos p0) {
         llama_pos pos_max_rm = -1;
@@ -121,7 +98,6 @@ struct stats {
     int n_fail       = 0;
 };
 
-
 static bool range_ok_old(const ring & r) {
     const llama_kv_cells & c = r.cells;
     const uint32_t n = c.get_used();
@@ -147,7 +123,6 @@ static bool range_ok_old(const ring & r) {
     return true;
 }
 
-
 static bool feed(ring & r, llama_pos p0, uint32_t n, stats & st, const char * what) {
     const std::vector<uint32_t> idxs = r.find_slot(n);
     if (idxs.empty()) {
@@ -160,7 +135,6 @@ static bool feed(ring & r, llama_pos p0, uint32_t n, stats & st, const char * wh
 
     const llama_kv_cells & c = r.cells;
     const uint32_t size = c.size();
-
 
     const bool base = c.get_used() > 0 && c.seq_n_cells(0) == c.get_used() && r.n_swa + n <= size;
     const int64_t oldest = base ? llama_kv_cells_ring_oldest(c, r.head) : -1;
@@ -184,7 +158,6 @@ static bool feed(ring & r, llama_pos p0, uint32_t n, stats & st, const char * wh
         const llama_pos p = p0 + (llama_pos) i;
         int32_t row[4];
         llama_kv_cells_ring_window(size, (uint32_t) oldest, idxs[i], r.n_swa, row);
-
 
         size_t n_got = 0;
         size_t n_want = 0;
@@ -215,7 +188,6 @@ static int test_spec(uint32_t n_swa, uint32_t n_ub, uint32_t n_rounds, uint32_t 
     ring r(size, n_swa);
     stats st;
     std::mt19937 rng(seed);
-
 
     llama_pos pos = 1000;
     const uint32_t n_prompt = n_swa + n_ub/4;
@@ -294,7 +266,6 @@ static int test_random(uint32_t n_swa, uint32_t n_ub, uint32_t n_ops, uint32_t s
             if (hi - lo > 4) {
                 const llama_pos p0 = lo + 1 + (llama_pos) (rng() % (uint32_t) (hi - lo - 2));
                 r.seq_rm(p0, p0 + 1);
-
 
                 if (rng() % 2) {
                     r.seq_rm(p0, std::numeric_limits<llama_pos>::max());

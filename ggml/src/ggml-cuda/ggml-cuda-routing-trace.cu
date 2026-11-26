@@ -20,35 +20,12 @@
 
 #if !defined(GGML_USE_MUSA) && !defined(GGML_USE_HIP)
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 namespace {
-
-
-
 
 constexpr uint32_t TRACE_VERSION      = 1;
 constexpr uint32_t TRACE_HEADER_BYTES = 32;
 
-
-
-
 constexpr uint32_t TRACE_REC_PREFILL = 1u << 1;
-
 
 constexpr size_t TRACE_MAX_EVENTS = 1024;
 
@@ -86,7 +63,6 @@ struct trace_device_state {
 
     std::vector<int32_t> stage;
 
-
     FILE *   file = nullptr;
     uint32_t n_layer  = 0;
     uint32_t n_expert = 0;
@@ -96,8 +72,6 @@ struct trace_device_state {
 std::mutex g_trace_mutex;
 trace_device_state * g_trace_dev[GGML_CUDA_MAX_DEVICES] = {};
 
-
-
 static bool trace_enabled_cached() {
     return ggml_expert_store_trace_enabled();
 }
@@ -105,8 +79,6 @@ static bool trace_enabled_cached() {
 static void put16(uint8_t * p, uint16_t v) { memcpy(p, &v, 2); }
 static void put32(uint8_t * p, uint32_t v) { memcpy(p, &v, 4); }
 static void put64(uint8_t * p, uint64_t v) { memcpy(p, &v, 8); }
-
-
 
 static void trace_write_header(trace_device_state * state) {
     if (state->file == nullptr) {
@@ -130,8 +102,6 @@ static void trace_write_header(trace_device_state * state) {
     }
     fflush(state->file);
 }
-
-
 
 static void trace_open_file(trace_device_state * state, bool multi_device) {
     const std::string base = ggml_expert_store_get_trace_path();
@@ -185,8 +155,6 @@ static void trace_open_file(trace_device_state * state, bool multi_device) {
     GGML_LOG_INFO("%s: device %d: writing a routing trace to '%s'\n", __func__, state->device, path.c_str());
 }
 
-
-
 static void drain_record(trace_device_state * state, const trace_record & rec) {
     if (rec.ev != nullptr) {
         CUDA_CHECK(cudaEventSynchronize(rec.ev));
@@ -202,8 +170,6 @@ static void drain_record(trace_device_state * state, const trace_record & rec) {
     }
 
     if (state->file != nullptr) {
-
-
 
         const uint32_t n_layer  = std::max(state->n_layer, rec.layer + 1);
         uint32_t n_expert = state->n_expert;
@@ -227,7 +193,6 @@ static void drain_record(trace_device_state * state, const trace_record & rec) {
             GGML_LOG_ERROR("%s: device %d: cannot write a routing trace record\n", __func__, state->device);
         }
     }
-
 
     {
         std::lock_guard<std::mutex> slock(state->m);
@@ -291,7 +256,8 @@ static trace_device_state * get_device_state(int device) {
         return nullptr;
     }
 
-    trace_open_file(state, ggml_backend_cuda_get_device_count() > 1);
+    const int n_model_devices = ggml_expert_store_n_devices();
+    trace_open_file(state, (n_model_devices > 0 ? n_model_devices : ggml_backend_cuda_get_device_count()) > 1);
 
     state->thread = std::thread(drain_thread, state);
     g_trace_dev[device] = state;
@@ -299,7 +265,6 @@ static trace_device_state * get_device_state(int device) {
         __func__, device, (long long) pow2, (double) pow2 * sizeof(int32_t) / 1024.0 / 1024.0);
     return state;
 }
-
 
 __global__ void routing_trace_kernel(
         const int32_t * __restrict__ ids, const int64_t n_entries, const int n_expert_used,
@@ -312,8 +277,6 @@ __global__ void routing_trace_kernel(
     const int     slot  = (int) (i - token * n_expert_used);
     ring[(base + i) & mask] = ids[token * ids_stride + slot];
 }
-
-
 
 static int trace_tensor_layer(const ggml_tensor * t) {
     const char * p = strstr(t->name, "blk.");
@@ -332,7 +295,7 @@ static int trace_tensor_layer(const ggml_tensor * t) {
     return layer;
 }
 
-} // namespace
+}
 
 bool ggml_cuda_routing_trace_enabled(void) {
     return trace_enabled_cached();
@@ -370,15 +333,11 @@ void ggml_cuda_routing_trace_record(const ggml_tensor * src0, const ggml_tensor 
         return;
     }
 
-
-
-
     std::lock_guard<std::mutex> lock(state->m);
 
     if (state->k == 0) {
         state->k = (uint32_t) k;
     } else if (state->k != (uint32_t) k) {
-
 
         GGML_ABORT("%s: n_expert_used changed from %u to %lld during the trace\n",
             __func__, state->k, (long long) k);
@@ -387,8 +346,6 @@ void ggml_cuda_routing_trace_record(const ggml_tensor * src0, const ggml_tensor 
     if (state->has_last && layer == state->last_layer) {
         return;
     }
-
-
 
     if (state->has_last && layer < state->last_layer) {
         state->step++;
@@ -401,7 +358,6 @@ void ggml_cuda_routing_trace_record(const ggml_tensor * src0, const ggml_tensor 
         state->dropped++;
         return;
     }
-
 
     cudaEvent_t ev = nullptr;
     if (!state->ev_free.empty()) {
@@ -496,7 +452,6 @@ void ggml_cuda_routing_trace_shutdown_all(void) {
 }
 
 #else
-
 
 bool ggml_cuda_routing_trace_enabled(void) {
     return false;

@@ -1,5 +1,8 @@
 <script lang="ts">
 	import '../app.css';
+	import Monitor from '$lib/components/telemetry/Monitor.svelte';
+	import TelemetrySidebar from '$lib/components/telemetry/Sidebar.svelte';
+	import { locale } from '$lib/stores/locale.svelte';
 	import { browser } from '$app/environment';
 	import { goto } from '$app/navigation';
 	import { base } from '$app/paths';
@@ -38,6 +41,7 @@
 	import { pwaAssetsHead } from 'virtual:pwa-assets/head';
 
 	let { children } = $props();
+	let monitor: ReturnType<typeof Monitor>;
 
 	// migrations and store startup, ordered explicitly instead of import side effects
 	void initStores();
@@ -181,6 +185,7 @@
 	}
 
 	onMount(() => {
+		locale.restore();
 		updateFavicon();
 		// snapshot of every backend running stream on first load, populates the sidebar spinners
 		// so the user sees each conv that has a live inference, even ones not opened yet
@@ -314,6 +319,7 @@
 <svelte:document onvisibilitychange={handleVisibilityChange} />
 
 <Tooltip.Provider delayDuration={TOOLTIP_DELAY_DURATION}>
+	<div class="sticky top-0 z-40"><Monitor bind:this={monitor} /></div>
 	<div class="flex flex-col md:flex-row">
 		<SidebarNavigation
 			onSearchClick={() => {
@@ -331,6 +337,9 @@
 		<div class="min-w-0 flex-1">
 			{@render children?.()}
 		</div>
+		{#if page.route.id?.startsWith('/(chat)')}
+			<TelemetrySidebar openDetails={() => monitor.openDetails()} />
+		{/if}
 	</div>
 
 	<ModeWatcher />

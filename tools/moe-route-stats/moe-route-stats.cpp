@@ -1,18 +1,5 @@
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
 #include "arg.h"
 #include "common.h"
 #include "log.h"
@@ -80,7 +67,6 @@ static bool moe_route_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         return true;
     }
 
-
     if (t->nb[0] != ggml_element_size(t)) {
         static bool warned = false;
         if (!warned) {
@@ -100,7 +86,6 @@ static bool moe_route_cb(struct ggml_tensor * t, bool ask, void * user_data) {
         }
         return true;
     }
-
 
     const size_t nbytes = ggml_nbytes(t);
     st.ids.resize((nbytes + sizeof(uint32_t) - 1) / sizeof(uint32_t));
@@ -151,7 +136,6 @@ static void print_cache_hit_rates(const char * phase, const std::vector<uint32_t
         return;
     }
 
-
     std::vector<int64_t> sorted(count.begin(), count.end());
     std::sort(sorted.begin(), sorted.end(), std::greater<int64_t>());
 
@@ -167,7 +151,6 @@ static void print_cache_hit_rates(const char * phase, const std::vector<uint32_t
         }
         LOG_INF("  N = %5d : %6.2f%%\n", n, 100.0 * (double) hit / (double) total);
     }
-
 
     LOG_INF("%s : cache hit rate, per-layer top-(N/n_layer):\n", phase);
     for (int i = 0; i < n_cache_sizes; ++i) {
@@ -205,7 +188,6 @@ static bool save_stats(const std::string & fname, const moe_stats & st, uint32_t
     f.write((const char *) header, sizeof(header));
     f.write((const char *) st.count_prefill.data(), st.count_prefill.size() * sizeof(uint32_t));
     f.write((const char *) st.count_decode.data(),  st.count_decode.size()  * sizeof(uint32_t));
-
 
     std::vector<uint16_t> trace = st.trace;
     const size_t trace_size = (size_t) n_decode_tokens * st.n_layer * st.n_used;
@@ -310,7 +292,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-
     const int n_batch = params.n_batch > 0 ? std::min(params.n_batch, (int) llama_n_batch(ctx)) : (int) llama_n_batch(ctx);
 
     LOG_INF("%s : %zu prompt tokens, prefill in chunks of %d\n", __func__, tokens.size(), n_batch);
@@ -324,7 +305,6 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
-
 
     llama_sampler * smpl = llama_sampler_init_greedy();
 

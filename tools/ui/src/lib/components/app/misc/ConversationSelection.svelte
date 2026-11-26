@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import SearchInput from '$lib/components/app/forms/SearchInput.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Checkbox } from '$lib/components/ui/checkbox';
@@ -172,7 +173,7 @@
 	</div>
 
 	<div class="flex justify-end gap-2">
-		<Button onclick={handleCancel} variant="outline">Cancel</Button>
+		<Button onclick={handleCancel} variant="outline">{tr("Cancel")}</Button>
 
 		<Button disabled={selectedIds.size === 0} onclick={handleConfirm}>
 			{mode === 'export' ? 'Export' : 'Import'} ({selectedIds.size})

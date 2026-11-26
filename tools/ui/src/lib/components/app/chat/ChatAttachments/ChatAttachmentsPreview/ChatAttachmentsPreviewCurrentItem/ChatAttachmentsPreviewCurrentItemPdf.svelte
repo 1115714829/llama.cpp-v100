@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Eye, FileText, Info } from '@lucide/svelte';
 	import { SyntaxHighlightedCode } from '$lib/components/app';
 	import * as Alert from '$lib/components/ui/alert';
@@ -117,7 +118,7 @@
 	<Alert.Root class="mb-4 max-w-4xl">
 		<Info class={ICON_CLASS_DEFAULT} />
 
-		<Alert.Title>Preview only</Alert.Title>
+		<Alert.Title>{tr("Preview only")}</Alert.Title>
 
 		<Alert.Description>
 			<span class="inline-flex">
@@ -143,7 +144,7 @@
 				class="mx-auto mb-4 h-8 w-8 animate-spin rounded-full border-4 border-white border-t-transparent"
 			></div>
 
-			<p class="text-white/70">Converting PDF to images...</p>
+			<p class="text-white/70">{tr("Converting PDF to images...")}</p>
 		</div>
 	</div>
 {:else if pdfImagesError}
@@ -151,7 +152,7 @@
 		<div class="text-center">
 			<FileText class="mx-auto mb-4 h-16 w-16 text-white/50" />
 
-			<p class="mb-4 text-white/70">Failed to load PDF images</p>
+			<p class="mb-4 text-white/70">{tr("Failed to load PDF images")}</p>
 
 			<p class="text-sm text-white/50">{pdfImagesError}</p>
 		</div>
@@ -169,7 +170,7 @@
 		<div class="text-center">
 			<FileText class="mx-auto mb-4 h-16 w-16 text-white/50" />
 
-			<p class="text-white/70">No PDF pages available</p>
+			<p class="text-white/70">{tr("No PDF pages available")}</p>
 		</div>
 	</div>
 {/if}

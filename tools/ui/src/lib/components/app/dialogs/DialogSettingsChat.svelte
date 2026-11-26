@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { Settings, X } from '@lucide/svelte';
 	import { SettingsChat } from '$lib/components/app/settings';
 	import * as Dialog from '$lib/components/ui/dialog';
@@ -28,7 +29,7 @@
 			<Dialog.Title class="flex items-center gap-2">
 				<Settings class="h-5 w-5" />
 
-				<span>Settings</span>
+				<span>{tr("Settings")}</span>
 			</Dialog.Title>
 
 			<!-- the body is flush with the dialog, so the corner close needs its own inset -->
@@ -37,7 +38,7 @@
 			>
 				<X class="size-4" />
 
-				<span class="sr-only">Close</span>
+				<span class="sr-only">{tr("Close")}</span>
 			</Dialog.Close>
 		</Dialog.Header>
 

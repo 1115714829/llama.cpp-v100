@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { tr } from '$lib/stores/locale.svelte';
 	import { ChevronDown, ShieldQuestion } from '@lucide/svelte';
 	import { ChatMessageActionCard } from '$lib/components/app';
 	import { Button, buttonVariants } from '$lib/components/ui/button';
@@ -51,7 +52,7 @@
 
 			<DropdownMenu.Content align="start" class="min-w-[8rem]">
 				<DropdownMenu.Item onclick={() => onDecision(ToolPermissionDecision.ALWAYS)}>
-					Always allow <pre>{toolName}</pre>
+					{tr("Always allow")} <pre>{toolName}</pre>
 					tool
 				</DropdownMenu.Item>
 
