@@ -93,7 +93,7 @@ So updates will definitely slow down; please plan accordingly. The project will 
 | x86 32 GB Reference | **2 × 32 GB** | x86_64, 104 cores, 252 GB; 2 × V100-SXM2-32GB intra-island NVLink2; PCIe 3.0; CUDA 12.8 | **2318.28** | **65.20** | 77.20 / 84.49 / 62.56 *(2048 block)* |
 | x86 32 GB Reference | **4 × 32 GB** | x86_64, 44 cores, 136 GB; 4 × V100-SXM2-32GB all-to-all NVLink2; PCIe 3.0; CUDA 12.8 | **5771.30** | **66.57** | 126.55 (bounded lookup **139.16**) / **116.82** / **66.18** |
 | x86 32 GB Reference | **6 × 32 GB** | x86_64, 104 cores, 252 GB; 8 × V100-SXM2-32GB in two 4-GPU NVLink2 islands (6 GPUs measured); PCIe 3.0; CUDA 12.8 | **7597.04** | **89.53** | 130.40 (bounded lookup **166.69**) / **120.22** / **67.27** |
-| x86 32 GB Flagship | **8 × 32 GB** | x86_64, 104 cores, 252 GB; 8 × V100-SXM2-32GB in two 4-GPU NVLink2 islands (all 8 GPUs); PCIe 3.0; CUDA 12.8 | **8470.63** | **87.43** | 125.49 (bounded lookup **159.12**) / 115.95 / 65.81 |
+| x86 32 GB Reference | **8 × 32 GB** | x86_64, 104 cores, 252 GB; 8 × V100-SXM2-32GB in two 4-GPU NVLink2 islands (all 8 GPUs); PCIe 3.0; CUDA 12.8 | **8470.63** | **87.43** | 125.49 (bounded lookup **159.12**) / 115.95 / 65.81 |
 
 **How to read the two decode columns and prefill numbers:**
 
@@ -103,7 +103,7 @@ So updates will definitely slow down; please plan accordingly. The project will 
 - **Why does 200K prefill change from 9,372 / 9,401 / 11,240 (banner) to 7,412 / 7,597 / 8,471 (Table 1)?**
   - The top banner shows pure 48-layer target-model prefill with speculation off; with `MTP-3` on, the draft layer must also prefill the 200K context state, trading a few extra seconds of prefill for a **2–3×** decode speedup.
 - **Authoritative 16 GB standard machine & cross-platform differences**: IBM POWER9 AC922 (6 × V100-SXM2-16GB, 96 GB) is this project's authoritative 16 GB benchmark machine; x86 16 GB and 32 GB rows illustrate real-world scaling across host–GPU interconnect bandwidth (AC922 GPU–CPU NVLink2 vs x86 PCIe 3.0) and VRAM capacity.
-- **Reproducibility & zero-precision-loss cross-check**: An independent reproduction window on AC922 6 × 16 GB measured 7384.79 / 61.43 tok/s (within ≤ 1.42%, byte-identical outputs); x86 16 GB 2/4/6-GPU greedy 200K outputs are **byte-identical across GPU counts**; block-2048 200K measurements are 1375.39 / 24.70 (AC922 2×16 GB), 432.14 / 14.05 (x86 2×16 GB), and 1273.16 / 61.99 tok/s (x86 2×32 GB).
+- **Cold-prompt & zero-precision-loss cross-check**: All 200K prefill numbers were measured cold with prefix cache disabled (`cache_prompt=false`, multi-run medians, zero prefix-cache hits). An independent reproduction window on AC922 6 × 16 GB measured 7384.79 / 61.43 tok/s (within ≤ 1.42%, byte-identical outputs); x86 16 GB 2/4/6-GPU greedy 200K outputs are **byte-identical across GPU counts**; block-2048 200K measurements are 1375.39 / 24.70 (AC922 2×16 GB), 432.14 / 14.05 (x86 2×16 GB), and 1273.16 / 61.99 tok/s (x86 2×32 GB).
 - **Chinese multi-scenario reference (x86 6 × 32 GB, MTP-3 default / bounded lookup)**: Chinese Q&A **89.40 / 90.24 tok/s**, Chinese Prose **63.88 / 63.38 tok/s**, Chinese Code **96.17 / 91.79 tok/s**; 8 × 32 GB leads 200K prefill (8470.63 / bounded lookup 8478.28), while 6 × 32 GB leads single-stream decode (89.53 vs 87.43).
 
 ### Table 2｜Qwen3.8-27B (dense) + DFlash2 speculative decoding (zero-regression gate)
@@ -197,7 +197,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 numactl --membind=0,8 ./build/bin/llama-server 
   --expert-profile /models/flash-next-profile.txt \
   --model-draft /models/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf \
   --spec-type draft-mtp --spec-draft-n-max 3 \
-  --spec-draft-ubatch 256 --spec-draft-window 32768 \
+  --spec-draft-ubatch 256 --spec-draft-window 32768 --ctx-checkpoints 0 \
   --host 127.0.0.1 --port 8080 --metrics
 ```
 
@@ -208,7 +208,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 numactl --membind=0,8 ./build/bin/llama-server 
 **2 × 16 GB**: set `CUDA_VISIBLE_DEVICES=0,1` (preferably two GPUs of the same CPU socket), everything else unchanged; more host memory is required.
 
 - For decode-heavy chat, change `-b 4096 -ub 4096` to `-b 2048 -ub 2048`.
-- Without image input you may drop `--expert-profile` (usually slower); dropping `--model-draft` and the `--spec-…` lines disables speculative decoding.
+- `--ctx-checkpoints 0` enables target/draft async prefill overlap on long prompts (omit it to keep the default `32` if multi-turn prefix checkpoint rollback is preferred); dropping `--model-draft` and `--spec-…` disables speculative decoding; omitting `--expert-profile` also works (usually slower).
 - Per-GPU VRAM being nearly full is normal (the extra VRAM is used for speed); lower `-c` first if VRAM is short.
 
 ### Qwen3.8-27B (dense) + DFlash2
@@ -307,7 +307,7 @@ On the AC922 use podman (`sudo dnf install -y podman podman-docker`), run `sudo 
 ## Automatic Hardware Adaptation, 32 GB Low-RAM Support, and Three-Tier Placement
 
 - **Zero-configuration defaults**: at start-up the server detects GPU count, VRAM, interconnect topology, and available host memory, then picks the optimal placement and block size automatically; explicit CLI parameters always override defaults.
-- **Unified three-tier placement (runs 111 GB MoE down to 32 GB host RAM)**: the model and its experts settle smoothly along "**VRAM → Host RAM → Disk**" — resident in VRAM when space allows, spilling to host RAM when needed, and streaming safely from disk on low-RAM machines, always computed on GPU. **No quant downgrade and no context shrinkage**: large-memory servers run at full RAM speed, while servers with as little as **32 GB host RAM** (even with 1–2 × 16 GB V100s) can still bring up the full 100+ GB MoE cleanly.
+- **Unified three-tier placement (runs 111 GB MoE down to 32 GB host RAM)**: the model and its experts settle along "**VRAM → Host RAM → Disk**", always computed on GPU with **no quant downgrade and no context shrinkage**. Servers with ample RAM run fully in VRAM + Host RAM; when host RAM cannot hold all non-VRAM experts, pass `--expert-profile <profile>` with `--expert-disk-gib <per-GPU GiB>` (and `--expert-disk-dir <fast data disk>`) to enable the disk tier with full OS headroom and safe-flush guards.
 - **Host safety guards**: built-in memory budgeting reserves OS headroom (never counting swap as usable memory) and fails loudly with clear guidance rather than squeezing or OOM-hanging the host.
 - **Choosing the block size**: `-b` / `-ub` sets how many prompt tokens each prefill step processes. Larger blocks give faster prefill at slightly lower decode speed and higher host memory; use 2048 for chat and interactive coding, or 4096 for ingesting large codebases or long documents.
 
