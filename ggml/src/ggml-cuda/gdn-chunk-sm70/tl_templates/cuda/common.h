@@ -807,7 +807,6 @@ TL_DEVICE void increase_descriptor_offset(Tcgen05SMemDescriptor &descriptor,
 // and add the desired implicit conversion from bfloat16_t.
 struct float_e4m3_t : public cute::float_e4m3_t {
   using cute::float_e4m3_t::float_e4m3_t;
-  CUTLASS_HOST_DEVICE
   float_e4m3_t() = default;
 
   CUTLASS_HOST_DEVICE
@@ -824,7 +823,6 @@ struct float_e4m3_t : public cute::float_e4m3_t {
 
 struct float_e5m2_t : public cute::float_e5m2_t {
   using cute::float_e5m2_t::float_e5m2_t;
-  CUTLASS_HOST_DEVICE
   float_e5m2_t() = default;
 
   CUTLASS_HOST_DEVICE
@@ -841,7 +839,6 @@ struct float_e5m2_t : public cute::float_e5m2_t {
 
 struct tfloat32_t : public cute::tfloat32_t {
   using cute::tfloat32_t::tfloat32_t;
-  CUTLASS_HOST_DEVICE
   tfloat32_t() = default;
 
   CUTLASS_HOST_DEVICE

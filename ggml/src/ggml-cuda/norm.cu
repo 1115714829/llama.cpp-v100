@@ -1080,16 +1080,15 @@ static __global__ void dsv4_hc_post_rms_norm_mul_f32(
                 if (dst_f16 != nullptr) dst_f16[col] = __float2half(value);
             }
         }
-        return;
-    }
-    for (int col = tid; col < ncols; col += block_size) {
-        const int mul_col = keep ? col : fastmodulo(col, mul_ncols_packed);
-        const float xi = keep ? saved[col / block_size] : has_post ? row_post[col] : row_in[col*sr0];
-        const float value = scale * xi * mul[mul_col];
-        dst[col] = value;
-        if (dst_f16 != nullptr) {
-
-            dst_f16[col] = __float2half(value);
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            const int mul_col = fastmodulo(col, mul_ncols_packed);
+            const float xi = has_post ? row_post[col] : row_in[col*sr0];
+            const float value = scale * xi * mul[mul_col];
+            dst[col] = value;
+            if (dst_f16 != nullptr) {
+                dst_f16[col] = __float2half(value);
+            }
         }
     }
 }

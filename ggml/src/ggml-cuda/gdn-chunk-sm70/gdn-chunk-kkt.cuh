@@ -60,7 +60,6 @@ __global__ void __launch_bounds__(128, 1) tilelang_kkt_solve_kernel_kernel(half_
     condval_1 = 0;
   }
   seq_end_idx = condval_1;
-  int batch_idx_1 = batch_idx;
   int chunk_idx_1 = chunk_idx;
   int seq_start_idx_1 = seq_start_idx;
   int seq_end_idx_1 = seq_end_idx;

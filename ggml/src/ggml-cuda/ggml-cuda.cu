@@ -3094,19 +3094,6 @@ static std::vector<std::vector<int>> ggml_cuda_numa_probe_candidates(const ggml_
     return cands;
 }
 
-static int ggml_cuda_sysfs_read_int(const char * path) {
-    FILE * f = fopen(path, "r");
-    if (f == nullptr) {
-        return -1;
-    }
-    int value = -1;
-    if (fscanf(f, "%d", &value) != 1) {
-        value = -1;
-    }
-    fclose(f);
-    return value;
-}
-
 static int ggml_cuda_numa_topology_node(int device) {
     const int node = node_index(device);
     if (node < 0) {

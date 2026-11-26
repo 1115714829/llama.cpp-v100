@@ -245,10 +245,10 @@ __global__ void __launch_bounds__(128, 1) gdn_chunk_direct_kernel(const half_t* 
     }
     __syncthreads();
     if (((int)threadIdx.x) < 64) {
-      g_exp_shared[((int)threadIdx.x)] = exp2f((g_shared[((int)threadIdx.x)] * 0x1.715475a31a4bep+0f ));
+      g_exp_shared[((int)threadIdx.x)] = exp2f((g_shared[((int)threadIdx.x)] * 0x1.715476p+0f ));
       float condval_13;
       if (((left + ((int)threadIdx.x)) < seq_end_idx)) {
-        condval_13 = exp2f(((g_shared[63] - g_shared[((int)threadIdx.x)]) * 0x1.715475a31a4bep+0f ));
+        condval_13 = exp2f(((g_shared[63] - g_shared[((int)threadIdx.x)]) * 0x1.715476p+0f ));
       } else {
         condval_13 = 0x0p+0f ;
       }
@@ -289,7 +289,7 @@ __global__ void __launch_bounds__(128, 1) gdn_chunk_direct_kernel(const half_t* 
     #pragma unroll
     for (int i_15 = 0; i_15 < 32; ++i_15) {
       if (((((((((int)threadIdx.x) >> 6) * 32) + (((i_15 & 15) >> 2) * 8)) + (((((int)threadIdx.x) & 15) >> 3) * 4)) + (((((int)threadIdx.x) & 3) >> 1) * 2)) + (i_15 & 1)) <= ((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_15 >> 4) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + (((i_15 & 3) >> 1) * 2)) + (((int)threadIdx.x) & 1))) {
-        g_fragment[i_15] = exp2f((g_fragment[i_15] * 0x1.715475a31a4bep+0f ));
+        g_fragment[i_15] = exp2f((g_fragment[i_15] * 0x1.715476p+0f ));
       } else {
         g_fragment[i_15] = 0x0p+0f ;
       }
@@ -444,7 +444,7 @@ __global__ void __launch_bounds__(128, 1) gdn_chunk_direct_kernel(const half_t* 
     }
     #pragma unroll
     for (int i_35 = 0; i_35 < 32; ++i_35) {
-      p_fragment[i_35] = (p_fragment[i_35] * (0x1.6a09e667f3bcdp-4f * g_fragment[i_35]));
+      p_fragment[i_35] = (p_fragment[i_35] * (0x1.6a09e6p-4f * g_fragment[i_35]));
     }
     __syncthreads();
     #pragma unroll
@@ -460,7 +460,7 @@ __global__ void __launch_bounds__(128, 1) gdn_chunk_direct_kernel(const half_t* 
     for (int i_37 = 0; i_37 < 8; ++i_37) {
       float2 __14;
         float2 v__17 = *(float2*)(o_fragment + (i_37 * 2));
-        float2 v__18 = make_float2((0x1.6a09e667f3bcdp-4f * g_exp_shared[((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_37 >> 2) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + ((i_37 & 1) * 2)) + (((int)threadIdx.x) & 1))]), (0x1.6a09e667f3bcdp-4f * g_exp_shared[((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_37 >> 2) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + ((i_37 & 1) * 2)) + (((int)threadIdx.x) & 1))]));
+        float2 v__18 = make_float2((0x1.6a09e6p-4f * g_exp_shared[((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_37 >> 2) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + ((i_37 & 1) * 2)) + (((int)threadIdx.x) & 1))]), (0x1.6a09e6p-4f * g_exp_shared[((((((((((int)threadIdx.x) & 63) >> 5) * 32) + ((i_37 >> 2) * 16)) + (((((int)threadIdx.x) & 7) >> 2) * 8)) + (((((int)threadIdx.x) & 31) >> 4) * 4)) + ((i_37 & 1) * 2)) + (((int)threadIdx.x) & 1))]));
         __14.x = (v__17.x*v__18.x);
         __14.y = (v__17.y*v__18.y);
       *(float2*)(o_fragment + (i_37 * 2)) = __14;
