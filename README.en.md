@@ -44,15 +44,15 @@ So updates will definitely slow down; please plan accordingly. The project will 
 
 ---
 
-## ✨ Key Highlights in 2.0.2 (At a Glance)
+## ✨ Key Highlights in 2.0.2
 
 > [!TIP]
-> ### 🔥 Four Flagship Pillars
-> **⚡ 10K-Class 200K Long Prefill** (`9,372–9,401` on 6 GPUs · **`11,240 tok/s`** on 8 GPUs) ｜ **🎯 100% Strictly Zero Precision Loss** (Full Op Suite + Byte-Exact T=0 + PPL/KLD) ｜ **🧠 Runs 111 GB MoE Down to 32 GB Host RAM** (1–8 GPUs, No Quant Downgrade, Host-Safe) ｜ **🚀 Zero Env Vars Out-of-the-Box** (Auto Hardware Adaptation + Offline Built-in WebUI)
+> ### Core Highlights
+> **⚡ 10K-Class 200K Long Prefill** (`9,372–9,401` on 6 GPUs · **`11,240 tok/s`** on 8 GPUs) ｜ **🎯 100% Strictly Zero Precision Loss** (Full Op Suite + Byte-Exact T=0 + PPL/KLD) ｜ **🧠 Runs 111 GB MoE Down to 32 GB Host RAM** (1–8 GPUs, No Quant Downgrade, Host-Safe) ｜ **🚀 Zero Env Vars Out-of-the-Box** (Auto Hardware Adaptation + Offline Telemetry WebUI)
 
 > This project focuses exclusively on the inference runtime and **never creates or modifies quantized model weights**: public GGUF weights are used verbatim while the SM70 kernels, multi-GPU coordination, 3-tier placement, and speculative decoding pipeline are deeply customized for NVIDIA V100.
 
-| Key Feature | Headline Spec / Coverage | What Makes It Stand Out |
+| Key Feature | Measured Spec / Coverage | Details |
 |---|---|---|
 | **⚡ 10K-Class 200K Prefill** | **9,372–11,240 tok/s** pure prefill; **7,412–8,471 tok/s** with MTP-3 | Ingests 200K-token codebases in seconds while delivering **119–167 tok/s** code-editing decode with `MTP-3`, turning low-cost V100s into flagship long-context rigs |
 | **🧠 32 GB Minimum Host RAM for 100+ GB MoE** | Runs full **111 GB MoE** on **≥ 32 GB RAM** (even on **1 × 16 GB V100**, 1–8 GPUs) | **Unified 3-tier adaptive placement (VRAM → Host RAM → Disk)** with **no quant downgrade and no context shrinkage**: full RAM residency on large hosts, graceful disk streaming on 32 GB hosts, plus strict OS headroom guards (never counts swap, never hangs or OOM-kills the host) |
