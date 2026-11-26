@@ -46,6 +46,8 @@ jobs:
             -DGGML_CUDA=ON \
             -DCMAKE_CUDA_ARCHITECTURES=70-real \
             -DGGML_NATIVE=OFF \
+            -DLLAMA_BUILD_UI=OFF \
+            -DLLAMA_USE_PREBUILT_UI=OFF \
             -DLLAMA_FATAL_WARNINGS=ON \
             -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
             -DCMAKE_INSTALL_RPATH='$ORIGIN' \

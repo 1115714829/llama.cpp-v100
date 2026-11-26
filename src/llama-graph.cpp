@@ -333,7 +333,7 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
 
     GGML_ASSERT(ubatch->output);
 
-    int written = 0;
+    uint32_t written = 0;
 
     for (int i = 0; i < n_tokens; ++i) {
         if (ubatch->output[i]) {

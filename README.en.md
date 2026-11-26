@@ -227,7 +227,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 ./build/bin/llama-server \
 
 Change `CUDA_VISIBLE_DEVICES` and `--tensor-split` (one `1` per GPU) for 2 / 6 GPUs; on 2 GPUs use the Q4 configuration (main model `Qwen3.8-27B-UD-Q4_K_M.gguf`, `-ctk q4_0 -ctv q4_0`, draft `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`).
 
-### Recommended Models & Exact Download Links (Do Not Substitute Random Quants or Mismatched Drafts)
+### Recommended Models & Download Links
 
 > Users in mainland China should prefer **ModelScope** direct links (supports `wget -c` resume; on IBM AC922 wrap downloads with `numactl --membind=0,8` so page cache does not spill into GPU HBM nodes). Always use matching model, draft, and mmproj files from the verified lists below.
 

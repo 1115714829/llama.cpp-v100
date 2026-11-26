@@ -779,8 +779,8 @@ common_admission_result common_admission_check(
             uint64_t share = 0;
             if (total_size > 0) {
 
-                const unsigned __int128 product =
-                    (unsigned __int128) result.headroom * supply.nodes[i].total;
+                __extension__ const unsigned __int128 product =
+                    (__extension__ (unsigned __int128) result.headroom) * supply.nodes[i].total;
                 share = (uint64_t) (product / total_size);
                 if (share > result.headroom - reserve_sum) {
                     share = result.headroom - reserve_sum;

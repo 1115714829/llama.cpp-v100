@@ -93,8 +93,11 @@ status parse_list(const char * text,size_t n,mask & out,bool allow_empty) noexce
   if(p<end&&*p=='-'){++p;if(!decimal(p,end,last))return fail(code::malformed,"list-range");}
   if(last<first||(have&&first<=previous))return fail(code::malformed,"list-order");
   if(last>=node_bits)return fail(code::capacity,"list-capacity");
-  for(uint64_t x=first;x<=last;++x)set(out,unsigned(x));have=true;previous=last;
-  if(p==end)break;if(*p++!=','||p==end)return fail(code::malformed,"list-separator");
+  for (uint64_t x = first; x <= last; ++x) { set(out, unsigned(x)); }
+  have = true;
+  previous = last;
+  if (p == end) { break; }
+  if (*p++ != ',' || p == end) { return fail(code::malformed, "list-separator"); }
  }
  return fail(code::ok,"list");
 }
@@ -106,9 +109,11 @@ status parse_total(const char * text,size_t n,unsigned node,uint64_t & bytes) no
   if(size_t(e-p)>=size_t(length)&&!memcmp(p,prefix,size_t(length))){if(found)return fail(code::malformed,"memtotal-duplicate");found=true;
    const char * q=p+length;while(q<e&&(*q==' '||*q=='\t'))++q;uint64_t value;
    if(!decimal(q,e,value))return fail(code::malformed,"memtotal-number");
-   if(q==e||(*q!=' '&&*q!='\t'))return fail(code::malformed,"memtotal-unit");while(q<e&&(*q==' '||*q=='\t'))++q;
-   if(e-q!=2||memcmp(q,"kB",2))return fail(code::malformed,"memtotal-unit");
-   if(value>UINT64_MAX/1024)return fail(code::capacity,"memtotal-overflow");bytes=value*1024;
+   if (q == e || (*q != ' ' && *q != '\t')) { return fail(code::malformed, "memtotal-unit"); }
+   while (q < e && (*q == ' ' || *q == '\t')) { ++q; }
+   if (e - q != 2 || memcmp(q, "kB", 2)) { return fail(code::malformed, "memtotal-unit"); }
+   if (value > UINT64_MAX / 1024) { return fail(code::capacity, "memtotal-overflow"); }
+   bytes = value * 1024;
   }p=e+1;
  }return fail(found?code::ok:code::malformed,"memtotal");
 }

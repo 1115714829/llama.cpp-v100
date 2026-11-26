@@ -3477,6 +3477,7 @@ void ggml_cuda_expert_tail_fence(const ggml_tensor * w, cudaStream_t stream, uin
     ss.tail_worker = std::this_thread::get_id();
 }
 void ggml_cuda_expert_prefill_kick(const ggml_tensor * weight, int64_t tokens, cudaStream_t stream, uint64_t generation) {
+    GGML_UNUSED(generation);
     ggml_cuda_expert_table table;
     if (!ggml_cuda_expert_table_get(weight, &table) || !table.has_stage) return;
     auto * ctx = ggml_cuda_expert_buffer_ctx(weight);
@@ -5370,7 +5371,7 @@ static ggml_backend_buffer_t bind_buffer(
         }
         if (!tail_ok) {
 
-            GGML_LOG_ERROR("%s: device %d: the plan needs %zu MiB of tail slots but the borrow region is %.2f MiB; refusing the tail\n",
+            GGML_LOG_ERROR("%s: device %d: the plan needs %.2f MiB of tail slots but the borrow region is %.2f MiB; refusing the tail\n",
                 __func__, device, off / 1024.0 / 1024.0, ctx->backend_user.slab_used / 1024.0 / 1024.0);
             for (auto & p : tail_dev) {
                 p = nullptr;

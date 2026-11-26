@@ -749,7 +749,7 @@ void ggml_cuda_op_qsa_select(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
     static const bool skip = true;
 
     const bool grow = wide_tile && !legacy && n_tokens % QSA_SELECT_TILE == 0 && n_pool > QSA_TOPK_REG_MAX;
-    const int64_t limit = grow && n_pool <= (32*1024*1024)/(128*sizeof(float)) ? 128 : QSA_SELECT_TILE;
+    const int64_t limit = grow && n_pool <= (int64_t) ((32*1024*1024)/(128*sizeof(float))) ? 128 : QSA_SELECT_TILE;
     const int64_t tile = std::min(n_tokens, limit);
     ggml_cuda_pool_alloc<float> scores(ctx.pool(), n_pool*tile);
 
