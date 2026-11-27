@@ -57,7 +57,7 @@
 | **⚡ 万级 200K 长上下文预填充** | 纯预填充 **9,372～11,240 tok/s**；开 MTP-3 仍达 **7,412～8,471 tok/s** | 20 万 token 长代码库数秒读完；开启 `MTP-3` 后代码编辑吐字达 **119～167 tok/s**，在低成本 V100 上即可流畅处理长上下文与代码编辑 |
 | **🧠 最低 32 GB 内存跑百 GB 大 MoE** | **≥ 32 GB 主机内存**即可启动 **111 GB 大 MoE**（含单张 16 GB 卡与 1～8 卡） | **统一三层自适应放置（显存 → 内存 → 磁盘）**：不靠砍量化、降精度或缩上下文凑合；内存大时满血常驻、内存小时自动分层流式计算，并自动预留系统安全余量、不把 swap 算作可用内存、避免 OOM 或拖垮宿主机 |
 | **🎯 严格零精度损耗 & 双线零回退** | 全量算子回归 + T=0 逐字节一致 + PPL/KLD 双验证 | 不使用有损低精度通信或近似计算换分；稠密 27B（DFlash2）与大 MoE（MTP）双线相对 `2.0.1.2` 严格零回退 |
-| **🚀 零环境变量开箱即满血** | **0 个调优环境变量**，推荐命令直达公布跑分 | 启动自动识别卡数、显存、NVLink/PCIe 拓扑与可用内存，自动规划最优放置与块大小；高级参数仍支持显式锁定 |
+| **🚀 零环境变量开箱即满血** | **0 个调优环境变量**，推荐命令直达公布跑分 | 启动自动识别卡数、显存、NVLink/PCIe 拓扑与可用内存，自动规划显存/内存/磁盘三层最优放置与层切分；`-b`/`-ub` 等高级参数由启动命令显式指定并永远优先 |
 | **🌌 超长上下文 & 多路吐字优先** | 大 MoE 原生 **256K**；稠密 27B YaRN 最高 **512K～1M（1,048,576）** | 可容纳整仓代码与长程 Agent 记忆；`-np N` 多路并发内置**吐字优先限流调度（`--prefill-pace`）**，后来的长请求不会阻塞正在吐字的会话 |
 | **🔥 双投机解码引擎分线专精** | 大 MoE 走 **MTP**（+ 可选有界后缀查找）；稠密 27B 走 **DFlash2** | 按模型结构量身选型，针对真实生产采样惩罚与中英文代码/长文场景专项提速，带来 **2～3×** 无损吐字加速 |
 | **🖥️ 跨架构 · 全卡数 · 16G/32G 通吃** | **x86_64 + IBM POWER9 AC922（ppc64le）**；**1/2/3/4/5/6/8 卡**；**16G / 32G** | 一套源码通吃主流双架构与所有常见 V100 卡数（兼容 3/5/6 等非整除注意力头数拓扑），同步提供双架构 Docker / Podman 镜像与 x86 预编译包 |
@@ -309,7 +309,7 @@ AC922 上用 podman（`sudo dnf install -y podman podman-docker`），在源码�
 
 ## 硬件自动适配、32 GB 低内存支持与三层放置
 
-- **零配置默认**：启动时自动检测卡数、显存、拓扑与主机可用内存，按当前机器条件自动规划最优放置与块大小；用户显式传参永远优先覆盖默认。
+- **零配置放置默认**：启动时自动检测卡数、显存、拓扑与主机可用内存，按当前机器条件自动规划显存/内存/磁盘三层放置与层切分（块大小 `-b`/`-ub` 代码默认 `2048`/`512`，请按下方场景建议显式传入）；用户显式传参永远优先覆盖默认。
 - **统一三层放置（最低支持 32 GB 内存跑 111 GB 大 MoE）**：模型与专家按统一规则沿「**显存 → 主机内存 → 磁盘**」分层下沉，全程始终由 GPU 计算，**无需降量化、无需缩上下文**。内存充裕时自动全内存常驻；当主机内存不足以容纳全部非显存专家时，可配合 `--expert-profile <画像>` 与 `--expert-disk-gib <每卡磁盘预算GiB>`（及 `--expert-disk-dir <高速数据盘目录>`）启用专家磁盘层，并保持系统预留与安全刷盘（建议将数据盘与系统盘分离）。
 - **宿主机安全硬防护**：内置统一可用内存账本与系统安全预留（不把 swap 算作可用内存），装不下时提前明确报错并给出建议，绝不硬塞导致宿主机 OOM 假死或把系统盘写爆。
 - **块大小怎么选**：`-b` / `-ub` 表示预填充每一步处理的 token 数。块越大预填充越快、吐字略慢、主机内存占用略高；日常对话写代码推荐 2048，一次吞吐整仓代码或超长文档推荐 4096。
@@ -338,7 +338,7 @@ AC922 上用 podman（`sudo dnf install -y podman podman-docker`），在源码�
 | **KV 量化与块大小** | `-ctk <type> -ctv <type>`<br>`-ctkd <type> -ctvd <type>`<br>`-b <N> -ub <N>` | 主模型与草稿模型的 KV 缓存类型（推荐 `q8_0`，极致省显存选 `q4_0`）；`-b`/`-ub` 控制预填充块大小（交互推荐 `2048`，200K 吞吐推荐 `4096`）。 |
 | **多卡拓扑与 NUMA** | `--split-mode`（`-sm layer\|tensor\|row\|none`）<br>`--tensor-split`（`-ts N0,N1,...`）<br>`--numa <distribute\|isolate\|numactl>` | MoE 默认用 `layer`（层切分），稠密 27B 推荐 `tensor`（张量并行）；非对称卡可用 `-ts` 调整比例；双路主机可配合 `--numa`。 |
 | **MoE 三层放置与盘层** | `--expert-profile <文件>`<br>`--dump-expert-routing <文件>`<br>`--expert-host-gib <GiB>`<br>`--expert-disk-gib <每卡GiB>`<br>`--expert-disk-dir <目录>`<br>`--load-mode`（`-lm auto\|mmap\|dio\|mlock\|none`） | 结合专家路由画像将热专家驻留显存、温专家留主机内存、冷专家落高速数据盘（`--expert-disk-gib` 为**每张卡**预算）；`--dump-expert-routing` 可按自身业务自采路由画像；`-cmoe` / `-ncmoe N` 可显式控制 CPU 专家层数。 |
-| **自动适配与显存预算** | `--fit [on\|off]`<br>`--fit-target <MiB0,...>`<br>`--fit-ctx <N>` | 默认开启硬件自动规划，显式传参优先；可用 `--fit-target` 调整每卡预留显存余量。 |
+| **自动适配与显存预算** | `--fit [on\|off]`<br>`--fit-target <MiB0,...>`<br>`--fit-ctx <N>` | 默认 `on`，自动规划三层放置与上下文拟合，显式传参优先（**MoE 请保持默认 `on`，切勿传 `--fit off`**）；可用 `--fit-target` 调整每卡预留显存余量。 |
 | **投机解码与查找** | `--model-draft <GGUF>`<br>`--spec-type <draft-mtp\|draft-dflash\|ngram-*>`<br>`--spec-draft-n-max <N>` / `--draft-max <N>`<br>`--spec-draft-p-min <P>`<br>`--spec-draft-device`（`-devd`）<br>`--spec-draft-ngl`（`-ngld`）<br>`-lcs <文件>` / `-lcd <文件>` | MoE 用 `draft-mtp`（推荐 `--spec-draft-n-max 3`），27B 用 `draft-dflash`（推荐 `7`）；支持搭配有界后缀查找及静/动态查找缓存文件。 |
 | **长窗多轮与并发调度** | `--cache-ram <MiB>`（`-cram`）<br>`--ctx-checkpoints <N>`（`-ctxcp`）<br>`--checkpoint-min-step <N>`（`-cms`）<br>`-np <N>`（`--parallel`）<br>`--prefill-pace <0..100>` | 多轮对话自动复用前缀缓存（`-cram` 设上限，`-1` 不限、`0` 关闭；`-ctxcp` 控制多轮中途回退检查点）；`-np N` 多路并发时，`--prefill-pace` 限制新请求预填充时间片占比，保障正在吐字的会话流畅。 |
 | **多模态与思考控制** | `--mmproj <GGUF>`<br>`--mmproj-device`（`-mmdev <dev\|none>`）<br>`--image-min-tokens <N>`<br>`--video-ffmpeg-dir <目录>`<br>`--reasoning [on\|off\|auto]`<br>`--reasoning-effort <level>`<br>`--reasoning-budget <N>`<br>`--reasoning-preserve` | `-mmdev` 可将视觉编码器单独钉到指定卡（或 `none` 放 CPU）；小图推荐 `--image-min-tokens 1024`；支持命令行或请求体细粒度控制思考开关、强度与思考预算。 |
