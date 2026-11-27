@@ -26,7 +26,19 @@ static_assert(SM70_D256_KV_WINDOW == GGML_BACKEND_META_ASSIST_KV_WINDOW, "assist
 constexpr int SM70_D256_KV_SPLITS = 2;
 constexpr int SM70_D256_SPLIT_MIN_BLOCKS = 32;
 
-constexpr int SM70_D256_NSM = 80;
+constexpr int SM70_D256_LEGACY_NSM = 80;
+
+// Keep the historical split decision on 80-SM GV100s: changing it also changes
+// the floating-point reduction order. Other SM counts use the wave-count rule.
+static bool sm70_d256_should_split(int64_t ctas, int nsm) {
+    if (nsm == SM70_D256_LEGACY_NSM) {
+        return ctas < 4 * SM70_D256_LEGACY_NSM;
+    }
+
+    const int64_t waves       = (ctas + nsm - 1) / nsm;
+    const int64_t split_waves = (SM70_D256_KV_SPLITS * ctas + nsm - 1) / nsm;
+    return split_waves < SM70_D256_KV_SPLITS * waves;
+}
 
 __global__ void sm70_d256_stage_q_kernel(
         const float2 * __restrict__ src, half2 * __restrict__ dst,
@@ -290,7 +302,7 @@ struct sm70_d256_scratch {
     ggml_cuda_flash_attn_ext_f16_extra_data f16_extra;
 };
 
-static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst) {
+static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst, int nsm) {
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
@@ -313,8 +325,8 @@ static sm70_d256_scratch sm70_d256_get_scratch(const ggml_tensor * dst) {
     const int64_t kv_blocks =
         (kv_len + SM70_D256_MASK_BLOCK_N - 1) / SM70_D256_MASK_BLOCK_N;
     const bool split_dense = !windowed
-        && launch_ctas < 4 * SM70_D256_NSM
-        && kv_blocks >= 2 * SM70_D256_SPLIT_MIN_BLOCKS;
+        && kv_blocks >= 2 * SM70_D256_SPLIT_MIN_BLOCKS
+        && sm70_d256_should_split(launch_ctas, nsm);
     const bool partial = windowed || split_dense;
 
     sm70_d256_scratch s = {};
@@ -930,15 +942,16 @@ bool ggml_cuda_sm70_d256_assist_run(void * backend, const ggml_backend_meta_assi
     return true;
 }
 
-size_t ggml_cuda_sm70_d256_alloc_size(const ggml_tensor * dst) {
-    return sm70_d256_get_scratch(dst).total;
+size_t ggml_cuda_sm70_d256_alloc_size(int device, const ggml_tensor * dst) {
+    return sm70_d256_get_scratch(dst, ggml_cuda_info().devices[device].nsm).total;
 }
 
 bool ggml_cuda_sm70_d256_assist_scratch_layout(const ggml_tensor * dst, ggml_backend_meta_assist_scratch * layout) {
     if (dst == nullptr || dst->op != GGML_OP_FLASH_ATTN_EXT || layout == nullptr) {
         return false;
     }
-    const sm70_d256_scratch scratch = sm70_d256_get_scratch(dst);
+    const sm70_d256_scratch scratch = sm70_d256_get_scratch(
+        dst, ggml_cuda_info().devices[ggml_cuda_get_device()].nsm);
     if (!scratch.windowed) {
         return false;
     }
@@ -973,7 +986,8 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
     float scale = 1.0f;
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
-    const sm70_d256_scratch scratch = sm70_d256_get_scratch(dst);
+    const int nsm = ggml_cuda_info().devices[ctx.device].nsm;
+    const sm70_d256_scratch scratch = sm70_d256_get_scratch(dst, nsm);
     char * base = (char *) dst->data + ggml_nbytes(dst);
     half  * Qs = (half  *) (base + scratch.qs_offset);
     float * Os = (float *) (base + scratch.os_offset);
@@ -1041,7 +1055,7 @@ void ggml_cuda_flash_attn_ext_sm70_d256(ggml_backend_cuda_context & ctx, ggml_te
 
         const int m_blocks = q_pad / SM70_D256_BLOCK_M;
         const int window_ctas = m_blocks * batch * heads_q;
-        const bool split_window = window_ctas < 4 * SM70_D256_NSM;
+        const bool split_window = sm70_d256_should_split(window_ctas, nsm);
 
         const int64_t n_kv_rows = K->ne[1];
         const int n_win = (int) ((n_kv_rows + SM70_D256_KV_WINDOW - 1) / SM70_D256_KV_WINDOW);

@@ -16086,6 +16086,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // 24 Q heads x 13 / 16 q blocks = 312 / 384 CTAs: on 72-SM cards the
+    // wave-count rule splits both shapes; on 80-SM cards it keeps nb=1024 split
+    // off and nb=832 on the legacy split path.
+    for (int nb : { 832, 1024 }) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, true,  0));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 0, false, 1));
+    }
+
     for (int kv : { 4096, 32768 }) {
         for (int nb : { 2048, 17, 100 }) {
             for (const std::array<int32_t, 4> & perm : { std::array<int32_t, 4>{0, 1, 2, 3}, std::array<int32_t, 4>{0, 2, 1, 3} }) {
