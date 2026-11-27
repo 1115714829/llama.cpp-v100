@@ -316,6 +316,41 @@ AC922 上用 podman（`sudo dnf install -y podman podman-docker`），在源码�
 
 ---
 
+## 量化支持与高级参数
+
+### 一、支持的量化类型（SM70 V100 原生加速）
+
+1. **KV 缓存量化（`-ctk` / `-ctv` 及草稿 `-ctkd` / `-ctvd`）**
+   - 参数支持：`f32`、`f16`、`bf16`、`q8_0`、`q4_0`、`q4_1`、`iq4_nl`、`q5_0`、`q5_1`。
+   - **V100 专属高速内核覆盖**：
+     - **`q8_0`（主力推荐）**：稠密 27B（D256 注意力 + 分组验证）与大 MoE（QSA 稀疏注意力）均有 SM70 专属张量核加速，显存占用较 `f16` 减半、精度几乎无损；
+     - **`q4_0`（极省显存）**：配备 V100 专属向量化反量化注意力内核，适合 2 × 16 GB 跑 27B 256K 或 6 × 16 GB 跑 27B 1M 超长上下文；
+     - **`f16`**：全路径原生加速；V100 无原生 BF16 张量核，不建议使用 `bf16` KV 缓存。
+2. **模型权重量化（SM70 硬件原生算力承载）**
+   - **主力与小批量加速（Skinny / MMQ / Fused Expert）**：`Q8_0`（27B 4–6 卡主力，含专用 `q8` 小批量内核）、`Q4_K` / `UD-Q4_K_XL` / `UD-Q4_K_M`（MoE 与 2 卡 27B 主力）、`Q2_K` / `Q3_K` / `Q5_K` / `Q6_K`（全系小批量专属加速）、`Q4_0` / `Q4_1` / `Q5_0` / `Q5_1`。
+   - **低比特现代格式**：`FP8`（E4M3）、`NVFP4`、`MXFP4` 及 `IQ1_S`～`IQ4_NL`，均在 V100 上以硬件原生张量核 / `dp4a` 承载计算。
+   - **草稿模型提示**：V100 无原生 BF16 加速，若下到 BF16 草稿模型请先转为 `F16` 或直接使用 `Q8_0` / `Q4_K_M` 版本。
+
+### 二、常用高级参数速查（零环境变量，显式传参优先）
+
+| 分类 | 参数 | 作用与建议 |
+|---|---|---|
+| **KV 量化与块大小** | `-ctk <type> -ctv <type>`<br>`-ctkd <type> -ctvd <type>`<br>`-b <N> -ub <N>` | 主模型与草稿模型的 KV 缓存类型（推荐 `q8_0`，极致省显存选 `q4_0`）；`-b`/`-ub` 控制预填充块大小（交互推荐 `2048`，200K 吞吐推荐 `4096`）。 |
+| **多卡拓扑与 NUMA** | `--split-mode`（`-sm layer\|tensor\|row\|none`）<br>`--tensor-split`（`-ts N0,N1,...`）<br>`--numa <distribute\|isolate\|numactl>` | MoE 默认用 `layer`（层切分），稠密 27B 推荐 `tensor`（张量并行）；非对称卡可用 `-ts` 调整比例；双路主机可配合 `--numa`。 |
+| **MoE 三层放置与盘层** | `--expert-profile <文件>`<br>`--dump-expert-routing <文件>`<br>`--expert-host-gib <GiB>`<br>`--expert-disk-gib <每卡GiB>`<br>`--expert-disk-dir <目录>`<br>`--load-mode`（`-lm auto\|mmap\|dio\|mlock\|none`） | 结合专家路由画像将热专家驻留显存、温专家留主机内存、冷专家落高速数据盘（`--expert-disk-gib` 为**每张卡**预算）；`--dump-expert-routing` 可按自身业务自采路由画像；`-cmoe` / `-ncmoe N` 可显式控制 CPU 专家层数。 |
+| **自动适配与显存预算** | `--fit [on\|off]`<br>`--fit-target <MiB0,...>`<br>`--fit-ctx <N>` | 默认开启硬件自动规划，显式传参优先；可用 `--fit-target` 调整每卡预留显存余量。 |
+| **投机解码与查找** | `--model-draft <GGUF>`<br>`--spec-type <draft-mtp\|draft-dflash\|ngram-*>`<br>`--spec-draft-n-max <N>` / `--draft-max <N>`<br>`--spec-draft-p-min <P>`<br>`--spec-draft-device`（`-devd`）<br>`--spec-draft-ngl`（`-ngld`）<br>`-lcs <文件>` / `-lcd <文件>` | MoE 用 `draft-mtp`（推荐 `--spec-draft-n-max 3`），27B 用 `draft-dflash`（推荐 `7`）；支持搭配有界后缀查找及静/动态查找缓存文件。 |
+| **长窗多轮与并发调度** | `--cache-ram <MiB>`（`-cram`）<br>`--ctx-checkpoints <N>`（`-ctxcp`）<br>`--checkpoint-min-step <N>`（`-cms`）<br>`-np <N>`（`--parallel`）<br>`--prefill-pace <0..100>` | 多轮对话自动复用前缀缓存（`-cram` 设上限，`-1` 不限、`0` 关闭；`-ctxcp` 控制多轮中途回退检查点）；`-np N` 多路并发时，`--prefill-pace` 限制新请求预填充时间片占比，保障正在吐字的会话流畅。 |
+| **多模态与思考控制** | `--mmproj <GGUF>`<br>`--mmproj-device`（`-mmdev <dev\|none>`）<br>`--image-min-tokens <N>`<br>`--video-ffmpeg-dir <目录>`<br>`--reasoning [on\|off\|auto]`<br>`--reasoning-effort <level>`<br>`--reasoning-budget <N>`<br>`--reasoning-preserve` | `-mmdev` 可将视觉编码器单独钉到指定卡（或 `none` 放 CPU）；小图推荐 `--image-min-tokens 1024`；支持命令行或请求体细粒度控制思考开关、强度与思考预算。 |
+
+### 三、使用注意与已知限制
+
+- **MTP 投机请配 `-np 1`**：当前开启大 MoE `MTP` 投机解码时请使用 `-np 1`（不开 MTP 时多路 `-np > 1` 正常）。
+- **27B 张量并行 + DFlash2 勿加 `-devd`**：启用 `--split-mode tensor` 搭配 DFlash2 时，草稿模型与目标模型共享词嵌入权重，暂不支持通过 `-devd` 将草稿单独钉到单卡（`-mmdev` 单独使用不受限制）。
+- **旧版 NCCL 兜底**：正常推荐环境无需任何环境变量；仅在宿主机自带 NCCL 过旧导致多卡通信失败时，可设置 `GGML_CUDA_ALLREDUCE=internal` 使用内置通信路径。
+
+---
+
 ## 测试平台与定论边界
 
 - **16 GB 权威定论标准机**：IBM POWER9 AC922 双路 96 GB 内存，6 × Tesla V100-SXM2-16GB；岛内 NVLink2、GPU–CPU NVLink2；CUDA 12.4。本项目的 16 GB 定论数据一律出自该平台。

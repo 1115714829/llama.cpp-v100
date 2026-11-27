@@ -313,6 +313,41 @@ On the AC922 use podman (`sudo dnf install -y podman podman-docker`), run `sudo 
 
 ---
 
+## Supported Quantizations & Advanced Parameters
+
+### 1. Quantization Support (Native SM70 V100 Acceleration)
+
+1. **KV cache quantization (`-ctk` / `-ctv`, and draft `-ctkd` / `-ctvd`)**
+   - Accepted values: `f32`, `f16`, `bf16`, `q8_0`, `q4_0`, `q4_1`, `iq4_nl`, `q5_0`, `q5_1`.
+   - **Dedicated V100 fast kernels**:
+     - **`q8_0` (recommended default)**: native SM70 tensor-core kernels for both dense 27B (D256 attention + grouped verify) and large MoE (QSA sparse attention), halving KV VRAM vs `f16` with negligible quality loss.
+     - **`q4_0` (maximum VRAM savings)**: dedicated vectorized dequant attention kernels on SM70, ideal for 27B 256K on 2 × 16 GB or 1M context on 6 × 16 GB.
+     - **`f16`**: natively accelerated everywhere. V100 has no native BF16 tensor cores, so `bf16` KV cache is not recommended.
+2. **Model weight quantizations (native SM70 execution)**
+   - **Primary & small-batch accelerated formats (Skinny / MMQ / Fused Expert)**: `Q8_0` (dedicated V100 `q8` skinny kernels, primary for 4–6 GPU 27B), `Q4_K` / `UD-Q4_K_XL` / `UD-Q4_K_M` (primary for MoE and 2-GPU 27B), `Q2_K` / `Q3_K` / `Q5_K` / `Q6_K` (full V100 skinny codec family), plus `Q4_0` / `Q4_1` / `Q5_0` / `Q5_1`.
+   - **Modern low-bit formats**: `FP8` (E4M3), `NVFP4`, `MXFP4`, and `IQ1_S`–`IQ4_NL`, executed via native Volta tensor cores / `dp4a`.
+   - **Draft model note**: convert BF16 draft checkpoints to `F16`, or use `Q8_0` / `Q4_K_M` directly on V100.
+
+### 2. Advanced CLI Reference (Zero Env Vars Required; Explicit Flags Always Win)
+
+| Category | Flags | Purpose & Recommendations |
+|---|---|---|
+| **KV Quant & Batching** | `-ctk <type> -ctv <type>`<br>`-ctkd <type> -ctvd <type>`<br>`-b <N> -ub <N>` | KV cache types for target and draft models (`q8_0` recommended, `q4_0` for tight VRAM); `-b`/`-ub` set prefill chunk size (`2048` interactive, `4096` long-context throughput). |
+| **Multi-GPU & NUMA** | `--split-mode` (`-sm layer\|tensor\|row\|none`)<br>`--tensor-split` (`-ts N0,N1,...`)<br>`--numa <distribute\|isolate\|numactl>` | Use `layer` for MoE and `tensor` for dense 27B; `-ts` adjusts per-GPU proportions on asymmetric setups; `--numa` tunes dual-socket hosts. |
+| **MoE Three-Tier & Disk Tier** | `--expert-profile <file>`<br>`--dump-expert-routing <file>`<br>`--expert-host-gib <GiB>`<br>`--expert-disk-gib <GiB/GPU>`<br>`--expert-disk-dir <dir>`<br>`--load-mode` (`-lm auto\|mmap\|dio\|mlock\|none`) | Places hot experts in VRAM, warm experts in host RAM, and cold experts on a fast data disk (`--expert-disk-gib` is **per GPU**); `--dump-expert-routing` captures custom routing profiles; `-cmoe` / `-ncmoe N` control CPU expert layers explicitly. |
+| **Auto-Fit & VRAM Margin** | `--fit [on\|off]`<br>`--fit-target <MiB0,...>`<br>`--fit-ctx <N>` | Automatic hardware-aware placement is on by default while respecting explicit flags; `--fit-target` tunes per-GPU free-VRAM headroom. |
+| **Speculative Decoding & Lookup** | `--model-draft <GGUF>`<br>`--spec-type <draft-mtp\|draft-dflash\|ngram-*>`<br>`--spec-draft-n-max <N>` / `--draft-max <N>`<br>`--spec-draft-p-min <P>`<br>`--spec-draft-device` (`-devd`)<br>`--spec-draft-ngl` (`-ngld`)<br>`-lcs <file>` / `-lcd <file>` | `draft-mtp` for MoE (`--spec-draft-n-max 3`), `draft-dflash` for 27B (`7`); supports bounded suffix lookup and static/dynamic lookup caches. |
+| **Multi-Turn Cache & Concurrency** | `--cache-ram <MiB>` (`-cram`)<br>`--ctx-checkpoints <N>` (`-ctxcp`)<br>`--checkpoint-min-step <N>` (`-cms`)<br>`-np <N>` (`--parallel`)<br>`--prefill-pace <0..100>` | Automatic prefix-cache reuse across turns (`-cram` caps MiB, `-1` unlimited, `0` off; `-ctxcp` keeps checkpoints for mid-conversation branching); under `-np N` concurrency, `--prefill-pace` caps incoming prefill wall-time share to keep active decoding smooth. |
+| **Multimodal & Thinking** | `--mmproj <GGUF>`<br>`--mmproj-device` (`-mmdev <dev\|none>`)<br>`--image-min-tokens <N>`<br>`--video-ffmpeg-dir <dir>`<br>`--reasoning [on\|off\|auto]`<br>`--reasoning-effort <level>`<br>`--reasoning-budget <N>`<br>`--reasoning-preserve` | `-mmdev` pins the vision projector to a specific GPU (or `none` for CPU); use `--image-min-tokens 1024` for small images; fine-grained CLI and per-request controls for thinking mode, effort, and token budget. |
+
+### 3. Operational Notes & Known Limitations
+
+- **Use `-np 1` with MTP speculation**: please keep `-np 1` when running MoE with `MTP` enabled (without MTP, `-np > 1` works normally).
+- **Do not combine `-devd` with `--split-mode tensor` + DFlash2**: the DFlash2 draft shares `token_embd` with the tensor-split target model and cannot currently be pinned to a single card via `-devd` (`-mmdev` alone is unaffected).
+- **Older NCCL fallback**: no environment variables are needed on recommended stacks; only if a host ships an older NCCL library that fails multi-GPU collectives, set `GGML_CUDA_ALLREDUCE=internal` to use the built-in collective path.
+
+---
+
 ## Test platforms and the boundary of the conclusions
 
 - **Authoritative 16 GB standard machine**: IBM POWER9 AC922, dual socket, 96 GB memory, 6 × Tesla V100-SXM2-16GB; intra-island NVLink2 and GPU–CPU NVLink2; CUDA 12.4. All 16 GB authoritative numbers of this project come from this platform.
