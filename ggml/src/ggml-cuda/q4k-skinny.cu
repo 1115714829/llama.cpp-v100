@@ -650,7 +650,8 @@ __global__ void qskinny_to_f16_kernel(half * __restrict__ output, const uint8_t 
       : "r"(A0), "r"(A1), "r"(B0), "r"(B1))
 
 template <ggml_type T, int SplitK, int NAcc, bool M1Only = false, int RowTiles = 1>
-__global__ void q4k_skinny_kernel(
+__global__ void __launch_bounds__(32 * SplitK, RowTiles == 1 ? 2 : 1)
+q4k_skinny_kernel(
     const uint8_t * __restrict__ codes, const half * __restrict__ input,
     float * __restrict__ output, int n, int k, int m) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
